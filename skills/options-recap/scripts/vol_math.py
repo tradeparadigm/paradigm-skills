@@ -3,7 +3,7 @@ vol_math.py — deterministic vol calculations for the options-recap skill.
 
 Single source of truth for the math the agent must NOT do by mental arithmetic:
 realized volatility and Black-76 flow greeks. Both the production CLI
-(paradex_options_recap.py) and the eval fixture generator (../evals/
+(paradigm_options_recap.py) and the eval fixture generator (../evals/
 generate_fixture.py) import from here, so the formula never forks.
 
 Pure functions, no I/O, no network — unit-tested in test_vol_math.py.

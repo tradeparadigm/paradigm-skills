@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # Shared vol math — single source of truth for the formulas the agent must not
-# do by hand. The production CLI (../scripts/paradex_options_recap.py) imports
+# do by hand. The production CLI (../scripts/paradigm_options_recap.py) imports
 # the same module, so the fixture and live runs can never diverge.
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 from vol_math import (  # noqa: E402

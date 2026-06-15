@@ -60,29 +60,34 @@ prime-LP filter was bypassed.
 
 ### Fair value
 
+Paradex exposes a public REST API — no MCP server or auth required.
+Base: `https://api.prod.paradex.trade/v1`. Pull fair value with
+`web_fetch`:
+
 **`kind = FUTURE` (perp / dated future):**
 
-- `paradex_bbo(market=...)` → best bid/ask.
-- `paradex_market_summaries(...)` → mark + funding + 24h stats.
-- `paradex_orderbook(...)` → walk the book for the full RFQ size.
-  This is the implicit "what would I get on-screen?" benchmark
+- `web_fetch .../bbo/<market>` → best bid/ask.
+- `web_fetch .../markets/summary?market=<market>` → mark + funding +
+  24h stats.
+- `web_fetch .../orderbook/<market>` → walk the book for the full RFQ
+  size. This is the implicit "what would I get on-screen?" benchmark
   that every RFQ price should be compared against.
 
 **`kind = OPTION`:**
 
-- `paradex_market_summaries(market=...)` per leg → `mark_price`,
-  `mark_iv`, `delta`, `vega`.
+- `web_fetch .../markets/summary?market=<market>` per leg →
+  `mark_price`, `mark_iv`, `delta`, `vega`.
 - Pull `<BASE>-USD-PERP` mark for the underlying spot.
 - Aggregate for multi-leg: `structure_mark = Σ (ratio × leg_mark ×
   side_sign)`, net delta = Σ (ratio × δ × side_sign), net vega
   similar.
-- BS / IV math itself: defer to `paradex-options-pricer` formulas.
+- BS / IV math itself: use standard Black-Scholes greek formulas.
 
 ### Edge syntax
 
 - "Y bps over mid" → `price = mid × (1 + Y/10000)` (ask) or
   `× (1 - Y/10000)` (bid). Mid = `(best_bid + best_ask) / 2` from
-  `paradex_bbo`.
+  the public `.../bbo/<market>` endpoint.
 - "Tighten the BBO by Z bps" → quote inside the current Paradex
   best. Flag if it implies a negative spread.
 - "X vol over mark IV" (options only) → bump per-leg IV by X,
@@ -90,9 +95,11 @@ prime-LP filter was bypassed.
 
 ### Settlement check
 
-- `paradex_account_fills(market=..., start_at=...)` — confirm the
-  block landed in the user's Paradex account.
-- `paradex_account_positions` — surface the updated position.
+No Paradex account integration at this skill version. After the cross:
+
+- Surface `trade_id` from `paradigm_drfqv2_trades(rfq_id=...)`.
+- Tell the user the block will appear on their Paradex account and
+  to verify there directly.
 
 ### Quirks
 
@@ -131,9 +138,9 @@ infix.
 
 - `deribit__get_ticker` (or web_fetch) for the instrument — returns
   mark, BBO.
-- Cross-venue check vs Paradex via `paradex_bbo` is optional;
-  Deribit's own book is the relevant benchmark since the trade
-  settles there.
+- Cross-venue check vs Paradex via the public `.../bbo/<market>`
+  endpoint is optional; Deribit's own book is the relevant benchmark
+  since the trade settles there.
 
 ### Edge syntax
 

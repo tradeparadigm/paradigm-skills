@@ -13,24 +13,22 @@ description: >
   goes through an explicit confirmation gate. Use when the user asks
   to "send a Paradigm block RFQ", "block-trade X BTC", "send a BTC
   straddle on Paradex / Deribit", "quote rfq_X", "hit the best bid",
-  "cancel rfq_X". Does NOT cover small Paradex order-book trades
-  (paradex-order-builder), post-trade analysis (paradigm-block-analyst),
+  "cancel rfq_X". Does NOT cover small central-order-book trades,
+  post-trade analysis (paradigm-block-analyst),
   historical tape (paradigm-data-discovery).
 compatibility: >
   Requires mcp-paradigm-py
   (github.com/tradeparadigm/mcp-paradigm-py). Per-venue fair-value
-  dependencies are documented in references/venues.md: mcp-paradex-py
-  for PRDX RFQs; deribit__get_ticker MCP or web_fetch for DBT RFQs.
-  Install mcp-paradigm via .mcpb bundle (Claude Desktop) or
-  `pip install mcp-paradigm` / `uvx mcp-paradigm`. Env vars set in
-  the MCP server: PARADIGM_ACCESS_KEY, PARADIGM_SIGNING_KEY,
-  PARADIGM_ENVIRONMENT=testnet|prod. REST fallback in
-  references/auth.md. Optional: paradex-webchat-ui-renderer for rich
-  cards (live quote ladder, confirmation card) in the Paradex webchat
-  channel — plain text everywhere else.
+  dependencies are documented in references/venues.md: the Paradex
+  public REST API via web_fetch for PRDX RFQs; deribit__get_ticker MCP
+  or web_fetch for DBT RFQs. Install mcp-paradigm via .mcpb bundle
+  (Claude Desktop) or `pip install mcp-paradigm` / `uvx mcp-paradigm`.
+  Env vars set in the MCP server: PARADIGM_ACCESS_KEY,
+  PARADIGM_SIGNING_KEY, PARADIGM_ENVIRONMENT=testnet|prod. REST fallback
+  in references/auth.md.
 metadata:
-  author: tradeparadex
-  version: "5.6"
+  author: tradeparadigm
+  version: "1.0"
 ---
 
 # Paradigm RFQ Trader
@@ -54,12 +52,11 @@ recipe (naming, fair-value tools, edge syntax, settlement check).
 
 **Out of scope at this skill version:**
 
-- Small / liquid orders on Paradex's central order book →
-  `paradex-order-builder`.
+- Small / liquid orders on a venue's central order book.
 - Post-trade analysis of a filled block → `paradigm-block-analyst`.
 - Historical tape queries → `paradigm-data-discovery`.
 - Heavy options pricing math (greek formulas, IV surface fitting)
-  → defer to `paradex-options-pricer` patterns. The math is the
+  → use standard Black-Scholes greek formulas. The math is the
   same regardless of settlement venue.
 
 ## Trigger
@@ -79,7 +76,7 @@ If the user doesn't specify a venue, ask — don't guess. The choice
 
 Do **not** fire on:
 
-- Direct Paradex order-book trades → `paradex-order-builder`.
+- Direct central-order-book trades on a venue.
 - Post-trade analysis of a filled block JSON → `paradigm-block-analyst`.
 - Historical tape queries → `paradigm-data-discovery`.
 - RFQs on Bybit / Bit.com — currently out of scope.
@@ -105,10 +102,11 @@ From `mcp-paradigm-py` (RFQ workflow):
 | `paradigm_drfqv2_price_legs` | Multi-leg structure pricer (bid/ask in → per-leg out) | no |
 | `paradigm_drfqv2_mmp` | Maker circuit-breaker — status or reset | **yes** for reset |
 
-The skill also calls **venue-specific fair-value tools** per
-`references/venues.md` — e.g. `paradex_bbo`, `paradex_market_summaries`,
-`deribit__get_ticker`. Which exact tools depends on the RFQ's
-settlement venue and the instrument's `kind`.
+The skill also uses **venue-specific fair-value sources** per
+`references/venues.md` — e.g. `web_fetch` against the Paradex public
+REST API, or `deribit__get_ticker` / `web_fetch` for Deribit. Which
+exact source depends on the RFQ's settlement venue and the instrument's
+`kind`.
 
 WebSocket subscriptions are designed but not yet shipped in the
 Paradigm MCP — poll the read tools at 1–3 s during an active RFQ and
@@ -413,8 +411,8 @@ pre-states "just send it" in the same message.
   check" subsection per venue in `references/venues.md`.
 - **Historical context** — `paradigm-data-discovery` over the S3
   tape.
-- **Hedging the new exposure** — `paradex-order-builder` for Paradex
-  delta hedges.
+- **Hedging the new exposure** — place delta hedges directly on the
+  venue's central order book.
 
 ## Output format
 
@@ -434,25 +432,6 @@ prose. Surface only what the trader acts on:
 
 Drop empty sections. Don't restate inputs the user just gave. Never
 invent fair-value numbers when a data source is unreachable — say so.
-
-### Webchat channel (rich UI — default for non-trivial data)
-
-In the Paradex webchat channel, **default to rich UI** via the
-`paradex-webchat-ui-renderer` skill for any non-trivial output — the
-multi-leg structures this skill builds, the live quote ladder,
-confirmation blocks, and results. Reserve plain text for one-line
-replies, or when the user explicitly asks for plain text / raw values.
-Map:
-
-- **Live quote ladder** → `data_table` (columns: Desk, Side, Price,
-  Size, Age, Offset), re-emitted as quotes arrive. Best row first.
-- **Confirmation block** → `alert_banner` (warning: "Confirm RFQ —
-  live money") + `labeled_output`s for side/qty/counterparties/notional
-  and the fair-value reference.
-- **Result** → `metric_card`s (`rfq_id`, fill price, notional).
-
-Emit the renderer's raw JSON spec (no code fences). Outside webchat,
-use the compact plain-text format above.
 
 ## Caveats
 

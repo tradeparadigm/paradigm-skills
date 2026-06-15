@@ -4,7 +4,7 @@
 # dependencies = []
 # ///
 """
-paradex_options_recap.py — deterministic vol math for the options recap.
+paradigm_options_recap.py — deterministic vol math for the options recap.
 
 Computes realized-vs-implied vol and net dealer positioning (flow greeks) from
 a pre-fetched Deribit snapshot, so the agent never does the arithmetic by hand
@@ -30,8 +30,8 @@ Input snapshot (--data FILE, JSON):
 Any field may be omitted; the corresponding section is then reported as null.
 
 Usage:
-    uv run scripts/paradex_options_recap.py --data snapshot.json
-    uv run scripts/paradex_options_recap.py --data snapshot.json --pretty
+    uv run scripts/paradigm_options_recap.py --data snapshot.json
+    uv run scripts/paradigm_options_recap.py --data snapshot.json --pretty
 
 Output (stdout, JSON):
     {"realized_vol": {...}, "flow_greeks": {...}, "top_blocks": [...], "vol_surface": {...}}

@@ -1,5 +1,5 @@
 ---
-name: paradex-options-recap
+name: paradigm-options-recap
 description: >
   Options market recap for a user-specified window, invoked via /recap. Parses
   "/recap [asset] [options] [window]" (e.g. "/recap btc options 8h") and produces
@@ -10,8 +10,8 @@ description: >
 compatibility: Deribit public API (web_fetch), Paradigm block tape (if injected),
   OKX/Bullish/IBIT public APIs (web_fetch). No authentication required.
 metadata:
-  author: tradeparadex
-  version: "1.5"
+  author: tradeparadigm
+  version: "1.0"
 ---
 
 # Options Recap
@@ -55,7 +55,7 @@ Fetch DVOL, spot, and trades in parallel. Vol surface needs the instrument list 
 Realized vol, flow greeks (Black-76), and surface skew are math that LLMs get wrong by estimating. **Always use the bundled script; never hand-compute these.**
 
 ```bash
-uv run scripts/paradex_options_recap.py --data snapshot.json
+uv run scripts/paradigm_options_recap.py --data snapshot.json
 ```
 
 Snapshot shape (omit any field to skip that section):

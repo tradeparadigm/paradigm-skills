@@ -7,11 +7,9 @@ Step-by-step guide for contributing a new skill to this repo.
 Review the [existing skills](../README.md#skills) to make sure your idea is distinct.
 Skills should have a clear, non-overlapping purpose:
 
-- **market-analyst**: Market observation and technical analysis
-- **portfolio-copilot**: Account status and P&L briefings
-- **risk-guardian**: Risk monitoring and margin analysis
-- **strategy-builder**: Strategy design and historical validation
-- **vault-intelligence**: Vault discovery and comparison
+- **paradigm-rfq-trader**: Block-trade RFQ lifecycle (build, benchmark, submit, manage)
+- **block-analyst**: Post-trade analysis and fill benchmarking of cleared blocks
+- **data-discovery**: Historical market-data catalog and DuckDB query launcher
 
 ## 2. Create the directory
 
@@ -25,13 +23,13 @@ Create `skills/your-skill-name/SKILL.md`:
 
 ```yaml
 ---
-name: paradex-your-skill-name
+name: paradigm-your-skill-name
 description: >
   What this skill does. When to use it. Include trigger phrases like
   "check my X", "analyze Y", "show me Z" so agents can discover it.
 ---
 
-# Paradex Your Skill Name
+# Paradigm Your Skill Name
 
 One-liner: what this skill does and why it exists.
 
@@ -39,9 +37,7 @@ One-liner: what this skill does and why it exists.
 
 | Tool | What it provides |
 |------|-----------------|
-| `paradex_tool_name` | Description of data used |
-
-See [mcp-tools.md](../docs/mcp-tools.md) for the full tool reference.
+| `paradigm_tool_name` | Description of data used |
 
 ## Capabilities
 
@@ -68,8 +64,8 @@ Include the process, key calculations, and decision logic.
 
 | Rule | Example |
 |------|---------|
-| Directory: lowercase, hyphens, no `paradex-` prefix | `skills/market-scanner/` |
-| Name field: include `paradex-` prefix for discoverability | `name: paradex-market-scanner` |
+| Directory: lowercase, hyphens, no `paradigm-` prefix | `skills/block-scanner/` |
+| Name field: include `paradigm-` prefix for discoverability | `name: paradigm-block-scanner` |
 | Max 64 characters for name | — |
 | Description: max 1024 characters | — |
 | Description must include WHAT it does and WHEN to use it | — |
@@ -96,14 +92,14 @@ Keep references one level deep — don't chain reference files to other referenc
 
 - Keep SKILL.md body under **500 lines**
 - Include an MCP tools table listing every tool the skill uses
-- Provide concrete output format examples with realistic Paradex data
+- Provide concrete output format examples with realistic market data
 - State caveats clearly — what the skill can't do, data limitations, not financial advice
 - Use a conversational but precise tone
 - Match the style of existing skills
 
 ## 7. Test your skill
 
-1. Connect the [Paradex MCP server](https://github.com/tradeparadex/mcp-paradex-py)
+1. Connect the [Paradigm MCP server](https://github.com/tradeparadigm/mcp-paradigm-py)
 2. Copy your skill folder into your agent's skills directory
 3. Ask questions that should trigger your skill
 4. Verify the skill activates and produces useful output
