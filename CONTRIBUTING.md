@@ -1,4 +1,4 @@
-# Contributing to Paradex Skills
+# Contributing to Paradigm Skills
 
 Thanks for your interest in contributing! This repo follows the [AgentSkills](https://agentskills.so) open standard.
 
@@ -6,9 +6,9 @@ Thanks for your interest in contributing! This repo follows the [AgentSkills](ht
 
 ### 1. Choose your skill idea
 
-Good Paradex skills:
+Good Paradigm skills:
 - Solve a specific analytical or decision-making need
-- Orchestrate one or more [Paradex MCP tools](./docs/mcp-tools.md)
+- Orchestrate one or more Paradigm MCP tools
 - Are distinct from existing skills (check the [skill table](./README.md#skills))
 
 ### 2. Create the directory
@@ -37,7 +37,7 @@ Every skill needs a `SKILL.md` with YAML frontmatter and markdown instructions.
 
 ```yaml
 ---
-name: paradex-your-skill-name
+name: paradigm-your-skill-name
 description: >
   One-paragraph description of what this skill does and when an agent should
   activate it. Include specific trigger phrases like "analyze my positions",
@@ -52,7 +52,7 @@ One-liner about what this skill does.
 
 | Tool | What it provides |
 |------|-----------------|
-| `paradex_tool_name` | Description |
+| `paradigm_tool_name` | Description |
 
 ## Capabilities
 
@@ -77,10 +77,10 @@ One-liner about what this skill does.
 
 ### 5. Naming conventions
 
-- **Directory names**: no `paradex-` prefix (e.g., `skills/market-analyst/`)
-- **`name` field**: include `paradex-` prefix for discoverability on registries (e.g., `name: paradex-market-analyst`)
-- Use descriptive names: `market-analyst` not `analyzer`
-- Prefer noun or gerund form: `risk-guardian`, `strategy-builder`
+- **Directory names**: no `paradigm-` prefix (e.g., `skills/block-analyst/`)
+- **`name` field**: include `paradigm-` prefix for discoverability on registries (e.g., `name: paradigm-block-analyst`)
+- Use descriptive names: `block-analyst` not `analyzer`
+- Prefer noun or gerund form: `block-analyst`, `data-discovery`
 
 ## Evals
 
@@ -101,7 +101,7 @@ skills/your-skill-name/
 
 ```json
 {
-  "skill_name": "paradex-your-skill-name",
+  "skill_name": "paradigm-your-skill-name",
   "requires_auth": false,
   "evals": [
     {
@@ -118,7 +118,7 @@ skills/your-skill-name/
 }
 ```
 
-**`requires_auth`** — set to `true` if any capability in this eval uses authenticated MCP tools (`paradex_account_*`, `paradex_orders_*`). See [MCP authentication](#mcp-authentication-for-evals) below.
+**`requires_auth`** — set to `true` if any capability in this eval uses authenticated MCP tools. See [MCP authentication](#mcp-authentication-for-evals) below.
 
 **Assertion guidelines:**
 
@@ -144,7 +144,7 @@ use validation to check generalization.
 
 ```json
 {
-  "skill_name": "paradex-trading-recap",
+  "skill_name": "paradigm-rfq-trader",
   "trigger_evals": [
     { "query": "recap my trading today", "should_trigger": true },
     { "query": "what are my current positions", "should_trigger": false },
@@ -161,7 +161,7 @@ If your skill is under-triggering in practice, improve the `description` field �
 **Using the included runner (recommended):**
 
 ```bash
-# Set API key (and optionally Paradex key for auth-required skills)
+# Set API key (and optionally PARADEX_ACCOUNT_PRIVATE_KEY for auth-required skills)
 export ANTHROPIC_API_KEY=sk-ant-...
 export PARADEX_ACCOUNT_PRIVATE_KEY=...   # optional — enables live account data
 
@@ -169,10 +169,10 @@ export PARADEX_ACCOUNT_PRIVATE_KEY=...   # optional — enables live account dat
 uv run run_evals.py
 
 # Run a specific skill
-uv run run_evals.py market-analyst
+uv run run_evals.py paradigm-rfq-trader
 
 # Run multiple skills
-uv run run_evals.py trading-recap execution-analyst
+uv run run_evals.py block-analyst data-discovery
 
 # Fastest check (first eval case only)
 uv run run_evals.py --smoke
@@ -193,7 +193,7 @@ uv run run_evals.py --output results.json
 All skills run in **simulation mode** by default: the eval runner has no MCP server
 connection, so the agent is told to fabricate realistic example values for testing
 format and structure. Use `--live-mcp` to disable this for non-auth skills when a
-real Paradex MCP server is available. Skills marked `requires_auth: true` always
+real Paradigm MCP server is available. Skills marked `requires_auth: true` always
 simulate when `PARADEX_ACCOUNT_PRIVATE_KEY` is unset, even with `--live-mcp`.
 
 **Dual-run (with vs. without skill):**
@@ -203,7 +203,7 @@ pass-rate delta of ≥30 points justifies the token cost of installing the skill
 
 ```bash
 # Run with baseline comparison (doubles API calls but shows skill value)
-uv run run_evals.py trading-recap --with-baseline
+uv run run_evals.py paradigm-rfq-trader --with-baseline
 ```
 
 The `--with-baseline` flag re-runs each case without the skill system prompt and
@@ -219,19 +219,19 @@ shows a Δ score per skill.
 
 ### MCP authentication for evals
 
-Skills that use account-data tools (`paradex_account_*`, `paradex_orders_*`) require the Paradex MCP server running with `PARADEX_ACCOUNT_PRIVATE_KEY` configured. Mark these with `"requires_auth": true` in `evals.json`.
+Skills that use account-data or order-placement tools require the Paradigm MCP server running with `PARADEX_ACCOUNT_PRIVATE_KEY` configured. Mark these with `"requires_auth": true` in `evals.json`.
 
 For CI/automated evals, use a **testnet account** with small balances. Never commit private keys — pass them as environment variables.
 
-Skills using only public tools (`paradex_market_*`, `paradex_vaults`, `paradex_klines`, etc.) set `"requires_auth": false` and can run in any environment.
+Skills using only public, read-only tools set `"requires_auth": false` and can run in any environment.
 
 ## PR checklist
 
 Before submitting:
 
-- [ ] `name` field is `paradex-` + directory name (see [agents.md](./agents.md) for naming convention)
+- [ ] `name` field is `paradigm-` + directory name (see [agents.md](./agents.md) for naming convention)
 - [ ] `description` field explains what AND when (under 1024 chars)
-- [ ] `compatibility: Requires Paradex MCP server (mcp-paradex-py)` is set
+- [ ] `compatibility: Requires Paradigm MCP server (mcp-paradigm-py)` is set
 - [ ] `metadata: author: tradeparadex` and `metadata: version: "X.Y"` are set
 - [ ] Name is lowercase with hyphens only (max 64 chars)
 - [ ] SKILL.md body is under 500 lines
@@ -239,7 +239,7 @@ Before submitting:
 - [ ] MCP tools table lists all tools the skill uses
 - [ ] Output format section has concrete examples
 - [ ] Caveats section is present and honest
-- [ ] Tested with the Paradex MCP server connected
+- [ ] Tested with the Paradigm MCP server connected
 - [ ] `evals/evals.json` present with at least 2 test cases and 3+ assertions each
 - [ ] Evals pass at ≥80%: `uv run run_evals.py your-skill`
 - [ ] skills-ref validates: `npx skills-ref validate ./skills/your-skill` (naming mismatch is expected — see agents.md)
@@ -261,14 +261,14 @@ Once skills are merged to main, they can be listed on skill registries for broad
 No action needed. As users install via the CLI, skills get indexed automatically:
 
 ```bash
-npx skills add tradeparadex/paradex-skills
+npx skills add tradeparadigm/paradigm-skills
 ```
 
 ### ClawHub
 
 ```bash
 npm install -g clawhub
-clawhub publish ./skills/your-skill-name --slug paradex-your-skill-name --version 1.0.0
+clawhub publish ./skills/your-skill-name --slug paradigm-your-skill-name --version 1.0.0
 ```
 
 ### agentskills.so
@@ -281,4 +281,5 @@ Submit via the web interface at [skilldock.io](https://skilldock.io).
 
 ## Code of conduct
 
-Be constructive. This is a community project for making Paradex more accessible to AI agents and their users.
+Be constructive. This is a community project for making Paradigm more accessible to AI agents and their users.
+</content>

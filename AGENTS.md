@@ -6,13 +6,13 @@ This repository intentionally deviates from the [AgentSkills specification](http
 
 ### Rationale
 
-The `paradex-` prefix in the `name` field namespaces each skill to the Paradex platform. In a shared skills registry, skills from different vendors may share generic names (e.g., `market-analyst`). The prefix avoids collisions and makes the skill's origin unambiguous to agent routers.
+The `paradigm-` prefix in the `name` field namespaces each skill to the Paradigm platform. In a shared skills registry, skills from different vendors may share generic names (e.g., `block-analyst`). The prefix avoids collisions and makes the skill's origin unambiguous to agent routers.
 
 Short directory names (without the prefix) keep the repository easier to navigate and match common CLI convention.
 
 ### Validation
 
-`npx skills-ref validate ./skills/execution-analyst` will fail with "Directory name 'execution-analyst' must match skill name 'paradex-execution-analyst'". This is expected and intentional.
+`npx skills-ref validate ./skills/block-analyst` will fail with "Directory name 'block-analyst' must match skill name 'paradigm-block-analyst'". This is expected and intentional.
 
 All other validation checks (description length, name format, required fields) pass:
 

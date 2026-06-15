@@ -30,7 +30,7 @@ compatibility: >
   channel — plain text everywhere else.
 metadata:
   author: tradeparadex
-  version: "5.6"
+  version: "1.0"
 ---
 
 # Paradigm RFQ Trader
