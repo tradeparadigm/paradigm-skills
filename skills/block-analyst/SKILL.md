@@ -218,7 +218,7 @@ not the word count.
 ### 3d — Where else did it trade (required, reported compactly)
 After Paradigm/Deribit, check whether the same structure/legs printed on the other venues so the
 output can answer "where else did this trade": **OKX** (`/api/v5/market/trades` per leg), **Bullish**
-(`/trading-api/v1/trades`), **Paradex** (`paradex_trades` MCP — esp. perp legs), and Bybit if relevant.
+(`/trading-api/v1/trades`), **Paradex** (`/v1/trades` public REST via `web_fetch` — esp. perp legs), and Bybit if relevant.
 See `references/venues.md` for naming/endpoints.
 Report as **ONE compact line**: name only the venues where it actually printed (with rough size),
 then a terse "not seen on X/Y" for the rest. Do NOT spend a row per empty venue — one line total.

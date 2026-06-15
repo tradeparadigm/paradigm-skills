@@ -107,7 +107,8 @@ Before calling Bybit options endpoints, follow the Bybit skill Module Router:
 
 ## Paradex
 
-**Tool:** `paradex_trades` MCP (native — no auth required for public trades)
+**Method:** `web_fetch` the Paradex public REST API —
+`GET https://api.prod.paradex.trade/v1/trades?market=<market>` (no auth required for public trades)
 
 **Instrument naming:**
 - Perpetuals: `BTC-USD-PERP`, `ETH-USD-PERP`
@@ -175,7 +176,7 @@ Before calling Bybit options endpoints, follow the Bybit skill Module Router:
 | Venue | Method | Granularity | Notes |
 |---|---|---|---|
 | Paradigm | injected tape | Full structured blocks | Best for block-trade recurrence |
-| Paradex | `paradex_trades` MCP | Per-instrument trades | Perp legs most relevant |
+| Paradex | `web_fetch /v1/trades` | Per-instrument trades | Perp legs most relevant |
 | Deribit | `web_fetch /api/v2/public/get_last_trades_by_instrument` | Per-leg trades | Deepest options history |
 | OKX | `web_fetch /api/v5/market/trades` | Per-leg trades | Good secondary source |
 | Bullish | `web_fetch /trading-api/v1/trades` | Per-instrument | Limited listing; expect "not listed" |

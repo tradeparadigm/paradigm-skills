@@ -327,8 +327,8 @@ spot-ETF flow vs crypto-spot flow.
 On-chain Paradex perpetual trades — the *executed-trade* tape of the
 Paradex DEX. This is **historical Paradex trade data** and is in scope for
 this catalog; live Paradex markets, positions, orderbook, funding, and
-account data remain out of scope (route those to the Paradex-specific
-skills).
+account data remain out of scope — those belong to live trading/market
+tooling, not this historical catalog.
 
 - **Path:** `s3://terminal-dime-prod/paradex_data/paradex_trade_tape.csv.gz`
   (plus Parquet parts in the same prefix)

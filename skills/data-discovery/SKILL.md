@@ -68,9 +68,8 @@ snapshots + orderbook history, IBIT ETF option trades, and the historical
 Paradex perp trade tape (`paradex_data/paradex_trade_tape.csv.gz`).
 
 Out of scope: anything **live** — live Paradex markets, positions,
-funding, vaults, orderbook, order placement, account state. For those,
-route to the Paradex-specific skills (`market-analyst`,
-`portfolio-copilot`, `vault-intelligence`, etc.).
+funding, vaults, orderbook, order placement, account state. Those
+belong to live trading/market tooling, not this historical catalog.
 
 Rule of thumb: if the user's question is anchored to a specific past date
 or date range, or asks about a tape / snapshot / historical aggregate,
