@@ -232,7 +232,7 @@ Before submitting:
 - [ ] `name` field is `paradigm-` + directory name (see [agents.md](./agents.md) for naming convention)
 - [ ] `description` field explains what AND when (under 1024 chars)
 - [ ] `compatibility: Requires Paradigm MCP server (mcp-paradigm-py)` is set
-- [ ] `metadata: author: tradeparadex` and `metadata: version: "X.Y"` are set
+- [ ] `metadata: author: tradeparadigm` and `metadata: version: "X.Y"` are set
 - [ ] Name is lowercase with hyphens only (max 64 chars)
 - [ ] SKILL.md body is under 500 lines
 - [ ] References are one level deep from SKILL.md

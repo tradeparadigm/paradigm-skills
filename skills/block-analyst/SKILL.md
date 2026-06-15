@@ -23,7 +23,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   injected DuckDB source. Degrades gracefully when the tape or a venue is
   unreachable, never fabricating the fill.
 metadata:
-  author: tradeparadex
+  author: tradeparadigm
   version: "1.0"
 ---
 

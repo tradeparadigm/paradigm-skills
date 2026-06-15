@@ -27,7 +27,7 @@ compatibility: >
   PARADIGM_SIGNING_KEY, PARADIGM_ENVIRONMENT=testnet|prod. REST fallback
   in references/auth.md.
 metadata:
-  author: tradeparadex
+  author: tradeparadigm
   version: "1.0"
 ---
 

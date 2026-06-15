@@ -18,7 +18,7 @@ compatibility: Read-only data catalog. No authentication required to view the
   credentials (AWS_WEB_IDENTITY_TOKEN_FILE, AWS_ROLE_ARN) — see
   references/s3-access.md for the credential bootstrap.
 metadata:
-  author: tradeparadex
+  author: tradeparadigm
   version: "1.0"
 ---
 
