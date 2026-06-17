@@ -349,6 +349,100 @@ tooling, not this historical catalog.
 
 ---
 
+## Dataset 6 — Tardis-Realtime Hot Pulse (Live Snapshot)
+
+Single-file LLM-shaped market snapshot. The fastest way to answer
+"what's happening right now" without scanning per-period data —
+clobbered every 60 seconds at a stable key. Use this **before** any
+exchange `web_fetch` for spot price, ATM IV, DVOL, last-minute volume,
+or live block-trade activity.
+
+This is the only dataset in this catalog that is **near-real-time**
+(1-minute cadence). All other datasets are historical-only.
+
+### 6a. `tardis_realtime_hot_pulse` — Live Market Heartbeat
+
+- **Path:** `s3://terminal-dime-prod/paradigm_data/tardis_realtime/hot/pulse.parquet`
+- **Refresh:** every 60 s (clobbered in place; bucket versioning retains
+  prior pulses recoverably for ~24 h)
+- **Row count:** ~35–50 (bounded by design; fits in any LLM context)
+- **Schema:** 19 cols, polymorphic via `signal_type`
+
+| Column | Type | Notes |
+|---|---|---|
+| `signal_type` | varchar | Discriminator: `spot` \| `atm_iv` \| `dvol` \| `volume_last_min` \| `block_summary` |
+| `exchange` | varchar | Source venue (`deribit`, `okex-options`, `bybit-options`, `bullish`) |
+| `asset` | varchar | `BTC` or `ETH` |
+| `expiry` | varchar | Venue-native expiry (populated for `atm_iv`; null otherwise) |
+| `value` | double | Primary metric — interpretation depends on `signal_type` |
+| `delta_1m` | double | Change in `value` vs 1 minute ago (null on first run / after gaps) |
+| `at` | bigint | Unix **milliseconds** — source period_start (not ISO string) |
+| `atm_call_iv`, `atm_put_iv`, `atm_strike`, `underlying_price`, `open_interest` | double | `atm_iv` rows only; null elsewhere |
+| `call_volume`, `put_volume`, `buy_volume`, `sell_volume`, `notional` | double | `volume_last_min` rows only |
+| `trade_count` | bigint | `volume_last_min` rows only |
+| `block_total_notional`, `block_largest_notional` | double | `block_summary` rows only (Deribit raw only today) |
+
+**`value` semantics per signal_type:**
+
+| `signal_type` | `value` is… | Units |
+|---|---|---|
+| `spot` | Spot/perp close price | Venue-native |
+| `atm_iv` | ATM strike's `markIV_close` | **Vol points uniformly** (OKX/Bybit decimal IVs pre-scaled ×100) |
+| `dvol` | Latest DVOL index value | Vol points |
+| `volume_last_min` | Total `amount` traded in the minute | Venue-native |
+| `block_summary` | Block count in the minute | Integer (stored as double) |
+
+**Read pattern (DuckDB):**
+
+```sql
+INSTALL httpfs; LOAD httpfs;
+
+-- What's BTC ATM IV across venues right now?
+SELECT exchange, expiry, atm_strike, value AS atm_iv_vol_points,
+       atm_call_iv, atm_put_iv, open_interest, delta_1m
+FROM read_parquet('s3://terminal-dime-prod/paradigm_data/tardis_realtime/hot/pulse.parquet')
+WHERE signal_type = 'atm_iv' AND asset = 'BTC'
+ORDER BY expiry;
+
+-- What just printed in the last minute?
+SELECT exchange, asset, value AS total_volume,
+       call_volume, put_volume, buy_volume, sell_volume,
+       notional, trade_count
+FROM read_parquet('s3://terminal-dime-prod/paradigm_data/tardis_realtime/hot/pulse.parquet')
+WHERE signal_type = 'volume_last_min';
+
+-- Block activity in the last minute (Deribit only today)
+SELECT exchange, asset, value AS block_count,
+       block_total_notional, block_largest_notional
+FROM read_parquet('s3://terminal-dime-prod/paradigm_data/tardis_realtime/hot/pulse.parquet')
+WHERE signal_type = 'block_summary';
+```
+
+**When to use:** front-month ATM IV across venues, current spot,
+last-minute volume + call/put split, DVOL, block activity — any "right
+now" question. Reach for pulse **before** doing exchange `web_fetch`
+for the same data; one S3 read replaces several round-trips.
+
+**Caveats:**
+
+- `at` is **Unix milliseconds**, not an ISO string. Convert via
+  `to_timestamp(at / 1000)`.
+- IV columns are uniformly in **vol points** — `atm_call_iv` from OKX
+  reads `38.03`, not `0.38`, despite OKX's wire format using decimals.
+  Pulse pre-scales them at materialisation time. (The per-period
+  files in `paradex-tardis-realtime` keep venue-native units — don't
+  cross-join pulse with those without conversion.)
+- `expiry` is venue-native (`20JUN26` from Deribit, `260620` from OKX).
+  Parse per-venue for canonical dates.
+- `block_summary` is **Deribit-only today**. OKX/Bybit/Bullish block
+  detection not yet sourced into pulse.
+- Pulse does **not** carry the full vol surface — only ATM. For the
+  full surface across strikes/expiries use
+  `paradigm_data/v_vol_surface/` (separate dataset, computed by the IV
+  pipeline; different shape and cadence).
+
+---
+
 ## What Is NOT Here
 
 - **Deribit option quotes beyond 2026-01-01** — only trades are consistently available.
@@ -361,8 +455,11 @@ tooling, not this historical catalog.
   with no expiry date and are excluded from this catalog. Paradex options
   *block-trade* flow is visible in the Paradigm trade tape under
   `BTC OPTION - PRDX`. Paradex *perp* trade flow is in Dataset 5.
-- **Live / streaming feeds** — everything here is historical S3-backed data.
-  For live tickers, marks, and account state, route to the live-data skills.
+- **Live exchange streams / raw orderbook / account state** — for raw
+  exchange tick streams, live order books, and account state, route to
+  the live-data skills. Dataset 6 (tardis-realtime hot pulse) is this
+  catalog's only near-real-time entry and serves the "what's happening
+  right now" use case at 1-minute grain.
 
 ---
 

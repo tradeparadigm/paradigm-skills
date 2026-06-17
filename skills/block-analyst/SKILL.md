@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.0"
+  version: "1.1"
 ---
 
 # Paradigm Block Trade Analyst
@@ -124,7 +124,17 @@ The taker's real position comes from the **leg-level `side` fields** plus the si
 
 ## Step 2 — Fetch Live Data
 
-Use whatever data sources are available — query all reachable venues in parallel.
+**Step 2a — surface anchor (one DuckDB read).** Read the tardis-realtime
+hot pulse for the current ATM IV per venue + recent block activity before
+hitting per-leg endpoints:
+`s3://terminal-dime-prod/paradigm_data/tardis_realtime/hot/pulse.parquet`.
+See `paradigm-data-discovery` Dataset 6 for the schema. Use to anchor
+each leg's IV against the venue's current ATM (rich/cheap framing) and
+to surface recent Deribit block activity (`signal_type = 'block_summary'`)
+that may contextualise the trade. Pulse does NOT replace per-leg fetches
+— block-analyst still needs specific instrument marks for fill benchmarking.
+
+**Step 2b — per-leg fetches.** Use whatever data sources are available — query all reachable venues in parallel.
 See `references/venues.md` for exact endpoints, instrument naming, and limitations.
 
 **Deribit (primary):**

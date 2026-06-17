@@ -11,7 +11,7 @@ compatibility: Deribit public API (web_fetch), Paradigm block tape (if injected)
   OKX/Bullish/IBIT public APIs (web_fetch). No authentication required.
 metadata:
   author: tradeparadigm
-  version: "1.0"
+  version: "1.1"
 ---
 
 # Options Recap
@@ -29,7 +29,18 @@ metadata:
 
 ## Data Fetches
 
-Fetch DVOL, spot, and trades in parallel. Vol surface needs the instrument list first, then per-instrument tickers.
+**Live snapshot first.** Read the tardis-realtime hot pulse from S3
+(`s3://terminal-dime-prod/paradigm_data/tardis_realtime/hot/pulse.parquet`,
+~50 rows, one DuckDB read) for the "right now" anchor: current DVOL,
+current spot per venue, last-minute volume + call/put split, current
+ATM IV per expiry per venue (with `atm_call_iv` / `atm_put_iv` for skew),
+and recent block activity. See `paradigm-data-discovery` Dataset 6 for
+the schema. Use pulse values as the "now" anchor and to seed the
+vol-surface ATM IV reads — saves several `web_fetch` round-trips.
+
+**Then window history.** Fetch DVOL, spot, and trades in parallel via
+the endpoints below for the recap window. Vol surface needs the
+instrument list first, then per-instrument tickers.
 
 | Data | Endpoint |
 |---|---|
