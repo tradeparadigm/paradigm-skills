@@ -12,8 +12,8 @@ description: >
   vol cross-reference; DO NOT dismiss as out of scope — it lives in
   this S3 bucket), the on-chain Paradex perp historical trade tape,
   and the **hot pulse** (live 1-minute snapshot of
-  spot, ATM IV, DVOL, last-minute volume, and block-trade activity —
-  the only near-real-time dataset in this catalog). Fires for any
+  spot, ATM IV, DVOL, last-minute volume, and block-trade activity).
+  Fires for any
   retrospective "what data do we have" question AND for "what's
   happening right now" questions answerable from pulse — returns S3
   path + ready-to-run DuckDB query. Does NOT cover live Paradex
