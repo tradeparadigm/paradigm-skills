@@ -434,12 +434,57 @@ for the same data; one S3 read replaces several round-trips.
   those without conversion.)
 - `expiry` is venue-native (`20JUN26` from Deribit, `260620` from OKX).
   Parse per-venue for canonical dates.
-- `block_summary` is **Deribit-only today**. OKX/Bybit/Bullish block
-  detection not yet sourced into pulse.
+- `block_summary` covers **Deribit, OKX, and Bullish** (each venue's
+  native block/OTC id). Bybit is excluded — it exposes only an
+  is-block flag with no group id, so its blocks can't be de-legged.
 - Pulse does **not** carry the full vol surface — only ATM. For the
   full surface across strikes/expiries use
   `paradigm_data/v_vol_surface/` (separate dataset, computed by the IV
   pipeline; different shape and cadence).
+
+### 6b. Hot Windows — Trailing Aggregates
+
+Alongside the snapshot, the hot surface publishes pre-aggregated
+**trailing windows** — same prefix, one file per window:
+
+- **Path:** `s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__<window>.parquet`
+- **Windows:** `5m`, `10m`, `20m`, `1h`, `4h`, `8h`, `24h`
+- **Refresh:** every 5 minutes (clobbered in place)
+
+Each file holds exactly one trailing window (the `window` column equals
+the file's window). Unlike the snapshot's `signal_type` shape, windows
+use a **`row_type`** discriminator with three kinds:
+
+| `row_type` | What | Key columns |
+|---|---|---|
+| `dvol_spot` | DVOL + spot OHLC over the window | `metric` (`dvol`\|`spot`), `open`, `close`, `high`, `low` |
+| `volume` | Per (exchange, asset) traded volume | `volume_sum`, `notional`, `buy_volume`, `sell_volume`, `trade_count` |
+| `flow` | Per-contract flow | `exchange`, `asset`, `optionType`, `expiry`, `strike`, `side`, `volume_sum`, `trade_count`, `avg_iv` |
+
+Common cols: `row_type`, `window`, `exchange`, `asset`, `window_start`
+(Unix ms), `at` (Unix ms, window end); `flow` rows also carry surface
+fields (`markIV_close`, `delta`, `openInterest`, `underlying_price`).
+
+**Read pattern (DuckDB):**
+
+```sql
+INSTALL httpfs; LOAD httpfs;
+
+-- DVOL + spot OHLC over the last hour
+SELECT exchange, asset, metric, open, close, high, low
+FROM read_parquet('s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__1h.parquet')
+WHERE row_type = 'dvol_spot';
+
+-- Volume by venue over the last 24h
+SELECT exchange, asset, volume_sum, notional, buy_volume, sell_volume, trade_count
+FROM read_parquet('s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__24h.parquet')
+WHERE row_type = 'volume';
+```
+
+**When to use:** a "last `<window>`" question (volume / flow / DVOL move
+over 5m–24h) — one S3 read of the matching `hot__<window>` file instead
+of multiple API round-trips. For anything beyond 24h, use the historical
+per-period datasets above.
 
 ---
 

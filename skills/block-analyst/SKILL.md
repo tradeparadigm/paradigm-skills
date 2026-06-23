@@ -134,8 +134,11 @@ to surface recent Deribit block activity (`signal_type = 'block_summary'`)
 that may contextualise the trade. Pulse does NOT replace per-leg fetches
 — block-analyst still needs specific instrument marks for fill benchmarking.
 
-**Step 2b — per-leg fetches.** Use whatever data sources are available — query all reachable venues in parallel.
-See `references/venues.md` for exact endpoints, instrument naming, and limitations.
+**Step 2b — per-leg fetches.** For each leg, fetch its current mark from the venues below in
+parallel, in priority order: Deribit first (primary venue), then OKX and/or Bybit only when you
+need a cross-venue benchmark or the leg is not listed on Deribit. Use the exact endpoints in
+`references/venues.md` (instrument naming + per-venue limitations) — do not substitute ad-hoc
+sources.
 
 **Deribit (primary):**
 Preferred: `deribit__get_ticker` per leg (native MCP, fastest).

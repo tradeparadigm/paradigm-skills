@@ -38,8 +38,16 @@ and recent block activity. See `paradigm-data-discovery` Dataset 6 for
 the schema. Use pulse values as the "now" anchor and to seed the
 vol-surface ATM IV reads — saves several `web_fetch` round-trips.
 
-**Then window history.** Fetch DVOL, spot, and trades in parallel via
-the endpoints below for the recap window. Vol surface needs the
+**Then window aggregates (one S3 read).** For the recap `window`
+(`1h`/`4h`/`8h`/`24h`; treat `1d` as `24h`), read the matching trailing-window file
+`s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__<window>.parquet` — it carries
+DVOL+spot OHLC (`row_type='dvol_spot'`), volume by venue (`row_type='volume'`), and
+per-contract flow (`row_type='flow'`) over exactly that window in one read (see
+`paradigm-data-discovery` Dataset 6b). Finer windows (`5m`/`10m`/`20m`) exist too.
+
+**Then fill the gaps via the endpoints below.** Use these for what the window file
+doesn't cover — the per-instrument vol surface, 7d spot for realized vol, and per-trade
+detail — and as a fallback if the hot file is stale/absent. Vol surface needs the
 instrument list first, then per-instrument tickers.
 
 | Data | Endpoint |

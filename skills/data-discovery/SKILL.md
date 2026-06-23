@@ -196,6 +196,10 @@ Pull from `references/datasets.md`. Grouped into:
    - `hot__snapshot.parquet` — single-file LLM-shaped live snapshot
      (spot / ATM IV / DVOL / 1-min volume / block activity);
      clobbered every 60 s. The catalog's only near-real-time entry.
+   - `hot__<window>.parquet` — trailing-window aggregates
+     (`5m`/`10m`/`20m`/`1h`/`4h`/`8h`/`24h`): DVOL+spot OHLC, volume by
+     venue, and per-contract flow over the window; refreshed every 5 min.
+     See Dataset 6b for the (different) window schema.
 
 For each, report: S3 path (with the correct partition pattern —
 `YYYY/MM/DD/` for option/future market data, `date=YYYY-MM-DD/` Hive-style for Bullish/IBIT,
