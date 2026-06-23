@@ -11,7 +11,7 @@ compatibility: Deribit public API (web_fetch), Paradigm block tape (if injected)
   OKX/Bullish/IBIT public APIs (web_fetch). No authentication required.
 metadata:
   author: tradeparadigm
-  version: "2.0"
+  version: "1.2"
 ---
 
 # Options Recap
