@@ -1,25 +1,30 @@
 ---
 name: paradigm-data-discovery
 description: >
-  Catalog and query-launcher for ALL historical market data in S3
-  (s3://terminal-dime-prod). ALWAYS load this skill before concluding
-  any dataset is out of scope — do not dismiss based on asset class or
-  venue assumptions. Covers: Paradigm RFQ block-trade tape,
-  Paradigm RFQ activity tape, Deribit/OKX option trades + combo
-  quotes + future top-of-book quotes, Bullish option chain snapshots
-  (native greeks/IV) + orderbook history, IBIT ETF options trades
-  (equity-side vol cross-reference; DO NOT dismiss
-  as out of scope — it lives in this S3 bucket), and the on-chain Paradex
-  perp historical trade tape. Fires for any retrospective or "what data do
-  we have" question — returns S3 path + ready-to-run DuckDB query. Does
-  NOT cover live Paradex markets, positions, vaults, or order placement.
+  Catalog and query-launcher for market data in S3
+  (s3://terminal-dime-prod) — both historical and the near-real-time
+  hot pulse. ALWAYS load this skill before concluding any dataset is
+  out of scope — do not dismiss based on asset class or venue
+  assumptions. Covers: Paradigm RFQ block-trade tape, Paradigm RFQ
+  activity tape, Deribit/OKX option trades + combo quotes + future
+  top-of-book quotes, Bullish option chain snapshots (native
+  greeks/IV) + orderbook history, IBIT ETF options trades (equity-side
+  vol cross-reference; DO NOT dismiss as out of scope — it lives in
+  this S3 bucket), the on-chain Paradex perp historical trade tape,
+  and the **hot pulse** (live 1-minute snapshot of
+  spot, ATM IV, DVOL, last-minute volume, and block-trade activity).
+  Fires for any
+  retrospective "what data do we have" question AND for "what's
+  happening right now" questions answerable from pulse — returns S3
+  path + ready-to-run DuckDB query. Does NOT cover live Paradex
+  markets, positions, vaults, or order placement.
 compatibility: Read-only data catalog. No authentication required to view the
   catalog itself. Running the suggested DuckDB/S3 queries requires IRSA
   credentials (AWS_WEB_IDENTITY_TOKEN_FILE, AWS_ROLE_ARN) — see
   references/s3-access.md for the credential bootstrap.
 metadata:
   author: tradeparadigm
-  version: "1.0"
+  version: "1.1"
 ---
 
 ## Hard Rules
@@ -59,22 +64,30 @@ Two jobs:
    "I don't have access to historical block trade data" — the tapes on S3
    *are* the historical data.
 
-## Scope — historical S3 data, not live feeds
+## Scope — S3-backed market data (historical + near-real-time pulse)
 
 In scope: anything stored under `s3://terminal-dime-prod` —
-Paradigm block-trade tapes, Deribit/OKX option and combo
-data, Deribit/Bybit/OKX future quotes, Bullish option chain
-snapshots + orderbook history, IBIT ETF option trades, and the historical
-Paradex perp trade tape (`paradex_data/paradex_trade_tape.csv.gz`).
+Paradigm block-trade tapes, Deribit/OKX option and combo data,
+Deribit/Bybit/OKX future quotes, Bullish option chain snapshots +
+orderbook history, IBIT ETF option trades, the historical Paradex perp
+trade tape (`paradex_data/paradex_trade_tape.csv.gz`), and the
+near-real-time **hot pulse** (`paradigm_data/realtime/hot/hot__snapshot.parquet`).
 
-Out of scope: anything **live** — live Paradex markets, positions,
-funding, vaults, orderbook, order placement, account state. Those
-belong to live trading/market tooling, not this historical catalog.
+Out of scope: anything **live** that isn't in the pulse — live Paradex
+markets, positions, funding, vaults, raw orderbook, order placement,
+account state. Those belong to live trading/market tooling.
 
-Rule of thumb: if the user's question is anchored to a specific past date
-or date range, or asks about a tape / snapshot / historical aggregate,
-this skill is in scope. If the user wants "right now" / current / live
-state of a Paradex account or market, stand down.
+Rule of thumb:
+
+- If the user's question is anchored to a past date or date range, or
+  asks about a tape / snapshot / historical aggregate → historical
+  datasets (1–5).
+- If the user asks "what's happening right now" / "current ATM IV" /
+  "spot move in the last minute" / "DVOL right now" / "any blocks just
+  printed" → reach for **Dataset 6 (pulse)** first. One S3 read
+  replaces several `web_fetch` round-trips.
+- If the user wants live Paradex account state or order placement →
+  stand down (route to live-trading skills).
 
 ## Trigger
 
@@ -179,6 +192,14 @@ Pull from `references/datasets.md`. Grouped into:
 5. **Paradex DEX Trade Tape** (`paradex_data/`)
    - `paradex_trade_tape.csv.gz` — on-chain Paradex perp trades
      (historical only; live Paradex state is out of scope)
+6. **Hot Pulse** (`paradigm_data/realtime/hot/`)
+   - `hot__snapshot.parquet` — single-file LLM-shaped live snapshot
+     (spot / ATM IV / DVOL / 1-min volume / block activity);
+     clobbered every 60 s. The catalog's only near-real-time entry.
+   - `hot__<window>.parquet` — trailing-window aggregates
+     (`5m`/`10m`/`20m`/`1h`/`4h`/`8h`/`24h`): DVOL+spot OHLC, volume by
+     venue, and per-contract flow over the window; refreshed every 5 min.
+     See Dataset 6b for the (different) window schema.
 
 For each, report: S3 path (with the correct partition pattern —
 `YYYY/MM/DD/` for option/future market data, `date=YYYY-MM-DD/` Hive-style for Bullish/IBIT,
