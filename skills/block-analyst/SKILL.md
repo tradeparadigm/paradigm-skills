@@ -127,7 +127,7 @@ The taker's real position comes from the **leg-level `side` fields** plus the si
 **Step 2a — surface anchor (one DuckDB read).** Read the tardis-realtime
 hot pulse for the current ATM IV per venue + recent block activity before
 hitting per-leg endpoints:
-`s3://terminal-dime-prod/paradigm_data/tardis_realtime/hot/pulse.parquet`.
+`s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__snapshot.parquet`.
 See `paradigm-data-discovery` Dataset 6 for the schema. Use to anchor
 each leg's IV against the venue's current ATM (rich/cheap framing) and
 to surface recent Deribit block activity (`signal_type = 'block_summary'`)

@@ -362,7 +362,7 @@ This is the only dataset in this catalog that is **near-real-time**
 
 ### 6a. `tardis_realtime_hot_pulse` — Live Market Heartbeat
 
-- **Path:** `s3://terminal-dime-prod/paradigm_data/tardis_realtime/hot/pulse.parquet`
+- **Path:** `s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__snapshot.parquet`
 - **Refresh:** every 60 s (clobbered in place; bucket versioning retains
   prior pulses recoverably for ~24 h)
 - **Row count:** ~35–50 (bounded by design; fits in any LLM context)
@@ -400,7 +400,7 @@ INSTALL httpfs; LOAD httpfs;
 -- What's BTC ATM IV across venues right now?
 SELECT exchange, expiry, atm_strike, value AS atm_iv_vol_points,
        atm_call_iv, atm_put_iv, open_interest, delta_1m
-FROM read_parquet('s3://terminal-dime-prod/paradigm_data/tardis_realtime/hot/pulse.parquet')
+FROM read_parquet('s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__snapshot.parquet')
 WHERE signal_type = 'atm_iv' AND asset = 'BTC'
 ORDER BY expiry;
 
@@ -408,13 +408,13 @@ ORDER BY expiry;
 SELECT exchange, asset, value AS total_volume,
        call_volume, put_volume, buy_volume, sell_volume,
        notional, trade_count
-FROM read_parquet('s3://terminal-dime-prod/paradigm_data/tardis_realtime/hot/pulse.parquet')
+FROM read_parquet('s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__snapshot.parquet')
 WHERE signal_type = 'volume_last_min';
 
 -- Block activity in the last minute (Deribit only today)
 SELECT exchange, asset, value AS block_count,
        block_total_notional, block_largest_notional
-FROM read_parquet('s3://terminal-dime-prod/paradigm_data/tardis_realtime/hot/pulse.parquet')
+FROM read_parquet('s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__snapshot.parquet')
 WHERE signal_type = 'block_summary';
 ```
 

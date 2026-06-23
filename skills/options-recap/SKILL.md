@@ -30,7 +30,7 @@ metadata:
 ## Data Fetches
 
 **Live snapshot first.** Read the tardis-realtime hot pulse from S3
-(`s3://terminal-dime-prod/paradigm_data/tardis_realtime/hot/pulse.parquet`,
+(`s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__snapshot.parquet`,
 ~50 rows, one DuckDB read) for the "right now" anchor: current DVOL,
 current spot per venue, last-minute volume + call/put split, current
 ATM IV per expiry per venue (with `atm_call_iv` / `atm_put_iv` for skew),
