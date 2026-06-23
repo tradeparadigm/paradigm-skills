@@ -349,7 +349,7 @@ tooling, not this historical catalog.
 
 ---
 
-## Dataset 6 — Tardis-Realtime Hot Pulse (Live Snapshot)
+## Dataset 6 — Hot Pulse (Live Snapshot)
 
 Single-file LLM-shaped market snapshot. The fastest way to answer
 "what's happening right now" without scanning per-period data —
@@ -360,7 +360,7 @@ or live block-trade activity.
 This is the only dataset in this catalog that is **near-real-time**
 (1-minute cadence). All other datasets are historical-only.
 
-### 6a. `tardis_realtime_hot_pulse` — Live Market Heartbeat
+### 6a. `hot_pulse` — Live Market Heartbeat
 
 - **Path:** `s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__snapshot.parquet`
 - **Refresh:** every 60 s (clobbered in place; bucket versioning retains
@@ -430,8 +430,8 @@ for the same data; one S3 read replaces several round-trips.
 - IV columns are uniformly in **vol points** — `atm_call_iv` from OKX
   reads `38.03`, not `0.38`, despite OKX's wire format using decimals.
   Pulse pre-scales them at materialisation time. (The per-period
-  files in `paradex-tardis-realtime` keep venue-native units — don't
-  cross-join pulse with those without conversion.)
+  source files keep venue-native units — don't cross-join pulse with
+  those without conversion.)
 - `expiry` is venue-native (`20JUN26` from Deribit, `260620` from OKX).
   Parse per-venue for canonical dates.
 - `block_summary` is **Deribit-only today**. OKX/Bybit/Bullish block
@@ -457,7 +457,7 @@ for the same data; one S3 read replaces several round-trips.
   `BTC OPTION - PRDX`. Paradex *perp* trade flow is in Dataset 5.
 - **Live exchange streams / raw orderbook / account state** — for raw
   exchange tick streams, live order books, and account state, route to
-  the live-data skills. Dataset 6 (tardis-realtime hot pulse) is this
+  the live-data skills. Dataset 6 (hot pulse) is this
   catalog's only near-real-time entry and serves the "what's happening
   right now" use case at 1-minute grain.
 

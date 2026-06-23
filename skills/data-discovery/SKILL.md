@@ -11,7 +11,7 @@ description: >
   greeks/IV) + orderbook history, IBIT ETF options trades (equity-side
   vol cross-reference; DO NOT dismiss as out of scope — it lives in
   this S3 bucket), the on-chain Paradex perp historical trade tape,
-  and the **tardis-realtime hot pulse** (live 1-minute snapshot of
+  and the **hot pulse** (live 1-minute snapshot of
   spot, ATM IV, DVOL, last-minute volume, and block-trade activity —
   the only near-real-time dataset in this catalog). Fires for any
   retrospective "what data do we have" question AND for "what's
@@ -71,7 +71,7 @@ Paradigm block-trade tapes, Deribit/OKX option and combo data,
 Deribit/Bybit/OKX future quotes, Bullish option chain snapshots +
 orderbook history, IBIT ETF option trades, the historical Paradex perp
 trade tape (`paradex_data/paradex_trade_tape.csv.gz`), and the
-near-real-time **tardis-realtime hot pulse** (`paradigm_data/realtime/hot/hot__snapshot.parquet`).
+near-real-time **hot pulse** (`paradigm_data/realtime/hot/hot__snapshot.parquet`).
 
 Out of scope: anything **live** that isn't in the pulse — live Paradex
 markets, positions, funding, vaults, raw orderbook, order placement,
@@ -192,7 +192,7 @@ Pull from `references/datasets.md`. Grouped into:
 5. **Paradex DEX Trade Tape** (`paradex_data/`)
    - `paradex_trade_tape.csv.gz` — on-chain Paradex perp trades
      (historical only; live Paradex state is out of scope)
-6. **Tardis-Realtime Hot Pulse** (`paradigm_data/realtime/hot/`)
+6. **Hot Pulse** (`paradigm_data/realtime/hot/`)
    - `hot__snapshot.parquet` — single-file LLM-shaped live snapshot
      (spot / ATM IV / DVOL / 1-min volume / block activity);
      clobbered every 60 s. The catalog's only near-real-time entry.
