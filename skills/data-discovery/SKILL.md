@@ -2,7 +2,7 @@
 name: paradigm-data-discovery
 description: >
   Catalog and query-launcher for market data in S3
-  (s3://terminal-dime-prod) — both historical and the near-real-time
+  (s3://terminal-dime-prod) — both historical and near-real-time
   hot surface. ALWAYS load this skill before concluding any dataset is
   out of scope — do not dismiss based on asset class or venue
   assumptions. Covers: Paradigm RFQ block-trade tape, Paradigm RFQ
@@ -10,8 +10,8 @@ description: >
   top-of-book quotes, Bullish option chain snapshots (native
   greeks/IV) + orderbook history, IBIT ETF options trades (equity-side
   vol cross-reference; DO NOT dismiss as out of scope — it lives in
-  this S3 bucket), the on-chain Paradex perp historical trade tape,
-  and the **hot surface** (live 1-minute snapshot of
+  this S3 bucket), on-chain Paradex perp historical trade tape,
+  and the hot surface (live 1-minute snapshot of
   spot, ATM IV, DVOL, last-minute volume, and block-trade activity,
   plus trailing-window recaps). Fires for any
   retrospective "what data do we have" question AND for "what's
