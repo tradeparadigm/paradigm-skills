@@ -12,7 +12,7 @@ compatibility: Deribit public API (curl), Paradigm hot surface (DuckDB+S3 via IR
   S3 hot surface requires the IRSA bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.5"
+  version: "1.6"
 ---
 
 # Options Recap
@@ -205,6 +205,11 @@ RV must be 7-day trailing window. Read from `derived.realized_vol` or the script
 **Vol Surface** — built from `surface.csv`, **not** a fetch:
 1. Feed the surface rows as the script's `tickers` plus `spot`.
 2. Read `atm_iv`, `rr_25d`, `butterfly_25d`, `term_structure` back. Note `wings_extrapolated` if set.
+3. **Deltas (ΔATM, ΔRR, ΔFly) = close − open over the recap window.**
+   - Preferred source: `markIV_open` on the `surface` row if present (newer parquet schemas carry it). Compute per-expiry ATM/RR/Fly twice — once with `markIV_close`, once with `markIV_open` — and diff.
+   - Fallback when `markIV_open` is absent: pass `tickers_open` to the script using a second surface snapshot taken at `window_start` (the script's `vol_surface_delta` helper accepts it).
+   - If neither source resolves for an expiry/metric, render that cell as `n/a` — never estimate the Δ.
+   - Format: `+X.Xv` / `-X.Xv` / `flat` (when `|Δ| < 0.05v`). Append `*` to any value derived from extrapolated wings (`wings_extrapolated` set on either close or open side).
 
 ## Output Format — FIXED
 
@@ -248,13 +253,27 @@ P/C       [X.Xx]x     [calls/puts] dominant
 Skew: front 25Δ RR [±X]v → [puts bid / calls bid] · Term: [front]v → [back]v → [contango / flat / backwardation]
 
 ```yaml
-Expiry     ATM                  25d RR               Fly
----------  -------------------  -------------------  -------------------
-[DDMMMYY]  [X.X] → [Y.Y]v      [±X.X] → [±Y.Y]v    [X.X] → [Y.Y]v
+Expiry     ATM      ΔATM    25d RR    ΔRR     Fly    ΔFly
+---------  ------   ------  --------  ------  -----  ------
+[DDMMMYY]  [X.X]v   [±X.X]v  [±X.X]v   [±X.X]v  [X.X]v [±X.X]v
 …
 ```
 
-`* wings extrapolated` (if applicable)
+Formatting rules:
+- ATM / RR / Fly columns: current (close) values only, `X.Xv` precision.
+- Δ columns: signed `+X.Xv` / `-X.Xv`, or `flat` when `|Δ| < 0.05v`, or `n/a` when open value unavailable.
+- Append `*` to any cell whose value (or its open counterpart) is derived from extrapolated wings; e.g. `-4.0v*` / `-0.2v*`.
+
+Example:
+
+```
+Expiry     ATM     ΔATM    25d RR    ΔRR     Fly    ΔFly
+---------  ------  ------  --------  ------  -----  ------
+12JUN26    43.2v   +1.2v   -5.6v     -0.5v   1.6v   -0.2v
+26JUN26    43.4v   flat    -5.7v     -0.5v   1.0v   -0.1v
+31JUL26    43.1v   +0.1v   -4.0v*    -0.2v*  0.6v   -0.1v
+25SEP26    43.8v   +0.3v   n/a       n/a     n/a    n/a
+```
 
 ---
 
