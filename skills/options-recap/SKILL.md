@@ -12,7 +12,7 @@ compatibility: Deribit public API (curl), Paradigm hot surface (DuckDB+S3 via IR
   S3 hot surface requires the IRSA bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.6"
+  version: "1.7"
 ---
 
 # Options Recap
@@ -30,192 +30,111 @@ metadata:
 
 ## Performance Contract — read first
 
-Cold target: **≤45s end-to-end**. Warm (second recap in <5 min): **≤20s**.
-The whole recap is **four independent I/O operations** plus a single Python
-analysis pass. Run the I/O in parallel. Anything sequential here is a bug.
+Target: **≤30s, every run.** The path is exactly **two tool calls**, then you
+render:
 
-The four ops:
+1. **One bash block** — bootstrap S3 creds, run the single DuckDB session into
+   CSVs, then call `recap.py` once. The orchestrator does *all* the Deribit
+   fetching (with concurrent, time-sliced pagination), CSV ingest, snapshot
+   assembly, and vol math, and prints one JSON object.
+2. **Render** the four sections from that JSON.
 
-| # | Op | What it produces |
-|---|---|---|
-| 1 | DuckDB read of `hot__market_signals_1m.parquet` | Snapshot rows (DVOL, spot, vol_last_min, per-expiry ATM IV) |
-| 2 | DuckDB read of `hot__recap_<window>.parquet` | All `row_type` slices (dvol_spot, volume, block, surface) |
-| 3 | `curl` Deribit `get_tradingview_chart_data` (7d hourly closes) | Realized vol input |
-| 4 | `curl` Deribit `get_last_trades_by_currency` (window, paginated) | Block leg geometry |
+This is a copy-paste runbook. **Do not** improvise extra steps — no per-page
+trade backfill, no `DESCRIBE`, no instrument/ticker fan-out, no hand-building a
+snapshot from CSVs. Every one of those was a multi-second model round-trip and
+a source of run-to-run drift. `recap.py` owns them now; you only set `WIN`,
+`ASSET`, `CUR` and read the result.
 
-Fire all four with `&` then `wait`. Do not start Python until `wait` returns.
+## Modes — pick one, then render the same four sections
 
-## Data Fetches
+- **Live** (real `/recap`, tools available): run the bash block below, render
+  from `recap.py`'s JSON. This is the normal path.
+- **Injected data** (a `<market_data>` block with `derived` is in context):
+  that block is the sole source of truth. Render directly from
+  `derived.realized_vol` (RV/VRP), `derived.top_blocks` (Biggest Print + Block
+  Flow), and `derived.vol_surface` (skew/term + per-expiry ATM/RR/Fly), reading
+  DVOL open/close and the spot range from the raw `dvol`/`spot` tape. **Do not**
+  run the script, recompute those figures, or add any estimated-data
+  disclaimer.
+- **Simulate** (no tools and no injected data): produce the four sections with
+  plausible example values following the templates exactly, and prepend one
+  line: `⚠ Data estimated — no live feed available.`
 
-**Two hot reads cover the whole recap. They are authoritative — never
-`curl`/`web_fetch` anything they already carry** (DVOL, spot, window volume,
-ATM IV, vol surface). Mixing live-API values into a hot-file recap is the
-#1 cause of inconsistent reports.
-
-**Read 1 — snapshot (the "now" anchor).** Single DuckDB read of
-`s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet`:
-current DVOL, spot per venue, last-minute volume + call/put split, current
-ATM IV per expiry (`atm_call_iv`/`atm_put_iv` for skew), recent block
-activity. Filter by `signal_type`.
-
-**Read 2 — recap window.** Single DuckDB read of
-`s3://terminal-dime-prod/paradigm_data/hot/hot__recap_<window>.parquet` for
-the recap `window` (`1h`/`4h`/`8h`/`24h`; `1d`→`24h`; `5m`/`10m`/`20m` also
-exist). Pick rows by `row_type` — this map is the contract:
-
-| Recap section | `row_type` | Columns to read |
-|---|---|---|
-| Snapshot — DVOL/spot OHLC | `dvol_spot` | `metric` (`dvol`\|`spot`), `open`, `close`, `high`, `low` |
-| Snapshot — Volume + P/C | `volume` | `volume_sum`, `notional`, `buy_volume`, `sell_volume`, `trade_count` (P/C via `optionType`) |
-| Block Flow (ranking) | `block` | `block_id`, `notional`, `volume_sum`, `leg_count`, `avg_iv` |
-| Vol Surface | `surface` | `expiry`, `strike`, `optionType`, `markIV_close`, `delta`, `openInterest`, `underlying_price` |
-
-IV on `block` rows is `avg_iv`; `markIV_close`/`delta` are on `surface` rows
-only. `at` is Unix ms.
-
-`row_type='flow'` rows exist but are no longer consumed by this recap — skip them.
-
-**`curl` — only these two (hot never carries them):**
-
-| Data | Endpoint | Used for |
-|---|---|---|
-| Spot 7d | `/api/v2/public/get_tradingview_chart_data?instrument_name=BTC-PERPETUAL&resolution=60&start_timestamp=<7d-ago>&end_timestamp=<now>` → `result.close[]` | realized vol (hot maxes at 24h) |
-| Window option trades | `/api/v2/public/get_last_trades_by_currency?currency=BTC&kind=option&count=1000&start_timestamp=<ms>&sorting=desc` | block leg detail (biggest print) clustering by `block_trade_id` |
-
-**Use `curl` directly, not `web_fetch`.** `web_fetch` truncates `get_last_trades_by_currency` responses at ~20KB, which is below the size of a 1000-trade reply. You will silently lose blocks. Always go to disk:
-
-```bash
-curl -s "<url>" -o /tmp/trades.json
-```
-
-For windows >2h you usually need pagination. Fetch desc + asc in parallel and dedupe by `trade_id`. If `asc[-1].timestamp < window_end - 30min`, fetch one more page anchored at that cursor:
-
-```bash
-( curl -s "...&sorting=desc&start_timestamp=$WIN_START&end_timestamp=$NOW" -o /tmp/trades_desc.json ) &
-( curl -s "...&sorting=asc&start_timestamp=$WIN_START&end_timestamp=$NOW" -o /tmp/trades_asc.json ) &
-```
-
-**Hot-only — no live reconstruction of these metrics.** The hot files are
-the single source for DVOL/spot/volume/surface; never rebuild them from
-exchange APIs. Handle freshness by the `at` timestamp, not by falling back:
-- **Stale** (file present, `at` behind wall-clock): proceed and prepend
-  `⚠ hot data ~N min old`. A few-minute-old window file is fine.
-- **Absent** (read 404s): emit the fixed format with affected sections marked
-  `No data` and prepend `⚠ hot surface unavailable`. Do not fabricate.
-
-## DuckDB — single-session, single-file query
-
-Run **one** DuckDB invocation per recap. Bootstrap STS creds once, emit every dataset via `COPY (…) TO` into `/tmp/recap/*.csv`, then read those in Python. Eliminates per-invocation `INSTALL httpfs; LOAD httpfs;` and cred-set overhead.
-
-**Two SQL gotchas — both must be honored or queries fail silently or with cryptic errors:**
-
-1. **`at` is a reserved keyword.** Always alias: `"at" AS at_ms`.
-2. **One statement per line in the file.** Heredocs assembled with `$(cat …)` collapse newlines and DuckDB parses the lot as a single malformed statement. Write the .sql file with literal newlines (here-doc with `EOF`, or `printf`), never via `$(cat oneline.sql) other_stmt`.
-
-Reference layout for the combined query file (`/tmp/recap.sql`):
-
-```sql
-INSTALL httpfs;
-LOAD httpfs;
-SET s3_region='ap-northeast-1';
-SET s3_access_key_id='<AK>';
-SET s3_secret_access_key='<SK>';
-SET s3_session_token='<ST>';
-
-COPY (
-  SELECT signal_type, exchange, expiry, value, atm_call_iv, atm_put_iv,
-         underlying_price, call_volume, put_volume, buy_volume, sell_volume,
-         notional, trade_count, "at" AS at_ms
-  FROM read_parquet('s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet')
-  WHERE asset='BTC'
-) TO '/tmp/recap/snapshot.csv' (HEADER, DELIMITER ',');
-
-COPY (
-  SELECT exchange, metric, open, close, high, low
-  FROM read_parquet('s3://terminal-dime-prod/paradigm_data/hot/hot__recap_8h.parquet')
-  WHERE asset='BTC' AND row_type='dvol_spot'
-) TO '/tmp/recap/dvol_spot.csv' (HEADER, DELIMITER ',');
-
-COPY (… row_type='volume' …) TO '/tmp/recap/volume.csv' (HEADER, DELIMITER ',');
-COPY (… row_type='block'  …) TO '/tmp/recap/block.csv'  (HEADER, DELIMITER ',');
-COPY (… row_type='surface' AND exchange='deribit' …) TO '/tmp/recap/surface.csv' (HEADER, DELIMITER ',');
-```
-
-Schema is documented above and in the data-discovery skill. **Do not `DESCRIBE` the parquets at runtime** — only fall back to `DESCRIBE` if a column-not-found error fires.
-
-## Parallel I/O harness
+## The run — one bash block
 
 ```bash
 mkdir -p /tmp/recap
-WIN=8h; NOW=$(date -u +%s%3N); WIN_START=$((NOW - 8*3600*1000)); SEVEN_D=$((NOW - 7*24*3600*1000))
+ASSET=BTC; CUR=BTC; WIN=8h            # from the command; 1d → 24h
+RWIN=${WIN/1d/24h}
 
-# Build /tmp/recap.sql once (creds + COPY blocks above)
+# 1. STS bootstrap (idempotent; see paradigm-data-discovery skill)
+TOKEN=$(cat "$AWS_WEB_IDENTITY_TOKEN_FILE")
+CREDS=$(curl -s "https://sts.ap-northeast-1.amazonaws.com/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=${AWS_ROLE_ARN}&RoleSessionName=duckdb&WebIdentityToken=${TOKEN}")
+AK=$(echo "$CREDS" | grep -o '<AccessKeyId>[^<]*'     | cut -d'>' -f2)
+SK=$(echo "$CREDS" | grep -o '<SecretAccessKey>[^<]*' | cut -d'>' -f2)
+ST=$(echo "$CREDS" | grep -o '<SessionToken>[^<]*'    | cut -d'>' -f2)
 
-( duckdb < /tmp/recap.sql > /tmp/recap/duck.log 2>&1 ) &
-( curl -s "https://www.deribit.com/api/v2/public/get_tradingview_chart_data?instrument_name=BTC-PERPETUAL&resolution=60&start_timestamp=$SEVEN_D&end_timestamp=$NOW" -o /tmp/recap/chart.json ) &
-( curl -s "https://www.deribit.com/api/v2/public/get_last_trades_by_currency?currency=BTC&kind=option&count=1000&start_timestamp=$WIN_START&end_timestamp=$NOW&sorting=desc" -o /tmp/recap/trades_desc.json ) &
-( curl -s "https://www.deribit.com/api/v2/public/get_last_trades_by_currency?currency=BTC&kind=option&count=1000&start_timestamp=$WIN_START&end_timestamp=$NOW&sorting=asc"  -o /tmp/recap/trades_asc.json  ) &
-wait
+# 2. One DuckDB session → CSVs (one statement per line; alias the reserved word `at`)
+SIG=s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet
+REC=s3://terminal-dime-prod/paradigm_data/hot/hot__recap_${RWIN}.parquet
+cat > /tmp/recap.sql <<SQL
+INSTALL httpfs;
+LOAD httpfs;
+SET s3_region='ap-northeast-1';
+SET s3_access_key_id='${AK}';
+SET s3_secret_access_key='${SK}';
+SET s3_session_token='${ST}';
+COPY (SELECT signal_type, exchange, expiry, value, atm_call_iv, atm_put_iv, underlying_price, call_volume, put_volume, buy_volume, sell_volume, notional, trade_count, "at" AS at_ms FROM read_parquet('${SIG}') WHERE asset='${CUR}') TO '/tmp/recap/snapshot.csv' (HEADER, DELIMITER ',');
+COPY (SELECT exchange, metric, open, close, high, low FROM read_parquet('${REC}') WHERE asset='${CUR}' AND row_type='dvol_spot') TO '/tmp/recap/dvol_spot.csv' (HEADER, DELIMITER ',');
+COPY (SELECT exchange, optionType, volume_sum, notional, buy_volume, sell_volume, trade_count FROM read_parquet('${REC}') WHERE asset='${CUR}' AND row_type='volume') TO '/tmp/recap/volume.csv' (HEADER, DELIMITER ',');
+COPY (SELECT block_id, notional, volume_sum, leg_count, avg_iv FROM read_parquet('${REC}') WHERE asset='${CUR}' AND row_type='block') TO '/tmp/recap/block.csv' (HEADER, DELIMITER ',');
+COPY (SELECT expiry, strike, optionType, markIV_close, delta, openInterest, underlying_price FROM read_parquet('${REC}') WHERE asset='${CUR}' AND row_type='surface' AND exchange='deribit') TO '/tmp/recap/surface.csv' (HEADER, DELIMITER ',');
+SQL
+duckdb < /tmp/recap.sql > /tmp/recap/duck.log 2>&1 || echo "duckdb failed (see duck.log) — recap.py will mark hot sections No data"
+
+# 3. One orchestrator call — fetches Deribit, ingests CSVs, computes, prints JSON
+uv run scripts/recap.py --asset "$ASSET" --window "$WIN" --csv-dir /tmp/recap --pretty
 ```
 
-Only after `wait` returns, run the analysis script.
+`recap.py` fetches the Deribit tape itself (7d hourly closes for realized vol +
+the window's option trades via concurrent, time-sliced pagination — no serial
+backfill) and reads the hot CSVs the DuckDB step wrote. Hot files are
+authoritative for DVOL/spot/volume/surface; Deribit supplies only the 7d closes
+and block-leg geometry (hot carries neither). If a source fails, the affected
+fields come back `null` and a line is added to `warnings` — the JSON is always
+renderable.
 
-## Session cache
+**Freshness / degradation** (read `warnings` in the JSON):
+- DuckDB failed / CSVs absent → snapshot volume, P/C, and vol surface are
+  `null`. Render those rows as `No data` and prepend `⚠ hot surface unavailable`.
+- A `~N min old` note belongs only if you can see the hot `at_ms` lagging
+  wall-clock by minutes; a few minutes is fine — proceed.
+- Never fabricate a number to fill a `null`.
 
-If `/tmp/recap/cache.json` exists with `cached_at < 5min` ago, reuse:
+## Output JSON → sections (field map)
 
-- `realized_vol_7d` — 7d closes barely move in 5 min; skip the chart fetch
-- `vol_surface` — front-month skew is stable on 5-min scale; skip the surface CSV ingest
+`recap.py` prints one object. Render each section straight from these fields —
+no recomputation, no re-fetching.
 
-Cache invalidation: any time `window`, `asset`, or the snapshot `at` advances >5 min, refresh both.
-
-For a `/recap` issued within 5 min of the prior one this turns the run into: 1 DuckDB read + 1 trades curl + 1 Python pass. Target ≤20s.
-
-## Computing the numbers
-
-Realized vol (Black-76) and surface skew are math that LLMs get wrong by estimating. **Always use the bundled script; never hand-compute these.**
-
-```bash
-uv run scripts/paradigm_options_recap.py --data snapshot.json
-```
-
-Build `snapshot.json` **from the CSV outputs** of the single DuckDB run, plus the two `curl` outputs:
-
-| Field | Source |
+| JSON path | Renders into |
 |---|---|
-| `dvol_close` | `snapshot.csv` row where `signal_type='dvol'` (or `dvol_spot.csv` `close`) |
-| `spot` | `snapshot.csv` row where `signal_type='spot'` |
-| `tickers` (`{sym: {mark_iv, delta}}`) | `surface.csv` — `mark_iv`=`markIV_close`, `delta`=`delta`. Build `sym` as the Deribit instrument name `{asset}-{expiry}-{int(strike)}-{C\|P}` (expiry already Deribit-native, e.g. `3JUL26`). Filter to deribit only. No instrument-list/ticker fan-out. |
-| `spot_closes_7d` | `chart.json` → `result.close[]` |
-| `trades` | merge `trades_desc.json` + `trades_asc.json`, dedupe on `trade_id`, group by `block_trade_id` (only needed for top-block leg geometry) |
+| `header.{asset,window,start_utc,end_utc}` | Title line |
+| `snapshot.{spot,spot_from,spot_low,spot_change_pct,dvol,dvol_open,dvol_close,dvol_label,rv_7d,vrp,vrp_label,volume_usd_m,primary_venue,pc_ratio,pc_dominant,spot_vol_label}` | **Snapshot** |
+| `biggest_print.{expiry,structure,size,notional_m,time_utc,venue?,side}` | **Biggest Print** |
+| `block_flow.{total_m,n_blocks,rows[]}` — each row `{rank,structure,notl_m,detail}` | **Block Flow** |
+| `vol_surface.{skew_line,term_line,rows[]}` — each row `{expiry,atm,rr_25d,fly,extrapolated}` | **Vol Surface** |
 
-Returns `realized_vol`, `top_blocks`, `vol_surface`. If a `derived` block is already injected into context, read it and skip the script.
-
-## Analysis
-
-**Snapshot** — pull spot, DVOL open→close, RV(7d) vs implied. VRP = implied − realized. Label:
-- spot↑ vol↓ → "vol sold through rally"
-- spot↓ vol↑ → "vol bid into weakness"
-- spot↑ vol↑ → "vol bought through rally"
-
-RV must be 7-day trailing window. Read from `derived.realized_vol` or the script — never estimate.
-
-**Block Flow** — rank from `block.csv` (sort by `notional`); the `$XM / N blocks` header is `sum(volume_sum) * spot` and `count(block_id)`. For the biggest few, pull leg geometry from the merged trades file (cluster by `block_trade_id`) → feed to the script's `top_blocks`. Mark `two-way`/one-sided from the field — do not infer.
-
-**Vol Surface** — built from `surface.csv`, **not** a fetch:
-1. Feed the surface rows as the script's `tickers` plus `spot`.
-2. Read `atm_iv`, `rr_25d`, `butterfly_25d`, `term_structure` back. Note `wings_extrapolated` if set.
-3. **Deltas (ΔATM, ΔRR, ΔFly) = close − open over the recap window.**
-   - Preferred source: `markIV_open` on the `surface` row if present (newer parquet schemas carry it). Compute per-expiry ATM/RR/Fly twice — once with `markIV_close`, once with `markIV_open` — and diff.
-   - Fallback when `markIV_open` is absent: pass `tickers_open` to the script using a second surface snapshot taken at `window_start` (the script's `vol_surface_delta` helper accepts it).
-   - If neither source resolves for an expiry/metric, render that cell as `n/a` — never estimate the Δ.
-   - Format: `+X.Xv` / `-X.Xv` / `flat` (when `|Δ| < 0.05v`). Append `*` to any value derived from extrapolated wings (`wings_extrapolated` set on either close or open side).
+The vol math (realized-vs-implied, Black-76 block clustering/ranking, surface
+skew/term) is done in `recap.py` via the bundled `vol_math.py`. Never hand-
+compute these. To verify the math offline: `python3 scripts/test_vol_math.py`.
+To smoke-test the orchestrator without S3 (Deribit-only):
+`uv run scripts/recap.py --asset btc --window 8h --no-s3 --pretty`.
 
 ## Output Format — FIXED
 
-Four sections, this exact order, every recap. Never reorder, add, or drop sections. **Do not emit Themes, Dealer positioning, or Bottom Line — those have been removed.**
-
-Work silently — no narration. If hot files are stale or absent, prepend the matching banner from Data Fetches (`⚠ hot data ~N min old` / `⚠ hot surface unavailable`).
+Four sections, this exact order, every recap. Never reorder, add, or drop
+sections. **Do not emit Themes, Dealer positioning, or a Bottom Line — those
+have been removed.** Work silently — no narration.
 
 ---
 
@@ -231,7 +150,7 @@ DVOL      [X]v        [flat/rising/falling] ([open] -> [close])
 RV 7d     [X]v        implied [CHEAP/RICH/IN LINE] vs realized
 VRP       [±X]v       vol [underpriced/overpriced] vs delivered
 Volume    $[X]M       [primary venue] (incl. Paradigm)
-P/C       [X.Xx]x     [calls/puts] dominant
+P/C       [X.Xx]      [calls/puts] dominant
 ```
 
 **Biggest Print**
@@ -253,26 +172,25 @@ P/C       [X.Xx]x     [calls/puts] dominant
 Skew: front 25Δ RR [±X]v → [puts bid / calls bid] · Term: [front]v → [back]v → [contango / flat / backwardation]
 
 ```yaml
-Expiry     ATM      ΔATM    25d RR    ΔRR     Fly    ΔFly
----------  ------   ------  --------  ------  -----  ------
-[DDMMMYY]  [X.X]v   [±X.X]v  [±X.X]v   [±X.X]v  [X.X]v [±X.X]v
+Expiry     ATM      25d RR    Fly
+---------  ------   --------  -----
+[DDMMMYY]  [X.X]v   [±X.X]v   [X.X]v
 …
 ```
 
 Formatting rules:
-- ATM / RR / Fly columns: current (close) values only, `X.Xv` precision.
-- Δ columns: signed `+X.Xv` / `-X.Xv`, or `flat` when `|Δ| < 0.05v`, or `n/a` when open value unavailable.
-- Append `*` to any cell whose value (or its open counterpart) is derived from extrapolated wings; e.g. `-4.0v*` / `-0.2v*`.
+- ATM / RR / Fly columns: current (close) values, `X.Xv` precision.
+- Append `*` to any cell whose value is derived from extrapolated wings
+  (`extrapolated: true` on that surface row); e.g. `-4.0v*`.
 
 Example:
 
 ```
-Expiry     ATM     ΔATM    25d RR    ΔRR     Fly    ΔFly
----------  ------  ------  --------  ------  -----  ------
-12JUN26    43.2v   +1.2v   -5.6v     -0.5v   1.6v   -0.2v
-26JUN26    43.4v   flat    -5.7v     -0.5v   1.0v   -0.1v
-31JUL26    43.1v   +0.1v   -4.0v*    -0.2v*  0.6v   -0.1v
-25SEP26    43.8v   +0.3v   n/a       n/a     n/a    n/a
+Expiry     ATM     25d RR    Fly
+---------  ------  --------  -----
+12JUN26    43.2v   -5.6v     1.6v
+26JUN26    43.4v   -5.7v     1.0v
+31JUL26    43.1v   -4.0v*    0.6v
 ```
 
 ---
