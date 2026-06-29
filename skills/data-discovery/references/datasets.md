@@ -16,6 +16,11 @@ trade tape.
 - **Bucket:** `s3://terminal-dime-prod`
 - **Region:** `ap-northeast-1`
 - **Auth:** IRSA (EKS web identity → STS) — see `s3-access.md`.
+- **How it's populated:** `paradigm_data/` and `paradex_data/` are
+  cross-region **replicated** into this bucket from the source datalake
+  (`paradigm-datalake-public-data-us-east-1`), landing at the **same
+  keys**. Anything outside those two prefixes (notably `external/`) is
+  **not** replicated — see the Dataset 2 caveat.
 
 ---
 
@@ -116,6 +121,14 @@ Paradigm across Deribit, Paradex, and Bybit.
 
 Raw exchange market data. Useful for vol surface
 construction, execution benchmarking, and Greeks calculation.
+
+> **⚠ Replication caveat:** these datasets live under `external/`, which
+> is **not** in the replicated set (only `paradigm_data/` + `paradex_data/`
+> replicate into `terminal-dime-prod`). The `external/tardis/v1/` tree is
+> either static historical data loaded directly into the bucket or
+> unavailable — **probe with a `glob()` before relying on it**, and don't
+> assume it refreshes. For live/recent IV and flow, prefer the hot surface
+> (Dataset 6) and `v_vol_surface` (Dataset 3-adjacent), which do replicate.
 
 ### 2a. Deribit — Option Trades
 
@@ -349,7 +362,7 @@ tooling, not this historical catalog.
 
 ---
 
-## Dataset 6 — Hot Pulse (Live Snapshot)
+## Dataset 6 — Hot Surface (Live Snapshot + Trailing Windows)
 
 Single-file LLM-shaped market snapshot. The fastest way to answer
 "what's happening right now" without scanning per-period data —
@@ -360,13 +373,13 @@ or live block-trade activity.
 This is the only dataset in this catalog that is **near-real-time**
 (1-minute cadence). All other datasets are historical-only.
 
-### 6a. `hot_pulse` — Live Market Heartbeat
+### 6a. `hot__market_signals_1m` — Live Market Heartbeat
 
-- **Path:** `s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__snapshot.parquet`
+- **Path:** `s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet`
 - **Refresh:** every 60 s (clobbered in place; bucket versioning retains
-  prior pulses recoverably for ~24 h)
-- **Row count:** ~35–50 (bounded by design; fits in any LLM context)
-- **Schema:** 19 cols, polymorphic via `signal_type`
+  prior snapshots recoverably for ~24 h)
+- **Row count:** ~50–70 (bounded by design; fits in any LLM context)
+- **Schema:** 20 cols, polymorphic via `signal_type`
 
 | Column | Type | Notes |
 |---|---|---|
@@ -380,7 +393,7 @@ This is the only dataset in this catalog that is **near-real-time**
 | `atm_call_iv`, `atm_put_iv`, `atm_strike`, `underlying_price`, `open_interest` | double | `atm_iv` rows only; null elsewhere |
 | `call_volume`, `put_volume`, `buy_volume`, `sell_volume`, `notional` | double | `volume_last_min` rows only |
 | `trade_count` | bigint | `volume_last_min` rows only |
-| `block_total_notional`, `block_largest_notional` | double | `block_summary` rows only (Deribit raw only today) |
+| `block_total_notional`, `block_largest_notional` | double | `block_summary` rows only (deribit + okex + bullish) |
 
 **`value` semantics per signal_type:**
 
@@ -400,7 +413,7 @@ INSTALL httpfs; LOAD httpfs;
 -- What's BTC ATM IV across venues right now?
 SELECT exchange, expiry, atm_strike, value AS atm_iv_vol_points,
        atm_call_iv, atm_put_iv, open_interest, delta_1m
-FROM read_parquet('s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__snapshot.parquet')
+FROM read_parquet('s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet')
 WHERE signal_type = 'atm_iv' AND asset = 'BTC'
 ORDER BY expiry;
 
@@ -408,19 +421,19 @@ ORDER BY expiry;
 SELECT exchange, asset, value AS total_volume,
        call_volume, put_volume, buy_volume, sell_volume,
        notional, trade_count
-FROM read_parquet('s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__snapshot.parquet')
+FROM read_parquet('s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet')
 WHERE signal_type = 'volume_last_min';
 
 -- Block activity in the last minute (Deribit only today)
 SELECT exchange, asset, value AS block_count,
        block_total_notional, block_largest_notional
-FROM read_parquet('s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__snapshot.parquet')
+FROM read_parquet('s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet')
 WHERE signal_type = 'block_summary';
 ```
 
 **When to use:** front-month ATM IV across venues, current spot,
 last-minute volume + call/put split, DVOL, block activity — any "right
-now" question. Reach for pulse **before** doing exchange `web_fetch`
+now" question. Reach for the snapshot **before** doing exchange `web_fetch`
 for the same data; one S3 read replaces several round-trips.
 
 **Caveats:**
@@ -429,41 +442,55 @@ for the same data; one S3 read replaces several round-trips.
   `to_timestamp(at / 1000)`.
 - IV columns are uniformly in **vol points** — `atm_call_iv` from OKX
   reads `38.03`, not `0.38`, despite OKX's wire format using decimals.
-  Pulse pre-scales them at materialisation time. (The per-period
-  source files keep venue-native units — don't cross-join pulse with
-  those without conversion.)
+  The snapshot pre-scales them at materialisation time. (The per-period
+  source files keep venue-native units — don't cross-join the snapshot
+  with those without conversion.)
 - `expiry` is venue-native (`20JUN26` from Deribit, `260620` from OKX).
   Parse per-venue for canonical dates.
 - `block_summary` covers **Deribit, OKX, and Bullish** (each venue's
   native block/OTC id). Bybit is excluded — it exposes only an
   is-block flag with no group id, so its blocks can't be de-legged.
-- Pulse does **not** carry the full vol surface — only ATM. For the
-  full surface across strikes/expiries use
-  `paradigm_data/v_vol_surface/` (separate dataset, computed by the IV
-  pipeline; different shape and cadence).
+- The snapshot does **not** carry the full vol surface — only ATM. For
+  the full surface across strikes/expiries you have two options that
+  both replicate: (1) the trailing-window files (Dataset 6b) embed it as
+  `row_type = 'surface'` rows; (2) the standalone single-GET file
+  `s3://terminal-dime-prod/paradigm_data/v_vol_surface/_hot.parquet`
+  (stable key, refreshed ~5 min).
 
 ### 6b. Hot Windows — Trailing Aggregates
 
 Alongside the snapshot, the hot surface publishes pre-aggregated
 **trailing windows** — same prefix, one file per window:
 
-- **Path:** `s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__<window>.parquet`
+- **Path:** `s3://terminal-dime-prod/paradigm_data/hot/hot__recap_<window>.parquet`
 - **Windows:** `5m`, `10m`, `20m`, `1h`, `4h`, `8h`, `24h`
 - **Refresh:** every 5 minutes (clobbered in place)
 
 Each file holds exactly one trailing window (the `window` column equals
 the file's window). Unlike the snapshot's `signal_type` shape, windows
-use a **`row_type`** discriminator with three kinds:
+use a **`row_type`** discriminator with **five** kinds:
 
 | `row_type` | What | Key columns |
 |---|---|---|
 | `dvol_spot` | DVOL + spot OHLC over the window | `metric` (`dvol`\|`spot`), `open`, `close`, `high`, `low` |
 | `volume` | Per (exchange, asset) traded volume | `volume_sum`, `notional`, `buy_volume`, `sell_volume`, `trade_count` |
-| `flow` | Per-contract flow | `exchange`, `asset`, `optionType`, `expiry`, `strike`, `side`, `volume_sum`, `trade_count`, `avg_iv` |
+| `flow` | Per-contract screen flow | `exchange`, `asset`, `optionType`, `expiry`, `strike`, `side`, `volume_sum`, `trade_count`, `avg_iv` |
+| `block` | Per-block trade flow over the window | `exchange`, `block_id`, `asset`, `notional`, `volume_sum`, `leg_count`, `avg_iv` |
+| `surface` | Full per-strike vol surface (point-in-time, stamped each tick) | `exchange`, `asset`, `expiry`, `strike`, `optionType`, `markIV_close`, `delta`, `openInterest`, `underlying_price` |
 
 Common cols: `row_type`, `window`, `exchange`, `asset`, `window_start`
-(Unix ms), `at` (Unix ms, window end); `flow` rows also carry surface
-fields (`markIV_close`, `delta`, `openInterest`, `underlying_price`).
+(Unix ms), `at` (Unix ms, window end).
+
+**IV lives in different columns per `row_type` — read the right one:**
+- `flow` and `block` rows carry IV as **`avg_iv`** (= `iv_sum`/`iv_count`).
+- `markIV_close`, `delta`, `openInterest`, `underlying_price` are
+  populated **ONLY on `surface` rows** — they are **null on `flow` rows**.
+  Do not read `markIV_close` off a `flow` row.
+- `block` rows are the window's block-trade tape (one row per
+  `block_id`); use these for "blocks in the last `<window>`" instead of a
+  `web_fetch`.
+- `surface` rows give the whole vol surface in the same file — no
+  separate fetch needed for skew/term structure.
 
 **Read pattern (DuckDB):**
 
@@ -472,19 +499,25 @@ INSTALL httpfs; LOAD httpfs;
 
 -- DVOL + spot OHLC over the last hour
 SELECT exchange, asset, metric, open, close, high, low
-FROM read_parquet('s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__1h.parquet')
+FROM read_parquet('s3://terminal-dime-prod/paradigm_data/hot/hot__recap_1h.parquet')
 WHERE row_type = 'dvol_spot';
 
 -- Volume by venue over the last 24h
 SELECT exchange, asset, volume_sum, notional, buy_volume, sell_volume, trade_count
-FROM read_parquet('s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__24h.parquet')
+FROM read_parquet('s3://terminal-dime-prod/paradigm_data/hot/hot__recap_24h.parquet')
 WHERE row_type = 'volume';
+
+-- Full vol surface (skew/term structure) over the last hour — no extra fetch
+SELECT exchange, asset, expiry, strike, optionType,
+       markIV_close, delta, openInterest, underlying_price
+FROM read_parquet('s3://terminal-dime-prod/paradigm_data/hot/hot__recap_1h.parquet')
+WHERE row_type = 'surface';
 ```
 
-**When to use:** a "last `<window>`" question (volume / flow / DVOL move
-over 5m–24h) — one S3 read of the matching `hot__<window>` file instead
-of multiple API round-trips. For anything beyond 24h, use the historical
-per-period datasets above.
+**When to use:** a "last `<window>`" question (volume / flow / blocks /
+DVOL move / vol surface over 5m–24h) — one S3 read of the matching
+`hot__recap_<window>` file instead of multiple API round-trips. For
+anything beyond 24h, use the historical per-period datasets above.
 
 ---
 
@@ -502,7 +535,7 @@ per-period datasets above.
   `BTC OPTION - PRDX`. Paradex *perp* trade flow is in Dataset 5.
 - **Live exchange streams / raw orderbook / account state** — for raw
   exchange tick streams, live order books, and account state, route to
-  the live-data skills. Dataset 6 (hot pulse) is this
+  the live-data skills. Dataset 6 (hot surface) is this
   catalog's only near-real-time entry and serves the "what's happening
   right now" use case at 1-minute grain.
 

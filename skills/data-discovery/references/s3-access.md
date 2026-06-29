@@ -39,14 +39,16 @@ SET s3_session_token='<ST>';
 
 ## Verifying access
 
-After bootstrap, the cheapest reachability check is a glob on a known-dense
-prefix:
+After bootstrap, the cheapest reachability check is a read of a known
+stable key in the replicated set:
 
 ```sql
-SELECT COUNT(*) FROM glob('s3://terminal-dime-prod/external/tardis/v1/quotes/combo/deribit/2026/05/**');
+SELECT COUNT(*) FROM read_parquet('s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet');
 ```
 
-A non-zero count confirms credentials and network path are good.
+A non-zero count confirms credentials and network path are good. (Use a
+`paradigm_data/` key, not `external/` — only `paradigm_data/` and
+`paradex_data/` replicate into this bucket, so `external/` may be absent.)
 
 ## Coverage probe pattern
 

@@ -2,20 +2,20 @@
 name: paradigm-data-discovery
 description: >
   Catalog and query-launcher for market data in S3
-  (s3://terminal-dime-prod) — both historical and the near-real-time
-  hot pulse. ALWAYS load this skill before concluding any dataset is
+  (s3://terminal-dime-prod) — both historical and near-real-time
+  hot surface. ALWAYS load this skill before concluding any dataset is
   out of scope — do not dismiss based on asset class or venue
   assumptions. Covers: Paradigm RFQ block-trade tape, Paradigm RFQ
   activity tape, Deribit/OKX option trades + combo quotes + future
   top-of-book quotes, Bullish option chain snapshots (native
   greeks/IV) + orderbook history, IBIT ETF options trades (equity-side
   vol cross-reference; DO NOT dismiss as out of scope — it lives in
-  this S3 bucket), the on-chain Paradex perp historical trade tape,
-  and the **hot pulse** (live 1-minute snapshot of
-  spot, ATM IV, DVOL, last-minute volume, and block-trade activity).
-  Fires for any
+  this S3 bucket), on-chain Paradex perp historical trade tape,
+  and the hot surface (live 1-minute snapshot of
+  spot, ATM IV, DVOL, last-minute volume, and block-trade activity,
+  plus trailing-window recaps). Fires for any
   retrospective "what data do we have" question AND for "what's
-  happening right now" questions answerable from pulse — returns S3
+  happening right now" questions answerable from it — returns S3
   path + ready-to-run DuckDB query. Does NOT cover live Paradex
   markets, positions, vaults, or order placement.
 compatibility: Read-only data catalog. No authentication required to view the
@@ -24,7 +24,7 @@ compatibility: Read-only data catalog. No authentication required to view the
   references/s3-access.md for the credential bootstrap.
 metadata:
   author: tradeparadigm
-  version: "1.1"
+  version: "1.2"
 ---
 
 ## Hard Rules
@@ -64,16 +64,16 @@ Two jobs:
    "I don't have access to historical block trade data" — the tapes on S3
    *are* the historical data.
 
-## Scope — S3-backed market data (historical + near-real-time pulse)
+## Scope — S3-backed market data (historical + near-real-time hot surface)
 
 In scope: anything stored under `s3://terminal-dime-prod` —
 Paradigm block-trade tapes, Deribit/OKX option and combo data,
 Deribit/Bybit/OKX future quotes, Bullish option chain snapshots +
 orderbook history, IBIT ETF option trades, the historical Paradex perp
 trade tape (`paradex_data/paradex_trade_tape.csv.gz`), and the
-near-real-time **hot pulse** (`paradigm_data/realtime/hot/hot__snapshot.parquet`).
+near-real-time **hot surface** (`paradigm_data/hot/hot__market_signals_1m.parquet`).
 
-Out of scope: anything **live** that isn't in the pulse — live Paradex
+Out of scope: anything **live** that isn't in the hot surface — live Paradex
 markets, positions, funding, vaults, raw orderbook, order placement,
 account state. Those belong to live trading/market tooling.
 
@@ -84,7 +84,7 @@ Rule of thumb:
   datasets (1–5).
 - If the user asks "what's happening right now" / "current ATM IV" /
   "spot move in the last minute" / "DVOL right now" / "any blocks just
-  printed" → reach for **Dataset 6 (pulse)** first. One S3 read
+  printed" → reach for **Dataset 6 (hot surface)** first. One S3 read
   replaces several `web_fetch` round-trips.
 - If the user wants live Paradex account state or order placement →
   stand down (route to live-trading skills).
@@ -192,14 +192,15 @@ Pull from `references/datasets.md`. Grouped into:
 5. **Paradex DEX Trade Tape** (`paradex_data/`)
    - `paradex_trade_tape.csv.gz` — on-chain Paradex perp trades
      (historical only; live Paradex state is out of scope)
-6. **Hot Pulse** (`paradigm_data/realtime/hot/`)
-   - `hot__snapshot.parquet` — single-file LLM-shaped live snapshot
-     (spot / ATM IV / DVOL / 1-min volume / block activity);
+6. **Hot Surface** (`paradigm_data/hot/`)
+   - `hot__market_signals_1m.parquet` — single-file LLM-shaped live
+     snapshot (spot / ATM IV / DVOL / 1-min volume / block activity);
      clobbered every 60 s. The catalog's only near-real-time entry.
-   - `hot__<window>.parquet` — trailing-window aggregates
+   - `hot__recap_<window>.parquet` — trailing-window aggregates
      (`5m`/`10m`/`20m`/`1h`/`4h`/`8h`/`24h`): DVOL+spot OHLC, volume by
-     venue, and per-contract flow over the window; refreshed every 5 min.
-     See Dataset 6b for the (different) window schema.
+     venue, per-contract flow, **per-block flow, and the full per-strike
+     vol surface** over the window; refreshed every 5 min. See Dataset 6b
+     for the (different) window schema — note its five `row_type`s.
 
 For each, report: S3 path (with the correct partition pattern —
 `YYYY/MM/DD/` for option/future market data, `date=YYYY-MM-DD/` Hive-style for Bullish/IBIT,

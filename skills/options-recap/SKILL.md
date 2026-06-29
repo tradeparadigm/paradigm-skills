@@ -11,7 +11,7 @@ compatibility: Deribit public API (web_fetch), Paradigm block tape (if injected)
   OKX/Bullish/IBIT public APIs (web_fetch). No authentication required.
 metadata:
   author: tradeparadigm
-  version: "1.2"
+  version: "1.3"
 ---
 
 # Options Recap
@@ -29,45 +29,55 @@ metadata:
 
 ## Data Fetches
 
-**Live snapshot first.** Read the hot pulse from S3
-(`s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__snapshot.parquet`,
-~50 rows, one DuckDB read) for the "right now" anchor: current DVOL,
-current spot per venue, last-minute volume + call/put split, current
-ATM IV per expiry per venue (with `atm_call_iv` / `atm_put_iv` for skew),
-and recent block activity. See `paradigm-data-discovery` Dataset 6 for
-the schema. Use pulse values as the "now" anchor and to seed the
-vol-surface ATM IV reads — saves several `web_fetch` round-trips.
+**Two hot reads cover the whole recap. They are authoritative — never
+`web_fetch` anything they already carry** (DVOL, spot, window volume,
+ATM IV, per-contract flow, vol surface). Mixing live-API values into a
+hot-file recap is the #1 cause of inconsistent reports. `web_fetch` is
+for the two things hot never has, plus stale-file recovery.
 
-**Then window aggregates (one S3 read).** For the recap `window`
-(`1h`/`4h`/`8h`/`24h`; treat `1d` as `24h`), read the matching trailing-window file
-`s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__<window>.parquet` — it carries
-DVOL+spot OHLC (`row_type='dvol_spot'`), volume by venue (`row_type='volume'`), and
-per-contract flow (`row_type='flow'`) over exactly that window in one read (see
-`paradigm-data-discovery` Dataset 6b). Finer windows (`5m`/`10m`/`20m`) exist too.
+**Read 1 — snapshot (the "now" anchor).** One DuckDB read of
+`s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet`:
+current DVOL, spot per venue, last-minute volume + call/put split, current
+ATM IV per expiry (`atm_call_iv`/`atm_put_iv` for skew), recent block
+activity. Filter by `signal_type`.
 
-**Then fill the gaps via the endpoints below.** Use these for what the window file
-doesn't cover — the per-instrument vol surface, 7d spot for realized vol, and per-trade
-detail — and as a fallback if the hot file is stale/absent. Vol surface needs the
-instrument list first, then per-instrument tickers.
+**Read 2 — recap window (everything over the window).** One DuckDB read of
+`s3://terminal-dime-prod/paradigm_data/hot/hot__recap_<window>.parquet` for
+the recap `window` (`1h`/`4h`/`8h`/`24h`; `1d`→`24h`; `5m`/`10m`/`20m` also
+exist). Pick rows by `row_type` — this map is the contract:
 
-| Data | Endpoint |
-|---|---|
-| DVOL history | `/api/v2/public/get_volatility_index_data?currency=BTC&resolution=3600&start_timestamp=<ms>&end_timestamp=<ms>` |
-| Spot (recap window) | `/api/v2/public/get_tradingview_chart_data?instrument_name=BTC-PERPETUAL&resolution=60&start_timestamp=<ms>&end_timestamp=<ms>` |
-| Spot (7d for realized) | Same endpoint, `start_timestamp=<7d-ago>` |
-| Option trades | `/api/v2/public/get_last_trades_by_currency?currency=BTC&kind=option&count=1000&start_timestamp=<ms>&end_timestamp=<ms>&sorting=desc` |
-| Instrument list | `/api/v2/public/get_instruments?currency=BTC&kind=option&expired=false` |
-| Per-instrument ticker | `/api/v2/public/ticker?instrument_name=<inst>` (or `deribit__get_ticker` MCP) |
-| OKX trades | `/api/v5/market/trades?instType=OPTION&instFamily=BTC-USD` |
-| Bullish trades | `/trading-api/v1/trades?type=option` |
+| Recap section | `row_type` | Columns to read |
+|---|---|---|
+| Snapshot — DVOL/spot OHLC | `dvol_spot` | `metric` (`dvol`\|`spot`), `open`, `close`, `high`, `low` |
+| Snapshot — Volume + P/C | `volume` | `volume_sum`, `notional`, `buy_volume`, `sell_volume`, `trade_count` (P/C via `optionType`) |
+| Themes (screen flow) | `flow` | `expiry`, `strike`, `optionType`, `side`, `volume_sum`, `avg_iv` |
+| Block Flow (ranking) | `block` | `block_id`, `notional`, `volume_sum`, `leg_count`, `avg_iv` |
+| Vol Surface | `surface` | `expiry`, `strike`, `optionType`, `markIV_close`, `delta`, `openInterest`, `underlying_price` |
 
-**Response shapes:**
-- DVOL: `result.data` → `[[ts, open, high, low, close], …]`. First open = start, last close = end.
-- Spot: `result` → `{open, high, low, close, ticks}`. Use `low[]`/`high[]`/`close[]`.
-- Instruments: `result` → `[{instrument_name, strike, expiration_timestamp, option_type}]`. Use the exact `instrument_name` string (Deribit format: `5JUN26`, not `05JUN26`).
-- Ticker: carries `mark_iv`, `greeks` (`delta`, `vega`, `gamma`). Use `mark_iv` only — thin books push `ask_iv` to extremes.
+IV on `flow`/`block` rows is `avg_iv`; `markIV_close`/`delta` are on
+`surface` rows only (null on `flow`). `at` is Unix ms.
 
-`block_trade_id` present = block; absent = screen.
+**`web_fetch` — only these two (hot never carries them):**
+
+| Data | Endpoint | Used for |
+|---|---|---|
+| Spot 7d | `/api/v2/public/get_tradingview_chart_data?instrument_name=BTC-PERPETUAL&resolution=60&start_timestamp=<7d-ago>&end_timestamp=<now>` → `result.close[]` | realized vol (hot maxes at 24h) |
+| Window option trades | `/api/v2/public/get_last_trades_by_currency?currency=BTC&kind=option&count=1000&start_timestamp=<ms>&sorting=desc` | block leg detail (biggest print) + flow-greeks clustering by `block_trade_id` |
+
+**Hot-only — no live reconstruction of these metrics.** The hot files are
+the single source for DVOL/spot/volume/flow/surface; never rebuild them
+from exchange APIs (a Deribit-only, unharmonized rebuild is a different,
+lower-quality report wearing the same format). Handle freshness by the
+`at` timestamp, not by falling back:
+- **Stale** (file present, `at` behind wall-clock): proceed from it and
+  prepend one line — `⚠ hot data ~N min old`. A few-minute-old window file
+  is fine for an hours-long recap.
+- **Absent** (read 404s): emit the fixed format with the affected sections
+  marked `No data` and prepend `⚠ hot surface unavailable`. Do not
+  fabricate from live APIs.
+
+The only `web_fetch`es in a recap are the two required pulls above (7d
+spot, window trades) — those are data hot never carries, not a fallback.
 
 ## Computing the numbers
 
@@ -77,20 +87,18 @@ Realized vol, flow greeks (Black-76), and surface skew are math that LLMs get wr
 uv run scripts/paradigm_options_recap.py --data snapshot.json
 ```
 
-Snapshot shape (omit any field to skip that section):
-```json
-{
-  "dvol_close": 48.16,
-  "spot": 61973.5,
-  "spot_closes_7d": [63670, 63812, …],
-  "trades": [{"instrument_name": "BTC-26JUN26-55000-P", "iv": 72.0,
-              "timestamp": 1780000000000, "direction": "buy",
-              "amount": 100, "block_trade_id": "BLOCK-1"}],
-  "tickers": {"BTC-5JUN26-62000-C": {"mark_iv": 82.87, "delta": 0.4956}}
-}
-```
+Build `snapshot.json` **mostly from the hot rows** — only `spot_closes_7d`
+and `trades` come from `web_fetch` (omit any field to skip that section):
 
-Returns `realized_vol`, `flow_greeks`, `top_blocks`, `vol_surface`. If a `derived` block is already injected into context, read it and skip the script.
+| Field | Source |
+|---|---|
+| `dvol_close` | snapshot `dvol` row (or recap `dvol_spot`/`dvol` `close`) |
+| `spot` | snapshot `spot` row |
+| `tickers` (`{sym: {mark_iv, delta}}`) | recap **`surface` rows** — `mark_iv`=`markIV_close`, `delta`=`delta`. Build `sym` as the Deribit instrument name `{asset}-{expiry}-{int(strike)}-{C\|P}` (the script parses expiry/type from this key, so it must be exact; `surface.expiry` is already Deribit-native, e.g. `3JUL26`). Filter to `exchange='deribit'`. No instrument-list/ticker fan-out. |
+| `spot_closes_7d` | `web_fetch` 7d spot `close[]` |
+| `trades` | `web_fetch` window option trades (block clustering for `flow_greeks`/`top_blocks`) |
+
+Returns `realized_vol`, `flow_greeks`, `top_blocks`, `vol_surface`. If a `derived` block is already injected into context, read it and skip the script. **Themes need no script** — group the `flow` rows directly.
 
 ## Analysis
 
@@ -101,25 +109,24 @@ Returns `realized_vol`, `flow_greeks`, `top_blocks`, `vol_surface`. If a `derive
 
 RV must be 7-day trailing window. Read from `derived.realized_vol` or the script — never estimate.
 
-**Block Flow** — read `top_blocks` from script. Biggest single print first, then structure table sorted by notional. Each row: structure name, total notional, detail line (strikes × size × side × IV). Mark `two-way` or one-sided from the field — do not infer.
+**Block Flow** — rank from the recap `block` rows (sort by `notional`); the `$XM / N blocks` header is their sum/count. For the biggest few, pull leg geometry (strikes × size × side × IV) from the one `web_fetch` trades pull, clustered by `block_trade_id` → feed to the script's `top_blocks`. Mark `two-way`/one-sided from the field — do not infer.
 
 Dealer positioning from `flow_greeks.positioning_label`:
 - short gamma → chase spot, amplify moves
 - long gamma → fade moves
 - balanced → no decisive positioning
 
-**Themes** — screen (non-block) trades grouped by expiry/strike/direction. 2–4 bullets. Named, factual, no intent inference.
+**Themes** — group the recap `flow` rows (screen, non-block) by expiry/strike/direction; size is `volume_sum`, IV is `avg_iv`. 2–4 bullets. Named, factual, no intent inference.
 
-**Vol Surface** — discover-then-fetch:
-1. `get_instruments` once. Front expiry (nearest ≥ now) + second if blocks span expiries.
-2. ATM ± 4 strikes per expiry. Fetch tickers in parallel. Pass `mark_iv` + `delta` + `spot` to script.
-3. Read `atm_iv`, `rr_25d`, `butterfly_25d`, `term_structure`. Note `wings_extrapolated` if set.
+**Vol Surface** — built from the recap `surface` rows, **not** a fetch:
+1. Feed the `surface` rows as the script's `tickers` (`mark_iv`=`markIV_close`, `delta`=`delta`) plus `spot`.
+2. Read `atm_iv`, `rr_25d`, `butterfly_25d`, `term_structure` back. Note `wings_extrapolated` if set.
 
 ## Output Format — FIXED
 
 Six sections, this exact order, every recap. Never reorder, add, or drop sections.
 
-Work silently — no narration. If live tools are unavailable, prepend one line: `⚠ Data estimated — no live feed available.`
+Work silently — no narration. If the hot files are stale or absent, prepend the matching banner from Data Fetches (`⚠ hot data ~N min old` / `⚠ hot surface unavailable`).
 
 ---
 

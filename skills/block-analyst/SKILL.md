@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.2"
+  version: "1.3"
 ---
 
 # Paradigm Block Trade Analyst
@@ -124,15 +124,19 @@ The taker's real position comes from the **leg-level `side` fields** plus the si
 
 ## Step 2 — Fetch Live Data
 
-**Step 2a — surface anchor (one DuckDB read).** Read the hot pulse
+**Step 2a — surface anchor (one DuckDB read).** Read the hot snapshot
 for the current ATM IV per venue + recent block activity before
 hitting per-leg endpoints:
-`s3://terminal-dime-prod/paradigm_data/realtime/hot/hot__snapshot.parquet`.
+`s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet`.
 See `paradigm-data-discovery` Dataset 6 for the schema. Use to anchor
 each leg's IV against the venue's current ATM (rich/cheap framing) and
-to surface recent Deribit block activity (`signal_type = 'block_summary'`)
-that may contextualise the trade. Pulse does NOT replace per-leg fetches
-— block-analyst still needs specific instrument marks for fill benchmarking.
+to surface recent block activity (`signal_type = 'block_summary'`,
+covering deribit/okex/bullish) that may contextualise the trade. For the
+full per-strike surface over a trailing window (Step 5 vol-surface
+impact), read `row_type = 'surface'` from
+`paradigm_data/hot/hot__recap_<window>.parquet` instead of fetching it.
+The snapshot does NOT replace per-leg fetches — block-analyst still needs
+specific instrument marks for fill benchmarking.
 
 **Step 2b — per-leg fetches.** For each leg, fetch its current mark from the venues below in
 parallel, in priority order: Deribit first (primary venue), then OKX and/or Bybit only when you
