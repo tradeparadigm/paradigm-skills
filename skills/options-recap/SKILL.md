@@ -12,7 +12,7 @@ compatibility: Deribit public API (curl), Paradigm hot surface (DuckDB+S3 via IR
   S3 hot surface requires the IRSA bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.7"
+  version: "1.8"
 ---
 
 # Options Recap

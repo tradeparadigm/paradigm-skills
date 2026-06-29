@@ -215,8 +215,7 @@ def load_hot(csv_dir: str, asset: str) -> dict:
     leaving the field null and recording a warning, never crashing."""
     out = {"dvol": None, "dvol_open": None, "dvol_low": None, "dvol_high": None,
            "spot_close": None, "spot_open": None, "spot_low": None,
-           "volume_usd": None, "put_vol": None, "call_vol": None,
-           "block_total_usd": None, "block_count": None,
+           "volume_btc": None, "put_vol": None, "call_vol": None,
            "tickers": {}, "primary_venue": None}
 
     ds = _read_csv(csv_dir, "dvol_spot.csv")
@@ -231,28 +230,30 @@ def load_hot(csv_dir: str, asset: str) -> dict:
     if not ds:
         warn("hot dvol_spot.csv missing — DVOL/spot from snapshot or fallback")
 
-    vol = _read_csv(csv_dir, "volume.csv")
+    # Volume / P/C. The hot recap carries per-(exchange,optionType) rows PLUS a
+    # per-exchange aggregate row (blank optionType) whose notional double-counts,
+    # and `volume_sum` units differ by venue (Deribit/Bullish in BTC, OKX/Bybit in
+    # contracts) — summing across them produced absurd ($10T) totals. Restrict to
+    # Deribit, the canonical BTC-denominated options venue, and derive the notional
+    # ourselves as contracts × spot. Drop the blank-optionType aggregate rows.
+    vol = [r for r in _read_csv(csv_dir, "volume.csv") if (r.get("optionType") or "").strip()]
     if vol:
-        tot = sum(_num(r, "notional") or 0 for r in vol)
-        out["volume_usd"] = tot or None
-        out["put_vol"] = sum(_num(r, "volume_sum") or 0 for r in vol
-                             if (r.get("optionType") or "").upper().startswith("P")) or None
-        out["call_vol"] = sum(_num(r, "volume_sum") or 0 for r in vol
+        deri = [r for r in vol if (r.get("exchange") or "").lower().startswith("deribit")]
+        use = deri or vol
+        out["call_vol"] = sum(_num(r, "volume_sum") or 0 for r in use
                               if (r.get("optionType") or "").upper().startswith("C")) or None
-        venues = defaultdict(float)
-        for r in vol:
-            ex = r.get("exchange") or r.get("venue")
-            if ex:
-                venues[ex] += _num(r, "notional") or 0
-        if venues:
-            out["primary_venue"] = max(venues, key=venues.get)
+        out["put_vol"] = sum(_num(r, "volume_sum") or 0 for r in use
+                             if (r.get("optionType") or "").upper().startswith("P")) or None
+        out["volume_btc"] = ((out["call_vol"] or 0) + (out["put_vol"] or 0)) or None
+        if deri:
+            out["primary_venue"] = "Deribit"
+        else:
+            byv = defaultdict(float)
+            for r in use:
+                byv[r.get("exchange") or "?"] += _num(r, "volume_sum") or 0
+            out["primary_venue"] = max(byv, key=byv.get) if byv else None
     else:
         warn("hot volume.csv missing — volume/P/C unavailable")
-
-    blk = _read_csv(csv_dir, "block.csv")
-    if blk:
-        out["block_count"] = len(blk)
-        out["block_total_usd"] = sum(_num(r, "notional") or 0 for r in blk) or None
 
     surf = _read_csv(csv_dir, "surface.csv")
     spot_for_surf = out["spot_close"]
@@ -310,13 +311,11 @@ def build_block_flow(trades: list[dict], hot: dict, spot: float | None) -> dict:
             "detail": _leg_phrase(legs),
             "side": b["side"], "avg_iv": b["avg_iv"], "time_utc": b["time_utc"],
         })
-    # Header totals: prefer authoritative hot block totals, else derive from tape.
-    total_usd = hot.get("block_total_usd")
-    n_blocks = hot.get("block_count")
-    if total_usd is None:
-        total_usd = sum(b["notional_usd"] for b in summarize_blocks(clusters, top_n=999, min_btc=0))
-    if n_blocks is None:
-        n_blocks = len(clusters)
+    # Header totals from the same Deribit clustering that produced the rows. The
+    # hot block.csv has unit-corrupt rows (one block at $5B) that inflate the sum,
+    # so we don't trust it here.
+    total_usd = sum(b["notional_usd"] for b in summarize_blocks(clusters, top_n=10**9, min_btc=0))
+    n_blocks = len(clusters)
     biggest = None
     if ranked:
         b0 = ranked[0]
@@ -385,8 +384,9 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
 
     rv = realized_vs_implied(deri.get("closes_7d") or [], dvol_close)
 
-    # Volume / P/C
-    vol_usd = hot.get("volume_usd")
+    # Volume / P/C — hot gives Deribit contracts (BTC); notional = contracts × spot.
+    vol_btc = hot.get("volume_btc")
+    vol_usd = vol_btc * spot if (vol_btc and spot) else None
     pv, cv = hot.get("put_vol"), hot.get("call_vol")
     pc = round(pv / cv, 2) if pv and cv else None
 
