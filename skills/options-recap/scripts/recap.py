@@ -442,6 +442,90 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     }
 
 
+def render_md(r: dict) -> str:
+    """Render the final four-section recap markdown so the agent relays it
+    verbatim — no field-mapping reasoning, fully deterministic output."""
+    h, s, bp, bf, vs = (r["header"], r["snapshot"], r["biggest_print"],
+                        r["block_flow"], r["vol_surface"])
+    L: list[str] = []
+
+    crit = [w for w in (r.get("warnings") or []) if any(
+        k in w for k in ("missing", "unavailable", "failed"))]
+    if crit and s.get("volume_usd_m") is None and vs is None:
+        L.append("⚠ hot surface unavailable — affected sections read No data")
+        L.append("")
+
+    L.append(f"**{h['asset']} Options · {h['window']} Recap · "
+             f"{h['start_utc']}–{h['end_utc']} UTC**")
+    L += ["", "**Snapshot**", "", "```yaml"]
+
+    spot = f"${s['spot']:,}" if s.get("spot") else "n/a"
+    chg = s.get("spot_change_pct")
+    chg_txt = ("flat" if not chg else f"{'up' if chg > 0 else 'down'} {abs(chg)}%")
+    extra = []
+    if s.get("spot_from"):
+        extra.append(f"from ${s['spot_from']:,}")
+    if s.get("spot_low"):
+        extra.append(f"low ${s['spot_low']:,}")
+    extra_txt = f" ({', '.join(extra)})" if extra else ""
+    L.append(f"{'Spot':<9} {spot:<11} {chg_txt}{extra_txt}")
+
+    dvol = f"{s['dvol']}v" if s.get("dvol") is not None else "n/a"
+    dv = (f" ({round(s['dvol_open'], 1)} -> {round(s['dvol_close'], 1)})"
+          if s.get("dvol_open") is not None and s.get("dvol_close") is not None else "")
+    L.append(f"{'DVOL':<9} {dvol:<11} {s.get('dvol_label') or ''}{dv}")
+
+    vrp = s.get("vrp")
+    rich = ("CHEAP" if vrp is not None and vrp < -1 else
+            "RICH" if vrp is not None and vrp > 1 else "IN LINE")
+    rv = f"{s['rv_7d']}v" if s.get("rv_7d") is not None else "n/a"
+    L.append(f"{'RV 7d':<9} {rv:<11} implied {rich} vs realized")
+
+    vrp_txt = f"{vrp:+}v" if vrp is not None else "n/a"
+    upo = ("underpriced" if vrp is not None and vrp < 0 else
+           "overpriced" if vrp is not None and vrp > 0 else "fair")
+    L.append(f"{'VRP':<9} {vrp_txt:<11} vol {upo} vs delivered")
+
+    vol = f"${s['volume_usd_m']}M" if s.get("volume_usd_m") else "n/a"
+    L.append(f"{'Volume':<9} {vol:<11} {s.get('primary_venue') or 'n/a'} (incl. Paradigm)")
+    pc = f"{s['pc_ratio']}x" if s.get("pc_ratio") is not None else "n/a"
+    L.append(f"{'P/C':<9} {pc:<11} {s.get('pc_dominant') or ''} dominant")
+    L += ["```", "", "**Biggest Print**", "", "```yaml"]
+
+    if bp:
+        iv = f", {bp['avg_iv']}v avg" if bp.get("avg_iv") is not None else ""
+        L.append(f"{bp['expiry']} {bp['structure']}   {bp['size']:g}x   "
+                 f"${bp['notional_m']}M   {bp['time_utc']} UTC   "
+                 f"via Paradigm/Deribit ({bp['side']}{iv})")
+    else:
+        L.append("No data")
+    L += ["```", "", f"**Block Flow — ${bf['total_m']}M / {bf['n_blocks']} blocks**",
+          "", "```yaml", f"{'#':<3}{'Structure':<27}{'Notl':<9}Detail",
+          f"{'-':<3}{'-' * 25:<27}{'-' * 7:<9}{'-' * 48}"]
+    for row in bf["rows"]:
+        notl = f"${row['notl_m']}M"
+        L.append(f"{str(row['rank']):<3}{row['structure']:<27}{notl:<9}{row['detail']}")
+    L += ["```", "", "**Vol Surface**"]
+
+    if vs and vs.get("rows"):
+        fa, ba, term = vs.get("front_atm"), vs.get("back_atm"), vs.get("term_line")
+        term_txt = (f"{fa}v → {ba}v → {term}" if fa is not None and ba is not None
+                    and term else (term or "n/a"))
+        L.append(f"Skew: {vs.get('skew_line') or 'n/a'} · Term: {term_txt}")
+        L += ["", "```yaml", f"{'Expiry':<11}{'ATM':<8}{'25d RR':<10}Fly",
+              f"{'-' * 9:<11}{'-' * 6:<8}{'-' * 8:<10}{'-' * 5}"]
+        for e in vs["rows"]:
+            star = "*" if e.get("extrapolated") else ""
+            atm = f"{e['atm']}v" if e.get("atm") is not None else "n/a"
+            rr = f"{e['rr_25d']:+}v{star}" if e.get("rr_25d") is not None else "n/a"
+            fly = f"{e['fly']}v" if e.get("fly") is not None else "n/a"
+            L.append(f"{e['expiry']:<11}{atm:<8}{rr:<10}{fly}")
+        L.append("```")
+    else:
+        L.append("No data")
+    return "\n".join(L)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Single-call options-recap orchestrator")
     ap.add_argument("--asset", default="btc")
@@ -451,6 +535,8 @@ def main() -> None:
                     help="skip hot CSVs; pull DVOL/spot/surface from Deribit (local test)")
     ap.add_argument("--now-ms", type=int, help="override wall-clock (testing)")
     ap.add_argument("--pretty", action="store_true")
+    ap.add_argument("--render", action="store_true",
+                    help="print the final four-section recap markdown (live path)")
     args = ap.parse_args()
 
     asset = args.asset.lower()
@@ -465,7 +551,10 @@ def main() -> None:
     # Deribit instrument names are case-sensitive (BTC-PERPETUAL); currency is not.
     deri = fetch_deribit(asset.upper(), start_ms, now_ms, want_market)
     result = build(asset, args.window, start_ms, now_ms, deri, hot)
-    print(json.dumps(result, indent=2 if args.pretty else None, default=str))
+    if args.render:
+        print(render_md(result))
+    else:
+        print(json.dumps(result, indent=2 if args.pretty else None, default=str))
 
 
 if __name__ == "__main__":
