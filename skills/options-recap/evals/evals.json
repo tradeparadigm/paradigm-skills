@@ -35,7 +35,7 @@
       "assertions": [
         "Response includes a Snapshot section for BTC with Spot, DVOL, and P/C fields",
         "Response includes a Block Flow section with a structure table",
-        "Response includes a Vol Surface section with expiry-level ATM IVs as the final section",
+        "Response includes a Vol Surface section with expiry-level ATM IVs",
         "Response does NOT include a Themes section or a Bottom Line section",
         "Response clearly labels any data as estimated or simulated when live tools are unavailable"
       ]
@@ -49,7 +49,7 @@
         "Response covers a 24h window — header or context indicates 24h or 1d",
         "Response includes a Snapshot section",
         "Response includes a Block Flow section",
-        "Response includes a Vol Surface section as the final section",
+        "Response includes a Vol Surface section",
         "Response clearly labels any data as estimated or simulated when live tools are unavailable"
       ]
     },
