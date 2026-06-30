@@ -60,6 +60,10 @@ from vol_math import (  # noqa: E402
 DERIBIT = "https://www.deribit.com/api/v2/public"
 WARNINGS: list[str] = []
 
+# Vol-surface table caps to the front N expiries (chronological). The v_vol_surface
+# store carries the full curve (~12 expiries); the recap only shows the near tenors.
+MAX_SURFACE_ROWS = 5
+
 
 def warn(msg: str) -> None:
     WARNINGS.append(msg)
@@ -217,7 +221,7 @@ def load_hot(csv_dir: str, asset: str) -> dict:
     out = {"dvol": None, "dvol_open": None, "dvol_low": None, "dvol_high": None,
            "spot_close": None, "spot_open": None, "spot_low": None,
            "volume_btc": None, "put_vol": None, "call_vol": None,
-           "tickers": {}, "primary_venue": None}
+           "tickers": {}, "vs_now": {}, "vs_open": {}, "primary_venue": None}
 
     ds = _read_csv(csv_dir, "dvol_spot.csv")
     for r in ds:
@@ -275,6 +279,27 @@ def load_hot(csv_dir: str, asset: str) -> dict:
     out["surface_spot"] = spot_for_surf
     if not surf:
         warn("hot surface.csv missing — vol surface from fallback or No data")
+
+    # v_vol_surface snapshots (consolidated per-strike IV+delta) for the window-
+    # over-window deltas: surface_now.csv = latest snapshot, surface_open.csv =
+    # snapshot nearest window-start. Both optional — absent → deltas read n/a.
+    out["vs_now"] = _load_surface_tickers(csv_dir, "surface_now.csv")
+    out["vs_open"] = _load_surface_tickers(csv_dir, "surface_open.csv")
+    return out
+
+
+def _load_surface_tickers(csv_dir: str, name: str) -> dict:
+    """Read a v_vol_surface CSV (symbol, mark_iv, delta) into a ticker map keyed
+    by the full instrument symbol — the shape compute_vol_surface expects. Each
+    symbol is e.g. BTC-1JUL26-58000-C, so its expiry/type parse exactly as the
+    Deribit instrument names the surface math already handles."""
+    out: dict[str, dict] = {}
+    for r in _read_csv(csv_dir, name):
+        sym = r.get("symbol")
+        iv = _num(r, "mark_iv")
+        if not sym or iv is None:
+            continue
+        out[sym] = {"mark_iv": iv, "delta": _num(r, "delta")}
     return out
 
 
@@ -391,9 +416,15 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     pv, cv = hot.get("put_vol"), hot.get("call_vol")
     pc = round(pv / cv, 2) if pv and cv else None
 
-    # Vol surface — hot tickers authoritative; fallback to Deribit market set.
-    tickers = hot.get("tickers") or (mkt or {}).get("tickers") or {}
-    surf = compute_vol_surface(tickers, hot.get("surface_spot") or spot) if tickers else None
+    # Vol surface — v_vol_surface "now" snapshot is authoritative (it pairs with
+    # the "open" snapshot for consistent window-over-window deltas); fall back to
+    # the hot surface.csv, then the Deribit market set. surf_open drives the deltas.
+    surf_spot = hot.get("surface_spot") or spot
+    vs_now = hot.get("vs_now") or {}
+    vs_open = hot.get("vs_open") or {}
+    tickers = vs_now or hot.get("tickers") or (mkt or {}).get("tickers") or {}
+    surf = compute_vol_surface(tickers, surf_spot) if tickers else None
+    surf_open = compute_vol_surface(vs_open, surf_spot) if vs_open else None
 
     block = build_block_flow(deri.get("trades") or [], hot, spot)
 
@@ -417,11 +448,21 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
 
     surface_out = None
     if surf:
+        open_by_exp = {e["expiry"]: e for e in (surf_open or {}).get("expiries", [])}
+
+        def _delta(curr, key, o):
+            prev = o.get(key) if o else None
+            return round(curr - prev, 1) if (curr is not None and prev is not None) else None
+
         rows = []
-        for e in surf.get("expiries", []):
+        for e in surf.get("expiries", [])[:MAX_SURFACE_ROWS]:
+            o = open_by_exp.get(e["expiry"])
             rows.append({
                 "expiry": e["expiry"], "atm": e["atm_iv"],
                 "rr_25d": e["rr_25d"], "fly": e["fly_25d"],
+                "d_atm": _delta(e["atm_iv"], "atm_iv", o),
+                "d_rr": _delta(e["rr_25d"], "rr_25d", o),
+                "d_fly": _delta(e["fly_25d"], "fly_25d", o),
                 "extrapolated": e["wings_extrapolated"],
             })
         surface_out = {
@@ -460,6 +501,17 @@ def run_duckdb(sql_path: str) -> int:
     except Exception as e:  # noqa: BLE001
         warn(f"duckdb invocation failed: {e}")
         return -1
+
+
+def _delta_fmt(d, star: str = "") -> str:
+    """Format a vol-surface delta cell: signed `+1.2v`, `flat` when it rounds to
+    zero, `n/a` when no window-open value was available. `star` carries the wing-
+    extrapolation flag from the paired metric."""
+    if d is None:
+        return "n/a"
+    if abs(d) < 0.05:
+        return "flat"
+    return f"{d:+}v{star}"
 
 
 def render_md(r: dict) -> str:
@@ -532,14 +584,18 @@ def render_md(r: dict) -> str:
         term_txt = (f"{fa}v → {ba}v → {term}" if fa is not None and ba is not None
                     and term else (term or "n/a"))
         L.append(f"Skew: {vs.get('skew_line') or 'n/a'} · Term: {term_txt}")
-        L += ["", "```yaml", f"{'Expiry':<11}{'ATM':<8}{'25d RR':<10}Fly",
-              f"{'-' * 9:<11}{'-' * 6:<8}{'-' * 8:<10}{'-' * 5}"]
+        L += ["", "```yaml",
+              f"{'Expiry':<11}{'ATM':<9}{'ΔATM':<9}{'25d RR':<10}{'ΔRR':<9}{'Fly':<8}ΔFly",
+              f"{'-' * 9:<11}{'-' * 6:<9}{'-' * 6:<9}{'-' * 8:<10}{'-' * 6:<9}{'-' * 5:<8}{'-' * 6}"]
         for e in vs["rows"]:
             star = "*" if e.get("extrapolated") else ""
             atm = f"{e['atm']}v" if e.get("atm") is not None else "n/a"
             rr = f"{e['rr_25d']:+}v{star}" if e.get("rr_25d") is not None else "n/a"
             fly = f"{e['fly']}v" if e.get("fly") is not None else "n/a"
-            L.append(f"{e['expiry']:<11}{atm:<8}{rr:<10}{fly}")
+            datm = _delta_fmt(e.get("d_atm"))
+            drr = _delta_fmt(e.get("d_rr"), star)
+            dfly = _delta_fmt(e.get("d_fly"))
+            L.append(f"{e['expiry']:<11}{atm:<9}{datm:<9}{rr:<10}{drr:<9}{fly:<8}{dfly}")
         L.append("```")
     else:
         L.append("No data")

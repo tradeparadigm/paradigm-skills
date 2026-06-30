@@ -22,6 +22,28 @@ ST=$(printf '%s' "$CREDS" | grep -o '<SessionToken>[^<]*'    | cut -d'>' -f2)
 SIG=s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet
 REC=s3://terminal-dime-prod/paradigm_data/hot/hot__recap_${WIN}.parquet
 
+# Vol-surface deltas (ΔATM/ΔRR/ΔFly) need a window-OPEN surface, which the hot
+# recap parquet doesn't carry (it's close-only). Read the consolidated per-strike
+# store v_vol_surface instead: its rolling _hot.parquet holds ~2h of 1-min
+# snapshots (covers windows ≤1h — both endpoints in one file), and older opens
+# come from the cold hour-partition that contains window-start. "Now" is always
+# _hot.parquet's latest snapshot, so open+close share one pipeline (clean deltas).
+case "$WIN" in
+  5m) SECS=300;; 10m) SECS=600;; 20m) SECS=1200;; 1h) SECS=3600;;
+  4h) SECS=14400;; 8h) SECS=28800;; 24h) SECS=86400;; *) SECS=28800;;
+esac
+NOW_S=$(date -u +%s); START_S=$((NOW_S - SECS)); START_MS=$((START_S * 1000))
+VS_HOT=s3://terminal-dime-prod/paradigm_data/v_vol_surface/_hot.parquet
+if [ "$SECS" -le 3600 ]; then
+  VS_OPEN=$VS_HOT                                   # window-start within _hot's buffer
+else                                                # cold partition at window-start hour
+  SY=$(date -u -d "@$START_S" +%Y 2>/dev/null || date -u -r "$START_S" +%Y)
+  SM=$(date -u -d "@$START_S" +%m 2>/dev/null || date -u -r "$START_S" +%m)
+  SD=$(date -u -d "@$START_S" +%d 2>/dev/null || date -u -r "$START_S" +%d)
+  SH=$(date -u -d "@$START_S" +%H 2>/dev/null || date -u -r "$START_S" +%H)
+  VS_OPEN=s3://terminal-dime-prod/paradigm_data/v_vol_surface/base=${ASSET}/year=${SY}/month=${SM}/day=${SD}/hour=${SH}/v_vol_surface.parquet
+fi
+
 # One DuckDB session → CSVs. One statement per line; `at` is reserved → alias it.
 cat > /tmp/recap.sql <<SQL
 INSTALL httpfs; LOAD httpfs;
@@ -34,6 +56,8 @@ COPY (SELECT exchange, metric, open, close, high, low FROM read_parquet('${REC}'
 COPY (SELECT exchange, optionType, volume_sum, notional, buy_volume, sell_volume, trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume') TO '/tmp/recap/volume.csv' (HEADER, DELIMITER ',');
 COPY (SELECT block_id, notional, volume_sum, leg_count, avg_iv FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='block') TO '/tmp/recap/block.csv' (HEADER, DELIMITER ',');
 COPY (SELECT expiry, strike, optionType, markIV_close, delta, openInterest, underlying_price FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='surface' AND exchange='deribit') TO '/tmp/recap/surface.csv' (HEADER, DELIMITER ',');
+COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '/tmp/recap/surface_now.csv' (HEADER, DELIMITER ',');
+COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_OPEN}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '/tmp/recap/surface_open.csv' (HEADER, DELIMITER ',');
 SQL
 
 # recap.py runs this DuckDB session in a thread concurrent with the Deribit fetch.
