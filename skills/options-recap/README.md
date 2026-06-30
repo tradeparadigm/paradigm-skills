@@ -124,6 +124,9 @@ python3 tests/test_recap.py       # 107 checks — orchestrator: window parsing,
                                     #   hot-CSV ingest, the volume/block corruption
                                     #   guards, assembly, vol-surface deltas,
                                     #   rendering, run_duckdb
+python3 tests/test_run_recap.py   # 10 checks — run_recap.sh arg normalization
+                                    #   (asset/window resolution, "options" keyword
+                                    #   strip) via the RECAP_PRINT_ARGS hook
 ```
 
 LLM output-format evals live in `evals/evals.json` and run via `run_evals.py`

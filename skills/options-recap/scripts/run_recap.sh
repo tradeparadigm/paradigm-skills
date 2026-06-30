@@ -7,8 +7,24 @@
 # Usage: bash scripts/run_recap.sh <ASSET> <WINDOW>     e.g. run_recap.sh BTC 8h
 set -uo pipefail
 
+# Some users type the no-op keyword "options" (/recap btc options 8h). This skill
+# is always options, so drop any "options"/"option" token before assigning
+# asset/window — otherwise a stray token lands in the window slot and breaks
+# parsing (hot__recap_options.parquet doesn't exist; parse_window_ms raises).
+ARGS=""
+for a in "$@"; do
+  case "$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')" in
+    options|option) ;;                       # no-op keyword — drop
+    *) ARGS="$ARGS $a" ;;
+  esac
+done
+set -- $ARGS
+
 ASSET=$(printf '%s' "${1:-BTC}" | tr '[:lower:]' '[:upper:]')
 WIN="${2:-8h}"; WIN="${WIN/1d/24h}"          # 1d → 24h
+# Testability hook: echo the resolved args and exit before any STS/DuckDB work
+# (no creds/network needed). Used by tests/test_run_recap.py.
+[ -n "${RECAP_PRINT_ARGS:-}" ] && { echo "$ASSET $WIN"; exit 0; }
 DIR="$(cd "$(dirname "$0")/.." && pwd)"      # skill dir (scripts/..)
 mkdir -p /tmp/recap
 

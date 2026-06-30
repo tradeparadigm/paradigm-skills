@@ -12,21 +12,24 @@ compatibility: Deribit public API (curl), Paradigm hot surface (DuckDB+S3 via IR
   S3 hot surface requires the IRSA bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.4.1"
+  version: "1.4.2"
 ---
 
 # Options Recap
 
 ## Command Syntax
 
-`/recap [asset] [window]` — order-independent, all optional.
+`/recap [asset] [options] [window]` — order-independent, all optional.
 
 | Token | Examples | Default |
 |---|---|---|
 | `asset` | `btc`, `eth` | `btc` |
 | `window` | `1h`, `4h`, `8h`, `24h`, `1d` | `24h` |
+| `options` | the literal word `options` | ignored — a no-op keyword (this skill is always options); `run_recap.sh` strips it |
 
-`/recap` alone = BTC options, last 24h.
+`/recap` alone = BTC options, last 24h. Still pass just `<ASSET> <WINDOW>` to
+`run_recap.sh` — it drops a stray `options`/`option` token, so `/recap btc
+options 8h` and `/recap btc 8h` resolve identically.
 
 ## How to run it — pick the mode, then emit the four sections
 
