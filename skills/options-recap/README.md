@@ -18,7 +18,7 @@ The live path is **one command** the agent runs, then it relays stdout verbatim:
 bash scripts/run_recap.sh <ASSET> <WINDOW>
         │
         ├── STS bootstrap (IRSA → temporary S3 creds)
-        ├── writes /tmp/recap.sql (one DuckDB session, 5 COPY statements → CSVs)
+        ├── writes /tmp/recap.sql (one DuckDB session, 7 COPY statements → CSVs)
         └── uv run scripts/recap.py --duckdb-sql /tmp/recap.sql --csv-dir /tmp/recap --render
                     │
                     ├── runs DuckDB in a thread  ─┐  (concurrent — both are
@@ -59,6 +59,23 @@ files are authoritative for DVOL/spot/volume/surface;** Deribit supplies only th
 `hot__market_signals_1m.parquet` is the "now" anchor (current DVOL/spot, ATM IV).
 S3 access (IRSA STS bootstrap) is documented in the `paradigm-data-discovery` skill.
 
+**Vol-surface deltas (ΔATM/ΔRR/ΔFly).** The hot recap parquet's `surface` rows are
+close-only, so window-over-window deltas read the consolidated per-strike store
+`v_vol_surface` instead (columns `symbol`, `type`, `mark_iv`, `delta`, `at`, …;
+Deribit basis = `symbol LIKE '<ASSET>-%'`, dropping the `<ASSET>_USDC-` legs):
+
+- **now** = the latest snapshot in the rolling `v_vol_surface/_hot.parquet`.
+- **open** = the snapshot nearest window-start — from `_hot.parquet` for windows
+  ≤1h (it holds ~2h of 1-min snapshots), else from the cold hour-partition
+  `v_vol_surface/base=<ASSET>/year=/month=/day=/hour=/v_vol_surface.parquet` whose
+  hour contains window-start.
+
+Both endpoints come from one pipeline, so the deltas carry no inter-feed noise;
+the displayed level also comes from this `now` snapshot. Missing/empty either CSV
+(`surface_now.csv`/`surface_open.csv`) degrades gracefully — the deltas read `n/a`
+and `recap.py` falls back to the hot `surface.csv` for the displayed values. The
+table is capped to the front `MAX_SURFACE_ROWS` expiries.
+
 ## Known hot-data quirk (important)
 
 `hot__recap_<window>.parquet` `volume`/`block` rows have **inconsistent units**
@@ -95,9 +112,10 @@ via `.github/workflows/options-recap-tests.yml`:
 
 ```bash
 python3 tests/test_vol_math.py    # 54 checks — the math formulas
-python3 tests/test_recap.py       # 77 checks — orchestrator: window parsing,
+python3 tests/test_recap.py       # 107 checks — orchestrator: window parsing,
                                     #   hot-CSV ingest, the volume/block corruption
-                                    #   guards, assembly, rendering, run_duckdb
+                                    #   guards, assembly, vol-surface deltas,
+                                    #   rendering, run_duckdb
 ```
 
 LLM output-format evals live in `evals/evals.json` and run via `run_evals.py`
@@ -106,8 +124,9 @@ LLM output-format evals live in `evals/evals.json` and run via `run_evals.py`
 
 ## Versioning
 
-`metadata.version` in `SKILL.md` is a single **patch** increment over whatever
-`main` currently carries — a branch/PR represents one patch release, not a
-running count of in-branch edits. `main` is at `1.3`, so this branch is `1.3.1`;
-don't bump per-commit. (The repo `CLAUDE.md` describes minor/major bumps for
-larger releases.)
+`metadata.version` in `SKILL.md` moves once per branch/PR, not per in-branch
+commit. The size of the bump follows the change: a **patch** for fixes/tweaks, a
+**minor** for new content/behaviour. `main` is at `1.3.1`; this branch adds the
+ΔATM/ΔRR/ΔFly columns and the `v_vol_surface` open-surface read — a content
+change — so it bumps the minor to `1.4`. (See the repo `CLAUDE.md` for the
+minor/major rules.)

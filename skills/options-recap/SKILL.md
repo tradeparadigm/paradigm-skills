@@ -12,7 +12,7 @@ compatibility: Deribit public API (curl), Paradigm hot surface (DuckDB+S3 via IR
   S3 hot surface requires the IRSA bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.3.1"
+  version: "1.4"
 ---
 
 # Options Recap
@@ -48,7 +48,8 @@ line is a `⚠ …` banner, keep it. Target: well under 30s; the heavy lifting i
 **Injected data (a `<market_data>` block with `derived` is in context).** No
 tools — render the four sections yourself from `derived.realized_vol` (RV/VRP),
 `derived.top_blocks` (Biggest Print + Block Flow), and `derived.vol_surface`
-(skew/term + per-expiry ATM/RR/Fly), reading DVOL open/close and the spot range
+(skew/term + per-expiry ATM/RR/Fly, plus ΔATM/ΔRR/ΔFly when present — else `n/a`),
+reading DVOL open/close and the spot range
 from the raw `dvol`/`spot` tape. Report those figures directly; do not recompute
 them and do not add a disclaimer.
 
@@ -98,14 +99,16 @@ P/C       [X.Xx]      [calls/puts] dominant
 Skew: front 25Δ RR [±X]v → [puts bid / calls bid] · Term: [front]v → [back]v → [contango / flat / backwardation]
 
 ```yaml
-Expiry     ATM      25d RR    Fly
----------  ------   --------  -----
-[DDMMMYY]  [X.X]v   [±X.X]v   [X.X]v
+Expiry     ATM      ΔATM     25d RR    ΔRR      Fly     ΔFly
+---------  ------   ------   --------  ------   -----   ------
+[DDMMMYY]  [X.X]v   [±X.X]v  [±X.X]v   [±X.X]v  [X.X]v  [±X.X]v
 …
 ```
 
-Formatting rules: ATM/RR/Fly are current (close) values, `X.Xv` precision.
-Append `*` to any cell derived from extrapolated wings (e.g. `-4.0v*`).
+Formatting rules: ATM/RR/Fly are current (close) values, `X.Xv` precision. The Δ
+columns are the window-over-window change (current − window-open), signed `+X.Xv`;
+`flat` when the change rounds to zero, `n/a` when no window-open surface was
+available. Append `*` to any cell derived from extrapolated wings (e.g. `-4.0v*`).
 
 ---
 

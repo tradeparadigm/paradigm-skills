@@ -25,6 +25,7 @@ import recap  # noqa: E402
 from recap import (  # noqa: E402
     parse_window_ms, load_hot, build, build_block_flow, render_md,
     _leg_phrase, pct, dvol_label, spot_vol_label, fmt_hhmm, run_duckdb,
+    _load_surface_tickers, _delta_fmt, MAX_SURFACE_ROWS,
 )
 
 _passed = 0
@@ -68,6 +69,22 @@ SURFACE_CSV = (
     "3JUL26,55000,P,52.0,-0.25,80,60468\n"
     "3JUL26,65000,C,48.0,0.25,90,60468\n"
 )
+# v_vol_surface snapshots (symbol, mark_iv, delta) — the consolidated per-strike
+# store the deltas read from. "now" reproduces the SURFACE_CSV grid (ATM 45.0,
+# 25d call 48.0, 25d put 52.0 → RR -4.0, fly 5.0); "open" is shifted to give a
+# known, non-trivial delta set: ΔATM flat (45→45), ΔRR -1.0 (-3→-4), ΔFly -0.5 (5.5→5).
+SURFACE_NOW_CSV = (
+    "symbol,mark_iv,delta\n"
+    "BTC-3JUL26-60000-C,45.0,0.50\n"
+    "BTC-3JUL26-65000-C,48.0,0.25\n"
+    "BTC-3JUL26-55000-P,52.0,-0.25\n"
+)
+SURFACE_OPEN_CSV = (
+    "symbol,mark_iv,delta\n"
+    "BTC-3JUL26-60000-C,45.0,0.50\n"
+    "BTC-3JUL26-65000-C,49.0,0.25\n"
+    "BTC-3JUL26-55000-P,52.0,-0.25\n"
+)
 # A 2-leg block: put buy + call sell (Strangle/RR), 100 BTC per leg @ $60k.
 TRADES = [
     {"instrument_name": "BTC-26JUN26-55000-P", "index_price": 60000, "iv": 72.0,
@@ -82,6 +99,16 @@ def _full_hot(d):
     _write(d, "volume.csv", CORRUPT_VOLUME_CSV)
     _write(d, "dvol_spot.csv", DVOL_SPOT_CSV)
     _write(d, "surface.csv", SURFACE_CSV)
+    return load_hot(d, "BTC")
+
+
+def _full_hot_deltas(d):
+    """Full hot set plus the v_vol_surface now/open snapshots that drive deltas."""
+    _write(d, "volume.csv", CORRUPT_VOLUME_CSV)
+    _write(d, "dvol_spot.csv", DVOL_SPOT_CSV)
+    _write(d, "surface.csv", SURFACE_CSV)
+    _write(d, "surface_now.csv", SURFACE_NOW_CSV)
+    _write(d, "surface_open.csv", SURFACE_OPEN_CSV)
     return load_hot(d, "BTC")
 
 
@@ -159,6 +186,90 @@ def test_surface_metrics_flow_through_build():
     check("ATM 45", row["atm"] == 45.0, row)
     check("25d RR -4 (calls 48 - puts 52)", row["rr_25d"] == -4.0, row)
     check("skew line present", bool(vs["skew_line"]), vs["skew_line"])
+    # No v_vol_surface CSVs in _full_hot → deltas are absent.
+    check("no-open → d_atm None", row.get("d_atm") is None, row)
+    check("no-open → d_rr None", row.get("d_rr") is None, row)
+
+
+# ── Vol-surface deltas (v_vol_surface now/open) ──────────────────────────────
+
+def test_load_surface_tickers():
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "surface_now.csv", SURFACE_NOW_CSV)
+        t = _load_surface_tickers(d, "surface_now.csv")
+    check("now sym count", len(t) == 3, t)
+    check("now call iv", t.get("BTC-3JUL26-60000-C", {}).get("mark_iv") == 45.0, t)
+    check("now put delta", t.get("BTC-3JUL26-55000-P", {}).get("delta") == -0.25, t)
+    check("missing CSV → empty", _load_surface_tickers(d, "nope.csv") == {})
+
+
+def test_load_hot_populates_vs_maps():
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot_deltas(d)
+    check("vs_now populated", len(hot["vs_now"]) == 3, hot["vs_now"])
+    check("vs_open populated", len(hot["vs_open"]) == 3, hot["vs_open"])
+    # _full_hot (no vs CSVs) leaves them empty.
+    with tempfile.TemporaryDirectory() as d2:
+        hot2 = _full_hot(d2)
+    check("vs_now empty without CSV", hot2["vs_now"] == {}, hot2["vs_now"])
+
+
+def test_surface_deltas_flow_through_build():
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot_deltas(d)
+        res = build("btc", "8h", 0, 8 * 3600_000,
+                    {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
+    row = res["vol_surface"]["rows"][0]
+    # Displayed (now) values come from v_vol_surface.
+    check("now ATM 45", row["atm"] == 45.0, row)
+    check("now RR -4", row["rr_25d"] == -4.0, row)
+    check("now Fly 5", row["fly"] == 5.0, row)
+    # Deltas vs the open snapshot.
+    check("ΔATM flat (0.0)", row["d_atm"] == 0.0, row)
+    check("ΔRR -1.0", row["d_rr"] == -1.0, row)
+    check("ΔFly -0.5", row["d_fly"] == -0.5, row)
+
+
+def test_render_delta_columns_present_and_formatted():
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot_deltas(d)
+        res = build("btc", "8h", 0, 8 * 3600_000,
+                    {"closes_7d": CLOSES_7D, "trades": TRADES, "market": None}, hot)
+    md = render_md(res)
+    check("header has ΔATM", "ΔATM" in md, md)
+    check("header has ΔRR", "ΔRR" in md, md)
+    check("header has ΔFly", "ΔFly" in md, md)
+    check("ΔATM flat rendered", "flat" in md, md)
+    check("ΔRR -1.0v rendered", "-1.0v" in md, md)
+    check("ΔFly -0.5v rendered", "-0.5v" in md, md)
+
+
+def test_delta_fmt():
+    check("positive signed", _delta_fmt(1.2) == "+1.2v", _delta_fmt(1.2))
+    check("negative signed", _delta_fmt(-0.5) == "-0.5v", _delta_fmt(-0.5))
+    check("zero → flat", _delta_fmt(0.0) == "flat", _delta_fmt(0.0))
+    check("tiny → flat", _delta_fmt(0.04) == "flat", _delta_fmt(0.04))
+    check("None → n/a", _delta_fmt(None) == "n/a", _delta_fmt(None))
+    check("star carried on value", _delta_fmt(-0.5, "*") == "-0.5v*", _delta_fmt(-0.5, "*"))
+    check("star dropped on n/a", _delta_fmt(None, "*") == "n/a", _delta_fmt(None, "*"))
+
+
+def test_surface_caps_to_max_rows():
+    # 6 expiries in the now snapshot → table caps to MAX_SURFACE_ROWS (front).
+    exps = ["3JUL26", "10JUL26", "17JUL26", "24JUL26", "31JUL26", "28AUG26"]
+    lines = ["symbol,mark_iv,delta"]
+    for e in exps:
+        lines += [f"BTC-{e}-60000-C,45.0,0.50",
+                  f"BTC-{e}-65000-C,48.0,0.25",
+                  f"BTC-{e}-55000-P,52.0,-0.25"]
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "dvol_spot.csv", DVOL_SPOT_CSV)
+        _write(d, "surface_now.csv", "\n".join(lines) + "\n")
+        hot = load_hot(d, "BTC")
+        res = build("btc", "8h", 0, 8 * 3600_000,
+                    {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
+    n = len(res["vol_surface"]["rows"])
+    check(f"rows capped to {MAX_SURFACE_ROWS}", n == MAX_SURFACE_ROWS, n)
 
 
 # ── load_hot: missing files degrade, don't crash ────────────────────────────
@@ -242,8 +353,11 @@ def test_render_four_sections():
     check("render volume line", "Volume" in md and "$449M" in md, "volume render")
     check("render P/C 0.57x", "0.57x" in md)
     check("render biggest Strangle/RR", "26JUN26 Strangle/RR" in md)
+    # Vol-surface delta columns are always present in the header; with no
+    # window-open surface (this fixture has none) the delta cells read n/a.
+    check("delta columns present", "ΔATM" in md and "ΔRR" in md and "ΔFly" in md, md)
+    check("deltas n/a without open", "45.0v" in md and "n/a" in md, "expected n/a deltas")
     # Dropped/forbidden output must not reappear.
-    check("no delta columns", "ΔATM" not in md and "ΔRR" not in md, "delta cols present!")
     check("no Themes", "Themes" not in md)
     check("no Dealer positioning", "Dealer positioning" not in md)
     check("four yaml fences", md.count("```yaml") == 4, md.count("```yaml"))
