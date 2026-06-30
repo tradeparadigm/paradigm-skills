@@ -12,7 +12,7 @@ compatibility: Deribit public API (curl), Paradigm hot surface (DuckDB+S3 via IR
   S3 hot surface requires the IRSA bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.4"
+  version: "1.4.1"
 ---
 
 # Options Recap
@@ -49,69 +49,22 @@ line is a `⚠ …` banner, keep it. Target: well under 30s; the heavy lifting i
 tools — render the four sections yourself from `derived.realized_vol` (RV/VRP),
 `derived.top_blocks` (Biggest Print + Block Flow), and `derived.vol_surface`
 (skew/term + per-expiry ATM/RR/Fly, plus ΔATM/ΔRR/ΔFly when present — else `n/a`),
-reading DVOL open/close and the spot range
-from the raw `dvol`/`spot` tape. Report those figures directly; do not recompute
-them and do not add a disclaimer.
+reading DVOL open/close and the spot range from the raw `dvol`/`spot` tape.
+Follow the exact template in `references/output-format.md`. Report those figures
+directly; do not recompute them and do not add a disclaimer.
 
 **Simulate (no tools and no injected data).** Produce the four sections with
-plausible example values following the template exactly, and prepend one line:
-`⚠ Data estimated — no live feed available.`
+plausible example values following `references/output-format.md` exactly, and
+prepend one line: `⚠ Data estimated — no live feed available.`
 
-## Output Format — FIXED
+## Output Format
 
-Four sections, this exact order, every recap. Never reorder, add, or drop
-sections. **Do not emit Themes, Dealer positioning, or a Bottom Line.** Work
-silently — no narration. `run_recap.sh` already emits exactly this shape; the
-template below is the contract it implements and what the injected/simulate
-modes must reproduce.
+Four sections, this exact order, every recap: **Snapshot · Biggest Print ·
+Block Flow · Vol Surface**. Never reorder, add, or drop sections. **Do not emit
+Themes, Dealer positioning, or a Bottom Line.** Work silently — no narration.
 
----
-
-**[ASSET] Options · [WINDOW] Recap · [HH:MM]–[HH:MM] UTC**
-
-**Snapshot**
-
-```yaml
-Spot      $[X]        [up/down X%] (from $[Y], low $[Z])
-DVOL      [X]v        [flat/rising/falling] ([open] -> [close])
-RV 7d     [X]v        implied [CHEAP/RICH/IN LINE] vs realized
-VRP       [±X]v       vol [underpriced/overpriced] vs delivered
-Volume    $[X]M       [primary venue] (incl. Paradigm)
-P/C       [X.Xx]      [calls/puts] dominant
-```
-
-**Biggest Print**
-
-```yaml
-[DDMMMYY] [structure]   [Nx]   $[X]M   [HH:MM] UTC   via [Venue] ([side], [IV]v avg)
-```
-
-**Block Flow — $[X]M / [N] blocks**
-
-```yaml
-#  Structure            Notl     Detail
--  -------------------  -------  ------------------------------------------
-1  [structure]          $[X]M    [strikes] x[size] - [side] [IV]v [two-way/one-sided]
-2  …
-```
-
-**Vol Surface**
-Skew: front 25Δ RR [±X]v → [puts bid / calls bid] · Term: [front]v → [back]v → [contango / flat / backwardation]
-
-```yaml
-Expiry     ATM      ΔATM     25d RR    ΔRR      Fly     ΔFly
----------  ------   ------   --------  ------   -----   ------
-[DDMMMYY]  [X.X]v   [±X.X]v  [±X.X]v   [±X.X]v  [X.X]v  [±X.X]v
-…
-```
-
-Formatting rules: ATM/RR/Fly are current (close) values, `X.Xv` precision. The Δ
-columns are the window-over-window change (current − window-open), signed `+X.Xv`;
-`flat` when the change rounds to zero, `n/a` when no window-open surface was
-available. Append `*` to any cell derived from extrapolated wings (e.g. `-4.0v*`).
-
----
-
-## Thin Window
-
-(< 2h, no blocks) — output all four sections; mark empty ones `No data`.
+In the live path `run_recap.sh` already prints exactly this shape, so you just
+relay it. The full template, per-field formatting, the Vol Surface delta columns,
+and the thin-window (`< 2h`) rules are the contract the script implements — see
+`references/output-format.md`. Read it only when **you** render (the injected and
+simulate modes); the live path never needs it.

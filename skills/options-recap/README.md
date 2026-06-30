@@ -8,7 +8,12 @@ follows; everything an operator or contributor needs lives here.
 
 `/recap [asset] [window]` produces a fixed four-section options recap (Snapshot,
 Biggest Print, Block Flow, Vol Surface) for BTC/ETH over a window (default 24h).
-Output shape is fixed and defined in `SKILL.md`.
+The live path renders the output in `scripts/recap.py` (`render_md`) and the
+agent relays it verbatim, so the format lives in code there. The exact template
+is also written out in `references/output-format.md` — the contract for the
+no-tool **injected** and **simulate** modes, where the agent renders it itself.
+`SKILL.md` only names the four sections + the guardrails and points to that file,
+so the common live path doesn't carry the full template in context.
 
 ## Architecture
 
@@ -35,6 +40,9 @@ bash scripts/run_recap.sh <ASSET> <WINDOW>
 - `scripts/vol_math.py` — pure vol math (realized-vs-implied, Black-76 flow
   greeks, block clustering/ranking, vol-surface skew/term). No I/O.
 - `scripts/recap.py --no-s3 --render` — offline smoke against live Deribit only.
+- `references/output-format.md` — the fixed four-section template + formatting
+  rules. The live path doesn't read it (the script emits the shape); it's the
+  rendering contract for the injected/simulate modes and the eval harness.
 
 Why one command: an instrumented run showed ~86% of wall time was the model
 *generating* a ~50-line inline bootstrap+SQL block. Moving it into a wrapper
@@ -126,7 +134,8 @@ LLM output-format evals live in `evals/evals.json` and run via `run_evals.py`
 
 `metadata.version` in `SKILL.md` moves once per branch/PR, not per in-branch
 commit. The size of the bump follows the change: a **patch** for fixes/tweaks, a
-**minor** for new content/behaviour. `main` is at `1.3.1`; this branch adds the
-ΔATM/ΔRR/ΔFly columns and the `v_vol_surface` open-surface read — a content
-change — so it bumps the minor to `1.4`. (See the repo `CLAUDE.md` for the
+**minor** for new content/behaviour. The ΔATM/ΔRR/ΔFly columns + `v_vol_surface`
+open-surface read were the minor bump to `1.4`; relocating the output template to
+`references/output-format.md` is a no-behaviour structural cleanup, so it's the
+**patch** to `1.4.1` (output is byte-identical). (See the repo `CLAUDE.md` for the
 minor/major rules.)
