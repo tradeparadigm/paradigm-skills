@@ -90,12 +90,12 @@ On a hot miss (DuckDB fails / CSVs absent) it degrades: affected sections read
 
 ## Testing
 
-Stdlib-only, no network/S3, run in CI (`unit-tests` job in
-`.github/workflows/evals.yml`):
+Stdlib-only, no network/S3. Run in CI on any change under `skills/options-recap/`
+via `.github/workflows/options-recap-tests.yml`:
 
 ```bash
-python3 scripts/test_vol_math.py    # 54 checks — the math formulas
-python3 scripts/test_recap.py       # 77 checks — orchestrator: window parsing,
+python3 tests/test_vol_math.py    # 54 checks — the math formulas
+python3 tests/test_recap.py       # 77 checks — orchestrator: window parsing,
                                     #   hot-CSV ingest, the volume/block corruption
                                     #   guards, assembly, rendering, run_duckdb
 ```

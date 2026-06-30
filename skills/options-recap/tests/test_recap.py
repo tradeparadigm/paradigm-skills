@@ -2,7 +2,7 @@
 """
 Unit tests for recap.py — no network, no S3, no deps.
 
-Run: python3 scripts/test_recap.py
+Run: python3 tests/test_recap.py
 
 Covers the orchestrator's pure logic: window parsing, hot-CSV ingest, the
 snapshot/block/surface assembly, markdown rendering, and the run_duckdb
@@ -20,7 +20,7 @@ import stat
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 import recap  # noqa: E402
 from recap import (  # noqa: E402
     parse_window_ms, load_hot, build, build_block_flow, render_md,
