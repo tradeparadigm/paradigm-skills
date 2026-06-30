@@ -109,35 +109,6 @@ Append `*` to any cell derived from extrapolated wings (e.g. `-4.0v*`).
 
 ---
 
-## Internals (maintenance only — the agent does not run these directly)
-
-`run_recap.sh` → `scripts/recap.py` own the whole pipeline; the math lives in
-`scripts/vol_math.py`. Tests (stdlib-only, no network — run in CI):
-`python3 scripts/test_vol_math.py` (math) and `python3 scripts/test_recap.py`
-(orchestrator: hot-CSV ingest, the volume/block corruption guards, assembly,
-rendering). Smoke-test against live Deribit without S3:
-`uv run scripts/recap.py --asset btc --window 8h --no-s3 --render`.
-
-Two authoritative hot reads (one DuckDB session) plus the Deribit tape cover the
-recap. Hot files are authoritative for DVOL/spot/volume/surface; Deribit supplies
-the 7d realized-vol closes and block-leg geometry. `row_type` map in
-`hot__recap_<window>.parquet`:
-
-| Section | `row_type` | Key columns |
-|---|---|---|
-| Snapshot DVOL/spot | `dvol_spot` | `metric`, `open`, `close`, `high`, `low` |
-| Snapshot volume/P-C | `volume` | `exchange`, `optionType`, `volume_sum`, `notional` |
-| Block Flow | `block` | `block_id`, `notional`, `volume_sum`, `leg_count`, `avg_iv` |
-| Vol Surface | `surface` | `expiry`, `strike`, `optionType`, `markIV_close`, `delta` |
-
-Known hot-data quirk recap.py defends against: the `volume`/`block` rows carry
-per-exchange aggregate rows and cross-venue unit inconsistencies (Deribit/Bullish
-`volume_sum` in BTC, OKX/Bybit in contracts) plus the occasional unit-corrupt
-row. recap.py derives Volume/P-C from Deribit only (contracts × spot) and block
-totals from the Deribit clustering that produces the displayed rows. On a hot
-miss it degrades (sections read `No data`, output is prefixed `⚠ hot surface
-unavailable`) rather than fabricating.
-
 ## Thin Window
 
 (< 2h, no blocks) — output all four sections; mark empty ones `No data`.
