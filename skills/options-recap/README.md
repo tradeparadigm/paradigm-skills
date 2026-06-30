@@ -106,7 +106,8 @@ LLM output-format evals live in `evals/evals.json` and run via `run_evals.py`
 
 ## Versioning
 
-`metadata.version` in `SKILL.md` tracks the skill's runtime behaviour/interface.
-Bump it for shippable behaviour or output-shape changes; do **not** bump for
-internal perf, tests, or docs that leave the output identical (see the repo
-`CLAUDE.md`).
+`metadata.version` in `SKILL.md` is a single **patch** increment over whatever
+`main` currently carries — a branch/PR represents one patch release, not a
+running count of in-branch edits. `main` is at `1.3`, so this branch is `1.3.1`;
+don't bump per-commit. (The repo `CLAUDE.md` describes minor/major bumps for
+larger releases.)
