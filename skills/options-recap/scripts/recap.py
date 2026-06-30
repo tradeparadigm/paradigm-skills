@@ -38,6 +38,7 @@ import argparse
 import csv
 import json
 import os
+import subprocess
 import sys
 import urllib.request
 from collections import defaultdict
@@ -442,6 +443,25 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     }
 
 
+def run_duckdb(sql_path: str) -> int:
+    """Run one DuckDB session from a .sql file (its COPY statements write the hot
+    CSVs). Invoked in a thread so it overlaps the Deribit fetch — both are
+    network-bound, so the two run concurrently instead of back-to-back."""
+    try:
+        with open(sql_path) as f:
+            r = subprocess.run(["duckdb"], stdin=f, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, timeout=60)
+        if r.returncode != 0:
+            warn(f"duckdb rc={r.returncode}: {(r.stderr or b'').decode()[:200]}")
+        return r.returncode
+    except FileNotFoundError:
+        warn("duckdb not found on PATH")
+        return -1
+    except Exception as e:  # noqa: BLE001
+        warn(f"duckdb invocation failed: {e}")
+        return -1
+
+
 def render_md(r: dict) -> str:
     """Render the final four-section recap markdown so the agent relays it
     verbatim — no field-mapping reasoning, fully deterministic output."""
@@ -533,6 +553,8 @@ def main() -> None:
     ap.add_argument("--csv-dir", default="/tmp/recap", help="dir with hot CSVs from DuckDB")
     ap.add_argument("--no-s3", action="store_true",
                     help="skip hot CSVs; pull DVOL/spot/surface from Deribit (local test)")
+    ap.add_argument("--duckdb-sql", help="run this .sql via DuckDB concurrently with the "
+                    "Deribit fetch (produces the hot CSVs); omit if CSVs already exist")
     ap.add_argument("--now-ms", type=int, help="override wall-clock (testing)")
     ap.add_argument("--pretty", action="store_true")
     ap.add_argument("--render", action="store_true",
@@ -540,16 +562,31 @@ def main() -> None:
     args = ap.parse_args()
 
     asset = args.asset.lower()
+    ASSET = asset.upper()  # Deribit instrument names are case-sensitive; currency is not.
     now_ms = args.now_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = now_ms - parse_window_ms(args.window)
 
-    hot = {} if args.no_s3 else load_hot(args.csv_dir, asset.upper())
-    if not hot:  # --no-s3: empty hot dict, market fallback fills DVOL/spot/surface
+    if args.no_s3:
+        # Offline/local: no hot CSVs; Deribit supplies DVOL/spot/surface too.
         hot = {"tickers": {}}
-    want_market = args.no_s3 or hot.get("dvol") is None
+        deri = fetch_deribit(ASSET, start_ms, now_ms, want_market=True)
+    else:
+        # Parallelize the DuckDB read (hot CSVs) with the always-needed Deribit
+        # core fetch (7d closes + window trades) — both are network-bound.
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            duck_fut = ex.submit(run_duckdb, args.duckdb_sql) if args.duckdb_sql else None
+            deri_fut = ex.submit(fetch_deribit, ASSET, start_ms, now_ms, False)
+            if duck_fut is not None:
+                duck_fut.result()
+            deri = deri_fut.result()
+        hot = load_hot(args.csv_dir, ASSET)
+        # Rare hot miss (DuckDB failed/empty): fall back to Deribit market data.
+        if hot.get("dvol") is None:
+            try:
+                deri["market"] = _fetch_market_fallback(ASSET, start_ms, now_ms)
+            except Exception as e:  # noqa: BLE001
+                warn(f"deribit market fallback failed: {e}")
 
-    # Deribit instrument names are case-sensitive (BTC-PERPETUAL); currency is not.
-    deri = fetch_deribit(asset.upper(), start_ms, now_ms, want_market)
     result = build(asset, args.window, start_ms, now_ms, deri, hot)
     if args.render:
         print(render_md(result))

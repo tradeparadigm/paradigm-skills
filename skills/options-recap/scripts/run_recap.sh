@@ -36,7 +36,6 @@ COPY (SELECT block_id, notional, volume_sum, leg_count, avg_iv FROM read_parquet
 COPY (SELECT expiry, strike, optionType, markIV_close, delta, openInterest, underlying_price FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='surface' AND exchange='deribit') TO '/tmp/recap/surface.csv' (HEADER, DELIMITER ',');
 SQL
 
-duckdb < /tmp/recap.sql > /tmp/recap/duck.log 2>&1 \
-  || echo "WARN: duckdb failed (see /tmp/recap/duck.log) — hot sections will read No data" >&2
-
-cd "$DIR" && exec uv run scripts/recap.py --asset "$ASSET" --window "$WIN" --csv-dir /tmp/recap --render
+# recap.py runs this DuckDB session in a thread concurrent with the Deribit fetch.
+cd "$DIR" && exec uv run scripts/recap.py \
+  --asset "$ASSET" --window "$WIN" --csv-dir /tmp/recap --duckdb-sql /tmp/recap.sql --render
