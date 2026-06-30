@@ -1,0 +1,34 @@
+name: options-recap tests
+
+# Runs the options-recap unit tests whenever anything in the skill folder
+# changes (any branch on push, and on PRs that touch it). Stdlib-only tests —
+# no network, no S3, no deps — so this is fast and needs no setup.
+on:
+  push:
+    paths:
+      - 'skills/options-recap/**'
+  pull_request:
+    paths:
+      - 'skills/options-recap/**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run options-recap unit tests
+        run: |
+          shopt -s nullglob
+          tests=(skills/options-recap/tests/test_*.py)
+          if [ ${#tests[@]} -eq 0 ]; then
+            echo "No tests found under skills/options-recap/tests/"; exit 1
+          fi
+          for t in "${tests[@]}"; do
+            echo "=== $t ==="
+            python3 "$t"
+          done
