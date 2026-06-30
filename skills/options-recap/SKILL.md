@@ -112,8 +112,10 @@ Append `*` to any cell derived from extrapolated wings (e.g. `-4.0v*`).
 ## Internals (maintenance only — the agent does not run these directly)
 
 `run_recap.sh` → `scripts/recap.py` own the whole pipeline; the math lives in
-`scripts/vol_math.py`. Verify the math offline: `python3 scripts/test_vol_math.py`.
-Smoke-test the orchestrator without S3 (Deribit-only):
+`scripts/vol_math.py`. Tests (stdlib-only, no network — run in CI):
+`python3 scripts/test_vol_math.py` (math) and `python3 scripts/test_recap.py`
+(orchestrator: hot-CSV ingest, the volume/block corruption guards, assembly,
+rendering). Smoke-test against live Deribit without S3:
 `uv run scripts/recap.py --asset btc --window 8h --no-s3 --render`.
 
 Two authoritative hot reads (one DuckDB session) plus the Deribit tape cover the
