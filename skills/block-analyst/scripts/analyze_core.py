@@ -296,19 +296,22 @@ def leg_key(l: dict) -> str:
     return f"{l['cp']}:{int(round(l['strike']))}:{l['expiry_c']}"
 
 
-def offset(price: float, ref: float, quote: str) -> dict:
-    """Fill vs mark. Coin-quoted (BTC/ETH) → bps (×10000). USD/USDC → percent."""
+def offset(price: float, ref: float, quote: str = "") -> dict:
+    """Fill vs mark, unit chosen by PREMIUM MAGNITUDE (robust across venues):
+      • coin-fraction premium (|ref| < 1, e.g. BTC 0.0131) → bps (×10000)
+      • dollar-priced premium (|ref| ≥ 1, e.g. SOL $2.90 or a Paradex $140 net,
+        even when QUOTE_CURRENCY says BTC) → percent
+    A dollar premium × 10000 would print an absurd bps (the −324953 bug)."""
     if price is None or ref is None:
         return {"txt": "n/a", "sign": 0}
     d = price - ref
-    q = (quote or "").upper()
-    if q in ("BTC", "ETH"):
+    sign = 1 if d > 0 else -1 if d < 0 else 0
+    if abs(ref) < 1:                      # coin-denominated fraction
         bps = round(d * 10000, 1)
-        return {"txt": f"{bps:+g} bps", "sign": (1 if d > 0 else -1 if d < 0 else 0),
-                "val": bps, "unit": "bps"}
+        return {"txt": f"{bps:+g} bps", "sign": sign, "val": bps, "unit": "bps"}
     pct = round(d / ref * 100, 1) if ref else None
     return {"txt": (f"{pct:+g}%" if pct is not None else "n/a"),
-            "sign": (1 if d > 0 else -1 if d < 0 else 0), "val": pct, "unit": "%"}
+            "sign": sign, "val": pct, "unit": "%"}
 
 
 def _f(v):

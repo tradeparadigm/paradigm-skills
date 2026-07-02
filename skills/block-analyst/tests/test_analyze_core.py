@@ -37,6 +37,8 @@ ok(ac.deribit_symbol("SOL", "31JUL26", 88, "c") == "SOL_USDC-31JUL26-88-C", "SOL
 ok(ac.offset(0.0131, 0.0135, "BTC")["txt"] == "-4 bps", "coin offset in bps (−4 not −40)")
 ok(ac.offset(2.90, 2.7494, "USD")["txt"] == "+5.5%", "USD offset in percent")
 ok(ac.offset(2.90, 2.7494, "USDC")["unit"] == "%", "USDC → percent")
+# dollar-magnitude premium quoted 'BTC' (Paradex) must be % not a giant bps (the −324953 bug)
+ok(ac.offset(140.87, 173.37, "BTC")["txt"] == "-18.7%", "dollar premium → percent, not bps")
 
 # ── single-leg SOL call (real: /analyze … Call 31 Jul 26 88) ───────────────────
 p = ac.parse_description("Call 31 Jul 26 88")
