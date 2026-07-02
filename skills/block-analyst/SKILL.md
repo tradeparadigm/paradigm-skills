@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.4"
+  version: "1.5"
 ---
 
 # Paradigm Block Trade Analyst
@@ -51,6 +51,50 @@ greeks").
 >
 > **Only emit the Step 7 unresolved-failure line after the suffix-tolerant query
 > genuinely returns zero rows on both the trade + RFQ tapes.**
+
+### Fast path — fire the slow calls IN PARALLEL on your first action
+
+The tape scan, the live Deribit marks, and the 30d Deribit trade tape are the three
+slow calls and they are **independent**: the leg instrument name is fully derivable
+from `<rfq description>` (`Call 31 Jul 26 66000` → `BTC-31JUL26-66000-C`,
+`Put 7 May 26 84000` → `BTC-7MAY26-84000-P`; ETH legs → `ETH-…`). So do **not** wait
+for the tape row before fetching live data. **In a single tool batch (parallel tool
+calls), immediately fire all of:**
+1. the combined tape read below (one `exec`),
+2. `deribit__get_ticker` (or `web_fetch` ticker) for **each leg** + the perp for spot,
+3. `web_fetch` Deribit `get_last_trades_by_instrument` for **each leg** (Step 3b).
+
+Only the greek *scaling* (× qty) and the fill-vs-mark line need the tape row — compute
+those after it returns. This overlap is the single biggest latency win; sequential
+fetching is the slow path.
+
+**Combined tape read (run this exact `exec` — no need to open `references/rfq-lookup.md`
+on the hot path; it holds the field mapping + fallbacks only).** Substitute `<CORE_ID>`
+(the `r_…` id, prefix stripped) and the `<EXPIRY>`/`<STRIKE>` tokens from the description:
+
+```bash
+TOKEN=$(cat "$AWS_WEB_IDENTITY_TOKEN_FILE")
+CREDS=$(curl -s "https://sts.ap-northeast-1.amazonaws.com/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=${AWS_ROLE_ARN}&RoleSessionName=duckdb&WebIdentityToken=${TOKEN}")
+AK=$(echo "$CREDS" | grep -o '<AccessKeyId>[^<]*' | cut -d'>' -f2)
+SK=$(echo "$CREDS" | grep -o '<SecretAccessKey>[^<]*' | cut -d'>' -f2)
+ST=$(echo "$CREDS" | grep -o '<SessionToken>[^<]*' | cut -d'>' -f2)
+duckdb -c "
+INSTALL httpfs; LOAD httpfs;
+SET s3_region='ap-northeast-1';
+SET s3_access_key_id='$AK'; SET s3_secret_access_key='$SK'; SET s3_session_token='$ST';
+CREATE TEMP TABLE tape AS
+SELECT DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE,
+       QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID
+FROM read_csv_auto('s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz')
+WHERE RFQ_ID LIKE '%<CORE_ID>%'
+   OR (DATE >= (CURRENT_DATE - INTERVAL 30 DAY)
+       AND DESCRIPTION LIKE '%<EXPIRY>%' AND DESCRIPTION LIKE '%<STRIKE>%');
+SELECT 'FILL' tag, * FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%';
+SELECT 'HIST' tag, DATE, TIME, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, BLOCK_TRADE_ID
+FROM tape WHERE DESCRIPTION LIKE '%<EXPIRY>%' AND DESCRIPTION LIKE '%<STRIKE>%'
+ORDER BY DATE DESC, TIME DESC;
+"
+```
 
 The input is **`/analyze <rfq_id> <rfq description>`**. Split it:
 
@@ -194,9 +238,25 @@ or conviction taker, not random flow.
   back to identifying Paradigm-routed prints on the Deribit tape (see 3b). Never fabricate counts.
 
 ### 3b — Deribit tape, always fetch (public, no auth)
-Per leg:
-`web_fetch GET /api/v2/public/get_last_trades_by_instrument?instrument_name=<leg>&count=1000&start_timestamp=<now_ms − 30d>&end_timestamp=<now_ms>&sorting=desc`
-(fall back to `count=100&sorting=desc` if the windowed pull returns nothing).
+Per leg, **fetch and aggregate in one `exec`** — do NOT `web_fetch` 1000 raw trades into
+context and reason over them by hand (that is slow and gives run-to-run drift). Pipe the
+response through a compact summarizer so only the buckets land in context:
+
+```bash
+NOW=$(date +%s%3N); START=$((NOW-30*24*3600*1000))
+curl -s "https://www.deribit.com/api/v2/public/get_last_trades_by_instrument?instrument_name=<leg>&count=1000&start_timestamp=${START}&end_timestamp=${NOW}&sorting=desc" \
+| python3 -c "
+import json,sys; t=json.load(sys.stdin)['result']['trades']
+now=max((x['timestamp'] for x in t), default=0)
+def bucket(days):
+    c=now-days*864e5; w=[x for x in t if x['timestamp']>=c]; b=[x for x in w if x.get('block_trade_id')]
+    return len(w),len(b),sum(x['amount'] for x in w),sum(x['amount'] for x in b)
+for d,l in [(1,'24h'),(7,'7d'),(30,'30d')]: print(l,'prints/blocks/contracts/blockc =',bucket(d))
+print('recent blocks:', [(x['timestamp'],x['amount'],x['price'],x.get('iv'),x['direction'],x.get('block_trade_id')) for x in t if x.get('block_trade_id')][:12])
+"
+```
+(fall back to `count=100&sorting=desc` if the windowed pull returns nothing.) You may run
+this in the same parallel first batch as the tape read and live tickers.
 
 **Identify Paradigm / block prints on the tape:** each trade carrying a `block_trade_id` field
 is a block trade — Paradigm-routed flow surfaces here as blocks (and multi-leg blocks share one
