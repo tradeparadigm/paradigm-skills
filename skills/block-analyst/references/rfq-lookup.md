@@ -11,43 +11,65 @@ used to be pasted as JSON).
 
 ## How to resolve it
 
-### 1. Query the Paradigm trade tape via `paradigm-data-discovery` (primary)
+### 1. ONE combined tape read — fill row **and** 30d recurrence in a single scan (primary)
 
-Hand the `rfq_id` to the `paradigm-data-discovery` skill and have it query the
-executed-block tape, filtered to that id. The dataset is
-`paradigm_trade_tape_slim` (executed RFQ block trades), keyed by `RFQ_ID`:
+The trade tape is a gzipped CSV on S3. Decompressing it is the dominant cost, so
+**scan it exactly once**: materialize the relevant rows into a temp table, then
+read both the fill row (Step 0) and the 30d structure recurrence (Step 3a) out of
+that temp table. **Do not run a second tape query later** — this one covers both.
 
-```sql
--- credential bootstrap + httpfs per paradigm-data-discovery (S3 via IRSA)
+This recipe is **self-contained**: the IRSA→STS bootstrap is inlined below, so you
+do **not** need to open `paradigm-data-discovery`'s `SKILL.md` or `s3-access.md`
+first. Substitute `<CORE_ID>` (the `r_…` id with any `DRFQv2-`/`GRFQ-` prefix
+stripped) and the `<EXPIRY>`/`<STRIKE>` tokens parsed from the `<rfq description>`
+(e.g. `31 Jul 26` and `66000`), then run it as one `exec`:
+
+```bash
+TOKEN=$(cat "$AWS_WEB_IDENTITY_TOKEN_FILE")
+CREDS=$(curl -s "https://sts.ap-northeast-1.amazonaws.com/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=${AWS_ROLE_ARN}&RoleSessionName=duckdb&WebIdentityToken=${TOKEN}")
+AK=$(echo "$CREDS" | grep -o '<AccessKeyId>[^<]*' | cut -d'>' -f2)
+SK=$(echo "$CREDS" | grep -o '<SecretAccessKey>[^<]*' | cut -d'>' -f2)
+ST=$(echo "$CREDS" | grep -o '<SessionToken>[^<]*' | cut -d'>' -f2)
+duckdb -c "
 INSTALL httpfs; LOAD httpfs;
-
-SELECT DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE,
-       SIDE, QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID
+SET s3_region='ap-northeast-1';
+SET s3_access_key_id='$AK'; SET s3_secret_access_key='$SK'; SET s3_session_token='$ST';
+-- single decompress → temp table holding the target RFQ + 30d matching structures
+CREATE TEMP TABLE tape AS
+SELECT DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE,
+       QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID
 FROM read_csv_auto('s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz')
--- rfq_id may arrive bare (r_...) or prefixed (DRFQv2-r_...); match either form
-WHERE RFQ_ID = '<rfq_id>'
-   OR RFQ_ID = 'DRFQv2-' || '<rfq_id>'
-   OR RFQ_ID LIKE '%' || regexp_replace('<rfq_id>', '^DRFQv2-', '');
+WHERE RFQ_ID LIKE '%<CORE_ID>%'
+   OR (DATE >= (CURRENT_DATE - INTERVAL 30 DAY)
+       AND DESCRIPTION LIKE '%<EXPIRY>%' AND DESCRIPTION LIKE '%<STRIKE>%');
+-- (a) the cleared block — authoritative for every numeric field
+SELECT 'FILL' tag, * FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%';
+-- (b) 30d recurrence of the same structure (Step 3a), newest first
+SELECT 'HIST' tag, DATE, TIME, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, BLOCK_TRADE_ID
+FROM tape
+WHERE DESCRIPTION LIKE '%<EXPIRY>%' AND DESCRIPTION LIKE '%<STRIKE>%'
+ORDER BY DATE DESC, TIME DESC;
+"
 ```
 
-> **The tape prefixes ids with a routing tag (e.g. `DRFQv2-`). Strip/ignore the
-> prefix when matching — the `r_…` core is the stable key. Never conclude "not on
-> tape" from an exact-match miss; retry with the suffix match above before failing.**
-
-`paradigm-data-discovery` owns the canonical bucket/path and credentials — defer
-to its `references/datasets.md` for the current S3 URI (it has moved before)
-rather than hard-coding it here.
+> **The tape prefixes ids with a routing tag (e.g. `DRFQv2-`). The `LIKE '%<CORE_ID>%'`
+> match is prefix-tolerant by construction — the `r_…` core is the stable key. Never
+> conclude "not on tape" from a miss without having run this suffix-tolerant match.**
 
 Notes:
 - A whole structure sits on the matched row(s) — `DESCRIPTION` encodes the full
   strategy (e.g. `Straddle 19 Nov 25 3050`, `RRCall 30 Jan 26 70000/108000`,
   `Cstm +1.00 Call 24 Apr 26 78000 -2.00 Call 24 Apr 26 85000`). Rows sharing a
   `BLOCK_TRADE_ID` are one block — keep them together.
+- The `HIST` rows ARE the Step 3a Paradigm-recurrence answer (count, sizes, sides,
+  most-recent). Cluster them by `BLOCK_TRADE_ID` and match the full leg set. For a
+  genuine single-leg outright, `%<EXPIRY>%<STRIKE>%` will also surface that strike
+  inside flies/spreads/ratios — count only rows whose `DESCRIPTION` is the *same
+  structure* as the recurrence; note the rest as strike-level context, not prints.
 - The tape is the **executed** tape. For RFQ-level context (fill rate, unfilled,
   lifespan) the sibling dataset is `paradigm_rfq_tape_slim` (same `RFQ_ID` key).
-- **Auth:** S3 reads need IRSA credentials — handled by `paradigm-data-discovery`
-  (see its `references/s3-access.md`). This is **not** chat-pasted; if the
-  credentials / DuckDB tool are unavailable, fall back below.
+- **Auth:** the STS block above assumes the IRSA role directly; no external file
+  read needed. If the credentials / DuckDB tool are unavailable, fall back below.
 
 **Self-test (regression guard — bare id must resolve a prefixed row):** given a
 tape row whose `RFQ_ID` is `DRFQv2-r_01H8XQ…`, the canonical query above invoked

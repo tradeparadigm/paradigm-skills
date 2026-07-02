@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.3"
+  version: "1.4"
 ---
 
 # Paradigm Block Trade Analyst
@@ -55,16 +55,18 @@ greeks").
 The input is **`/analyze <rfq_id> <rfq description>`**. Split it:
 
 - **`<rfq_id>`** — the first token after `/analyze`. This is the authoritative
-  key. **Resolve it by searching the Paradigm trade tape via the
-  `paradigm-data-discovery` skill** — query `paradigm_trade_tape_slim`
-  `WHERE RFQ_ID = '<rfq_id>'` to retrieve the cleared block: `DESCRIPTION`
-  (structure), `PRICE` (fill), `REF_PRICE` (mark), `QTY`, `SIDE`, `PRODUCT`
-  (venue + asset + kind), `QUOTE_CURRENCY`, `NOTIONAL_VOLUME_USD`. That skill
-  owns the S3 catalog, the IRSA credentials, and the DuckDB query path. Spot and
-  per-leg greeks/IV are **not** in the tape — pull them live in Step 2; infer
-  `strategy_code` from `DESCRIPTION`. The exact query, field mapping, and
-  fallback order (injected block-trade context → Deribit tape) are in
-  [`references/rfq-lookup.md`](references/rfq-lookup.md).
+  key. **Resolve it with the single combined tape read in
+  [`references/rfq-lookup.md`](references/rfq-lookup.md)** — that one `exec`
+  scans the gzipped tape **once** and returns BOTH the cleared block (`FILL`
+  row: `DESCRIPTION`, `PRICE`, `REF_PRICE`, `QTY`, `SIDE`, `PRODUCT`,
+  `QUOTE_CURRENCY`, `NOTIONAL_VOLUME_USD`) **and** the 30d recurrence of the
+  same structure (`HIST` rows — this IS the Step 3a answer). The STS/IRSA
+  credential bootstrap is inlined in that recipe, so **do not open
+  `paradigm-data-discovery`'s `SKILL.md` or `s3-access.md`** — read only this
+  skill's `references/rfq-lookup.md`. **Run the tape query exactly once**; never
+  issue a second tape scan in Step 3. Spot and per-leg greeks/IV are **not** in
+  the tape — pull them live in Step 2; infer `strategy_code` from `DESCRIPTION`.
+  Today's date is already in your context — **do not shell out to `date`.**
   - **Id normalization:** the resolved `RFQ_ID` may carry a `DRFQv2-`/`GRFQ-`
     routing prefix; the auction type (`AUCTION` = RFQ/OB) and the `drfq`/`grfq`
     read come from that prefix + `AUCTION` — surface as `drfq`/`grfq` in the
@@ -182,14 +184,14 @@ Two sources, both mandatory every time:
 ### 3a — Paradigm prior blocks (most important)
 Block recurrence on Paradigm is the strongest signal — a repeating block means a programmatic
 or conviction taker, not random flow.
-- **If a Paradigm block tape is injected** into the session (via a block-trade context tool or
-  equivalent feed): scan it for prior blocks matching this structure — same `strategy_code` +
-  same leg geometry (underlying, expiry pattern, strike/width or moneyness) within 30d. Report:
-  count of matching blocks, size range, most recent (date + level + side), and whether one-sided
-  (single taker building) or two-way.
-- **If no Paradigm tape is injected** (e.g. running outside the Dime terminal): say so in one
-  line and fall back to identifying Paradigm-routed prints on the Deribit tape (see 3b). Never
-  fabricate block counts.
+- **The `HIST` rows from the Step 0 combined tape read already answer this** — that single scan
+  returned the 30d matching-structure rows alongside the fill. Do **not** run another tape query.
+  Cluster the `HIST` rows by `BLOCK_TRADE_ID`, match the full leg set, and report: count of
+  matching blocks, size range, most recent (date + level + side), and whether one-sided (single
+  taker building) or two-way. Rows that share the strike/expiry but are a *different* structure
+  are strike-level context, not recurrence of this structure.
+- **If the tape read failed** (no credentials / DuckDB unavailable): say so in one line and fall
+  back to identifying Paradigm-routed prints on the Deribit tape (see 3b). Never fabricate counts.
 
 ### 3b — Deribit tape, always fetch (public, no auth)
 Per leg:
@@ -232,13 +234,19 @@ vol and the spread** — that is the signal Nic cares about most:
 Keep the *output* of this tight (one or two lines / a small table) — the depth is in the analysis,
 not the word count.
 
-### 3d — Where else did it trade (required, reported compactly)
-After Paradigm/Deribit, check whether the same structure/legs printed on the other venues so the
-output can answer "where else did this trade": **OKX** (`/api/v5/market/trades` per leg), **Bullish**
-(`/trading-api/v1/trades`), **Paradex** (`/v1/trades` public REST via `web_fetch` — esp. perp legs), and Bybit if relevant.
-See `references/venues.md` for naming/endpoints.
-Report as **ONE compact line**: name only the venues where it actually printed (with rough size),
-then a terse "not seen on X/Y" for the rest. Do NOT spend a row per empty venue — one line total.
+### 3d — Where else did it trade (best-effort, never blocks output)
+Paradigm + Deribit (3a/3b) are the authoritative recurrence sources. Cross-venue checks are
+**optional colour, not a gate** — they are the slowest and flakiest fetches and must never hold up
+the block. Rules:
+- **Perp legs:** one Paradex `/v1/trades` fetch is worth it (perps trade there).
+- **Option legs:** only bother with OKX (`/api/v5/market/trades` per leg) when Deribit recurrence
+  was thin AND the leg is liquid enough that OKX would plausibly show it. Skip Bullish/Bybit for
+  options by default — they almost never add signal. Do **at most one** extra venue fetch here.
+- If a cross-venue fetch errors, is slow, or returns nothing, **drop it silently** and move on —
+  do not retry, do not reformat the query, do not wait on it.
+Report as at most **ONE compact line**: name only venues where it actually printed (rough size). If
+you ran no cross-venue check (Deribit already answered), simply omit the "where else" token — do
+not add a row of "not seen on X/Y".
 
 ## Step 4 — Compute Net Greeks
 
@@ -270,11 +278,12 @@ live delta in the output — pick the live figure and state it once.
 - Cross-venue IV spread: flag if >2 vol points divergence between Deribit and OKX
 - Note if taker bought or sold the higher-IV leg (directional vs vol arb read)
 
-**Vol-surface impact (required when the trade had size / multiple clips):** did this flow move the
-surface, and how? Pull the **expiry's vol surface** — its ATM vol and skew (Deribit per-strike
-tickers, or OKX `opt-summary` which returns every strike's mark IV plus `volLv`, the expiry ATM
-level) — and compare where the traded strikes' IV and the expiry ATM/skew sit **now vs before the
-flow** (use the per-clip traded `iv` from Step 3c as the "before"). State it in one line, e.g.
+**Vol-surface impact (when the trade had size / multiple clips):** did this flow move the surface,
+and how? Answer this from data you **already have** — the per-clip traded `iv` from Step 3c (the
+"before") vs the current Deribit mark IV from Step 2 (the "now"). That comparison is the surface
+read; **do not fire an extra OKX `opt-summary` (or any new venue) call just for this** — it is slow
+and often returns nothing usable. Only pull OKX `volLv` if the Deribit IVs are genuinely missing.
+State it in one line, e.g.
 "lifted 6Jun ATM ~+0.8 vol and steepened call skew as the taker bought; rest of the surface
 unchanged" — or "no surface move, absorbed". Attribute the move to this flow only when timing/size
 support it; don't over-claim.
