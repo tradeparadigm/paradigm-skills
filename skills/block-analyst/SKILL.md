@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.6"
+  version: "1.7"
 ---
 
 # Paradigm Block Trade Analyst
@@ -96,12 +96,20 @@ FROM read_csv_auto('s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_sl
 WHERE RFQ_ID LIKE '%<CORE_ID>%'
    OR (DATE >= (CURRENT_DATE - INTERVAL 30 DAY)
        AND UPPER(REPLACE(DESCRIPTION,' ','')) LIKE '%<EXPIRY_C>%<STRIKE>%');
-SELECT 'FILL' tag, * FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%';
+SELECT 'FILL' tag, *,
+       ROUND(PRICE - REF_PRICE, 6) AS MARK_OFFSET,
+       ROUND((PRICE - REF_PRICE) * 10000, 1) AS OFFSET_BPS
+FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%';
 SELECT 'HIST' tag, DATE, TIME, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, BLOCK_TRADE_ID
 FROM tape WHERE DESC_N LIKE '%<EXPIRY_C>%<STRIKE>%'
 ORDER BY DATE DESC, TIME DESC;
 "
 ```
+
+The query returns `OFFSET_BPS` (= `(PRICE−REF_PRICE)×10000`, signed) already computed —
+**use it verbatim** for the `±N bps vs mark` token in the header and `[Fair]`. Do NOT
+recompute bps by hand (that is where the wobble comes from): a −0.0004 offset is **−4 bps**,
+not −40. `Paid`/`Recd`, `above`/`below` follow the sign of `MARK_OFFSET`.
 
 The input is **`/analyze <rfq_id> <rfq description>`**. Split it:
 
@@ -423,7 +431,8 @@ Spot 62,728 · 60k −4.3% OTM · long near-Γ / short far-vega · max loss at 6
 - Plain structure name ("Call Ratio", "Straddle", "Risk Reversal") — never the raw code (CS/SD/RR).
 - `Buyer` if the taker paid a net debit, `Seller` if they took in a net credit.
 - Size **per leg in coin** = block qty × each leg ratio (100 lots at 1×1.5 → `100/150 BTC`).
-- Premium: `Paid`/`Recd` <fill price>, then `±bps above/below mark` (`bps = |markOffset| × 10000`).
+- Premium: `Paid`/`Recd` <fill price>, then `±bps above/below mark` — use the query's
+  **precomputed `OFFSET_BPS`** verbatim (do not recompute by hand).
 
 **Line 2 — View, one clause:**
 `<spot + moneyness> · <exposure in greek shorthand> · <key level> · <flow type>`
@@ -450,7 +459,8 @@ Spot 62,728 · 60k −4.3% OTM · long near-Γ / short far-vega · max loss at 6
 - Drop a bracket row only if its data is genuinely unavailable — never pad, never invent.
 - Δ as the triangle; spell out vega/theta/gamma/vanna; theta & vega are USD ($/v, $/d), only Δ is coin.
 - `Δ %` = `net_delta_coin / block_qty × 100` (≈ `strategy_delta × 100`): ≈0% neutral, ±100% directional.
-- `bps from mid` = `|markOffset| × 10000`; neutral phrasing, never moralize about crossing the spread.
+- `bps vs mark` comes from the query's precomputed `OFFSET_BPS` (= `(PRICE−REF_PRICE)×10000`);
+  never recompute it mentally. Neutral phrasing, never moralize about crossing the spread.
 - Resolve Buyer/Seller and long/short from the leg sides + `strategy_delta` (per Step 1) silently —
   state only the verdict, never the convention reasoning.
 - Cite only real `block_trade_id`s; **never invent a `combo_id` — not in the output and not in your

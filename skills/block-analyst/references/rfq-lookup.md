@@ -46,8 +46,12 @@ FROM read_csv_auto('s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_sl
 WHERE RFQ_ID LIKE '%<CORE_ID>%'
    OR (DATE >= (CURRENT_DATE - INTERVAL 30 DAY)
        AND UPPER(REPLACE(DESCRIPTION,' ','')) LIKE '%<EXPIRY_C>%<STRIKE>%');
--- (a) the cleared block — authoritative for every numeric field
-SELECT 'FILL' tag, * FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%';
+-- (a) the cleared block — authoritative for every numeric field.
+-- OFFSET_BPS is precomputed so the bps token never needs hand-arithmetic.
+SELECT 'FILL' tag, *,
+       ROUND(PRICE - REF_PRICE, 6) AS MARK_OFFSET,
+       ROUND((PRICE - REF_PRICE) * 10000, 1) AS OFFSET_BPS
+FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%';
 -- (b) 30d recurrence of the same structure (Step 3a), newest first
 SELECT 'HIST' tag, DATE, TIME, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, BLOCK_TRADE_ID
 FROM tape
