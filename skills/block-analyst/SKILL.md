@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.7"
+  version: "1.8"
 ---
 
 # Paradigm Block Trade Analyst
@@ -62,11 +62,17 @@ for the tape row before fetching live data. **In a single tool batch (parallel t
 calls), immediately fire all of:**
 1. the combined tape read below (one `exec`),
 2. `deribit__get_ticker` (or `web_fetch` ticker) for **each leg** + the perp for spot,
-3. `web_fetch` Deribit `get_last_trades_by_instrument` for **each leg** (Step 3b).
+3. the Step 3b trade-tape pull for **each leg**.
 
 Only the greek *scaling* (× qty) and the fill-vs-mark line need the tape row — compute
 those after it returns. This overlap is the single biggest latency win; sequential
 fetching is the slow path.
+
+**Multi-leg (calendars, spreads, flies, RRs): keep it parallel and bounded.** Fire every
+leg's ticker and every leg's Step 3b pull **in the same one batch** — put each leg's tape
+pull in its **own parallel `exec`**, NOT a serial `for LEG in …` bash loop (a loop runs the
+1000-trade fetches back-to-back and is the main reason multi-leg felt slow). N legs → N
+concurrent execs, still one round. Do not add extra rounds per leg.
 
 **Combined tape read (run this exact `exec` — no need to open `references/rfq-lookup.md`
 on the hot path; it holds the field mapping + fallbacks only).** Substitute three tokens:
@@ -182,6 +188,21 @@ The taker's real position comes from the **leg-level `side` fields** plus the si
   quote-convention", no BUY/SELL leg mechanics. That logic is internal; the reader sees the verdict.
 - Single-leg `description` is just the instrument name; for multi-leg, parse legs from the `legs`
   array (or `description`: `[+/-][ratio] [Type] [DD Mon YY] [Strike]`, one per line).
+
+**Multi-leg direction — resolve in ONE pass, then stop (do not enumerate interpretations).**
+When the tape gives a single combined `DESCRIPTION` row (no per-leg `side`), fix the taker's
+position from the row `SIDE` + the structure's standard convention below, sanity-check it once
+against the `MARK_OFFSET` sign (debit paid ⇒ net-long premium ⇒ `Buyer`; credit received ⇒
+`Seller`), commit, and compute net greeks **once**. Churning through "is it a reverse cal / which
+leg is long" across your reasoning is the main multi-leg latency leak — decide and move on.
+- **Calendar (`CA`/`CCal`/`PCal`):** `DESCRIPTION` lists **near expiry first, far second**.
+  `SIDE=BUY` = **long calendar** (long far / short near, pays debit, long vega). `SIDE=SELL` =
+  **short (reverse) calendar** (short far / long near, receives credit, short vega, long near-Γ).
+- **Vertical / ratio / fly / condor / RR:** the row `SIDE` applies to the structure as named; the
+  first-named leg is the "long" anchor unless a `-`/ratio prefix says otherwise. Net-greek sign
+  follows the resolved per-leg longs/shorts × ratio × qty (Step 4).
+State only the plain verdict in the header ("Short Call Calendar", "Call Ratio") — never the
+convention reasoning.
 
 ## Step 2 — Fetch Live Data
 

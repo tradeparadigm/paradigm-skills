@@ -11,8 +11,17 @@ Maps `strategy_code` field values from the Paradigm block trade JSON to structur
 | `BF` | Butterfly | Three-strike spread (long wings, short body or vice versa) |
 | `CO` | Condor | Four-strike spread; wider wings than butterfly |
 | `CA` | Calendar | Same strike, different expiries (long back / short front or reverse) |
+| `CCal` | Call Calendar | Calendar built from calls (tape `DESCRIPTION` prefix `CCal`) |
+| `PCal` | Put Calendar | Calendar built from puts (tape `DESCRIPTION` prefix `PCal`) |
 | `RR` | Risk Reversal | Long OTM call + short OTM put (or reverse), same expiry |
 | `CM` | Custom Multi-leg | Arbitrary combination not covered by named structures |
+
+**Calendar direction (tape `DESCRIPTION` lists near expiry first, far second):**
+- `SIDE=BUY` → **long calendar**: long far / short near, pays debit, long vega, short near-gamma.
+- `SIDE=SELL` → **short (reverse) calendar**: short far / long near, receives credit, short vega,
+  long near-gamma, pays theta. Sanity-check against the `MARK_OFFSET` sign (credit ⇒ Seller).
+
+Resolve direction once from `SIDE` + this convention; do not re-derive it multiple ways.
 
 ## Perp Combo Legs
 
