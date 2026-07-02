@@ -20,13 +20,11 @@ that temp table. **Do not run a second tape query later** — this one covers bo
 
 This recipe is **self-contained**: the IRSA→STS bootstrap is inlined below, so you
 do **not** need to open `paradigm-data-discovery`'s `SKILL.md` or `s3-access.md`
-first. Substitute `<CORE_ID>` (the `r_…` id with any `DRFQv2-`/`GRFQ-` prefix
-stripped), `<ASSET>` (`BTC`/`ETH`/`SOL`/… — from the description if named, else read the
-FILL row's `PRODUCT`; never assume BTC), `<EXPIRY_C>` (the expiry compacted+uppercased, no
-spaces: `31 Jul 26` → `31JUL26`) and `<STRIKE>` (`66000` / `88`). The recurrence match **normalizes `DESCRIPTION`**
-(`UPPER(REPLACE(DESCRIPTION,' ',''))`) so it matches the tape's spaced form
-(`Call 31 Jul 26 66000`) regardless — use the compacted `<EXPIRY_C>`, not a spaced
-token. Run it as one `exec`:
+first. The **only** token is `<CORE_ID>` (the `r_…` id with any `DRFQv2-`/`GRFQ-` prefix
+stripped) — **nothing from the `<rfq description>`**. The `<rfq_id>` is the sole authoritative
+input; the description text is user reference only and must not seed the asset, instrument, or
+filter. HIST recurrence self-derives from the FILL row's own `PRODUCT` + normalized
+`DESCRIPTION`, so the query needs no strike/expiry/asset tokens. Run it as one `exec`:
 
 ```bash
 TOKEN=$(cat "$AWS_WEB_IDENTITY_TOKEN_FILE")
@@ -45,21 +43,19 @@ SELECT DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE,
        UPPER(REPLACE(DESCRIPTION,' ','')) AS DESC_N
 FROM read_csv_auto('s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz')
 WHERE RFQ_ID LIKE '%<CORE_ID>%'
-   OR (DATE >= (CURRENT_DATE - INTERVAL 30 DAY)
-       AND PRODUCT LIKE '%<ASSET> OPTION%'
-       AND UPPER(REPLACE(DESCRIPTION,' ','')) LIKE '%<EXPIRY_C>%<STRIKE>%');
--- (a) the cleared block — authoritative for every numeric field.
--- Read PRODUCT for the ASSET (BTC/ETH/SOL/…) — never assume BTC.
--- OFFSET_BPS is precomputed so the bps token never needs hand-arithmetic.
+   OR DATE >= (CURRENT_DATE - INTERVAL 30 DAY);
+-- (a) the cleared block — authoritative for every field. Asset ← PRODUCT (never assume BTC),
+-- structure ← DESCRIPTION. OFFSET_BPS precomputed so the bps token never needs hand-arithmetic.
 SELECT 'FILL' tag, *,
        ROUND(PRICE - REF_PRICE, 6) AS MARK_OFFSET,
        ROUND((PRICE - REF_PRICE) * 10000, 1) AS OFFSET_BPS
 FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%';
--- (b) 30d recurrence of the same structure (Step 3a), newest first.
--- The PRODUCT guard keeps a short strike (e.g. 88) from matching another coin (BTC 88000).
+-- (b) 30d recurrence (Step 3a): same structure = same PRODUCT + same normalized DESCRIPTION as
+-- the FILL, self-derived from the FILL row (no user text). Same-coin match blocks cross-asset leaks.
 SELECT 'HIST' tag, DATE, TIME, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, BLOCK_TRADE_ID
 FROM tape
-WHERE PRODUCT LIKE '%<ASSET> OPTION%' AND DESC_N LIKE '%<EXPIRY_C>%<STRIKE>%'
+WHERE PRODUCT IN (SELECT PRODUCT FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%')
+  AND DESC_N  IN (SELECT DESC_N  FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%')
 ORDER BY DATE DESC, TIME DESC;
 "
 ```
@@ -137,18 +133,15 @@ JSON. Map by the tape's actual columns:
 
 ## The role of the inline `<rfq description>`
 
-The `<rfq description>` after the `rfq_id` is a **human-readable hint**, not the
-source of truth:
+The `<rfq description>` after the `rfq_id` is **user reference only — not an input to the
+analysis**. Do not use it to choose the asset, build instrument names, filter the tape, or
+decide the structure; every one of those comes from the resolved `FILL` row (`PRODUCT` +
+`DESCRIPTION`). It may omit the asset or be outright wrong.
 
-- **Cross-check** — confirm the resolved row matches what the user expects
-  (right structure, strikes, expiry). If the tape row and the description
-  disagree materially, surface that the `rfq_id` resolved to a *different* trade
-  rather than silently overriding.
-- **Disambiguation** — if more than one row comes back, use the description to
-  pick the right block.
-- **Fallback** — if the tape can't be queried, parse the structure from the
-  description so the greeks/fair/live brackets can still be produced from live
-  data, with the fill-vs-mark line marked unavailable.
-
-The resolved tape row always wins for numeric fields (fill price, mark,
-quantity). The description never overrides a retrieved number.
+- **The only allowed use:** if the resolved row materially disagrees with what the description
+  implied, add a one-line note that the id resolved to a *different* trade — but the resolved
+  row still governs every field.
+- **Never** let the description seed a live fetch before the tape resolves, and **never**
+  fall back to "parse the structure from the description" — if the id doesn't resolve and the
+  asset therefore isn't known, report the RFQ unresolved (Step 7); do not fabricate an
+  asset/strike/structure or default to BTC.

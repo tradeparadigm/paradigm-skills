@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.10"
+  version: "1.11"
 ---
 
 # Paradigm Block Trade Analyst
@@ -52,42 +52,32 @@ greeks").
 > **Only emit the Step 7 unresolved-failure line after the suffix-tolerant query
 > genuinely returns zero rows on both the trade + RFQ tapes.**
 
-### Fast path — fire the slow calls IN PARALLEL on your first action
+### Resolve by the ID FIRST — the description is NOT authoritative
 
-The tape scan, the live Deribit marks, and the 30d Deribit trade tape are the three
-slow calls and they can run in parallel — but only once you know the **asset**.
+> **⚠️ The `<rfq_id>` is the ONLY authoritative input.** The `<rfq description>` after it
+> (`Call 31 Jul 26 88`) is **user reference only** — a human label that may omit the asset or
+> mis-state the strike/structure. **Never build instruments, tape filters, greeks, or the
+> output structure from the description.** Everything the block reports is derived from the
+> **resolved tape row**. (Deriving `BTC-…-88-C` from that text is exactly what turned a SOL
+> call into a hallucinated BTC straddle — so don't guess an instrument before the ID resolves.)
 
-> **⚠️ ASSET FIRST — never assume BTC.** The `<rfq description>` frequently omits the
-> underlying (`Call 31 Jul 26 88` is a **SOL** call at strike 88, not BTC). The asset is
-> authoritative from the tape `PRODUCT` field (`SOL OPTION - DBT` → SOL; `ETH OPTION - DBT`
-> → ETH). **Tell:** a strike too small for BTC/ETH — roughly **< 1000** (`88`, `180`, `250`)
-> — is almost never BTC/ETH; it is an alt (SOL, XRP, DOGE, …). Building `BTC-…-88-C` is the
-> bug that produced a hallucinated BTC straddle for a SOL call. So:
-> - **Asset unambiguous** (named in the description, OR a clean BTC/ETH-magnitude strike
->   ≥ ~1000): the leg name IS derivable (`Call 31 Jul 26 66000` → `BTC-31JUL26-66000-C`,
->   `Put 7 May 26 2375` → `ETH-7MAY26-2375-P`) — fire everything in parallel now.
-> - **Asset ambiguous** (no asset named AND a sub-1000 strike, or any doubt): run the tape
->   read **FIRST**, read `PRODUCT` for the asset + exact strikes, THEN fetch live. The one
->   extra round is worth it — a wrong-asset guess fabricates the whole block.
+Two rounds — **resolve, then live** (do NOT fetch live data before Round 1 returns):
 
-When the asset is unambiguous, **in a single tool batch (parallel tool calls), immediately
-fire all of:**
-1. the combined tape read below (one `exec`),
-2. `deribit__get_ticker` (or `web_fetch` ticker) for **each leg** + the perp for spot,
-3. the Step 3b trade-tape pull for **each leg**.
+**Round 1 — resolve (one `exec`, one gzip scan).** Run the combined tape query below. Its only
+token is `<CORE_ID>` (the `r_…` id, any `DRFQv2-`/`GRFQ-` prefix stripped). It returns the
+authoritative **`FILL`** row(s) (matched by `RFQ_ID`) plus the 30d **`HIST`** recurrence — HIST
+self-matches the FILL's own `PRODUCT` + normalized `DESCRIPTION`, so **no description tokens are
+needed**. If `FILL` is empty, the RFQ isn't on the tape → Step 7 unresolved line; do not invent.
 
-Only the greek *scaling* (× qty) and the fill-vs-mark line need the tape row — compute
-those after it returns. This overlap is the single biggest latency win; sequential
-fetching is the slow path. Deribit instrument naming per asset: BTC/ETH options are
-`<ASSET>-DDMMMYY-STRIKE-C/P`; USDC-margined alts (SOL, XRP, …) are `<ASSET>_USDC-DDMMMYY-STRIKE-C/P`
-(the `[Live]` line reads e.g. `SOL_USDC 88C`). Confirm the exact instrument exists before
-trusting an empty ticker as "no data".
-
-**Multi-leg (calendars, spreads, flies, RRs): keep it parallel and bounded.** Fire every
-leg's ticker and every leg's Step 3b pull **in the same one batch** — put each leg's tape
-pull in its **own parallel `exec`**, NOT a serial `for LEG in …` bash loop (a loop runs the
-1000-trade fetches back-to-back and is the main reason multi-leg felt slow). N legs → N
-concurrent execs, still one round. Do not add extra rounds per leg.
+**Round 2 — derive the structure from the FILL row, then fire live in ONE parallel batch.**
+Read from the tape row: **asset** ← `PRODUCT` (`BTC OPTION - DBT` → BTC, `SOL OPTION - DBT` → SOL;
+**never assumed**); **legs / strikes / expiries** ← `DESCRIPTION`. Build Deribit instrument names:
+BTC/ETH `<ASSET>-DDMMMYY-STRIKE-C/P`; USDC-margined alts (SOL, XRP, …) `<ASSET>_USDC-DDMMMYY-STRIKE-C/P`
+(the `[Live]` line reads e.g. `SOL_USDC 88C`). Then, in a single tool batch (parallel tool calls),
+fire: per-leg `deribit__get_ticker` (or `web_fetch` ticker) + the perp for spot + each leg's
+Step 3b 30d trade pull. **Multi-leg:** put each leg's trade pull in its **own parallel `exec`**,
+never a serial `for LEG in …` loop; N legs → N concurrent execs, one round. Confirm the instrument
+exists before treating an empty ticker as "no data".
 
 > **⛔ BOUND THE ANALYSIS — this is a 4-row block, not a research note.** Do the *minimum*
 > reasoning needed to fill the rows, then emit. On multi-leg trades, unbounded deliberation
@@ -98,20 +88,13 @@ concurrent execs, still one round. Do not add extra rounds per leg.
 > read recurrence counts straight from the query's `HIST`/tape buckets. Do not re-derive or
 > second-guess. Keep internal reasoning tight — a calendar needs no more thinking than a call.
 
-**Combined tape read (run this exact `exec` — no need to open `references/rfq-lookup.md`
-on the hot path; it holds the field mapping + fallbacks only).** Substitute four tokens:
-- `<CORE_ID>` — the `r_…` id with any `DRFQv2-`/`GRFQ-` prefix stripped.
-- `<ASSET>` — `BTC` / `ETH` / `SOL` / … . If the description doesn't name it and the strike is
-  ambiguous, leave the recurrence's `PRODUCT` guard out on the first pass, read it from the
-  FILL row's `PRODUCT`, then it's known. When known, it keeps `%<STRIKE>%` from matching a
-  different asset (strike `88` would otherwise match BTC `88000`).
-- `<EXPIRY_C>` — the expiry **compacted, uppercased, no spaces**: `31 Jul 26` → `31JUL26`.
-- `<STRIKE>` — the strike digits: `66000` / `88`.
-
-The recurrence match **normalizes `DESCRIPTION`** (strips spaces, uppercases) before
-comparing, so it matches whether the tape stores `Call 31 Jul 26 66000` or a compact form —
-**do not** paste the raw spaced expiry into the `LIKE`, use the compacted `<EXPIRY_C>`. The
-`PRODUCT LIKE '%<ASSET> OPTION%'` guard stops a short strike from matching another coin:
+**Combined tape read (Round 1 — run this exact `exec`; the STS bootstrap is inlined, so no need
+to open `references/rfq-lookup.md` on the hot path).** The **only** token is `<CORE_ID>` (the
+`r_…` id, any `DRFQv2-`/`GRFQ-` prefix stripped) — **no asset/strike/expiry from the description**.
+It scans the gzip once into a temp table, returns the `FILL` row(s) by `RFQ_ID`, then derives the
+`HIST` recurrence by self-matching the FILL's own `PRODUCT` + normalized `DESCRIPTION` (exact
+same structure — same legs/strikes/expiries — within the same coin; a short strike can't leak
+across assets because `PRODUCT` must match):
 
 ```bash
 TOKEN=$(cat "$AWS_WEB_IDENTITY_TOKEN_FILE")
@@ -129,18 +112,23 @@ SELECT DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE,
        UPPER(REPLACE(DESCRIPTION,' ','')) AS DESC_N
 FROM read_csv_auto('s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz')
 WHERE RFQ_ID LIKE '%<CORE_ID>%'
-   OR (DATE >= (CURRENT_DATE - INTERVAL 30 DAY)
-       AND PRODUCT LIKE '%<ASSET> OPTION%'
-       AND UPPER(REPLACE(DESCRIPTION,' ','')) LIKE '%<EXPIRY_C>%<STRIKE>%');
+   OR DATE >= (CURRENT_DATE - INTERVAL 30 DAY);
+-- FILL: authoritative — asset from PRODUCT, structure from DESCRIPTION. OFFSET_BPS precomputed.
 SELECT 'FILL' tag, *,
        ROUND(PRICE - REF_PRICE, 6) AS MARK_OFFSET,
        ROUND((PRICE - REF_PRICE) * 10000, 1) AS OFFSET_BPS
 FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%';
+-- HIST: same structure recurring in 30d — self-derived from the FILL, no user text involved.
 SELECT 'HIST' tag, DATE, TIME, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, BLOCK_TRADE_ID
-FROM tape WHERE PRODUCT LIKE '%<ASSET> OPTION%' AND DESC_N LIKE '%<EXPIRY_C>%<STRIKE>%'
+FROM tape
+WHERE PRODUCT IN (SELECT PRODUCT FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%')
+  AND DESC_N  IN (SELECT DESC_N  FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%')
 ORDER BY DATE DESC, TIME DESC;
 "
 ```
+
+(If `FILL` comes back empty the id isn't on the tape — `HIST` will also be empty; report the RFQ
+unresolved per Step 7 and never substitute an asset/strike/structure.)
 
 The query returns `OFFSET_BPS` (= `(PRICE−REF_PRICE)×10000`, signed) already computed —
 **use it verbatim** for the `±N bps vs mark` token in the header and `[Fair]`. Do NOT
@@ -166,21 +154,21 @@ The input is **`/analyze <rfq_id> <rfq description>`**. Split it:
     routing prefix; the auction type (`AUCTION` = RFQ/OB) and the `drfq`/`grfq`
     read come from that prefix + `AUCTION` — surface as `drfq`/`grfq` in the
     output, don't echo the raw `DRFQv2-` tag.
-- **`<rfq description>`** — the free-text remainder. A human-readable **hint**,
-  not the source of truth: use it to cross-check the resolved record, to
-  disambiguate, and as a structure fallback if the lookup fails. **The retrieved
-  record always wins for numeric fields** — the description never overrides a
-  fetched number. If the id resolves to a trade that materially disagrees with
-  the description (different strikes/expiry/structure), say so rather than
-  silently proceeding.
+- **`<rfq description>`** — the free-text remainder. **User reference only — NOT an input to
+  the analysis.** Do not use it to pick the asset, build instrument names, filter the tape, or
+  determine the structure; all of that comes from the resolved `FILL` row. It may be incomplete
+  (omits the asset) or simply wrong. The one allowed use: if the resolved row materially
+  disagrees with what the description implied, you may add a short note that the id resolved to a
+  different trade — but the resolved row still governs every field. **Never** let the description
+  seed a live fetch before Round 1 resolves.
 
 Do the resolution **silently** (no "resolving the RFQ" narration) and feed the
 record into Step 1. If a full JSON is pasted directly instead of an `rfq_id`,
-skip the lookup and parse it as-is. **If the id cannot be resolved on any
-source** (tape unreachable / no credentials / not on the tape), do **not** invent
-the trade: fall back to the inline description for structure + live marks, and
-lead the output with the one-line failure note in Step 7 so the fill, mark, and
-spot read as *unavailable* rather than fabricated.
+skip the lookup and parse it as-is. **If the id cannot be resolved** (tape unreachable / no
+credentials / not on the tape), do **not** invent the trade and do **not** fall back to the
+`<rfq description>` to build a structure — with no resolved row you don't know the asset, so you
+can't build correct live instruments either. Emit only the Step 7 unresolved line (fill, mark,
+spot, size, side, structure all *unavailable*). An honest "unresolved" beats a fabricated block.
 
 > **Never fabricate the asset or structure.** Two hard rules, both from a real miss where a
 > SOL call got reported as a BTC straddle:
@@ -455,13 +443,13 @@ The `yaml` fence renders the bracket rows in blue/teal in the terminal while the
 stay scannable as plain text outside it — matching the `paradigm-options-recap` style.
 
 **The one exception — RFQ not resolved (Step 0 lookup failed).** When the `rfq_id` could not be
-resolved on any source, lead with a single line stating so, then give the block built from the
-description + live marks with the unavailable fields marked, e.g.:
-`RFQ <id> not resolved (no Paradigm lookup available) — structure from description, live marks only; fill/mark/spot unavailable.`
-In that line and the block, **never invent** the fill price, trade-time mark, spot, size, or
-`markOffset` — those come only from the resolved record. Mark them `n/a`. The `[Greeks]`, `[Fair]`
-(IV only, no fill offset), and `[Live]` rows still render from live market data. This is the
-**only** text permitted before the block; when the RFQ *did* resolve, emit nothing before it.
+resolved, emit **only** a single line stating so — no bracket block. With no resolved row you
+don't know the asset, so you cannot build correct live instruments; do not fall back to the
+`<rfq description>` and do not default to BTC. e.g.:
+`RFQ <id> not resolved (not on Paradigm tape / id not ingested) — no asset/structure/fill available.`
+**Never invent** the asset, strike, expiry, structure, fill, mark, spot, size, or `markOffset`.
+This line is the entire response in the unresolved case; when the RFQ *did* resolve, emit nothing
+before the block.
 
 **Traders read this in seconds — facts only, zero commentary.** Every line is a terse string of
 data tokens separated by ` · ` or ` | `. Hard limits:
