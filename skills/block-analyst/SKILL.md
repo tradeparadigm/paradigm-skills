@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.12"
+  version: "1.13"
 ---
 
 # Paradigm Block Trade Analyst
@@ -69,15 +69,23 @@ authoritative **`FILL`** row(s) (matched by `RFQ_ID`) plus the 30d **`HIST`** re
 self-matches the FILL's own `PRODUCT` + normalized `DESCRIPTION`, so **no description tokens are
 needed**. If `FILL` is empty, the RFQ isn't on the tape → Step 7 unresolved line; do not invent.
 
-**Round 2 — derive the structure from the FILL row, then fire live in ONE parallel batch.**
+**Round 2 — derive the structure from the FILL row, then fire ALL live data in ONE batch.**
 Read from the tape row: **asset** ← `PRODUCT` (`BTC OPTION - DBT` → BTC, `SOL OPTION - DBT` → SOL;
 **never assumed**); **legs / strikes / expiries** ← `DESCRIPTION`. Build Deribit instrument names:
 BTC/ETH `<ASSET>-DDMMMYY-STRIKE-C/P`; USDC-margined alts (SOL, XRP, …) `<ASSET>_USDC-DDMMMYY-STRIKE-C/P`
-(the `[Live]` line reads e.g. `SOL_USDC 88C`). Then, in a single tool batch (parallel tool calls),
-fire: per-leg `deribit__get_ticker` (or `web_fetch` ticker) + the perp for spot + each leg's
-Step 3b 30d trade pull. **Multi-leg:** put each leg's trade pull in its **own parallel `exec`**,
-never a serial `for LEG in …` loop; N legs → N concurrent execs, one round. Confirm the instrument
-exists before treating an empty ticker as "no data".
+(the `[Live]` line reads e.g. `SOL_USDC 88C`).
+
+Then fire **everything live in a SINGLE tool batch (one assistant turn, parallel tool calls)** —
+this is the whole round, do not split it:
+- per-leg ticker (`deribit__get_ticker` or `web_fetch`) + the perp/future for spot, **and**
+- the **one** Step 3b `exec` that pulls all legs' 30d trades concurrently (backgrounded curls).
+
+**Do NOT open a second live round** (tickers now, trades later = the slow path that made a custom
+take 90s). Tickers and trades both need only the instrument name you already have — fetch them
+together. **Never call `session_status`, and never spend a whole turn on `date -u` to "check the year"** —
+today's date is in your context; those are pure wasted round-trips. (Using `date +%s%3N` *inside*
+the trades `exec` to build the 30d window is fine — that's not a separate round.) Confirm an
+instrument exists before treating an empty ticker as "no data".
 
 > **⛔ BOUND THE ANALYSIS — this is a 4-row block, not a research note.** Do the *minimum*
 > reasoning needed to fill the rows, then emit. On multi-leg trades, unbounded deliberation
@@ -309,22 +317,25 @@ or conviction taker, not random flow.
   back to identifying Paradigm-routed prints on the Deribit tape (see 3b). Never fabricate counts.
 
 ### 3b — Deribit tape, always fetch (public, no auth)
-Per leg, **fetch and aggregate in one `exec`** — do NOT `web_fetch` 1000 raw trades into
-context and reason over them by hand (that is slow and gives run-to-run drift). Pipe the
-response through a compact summarizer so only the buckets land in context:
+**Fetch and aggregate in ONE `exec`** — never `web_fetch` 1000 raw trades into context and
+reason over them by hand (slow + run-to-run drift). For **multi-leg**, put every leg in the same
+`exec` and **background the curls (`&` … `wait`)** so all legs fetch concurrently — do NOT run
+them one-after-another. Only the buckets land in context:
 
 ```bash
 NOW=$(date +%s%3N); START=$((NOW-30*24*3600*1000))
-curl -s "https://www.deribit.com/api/v2/public/get_last_trades_by_instrument?instrument_name=<leg>&count=1000&start_timestamp=${START}&end_timestamp=${NOW}&sorting=desc" \
-| python3 -c "
-import json,sys; t=json.load(sys.stdin)['result']['trades']
-now=max((x['timestamp'] for x in t), default=0)
+summ() { python3 -c "
+import json,sys; t=json.load(sys.stdin).get('result',{}).get('trades',[])
+if not t: print(sys.argv[1],'no trades'); sys.exit()
+now=max(x['timestamp'] for x in t)
 def bucket(days):
     c=now-days*864e5; w=[x for x in t if x['timestamp']>=c]; b=[x for x in w if x.get('block_trade_id')]
     return len(w),len(b),sum(x['amount'] for x in w),sum(x['amount'] for x in b)
-for d,l in [(1,'24h'),(7,'7d'),(30,'30d')]: print(l,'prints/blocks/contracts/blockc =',bucket(d))
-print('recent blocks:', [(x['timestamp'],x['amount'],x['price'],x.get('iv'),x['direction'],x.get('block_trade_id')) for x in t if x.get('block_trade_id')][:12])
-"
+print(sys.argv[1], {l:bucket(d) for d,l in [(1,'24h'),(7,'7d'),(30,'30d')]})
+print(' blocks:', [(x['timestamp'],x['amount'],x['price'],x.get('iv'),x['direction'],x.get('block_trade_id')) for x in t if x.get('block_trade_id')][:12])" "$1"; }
+for LEG in <leg1> <leg2> <leg3>; do   # one leg for single-leg trades
+  curl -s "https://www.deribit.com/api/v2/public/get_last_trades_by_instrument?instrument_name=${LEG}&count=1000&start_timestamp=${START}&end_timestamp=${NOW}&sorting=desc" | summ "$LEG" &
+done; wait
 ```
 (fall back to `count=100&sorting=desc` if the windowed pull returns nothing.) You may run
 this in the same parallel first batch as the tape read and live tickers.
