@@ -72,26 +72,28 @@ def fetch_ticker(sym):
 
 
 def fetch_trades_bucket(sym, now_ms):
-    """30d prints/blocks/contracts by 24h/7d/30d for one instrument."""
+    """30d prints/blocks/contracts by 24h/7d/30d for one instrument.
+    The whole body is guarded: one malformed trade record must degrade THIS
+    instrument to None (warned), never leak an exception into the caller."""
     start = now_ms - 30 * 86400_000
     try:
         r = _get("get_last_trades_by_instrument",
                  {"instrument_name": sym, "count": 1000, "start_timestamp": start,
                   "end_timestamp": now_ms, "sorting": "desc"})
         t = r.get("trades") or []
+        if not t:
+            return sym, {"24h": (0, 0, 0.0), "7d": (0, 0, 0.0), "30d": (0, 0, 0.0)}
+        latest = max(x.get("timestamp") or 0 for x in t)
+
+        def bucket(days):
+            c = latest - days * 86400_000
+            w = [x for x in t if (x.get("timestamp") or 0) >= c]
+            b = [x for x in w if x.get("block_trade_id")]
+            return len(w), len(b), round(sum(float(x.get("amount") or 0) for x in w), 1)
+        return sym, {"24h": bucket(1), "7d": bucket(7), "30d": bucket(30)}
     except Exception as e:  # noqa: BLE001
         warn(f"trades {sym}: {e}")
         return sym, None
-    if not t:
-        return sym, {"24h": (0, 0, 0.0), "7d": (0, 0, 0.0), "30d": (0, 0, 0.0), "oi_iv": None}
-    latest = max(x["timestamp"] for x in t)
-
-    def bucket(days):
-        c = latest - days * 864e5
-        w = [x for x in t if x["timestamp"] >= c]
-        b = [x for x in w if x.get("block_trade_id")]
-        return len(w), len(b), round(sum(x["amount"] for x in w), 1)
-    return sym, {"24h": bucket(1), "7d": bucket(7), "30d": bucket(30)}
 
 
 def main():
@@ -103,7 +105,10 @@ def main():
     try:
         _run(args)
     except Exception as e:  # noqa: BLE001 — never a traceback; degrade to raw rows
-        rows = _read_csv(os.path.join(args.csv_dir, "fill.csv"))
+        try:
+            rows = _read_csv(os.path.join(args.csv_dir, "fill.csv"))
+        except Exception:  # noqa: BLE001 — the fallback itself must not raise
+            rows = []
         if not rows:
             print("RFQ not resolved / analysis error — no data available.")
             return
@@ -217,8 +222,13 @@ def _run(args):
             blocks.setdefault(b, []).append(r)
     recurrence = len(blocks)
 
+    # grfq (multi-maker) vs drfq (directed) — from the resolved RFQ_ID's routing
+    # prefix (GRFQ- / DRFQv2-), the authoritative source per SKILL Step 0.
+    rfq_kind = "grfq" if (fill[0].get("RFQ_ID") or "").upper().startswith("GRFQ") else "drfq"
+
     result = {
         "asset": asset, "venue": prod["venue"], "structure": parsed["code"],
+        "rfq_kind": rfq_kind,
         "desc": desc, "side": side, "qty": qty, "reliable_signs": reliable,
         "unmapped": unmapped, "spot": spot, "quote": quote,
         "fill_net": round(fill_net, 6), "ref_net": round(ref_net, 6), "offset": off,
@@ -275,6 +285,7 @@ def _struct_name(code, legs):
                                     and len(opt) == 2) else "Combo")
     else:
         base = {"CL": "Call", "PL": "Put", "ST": "Straddle", "SN": "Strangle",
+                "CS": "Call Spread", "PS": "Put Spread",
                 "RR": "Risk Reversal", "CA": "Calendar", "CM": "Custom"}.get(code, code)
     return base + perp
 
@@ -290,11 +301,11 @@ def render(r) -> str:
     # tell the model to build the analysis from them (correct data, slower).
     if not legs:
         L = [f"⚠ UNMAPPED STRUCTURE — build the block from the raw tape rows below "
-             f"(resolved & correct); infer legs from the description, fetch each leg on "
-             f"Deribit, net the greeks.",
+             f"(resolved & correct); infer legs from these rows' DESCRIPTION (not the "
+             f"user's inline text), fetch each leg on Deribit, net the greeks.",
              "",
              f"**{a} · {r['desc'].strip()} · ×{r['qty']:g} | {r['side']} | "
-             f"{verb} {fillabs:g} | {r['offset']['txt']} vs mark** · drfq/{r['venue']}",
+             f"{verb} {fillabs:g} | {r['offset']['txt']} vs mark** · {r['rfq_kind']}/{r['venue']}",
              "",
              "```yaml",
              f"[Tape]  {len(r['fill_rows'])} fill row(s):"]
@@ -320,7 +331,7 @@ def render(r) -> str:
     note = ("⚠ unmapped structure — verify legs & net signs from the data below"
             if r.get("unmapped") else
             ("signs verified" if r["reliable_signs"] else "net greeks: confirm signs from legs below"))
-    L.append(f"Spot {sp} · {struct} · {note} · drfq/{r['venue']}")
+    L.append(f"Spot {sp} · {struct} · {note} · {r['rfq_kind']}/{r['venue']}")
     L.append("")
     # tag legs with expiry only when the structure spans >1 expiry (calendars/diagonals)
     multi_exp = len({l.get("expiry") for l in legs if l["cp"] != "FUT" and l.get("expiry")}) > 1

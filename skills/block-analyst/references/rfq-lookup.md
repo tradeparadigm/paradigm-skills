@@ -1,11 +1,11 @@
 # Resolve an RFQ by `rfq_id` — Paradigm trade tape via data-discovery
 
 The block analyst's input is `/analyze <rfq_id> <rfq description>`. The `rfq_id`
-is the authoritative key. **Resolve it by searching the Paradigm trade tape
-through the `paradigm-data-discovery` skill** — that skill owns the S3 catalog,
-the credentials, and the DuckDB query path. This file is the recipe for turning
-the `rfq_id` into the full trade record the analysis needs (the same fields that
-used to be pasted as JSON).
+is the authoritative key. **Resolve it by searching the Paradigm trade tape** —
+this file is the complete, self-contained recipe (the IRSA→STS credential
+bootstrap is inlined below; do not open `paradigm-data-discovery`'s docs for it)
+for turning the `rfq_id` into the full trade record the analysis needs (the same
+fields that used to be pasted as JSON).
 
 ---
 
@@ -24,11 +24,21 @@ first. The **only** token is `<CORE_ID>` (the `r_…` id with any `DRFQv2-`/`GRF
 stripped) — **nothing from the `<rfq description>`**. The `<rfq_id>` is the sole authoritative
 input; the description text is user reference only and must not seed the asset, instrument, or
 filter. HIST recurrence self-derives from the FILL row's own `PRODUCT` + normalized
-`DESCRIPTION`, so the query needs no strike/expiry/asset tokens. Run it as one `exec`:
+`DESCRIPTION`, so the query needs no strike/expiry/asset tokens.
+
+> **Sanitize `<CORE_ID>` before substituting it** — it lands inside a SQL string
+> literal on a session holding live S3 credentials. Accept only `[A-Za-z0-9_-]`
+> (reject anything else outright), and backslash-escape `_` (a `LIKE` wildcard)
+> as the `ESCAPE '\'` clauses below expect, so `r_3Fvz…` matches literally.
+
+Run it as one `exec`:
 
 ```bash
-TOKEN=$(cat "$AWS_WEB_IDENTITY_TOKEN_FILE")
-CREDS=$(curl -s "https://sts.ap-northeast-1.amazonaws.com/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=${AWS_ROLE_ARN}&RoleSessionName=duckdb&WebIdentityToken=${TOKEN}")
+# POST with the token read straight from its file keeps it out of argv/ps.
+CREDS=$(curl -s --max-time 20 -X POST "https://sts.ap-northeast-1.amazonaws.com/" \
+  --data "Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleSessionName=duckdb" \
+  --data-urlencode "RoleArn=${AWS_ROLE_ARN}" \
+  --data-urlencode "WebIdentityToken@${AWS_WEB_IDENTITY_TOKEN_FILE}")
 AK=$(echo "$CREDS" | grep -o '<AccessKeyId>[^<]*' | cut -d'>' -f2)
 SK=$(echo "$CREDS" | grep -o '<SecretAccessKey>[^<]*' | cut -d'>' -f2)
 ST=$(echo "$CREDS" | grep -o '<SessionToken>[^<]*' | cut -d'>' -f2)
@@ -42,7 +52,7 @@ SELECT DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE,
        QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID,
        UPPER(REPLACE(DESCRIPTION,' ','')) AS DESC_N
 FROM read_csv_auto('s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz')
-WHERE RFQ_ID LIKE '%<CORE_ID>%'
+WHERE RFQ_ID LIKE '%<CORE_ID>%' ESCAPE '\'
    OR DATE >= (CURRENT_DATE - INTERVAL 30 DAY);
 -- (a) the cleared block — authoritative for every field. Asset ← PRODUCT (never assume BTC),
 -- structure ← DESCRIPTION. Offsets precomputed: OFFSET_BPS (×10000) for COIN-quoted premiums
@@ -52,18 +62,18 @@ SELECT 'FILL' tag, *,
        ROUND(PRICE - REF_PRICE, 6) AS MARK_OFFSET,
        ROUND((PRICE - REF_PRICE) * 10000, 1) AS OFFSET_BPS,
        ROUND((PRICE - REF_PRICE) / NULLIF(REF_PRICE,0) * 100, 1) AS OFFSET_PCT
-FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%';
+FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%' ESCAPE '\';
 -- (b) 30d recurrence (Step 3a): same structure = same PRODUCT + same normalized DESCRIPTION as
 -- the FILL, self-derived from the FILL row (no user text). Same-coin match blocks cross-asset leaks.
 SELECT 'HIST' tag, DATE, TIME, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, BLOCK_TRADE_ID
 FROM tape
-WHERE PRODUCT IN (SELECT PRODUCT FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%')
-  AND DESC_N  IN (SELECT DESC_N  FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%')
+WHERE PRODUCT IN (SELECT PRODUCT FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%' ESCAPE '\')
+  AND DESC_N  IN (SELECT DESC_N  FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%' ESCAPE '\')
 ORDER BY DATE DESC, TIME DESC;
 "
 ```
 
-> **The tape prefixes ids with a routing tag (e.g. `DRFQv2-`). The `LIKE '%<CORE_ID>%'`
+> **The tape prefixes ids with a routing tag (e.g. `DRFQv2-`). The `LIKE '%<CORE_ID>%' ESCAPE '\'`
 > match is prefix-tolerant by construction — the `r_…` core is the stable key. Never
 > conclude "not on tape" from a miss without having run this suffix-tolerant match.**
 
@@ -73,10 +83,9 @@ Notes:
   `Cstm +1.00 Call 24 Apr 26 78000 -2.00 Call 24 Apr 26 85000`). Rows sharing a
   `BLOCK_TRADE_ID` are one block — keep them together.
 - The `HIST` rows ARE the Step 3a Paradigm-recurrence answer (count, sizes, sides,
-  most-recent). Cluster them by `BLOCK_TRADE_ID` and match the full leg set. For a
-  genuine single-leg outright, `%<EXPIRY>%<STRIKE>%` will also surface that strike
-  inside flies/spreads/ratios — count only rows whose `DESCRIPTION` is the *same
-  structure* as the recurrence; note the rest as strike-level context, not prints.
+  most-recent). Cluster them by `BLOCK_TRADE_ID` and match the full leg set —
+  count only rows whose `DESCRIPTION` is the *same structure* as the recurrence;
+  note the rest as strike-level context, not prints.
 - The tape is the **executed** tape. For RFQ-level context (fill rate, unfilled,
   lifespan) the sibling dataset is `paradigm_rfq_tape_slim` (same `RFQ_ID` key).
 - **Auth:** the STS block above assumes the IRSA role directly; no external file
@@ -84,10 +93,10 @@ Notes:
 
 **Self-test (regression guard — bare id must resolve a prefixed row):** given a
 tape row whose `RFQ_ID` is `DRFQv2-r_01H8XQ…`, the canonical query above invoked
-with the **bare** id `r_01H8XQ…` must return that row (via the `'DRFQv2-' || …`
-and `LIKE '%' || …` arms). If a bare-id lookup comes back empty on a tape known
-to carry the prefixed form, the prefix handling has regressed — fix the match
-before reporting "not on tape".
+with the **bare** id `r_01H8XQ…` must return that row (the substring
+`LIKE '%<CORE_ID>%' ESCAPE '\'` match is prefix-tolerant). If a bare-id lookup
+comes back empty on a tape known to carry the prefixed form, the prefix handling
+has regressed — fix the match before reporting "not on tape".
 
 ### 2. Fallbacks (when the tape can't be queried)
 
@@ -96,11 +105,11 @@ before reporting "not on tape".
 | Injected block-trade context | running inside the Dime/terminal session | the terminal attaches the cleared block (e.g. a `set_block_trade_context` feed) — read it directly |
 | Deribit public tape | last resort, no Paradigm tape access | reconstruct the block from `block_trade_id` clusters (SKILL Step 3b) |
 
-**If the id cannot be resolved on any source, do NOT fabricate the record.**
-Fall back to the inline `<rfq description>` for the structure, fetch live marks
-per the normal flow, and **state plainly that the RFQ could not be resolved** so
-the fill price / mark offset read as *unavailable* rather than invented. See the
-SKILL.md output rules for the failure-mode line.
+**If the id cannot be resolved on any source, do NOT fabricate the record — and
+do NOT fall back to the inline `<rfq description>` to build a structure.** With
+no resolved row the asset isn't known, so live instruments can't be built either.
+Emit only the SKILL.md Step 7 unresolved line (fill, mark, spot, size, side,
+structure all *unavailable*) and stop.
 
 ---
 
@@ -117,7 +126,7 @@ JSON. Map by the tape's actual columns:
 | `price` (fill) | `PRICE` (execution price, in `QUOTE_CURRENCY`) |
 | `mark_price` | `REF_PRICE` (reference/mark at trade time) |
 | `displayValues.markOffset` | computed: `PRICE − REF_PRICE` |
-| `venue` | from `PRODUCT` suffix — `DBT` Deribit, `PRDX` Paradex, `BYB` Bybit |
+| `venue` | from `PRODUCT` suffix — `DBT` Deribit, `PRDX` Paradex, `BYB` Bybit, `OKX` OKX |
 | `product_codes` / asset + kind | from `PRODUCT` — e.g. `BTC OPTION - DBT`, `ETH PERPETUAL - DBT`, `BTC OPTION - PRDX` |
 | `quote_currency` | `QUOTE_CURRENCY` (`BTC` / `ETH` / `USD` …) |
 | USD notional | `NOTIONAL_VOLUME_USD` |

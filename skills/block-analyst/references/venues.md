@@ -176,7 +176,7 @@ Before calling Bybit options endpoints, follow the Bybit skill Module Router:
 | Data source method | `deribit__get_ticker` | `web_fetch` | `web_fetch` (+ skill module) |
 | Paradigm venue code | `DBT` | `OKX` | — |
 
-### Trade History (90-day tape check)
+### Trade History (30-day tape check)
 
 | Venue | Method | Granularity | Notes |
 |---|---|---|---|

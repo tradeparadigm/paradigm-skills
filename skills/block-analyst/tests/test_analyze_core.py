@@ -39,6 +39,9 @@ ok(ac.offset(2.90, 2.7494, "USD")["txt"] == "+5.5%", "USD offset in percent")
 ok(ac.offset(2.90, 2.7494, "USDC")["unit"] == "%", "USDC → percent")
 # dollar-magnitude premium quoted 'BTC' (Paradex) must be % not a giant bps (the −324953 bug)
 ok(ac.offset(140.87, 173.37, "BTC")["txt"] == "-18.7%", "dollar premium → percent, not bps")
+# sub-$1 USD/USDC premium is still DOLLARS → percent, never ×10000 bps (cheap alt options)
+ok(ac.offset(0.53, 0.50, "USDC")["txt"] == "+6%", "sub-$1 USDC premium → percent, not +300 bps")
+ok(ac.offset(0.53, 0.50, "USD")["unit"] == "%", "sub-$1 USD premium → percent unit")
 
 # ── single-leg SOL call (real: /analyze … Call 31 Jul 26 88) ───────────────────
 p = ac.parse_description("Call 31 Jul 26 88")
@@ -51,6 +54,12 @@ ok(side == "Buyer" and reliable and legs[0]["sign"] == 1, "single call: Buyer, l
 # net greeks: long 1 call, delta 0.204 → +0.204 * qty
 ng = ac.net_greeks(legs, {ac.leg_key(legs[0]): {"delta": 0.204, "vega": 0.8, "gamma": 0.0, "theta": -0.1}}, 10000)
 ok(abs(ng["delta"] - 2040) < 1, "single call net delta scaled by qty")
+
+# net greeks: a leg with MISSING greeks → {} (per-leg ⚠ display), never a partial net
+p2 = ac.parse_description("ICondor  10 Jul 26  54000/56000/66000/67000")
+legs2, _, _ = ac.apply_orientation(p2, [{"SIDE": "SELL", "PRICE": 264.07, "QTY": 5}])
+gk = {ac.leg_key(l): {"delta": 0.1, "vega": 1.0, "gamma": 0.0, "theta": -0.1} for l in legs2[:3]}
+ok(ac.net_greeks(legs2, gk, 5) == {}, "missing one leg's greeks → {} not a 3-leg partial sum")
 
 # ── iron condor (real: /analyze … ICondor 10 Jul 26 54000/56000/66000/67000) ───
 p = ac.parse_description("ICondor  10 Jul 26  54000/56000/66000/67000")
@@ -84,6 +93,50 @@ ok(mid["ratio"] == 2, "fly body ratio 2")
 p = ac.parse_description("ICondor 10 Jul 26 54000/56000/66000/67000")
 legs, side, _ = ac.apply_orientation(p, [{"SIDE": "SELL", "PRICE": 264.07, "QTY": 5}])
 ok(side == "Seller", "iron condor net credit → Seller")
+
+# ── iron fly — 4 legs (2P+2C), credit reference, NOT a 3-leg put fly ───────────
+p = ac.parse_description("IFly 3 Jul 26 58000/60000/62000")
+ok(p["code"] == "BF" and len(p["legs"]) == 4, "IFly → 4 legs")
+ok(sorted((l["cp"], int(l["strike"])) for l in p["legs"]) ==
+   [("C", 60000), ("C", 62000), ("P", 58000), ("P", 60000)], "IFly legs: put wing/body + call body/wing")
+legs, side, reliable = ac.apply_orientation(p, [{"SIDE": "SELL", "PRICE": 0.02, "QTY": 10}])
+ok(side == "Seller" and reliable, "IFly net credit → Seller, reliable")
+byf = {(l["cp"], int(l["strike"])): l["sign"] for l in legs}
+ok(byf[("P", 58000)] == 1 and byf[("C", 62000)] == 1, "long IFly: long the wings")
+ok(byf[("P", 60000)] == -1 and byf[("C", 60000)] == -1, "long IFly: short the straddle body")
+
+# ── verticals — call spread ref is a debit, PUT spread ref is a CREDIT ─────────
+# call spread bought for a debit → long lo call / short hi call
+p = ac.parse_description("CSpread 31 Jul 26 60000/65000")
+ok(p["classified"] and len(p["legs"]) == 2, "call spread parsed to 2 legs")
+legs, side, reliable = ac.apply_orientation(p, [{"SIDE": "BUY", "PRICE": 0.02, "QTY": 100}])
+ok(side == "Buyer" and reliable, "call spread debit → Buyer, reliable")
+byv = {int(l["strike"]): l["sign"] for l in legs}
+ok(byv[60000] == 1 and byv[65000] == -1, "long call spread: +lo / -hi")
+# bear put spread bought for a DEBIT → long HI put / short LO put (the flip case
+# that was inverted when ref_is_debit was hardcoded True for puts)
+p = ac.parse_description("PSpread 31 Jul 26 60000/65000")
+legs, side, reliable = ac.apply_orientation(p, [{"SIDE": "BUY", "PRICE": 0.02, "QTY": 100}])
+ok(side == "Buyer" and reliable, "put spread debit → Buyer, reliable")
+byv = {int(l["strike"]): l["sign"] for l in legs}
+ok(byv[65000] == 1 and byv[60000] == -1, "bear put spread (debit): +hi / -lo")
+# bull put spread sold for a CREDIT → long lo put / short hi put (no flip)
+p = ac.parse_description("PSpread 31 Jul 26 60000/65000")
+legs, side, reliable = ac.apply_orientation(p, [{"SIDE": "SELL", "PRICE": 0.02, "QTY": 100}])
+ok(side == "Seller" and reliable, "put spread credit → Seller, reliable")
+byv = {int(l["strike"]): l["sign"] for l in legs}
+ok(byv[60000] == 1 and byv[65000] == -1, "bull put spread (credit): +lo / -hi")
+
+# ── ratio spreads are NOT 1:1 verticals → defer to the unmapped fallback ──────
+ok(ac.parse_description("CRatioSpread 27 Jun 26 60000/62000")["classified"] is False,
+   "ratio spread name → not classified (never netted 1:1)")
+
+# ── 2-digit alt strikes parse; the date's YY is never swallowed as a strike ────
+p = ac.parse_description("Strangle 28 Aug 26 88/95")
+ok(p["classified"] and sorted(int(l["strike"]) for l in p["legs"]) == [88, 95],
+   "2-digit SOL strikes parse as a strangle")
+ok(ac.parse_description("Straddle 19 Nov 25")["classified"] is False,
+   "strike-less description: year not misread as a strike")
 
 # ── RRPut — signs NOT reliably derivable from tape → defer to model ────────────
 p = ac.parse_description("RRPut 31 Jul 26 50000/70000")

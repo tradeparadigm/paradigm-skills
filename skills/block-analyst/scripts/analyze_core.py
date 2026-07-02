@@ -121,10 +121,11 @@ def parse_description(desc: str) -> dict:
 
     # Named multi-leg: <NAME> DD Mon YY  K[/K...]   (one expiry, N strikes)
     dm = re.search(_DATE, raw)
-    # strikes = the trailing a/b/c/d group
+    # strikes = the trailing a/b/c/d group AFTER the date (2-digit alt strikes
+    # like SOL 88/95 are valid; the position guard keeps the date's YY out).
     ks = []
-    km = re.search(r"(\d{3,7}(?:\s*/\s*\d{3,7})*)\s*$", raw)
-    if km:
+    km = re.search(r"(\d{2,7}(?:\s*/\s*\d{2,7})*)\s*$", raw)
+    if km and dm and km.start() >= dm.end():
         ks = [int(x) for x in re.split(r"\s*/\s*", km.group(1))]
     if dm and ks:
         d, mon, yy = dm.groups()
@@ -194,6 +195,8 @@ def _code_of(name_up: str) -> str:
         return "CO"
     if "FLY" in name_up or "BUTTERFLY" in name_up:
         return "BF"
+    if "SPREAD" in name_up or name_up in ("CS", "PS"):
+        return "PS" if name_up.startswith("P") else "CS"
     return name_up[:4]
 
 
@@ -225,14 +228,21 @@ def _named_legs(name_up: str, ks: list[int], ec: str):
         k1, k2, k3, k4 = sorted(ks)                                  # single-type condor (4 calls or 4 puts)
         cp = "P" if name_up.startswith("PCONDOR") else "C"
         return [L(cp, k1, +1), L(cp, k2, -1), L(cp, k3, -1), L(cp, k4, +1)], True  # long = debit
+    if name_up.startswith("IFLY") and len(ks) == 3:
+        k1, k2, k3 = sorted(ks)                                      # iron fly (2P+2C: put wing, straddle body, call wing)
+        return [L("P", k1, +1), L("P", k2, -1), L("C", k2, -1), L("C", k3, +1)], False  # long = credit
     if ("FLY" in name_up or "BUTTERFLY" in name_up) and len(ks) == 3:
         k1, k2, k3 = sorted(ks)
-        cp = "P" if (name_up.startswith("PFLY") or name_up.startswith("IFLY")) else "C"
+        cp = "P" if name_up.startswith("PFLY") else "C"
         return [L(cp, k1, +1), L(cp, k2, -1, 2), L(cp, k3, +1)], True  # long fly = debit (body ×2)
+    if "RATIO" in name_up:
+        return None                                                  # ratio legs aren't 1:1 → defer (unmapped)
     if ("SPREAD" in name_up or name_up in ("CS", "PS")) and len(ks) == 2:
         lo, hi = sorted(ks)
         cp = "P" if name_up.startswith("P") else "C"
-        return [L(cp, lo, +1), L(cp, hi, -1)], True
+        # [+lo, -hi] is a debit for calls (lo call is the dear leg) but a CREDIT
+        # for puts (hi put is the dear leg) — ref_is_debit must follow the type.
+        return [L(cp, lo, +1), L(cp, hi, -1)], cp == "C"
     return None
 
 
@@ -324,21 +334,19 @@ def apply_orientation(parsed: dict, rows: list[dict]) -> tuple[list[dict], str, 
 def net_greeks(legs: list[dict], greek_by_key: dict, qty: float) -> dict:
     """net_g = Σ (sign × ratio × per-leg greek) × qty, per greek.
     greek_by_key maps a leg key → {'delta','vega','gamma','theta'} (Deribit units:
-    delta/gamma in coin, vega/theta in USD). Perp legs carry delta ±1."""
+    delta/gamma in coin, vega/theta in USD). Perp legs carry delta ±1.
+    Returns {} unless EVERY leg has greeks — a partial sum is a silently wrong
+    net, so a missing leg degrades to the per-leg ⚠ display instead."""
+    if not legs or any(not greek_by_key.get(leg_key(l)) for l in legs):
+        return {}
     out = {"delta": 0.0, "vega": 0.0, "gamma": 0.0, "theta": 0.0}
-    have = False
     for l in legs:
-        g = greek_by_key.get(leg_key(l))
-        if not g:
-            continue
-        have = True
+        g = greek_by_key[leg_key(l)]
         s = l["sign"] * l["ratio"]
         for k in out:
             v = g.get(k)
             if v is not None:
                 out[k] += s * float(v)
-    if not have:
-        return {}
     return {k: v * qty for k, v in out.items()}
 
 
@@ -348,18 +356,23 @@ def leg_key(l: dict) -> str:
     return f"{l['cp']}:{int(round(l['strike']))}:{l['expiry_c']}"
 
 
+_STABLE_QUOTES = {"USD", "USDC", "USDT"}
+
+
 def offset(price: float, ref: float, quote: str = "") -> dict:
-    """Fill vs mark, unit chosen by PREMIUM MAGNITUDE (robust across venues):
-      • coin-fraction premium (|ref| < 1, e.g. BTC 0.0131) → bps (×10000)
-      • dollar-priced premium (|ref| ≥ 1, e.g. SOL $2.90 or a Paradex $140 net,
-        even when QUOTE_CURRENCY says BTC) → percent
-    A dollar premium × 10000 would print an absurd bps (the −324953 bug)."""
+    """Fill vs mark, unit chosen by QUOTE CURRENCY first, magnitude second:
+      • stable/fiat quote (USD/USDC/USDT — dollar prices, incl. a $0.50 alt
+        option) → percent; ×10000 on a dollar price is the −324953-bps bug.
+      • coin quote (BTC/ETH/SOL…) with a fraction premium (|ref| < 1, e.g.
+        BTC 0.0131) → bps (×10000).
+      • coin quote with |ref| ≥ 1 → the price is actually dollars (Paradex
+        labels $ nets 'BTC') → percent."""
     if price is None or ref is None:
         return {"txt": "n/a", "sign": 0}
     d = price - ref
     sign = 1 if d > 0 else -1 if d < 0 else 0
-    if abs(ref) < 1:                      # coin-denominated fraction
-        bps = round(d * 10000, 1)
+    if (quote or "").upper() not in _STABLE_QUOTES and abs(ref) < 1:
+        bps = round(d * 10000, 1)         # coin-denominated fraction
         return {"txt": f"{bps:+g} bps", "sign": sign, "val": bps, "unit": "bps"}
     pct = round(d / ref * 100, 1) if ref else None
     return {"txt": (f"{pct:+g}%" if pct is not None else "n/a"),

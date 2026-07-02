@@ -8,7 +8,7 @@ description: >
   the cleared-block record, then fetches live marks, IVs, and greeks per venue,
   computes net greeks for multi-leg structures, benchmarks the fill vs mark,
   reports how much of the structure traded over 24h / 7d / 30d and where else
-  it printed (Deribit, OKX, Bullish, Paradex), reads whether the flow moved the
+  it printed, reads whether the flow moved the
   vol surface, and outputs a concise analysis. Use when
   the user runs `/analyze <rfq_id> ...`, pastes a Paradigm block trade JSON,
   or asks to analyze, benchmark, or get market color on a Paradigm RFQ
@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.4"
+  version: "1.5"
 ---
 
 # Paradigm Block Trade Analyst
@@ -85,8 +85,9 @@ and ~one round-trip; the only unavoidable cost is the tape scan.
   perp combos). The per-leg greeks are already printed; apply the signs and replace that one line.
 - `⚠ UNMAPPED STRUCTURE …` / `⚠ analysis hit an error …` — the script couldn't map the structure,
   so it prints the **correct resolved tape rows** (`[Tape]`) + spot + recurrence. Build the full
-  4-row block from those: infer the legs from the description, fetch each leg on Deribit, net the
-  greeks, render. Slower, but the loaded data is authoritative — don't invent or skip.
+  4-row block from those: infer the legs from the printed tape rows' `DESCRIPTION` (resolved —
+  never from the user's inline `<rfq description>`), fetch each leg on Deribit, net the greeks,
+  render. Slower, but the loaded data is authoritative — don't invent or skip.
 - `RFQ not resolved …` — relay as-is; never invent an asset/strike/structure.
 
 Single-leg, straddles/strangles, verticals, condors/flies (iron **and** call/put), explicit-sign
@@ -110,7 +111,9 @@ The input is **`/analyze <rfq_id> <rfq description>`**. Split it:
   skill's `references/rfq-lookup.md`. **Run the tape query exactly once**; never
   issue a second tape scan in Step 3. Spot and per-leg greeks/IV are **not** in
   the tape — pull them live in Step 2; infer `strategy_code` from `DESCRIPTION`.
-  Today's date is already in your context — **do not shell out to `date`.**
+  Today's date is already in your context — **do not shell out to `date` for it**
+  (the epoch-ms `date +%s%3N` inside the manual Step 3b recipe is a window bound,
+  not a date lookup, and is fine).
   - **Id normalization:** the resolved `RFQ_ID` may carry a `DRFQv2-`/`GRFQ-`
     routing prefix; the auction type (`AUCTION` = RFQ/OB) and the `drfq`/`grfq`
     read come from that prefix + `AUCTION` — surface as `drfq`/`grfq` in the
@@ -194,6 +197,10 @@ convention reasoning.
 
 ## Step 2 — Fetch Live Data
 
+> **Live script path: skip this step.** `analyze.sh` already fetched every leg's
+> Deribit ticker/greeks. Steps 2a/2b apply on the manual fallback only (script
+> unavailable / injected data), or when filling in a `⚠ UNMAPPED` block.
+
 **Step 2a — surface anchor (one DuckDB read).** Read the hot snapshot
 for the current ATM IV per venue + recent block activity before
 hitting per-leg endpoints:
@@ -233,8 +240,13 @@ empty list is an expected result, not an error.
 
 ## Step 3 — Prior Prints & Flow Impact (last 30 days)
 
-**This is the highest-value part of the analysis. ALWAYS run the fetches below — never
-report "not checked" or defer them as optional.** The trader's first questions are: has this
+> **Live script path: skip the fetches in this step.** The script's `[History]`
+> row (Paradigm 30d recurrence from the HIST scan + Deribit leg blocks) IS the
+> Step 3 answer — relay it; do not re-run the tape query or the Deribit pulls.
+> The fetch recipes below are for the manual fallback path only.
+
+**On the manual path this is the highest-value part of the analysis. ALWAYS run the fetches
+below — never report "not checked" or defer them as optional.** The trader's first questions are: has this
 structure printed before, is one taker accumulating, and is the flow moving the market? Answer
 concretely with counts, sizes, levels, and impact.
 
@@ -247,7 +259,7 @@ context, worth a mention only if material. Never present "similar strike/expiry"
 activity as if the structure recurred. (For genuine single-leg trades — `CL`/`PL` — the leg IS
 the structure, so leg-level recurrence is the structure.)
 
-Two sources, both mandatory every time:
+Two sources, both mandatory every time on the manual path:
 
 ### 3a — Paradigm prior blocks (most important)
 Block recurrence on Paradigm is the strongest signal — a repeating block means a programmatic
@@ -433,7 +445,9 @@ data tokens separated by ` · ` or ` | `. Hard limits:
   separate fences — one `yaml` block holds all four.
 
 Shape to mirror (output exactly like this — two plain header lines, then one `yaml` block, every
-line terse and free of commentary):
+line terse and free of commentary). **This exemplar is the manual-path ceiling**: when
+`analyze.sh` rendered the block, its leaner `[History]`/`[Fair]`/`[Live]` rows are the intended
+live-path output — relay them verbatim; do not re-fetch to pad them up to the richness below:
 
 **BTC Put Calendar 60k · long Jun26 / short Sep26 · ×12.5 | Seller | Recd 0.0451 (~$35.4k) | −22 bps vs mark**
 
@@ -489,8 +503,9 @@ Spot 62,728 · 60k −4.3% OTM · long near-Γ / short far-vega · max loss at 6
 
 ## Notes
 
-- For perp legs (`product_codes` includes `DP`/`EP`): fetch `BTC-PERPETUAL` /
-  `ETH-PERPETUAL` mark price from available source; delta = ±1.0 per contract.
+- For perp legs (tape `PRODUCT` says `PERPETUAL`, e.g. `BTC PERPETUAL - DBT`):
+  fetch `BTC-PERPETUAL` / `ETH-PERPETUAL` mark price from available source;
+  delta = ±1.0 per contract.
 - For combo trades (option + perp), compute combined delta including perp leg.
 - OKX uses USDC-margined options (`BTC-USD_UM`); prices are in BTC terms but
   Greeks may differ slightly from coin-margined Deribit options. Flag when relevant.

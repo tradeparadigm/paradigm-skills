@@ -25,8 +25,9 @@ Resolve direction once from `SIDE` + this convention; do not re-derive it multip
 
 ## Perp Combo Legs
 
-When `product_codes` includes `DP` (BTC perp) or `EP` (ETH perp), the trade
-contains one or more perpetual futures legs alongside option legs.
+When a tape row's `PRODUCT` says `PERPETUAL` (e.g. `BTC PERPETUAL - DBT`,
+`ETH PERPETUAL - DBT`), the trade contains one or more perpetual futures legs
+alongside option legs.
 
 - Perp delta = ±1.0 per contract (sign from taker direction)
 - Use `BTC-PERPETUAL` / `ETH-PERPETUAL` instrument names on Deribit for mark price
