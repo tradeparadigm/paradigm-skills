@@ -207,6 +207,26 @@ def _sk(strike):
     return f"{k//1000}k" if k >= 1000 and k % 1000 == 0 else str(k)
 
 
+def _struct_name(code, legs):
+    """Human structure name; condor/fly reflect leg composition (a 4-call block is a
+    Call Condor, not an Iron Condor). Perp/future leg noted."""
+    opt = [l for l in legs if l["cp"] != "FUT"]
+    perp = " + perp" if any(l["cp"] == "FUT" for l in legs) else ""
+    allc = bool(opt) and all(l["cp"] == "C" for l in opt)
+    allp = bool(opt) and all(l["cp"] == "P" for l in opt)
+    if code == "CO":
+        base = "Call Condor" if allc else "Put Condor" if allp else "Iron Condor"
+    elif code == "BF":
+        base = "Call Fly" if allc else "Put Fly" if allp else "Iron Fly"
+    elif code == "combo":
+        base = ("Risk Reversal" if (any(l["cp"] == "C" for l in opt) and any(l["cp"] == "P" for l in opt)
+                                    and len(opt) == 2) else "Combo")
+    else:
+        base = {"CL": "Call", "PL": "Put", "ST": "Straddle", "SN": "Strangle",
+                "RR": "Risk Reversal", "CA": "Calendar", "CM": "Custom"}.get(code, code)
+    return base + perp
+
+
 def render(r) -> str:
     a = r["asset"]
     legs = r["legs"]
@@ -214,9 +234,7 @@ def render(r) -> str:
     strikes = "/".join(_sk(l["strike"]) for l in legs if l["cp"] != "FUT")
     verb = "Paid" if r["fill_net"] >= 0 else "Recd"
     fillabs = abs(r["fill_net"])
-    struct = {"CL": "Call", "PL": "Put", "ST": "Straddle", "SN": "Strangle",
-              "RR": "Risk Reversal", "CO": "Iron Condor", "BF": "Butterfly",
-              "CA": "Calendar", "CM": "Custom"}.get(r["structure"], r["structure"])
+    struct = _struct_name(r["structure"], legs)
     L = []
     L.append(f"**{a} {exp} {strikes} {struct} · ×{r['qty']:g} | {r['side']} | "
              f"{verb} {fillabs:g} | {r['offset']['txt']} vs mark**")
