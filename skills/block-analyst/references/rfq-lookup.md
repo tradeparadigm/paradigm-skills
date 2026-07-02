@@ -45,10 +45,13 @@ FROM read_csv_auto('s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_sl
 WHERE RFQ_ID LIKE '%<CORE_ID>%'
    OR DATE >= (CURRENT_DATE - INTERVAL 30 DAY);
 -- (a) the cleared block — authoritative for every field. Asset ← PRODUCT (never assume BTC),
--- structure ← DESCRIPTION. OFFSET_BPS precomputed so the bps token never needs hand-arithmetic.
+-- structure ← DESCRIPTION. Offsets precomputed: OFFSET_BPS (×10000) for COIN-quoted premiums
+-- (BTC/ETH); OFFSET_PCT (% of mark) for USD/USDC-quoted premiums (SOL/alts — dollar prices,
+-- where ×10000 bps is meaningless). Pick by QUOTE_CURRENCY. Never hand-compute the offset.
 SELECT 'FILL' tag, *,
        ROUND(PRICE - REF_PRICE, 6) AS MARK_OFFSET,
-       ROUND((PRICE - REF_PRICE) * 10000, 1) AS OFFSET_BPS
+       ROUND((PRICE - REF_PRICE) * 10000, 1) AS OFFSET_BPS,
+       ROUND((PRICE - REF_PRICE) / NULLIF(REF_PRICE,0) * 100, 1) AS OFFSET_PCT
 FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%';
 -- (b) 30d recurrence (Step 3a): same structure = same PRODUCT + same normalized DESCRIPTION as
 -- the FILL, self-derived from the FILL row (no user text). Same-coin match blocks cross-asset leaks.

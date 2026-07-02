@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.11"
+  version: "1.12"
 ---
 
 # Paradigm Block Trade Analyst
@@ -113,10 +113,13 @@ SELECT DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE,
 FROM read_csv_auto('s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz')
 WHERE RFQ_ID LIKE '%<CORE_ID>%'
    OR DATE >= (CURRENT_DATE - INTERVAL 30 DAY);
--- FILL: authoritative — asset from PRODUCT, structure from DESCRIPTION. OFFSET_BPS precomputed.
+-- FILL: authoritative — asset from PRODUCT, structure from DESCRIPTION. Offsets precomputed:
+-- OFFSET_BPS (×10000) is for COIN-quoted premiums (BTC/ETH, e.g. 0.0004 → 4 bps);
+-- OFFSET_PCT (% of mark) is what to show for USD/USDC-quoted premiums (SOL/alts, dollar prices).
 SELECT 'FILL' tag, *,
        ROUND(PRICE - REF_PRICE, 6) AS MARK_OFFSET,
-       ROUND((PRICE - REF_PRICE) * 10000, 1) AS OFFSET_BPS
+       ROUND((PRICE - REF_PRICE) * 10000, 1) AS OFFSET_BPS,
+       ROUND((PRICE - REF_PRICE) / NULLIF(REF_PRICE,0) * 100, 1) AS OFFSET_PCT
 FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%';
 -- HIST: same structure recurring in 30d — self-derived from the FILL, no user text involved.
 SELECT 'HIST' tag, DATE, TIME, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, BLOCK_TRADE_ID
@@ -130,10 +133,15 @@ ORDER BY DATE DESC, TIME DESC;
 (If `FILL` comes back empty the id isn't on the tape — `HIST` will also be empty; report the RFQ
 unresolved per Step 7 and never substitute an asset/strike/structure.)
 
-The query returns `OFFSET_BPS` (= `(PRICE−REF_PRICE)×10000`, signed) already computed —
-**use it verbatim** for the `±N bps vs mark` token in the header and `[Fair]`. Do NOT
-recompute bps by hand (that is where the wobble comes from): a −0.0004 offset is **−4 bps**,
-not −40. `Paid`/`Recd`, `above`/`below` follow the sign of `MARK_OFFSET`.
+**Fill-vs-mark token — pick the unit by `QUOTE_CURRENCY`, use the precomputed value verbatim
+(never hand-arithmetic):**
+- **Coin-quoted** (`QUOTE_CURRENCY` = BTC/ETH — premium is a coin fraction): use **`OFFSET_BPS`**
+  as `±N bps vs mark` (a −0.0004 offset is **−4 bps**, not −40).
+- **USD/USDC-quoted** (SOL and other alts — premium is a dollar price like 2.90): `OFFSET_BPS` is
+  meaningless (×10000 → absurd `+1506 bps`). Use **`OFFSET_PCT`** as `±N% vs mark` (optionally the
+  absolute `±$MARK_OFFSET`), e.g. `+5.5% vs mark`. Never print a bps figure for a USD-quoted premium.
+
+`Paid`/`Recd` and `above`/`below` follow the sign of `MARK_OFFSET`.
 
 The input is **`/analyze <rfq_id> <rfq description>`**. Split it:
 
