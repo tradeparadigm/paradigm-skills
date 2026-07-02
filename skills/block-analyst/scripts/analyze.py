@@ -23,6 +23,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import sys
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -245,6 +246,19 @@ def _sk(strike):
     return f"{k//1000}k" if k >= 1000 and k % 1000 == 0 else str(k)
 
 
+def _exp_short(ec):
+    """Compact expiry '31JUL26' → '31Jul' (drop year) for terse leg tags."""
+    m = re.match(r"(\d+)([A-Za-z]{3})", ec or "")
+    return f"{m.group(1)}{m.group(2).title()}" if m else (ec or "")
+
+
+def _leg_lbl(l, multi_exp):
+    """Per-leg label '60500C'; append '·3Jul' only when the structure spans >1 expiry
+    (calendars/diagonals) so same-strike legs are distinguishable — else stays clean."""
+    base = f"{_sk(l['strike'])}{l['cp']}"
+    return f"{base}·{_exp_short(l.get('expiry'))}" if multi_exp and l.get("expiry") else base
+
+
 def _struct_name(code, legs):
     """Human structure name; condor/fly reflect leg composition (a 4-call block is a
     Call Condor, not an Iron Condor). Perp/future leg noted."""
@@ -308,6 +322,8 @@ def render(r) -> str:
             ("signs verified" if r["reliable_signs"] else "net greeks: confirm signs from legs below"))
     L.append(f"Spot {sp} · {struct} · {note} · drfq/{r['venue']}")
     L.append("")
+    # tag legs with expiry only when the structure spans >1 expiry (calendars/diagonals)
+    multi_exp = len({l.get("expiry") for l in legs if l["cp"] != "FUT" and l.get("expiry")}) > 1
     L.append("```yaml")
     # [Greeks]
     ng = r["net_greeks"]
@@ -316,11 +332,11 @@ def render(r) -> str:
                  f"Γ {ng['gamma']:+.4f} · Θ {ng['theta']:+,.0f}/d")
     else:
         per = " · ".join(
-            f"{_sk(l['strike'])}{l['cp']} Δ{(l['tkr'] or {}).get('delta')}"
+            f"{_leg_lbl(l, multi_exp)} Δ{(l['tkr'] or {}).get('delta')}"
             for l in legs if l["cp"] != "FUT" and l.get("tkr"))
         L.append(f"[Greeks]   ⚠ net: confirm signs — per-leg: {per}")
     # [Fair]
-    ivs = " / ".join(f"{_sk(l['strike'])}{l['cp']} {(l['tkr'] or {}).get('iv')}v"
+    ivs = " / ".join(f"{_leg_lbl(l, multi_exp)} {(l['tkr'] or {}).get('iv')}v"
                      for l in legs if l["cp"] != "FUT" and l.get("tkr"))
     L.append(f"[Fair]     {r['offset']['txt']} vs mark · {ivs}")
     # [History]
@@ -328,7 +344,7 @@ def render(r) -> str:
     L.append(f"[History]  {r['recurrence_blocks']} same-structure block(s) on Paradigm 30d · "
              f"Deribit leg blocks 30d: {d30}")
     # [Live]
-    live = " · ".join(f"{_sk(l['strike'])}{l['cp']} {(l['tkr'] or {}).get('bid')}/{(l['tkr'] or {}).get('ask')}"
+    live = " · ".join(f"{_leg_lbl(l, multi_exp)} {(l['tkr'] or {}).get('bid')}/{(l['tkr'] or {}).get('ask')}"
                       for l in legs if l["cp"] != "FUT" and l.get("tkr"))
     L.append(f"[Live]     {live}")
     L.append("```")
