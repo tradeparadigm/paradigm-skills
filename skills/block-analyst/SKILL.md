@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.14"
+  version: "1.15"
 ---
 
 # Paradigm Block Trade Analyst
@@ -87,10 +87,18 @@ regardless of where the block executed — Deribit lists the same BTC/ETH strike
 reference. **Do NOT fire per-instrument Paradex or Bullish REST option lookups** (`api.prod.paradex.trade`,
 `api.exchange.bullish.com`): their option naming differs, the calls usually 404, and 4 of them
 serialized inside the exec is what stretched an iron-condor to ~45s. The fill benchmark is the tape
-`REF_PRICE`/`OFFSET_PCT` (already resolved) vs Deribit's live mark — that's enough. **Never call `session_status`, and never spend a whole turn on `date -u` to "check the year"** —
-today's date is in your context; those are pure wasted round-trips. (Using `date +%s%3N` *inside*
-the trades `exec` to build the 30d window is fine — that's not a separate round.) Confirm an
-instrument exists before treating an empty ticker as "no data".
+`REF_PRICE`/`OFFSET_PCT` (already resolved) vs Deribit's live mark — that's enough. **Never call `session_status`, and never spend a whole turn on `date -u` to "check the year".**
+The tape and the pod clock are **in 2026 — that is the correct, current date, NOT the future**.
+Trades stamped `2026-07-…` are **today's live prints**; do not second-guess them or shell out to
+`date` to verify the year (that burns a whole round and recurs on every multi-leg). Today's date is
+already in your context — trust it. (Using `date +%s%3N` *inside* the trades `exec` to build the 30d
+window is fine — that's not a separate round.) Confirm an instrument exists before treating an empty
+ticker as "no data".
+
+**One live round, hard rule.** Tickers and 30d trades go in the **same** batch — do NOT fetch
+tickers, look at them, then fetch trades in a later turn. Each extra round adds ~10s. If you catch
+yourself about to open a second live turn, stop: you already have the instrument names; everything
+live could have gone together.
 
 > **⛔ BOUND THE ANALYSIS — this is a 4-row block, not a research note.** Do the *minimum*
 > reasoning needed to fill the rows, then emit. On multi-leg trades, unbounded deliberation
