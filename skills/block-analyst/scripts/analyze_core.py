@@ -150,6 +150,31 @@ def parse_description(desc: str) -> dict:
             "classified": False, "raw": raw}
 
 
+_LEG_RE = re.compile(
+    r"(?:([+-]?\d*\.?\d+)\s+)?(Call|Put|C|P)\s+(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2})\s+(\d+)")
+
+
+def extract_legs_generic(desc: str) -> list[dict]:
+    """Best-effort: pull every `[±ratio] Type DD Mon YY Strike` leg out of ANY
+    description, even one whose structure name we don't map. Used as a fallback so
+    an unmapped-but-leg-listing structure still gets per-leg instruments fetched and
+    correct data shown (signs kept only where the description states them; else None
+    → the model assigns them). Returns [] when the description gives no explicit legs
+    (e.g. a named structure that lists only strikes) — caller then shows the raw rows."""
+    legs = []
+    for m in _LEG_RE.finditer(desc or ""):
+        r_, cp, d, mon, yy, k = m.groups()
+        sign, ratio = None, 1.0
+        if r_ is not None:
+            ratio = abs(float(r_))
+            sign = -1 if float(r_) < 0 else 1
+        lg = _leg(cp, k, ratio, sign, compact_expiry(d, mon, yy))
+        if sign is not None:
+            lg["_explicit"] = True
+        legs.append(lg)
+    return legs
+
+
 def _uniq_exp(legs):
     out = []
     for l in legs:

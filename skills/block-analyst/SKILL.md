@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.20"
+  version: "1.21"
 ---
 
 # Paradigm Block Trade Analyst
@@ -80,12 +80,17 @@ in the right unit, recurrence) and prints the finished block. **Do not** re-fetc
 recompute, add commentary, or run extra steps — its stdout already is the analysis. Deterministic
 and ~one round-trip; the only unavoidable cost is the tape scan.
 
-**The one thing you may finalise:** if a `[Greeks]` row is printed as `⚠ net: confirm signs …`
-(risk reversals, calendars, exotic customs — where the taker's per-leg long/short isn't reliably
-derivable from the tape), read the per-leg greeks the script already printed, apply the signs, and
-replace that one line. Single-leg, straddles/strangles, verticals, iron condors, and explicit-sign
-customs come back already-netted — relay them verbatim. If `analyze.sh` prints an `RFQ not resolved`
-line, relay it as-is (never invent an asset/strike/structure).
+**Safe fallbacks (correctness > speed — finish these yourself; the script never guesses):**
+- `[Greeks] ⚠ net: confirm signs …` — signs not reliably derivable (risk reversals, calendars,
+  perp combos). The per-leg greeks are already printed; apply the signs and replace that one line.
+- `⚠ UNMAPPED STRUCTURE …` / `⚠ analysis hit an error …` — the script couldn't map the structure,
+  so it prints the **correct resolved tape rows** (`[Tape]`) + spot + recurrence. Build the full
+  4-row block from those: infer the legs from the description, fetch each leg on Deribit, net the
+  greeks, render. Slower, but the loaded data is authoritative — don't invent or skip.
+- `RFQ not resolved …` — relay as-is; never invent an asset/strike/structure.
+
+Single-leg, straddles/strangles, verticals, condors/flies (iron **and** call/put), explicit-sign
+customs, and per-leg-row combos come back **already-netted** — relay them verbatim.
 
 Steps 1–7 below are the **contract the script implements** and the **fallback** when scripts/tools
 are unavailable (then follow them by hand — the manual tape recipe is in

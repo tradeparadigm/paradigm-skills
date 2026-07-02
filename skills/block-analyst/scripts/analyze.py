@@ -99,7 +99,23 @@ def main():
     ap.add_argument("--now-ms", type=int)
     ap.add_argument("--render", action="store_true")
     args = ap.parse_args()
+    try:
+        _run(args)
+    except Exception as e:  # noqa: BLE001 — never a traceback; degrade to raw rows
+        rows = _read_csv(os.path.join(args.csv_dir, "fill.csv"))
+        if not rows:
+            print("RFQ not resolved / analysis error — no data available.")
+            return
+        print(f"⚠ analysis hit an error ({type(e).__name__}) — the resolved tape rows below "
+              f"are correct; build the block from them (fetch each leg on Deribit):")
+        print("```yaml")
+        for r in rows:
+            print(f"  {r.get('SIDE')} {r.get('QTY')} @ {r.get('PRICE')} (ref {r.get('REF_PRICE')}) "
+                  f"· {r.get('DESCRIPTION')} · {r.get('PRODUCT')}")
+        print("```")
 
+
+def _run(args):
     import time
     now_ms = args.now_ms or int(time.time() * 1000)
 
@@ -118,6 +134,7 @@ def main():
     # Two tape shapes: (a) one combined-DESCRIPTION block (ICondor/Cstm/single) →
     # parse fill[0]; (b) one row PER LEG, each a single-leg desc or a perp/future →
     # build legs from the rows, sign straight from each row's SIDE (most reliable).
+    unmapped = False
     legs = ac.legs_from_rows(fill)
     if legs is not None:
         side = "Buyer" if ac.net_cash(fill) > 0 else "Seller"
@@ -127,7 +144,22 @@ def main():
         parsed = {"code": "combo"}
     else:
         parsed = ac.parse_description(desc)
-        legs, side, reliable = ac.apply_orientation(parsed, fill)
+        if parsed["classified"] and parsed["legs"]:
+            legs, side, reliable = ac.apply_orientation(parsed, fill)
+        else:
+            # Structure name not mapped. Safe fallback ladder (correctness > speed):
+            # 1) if the description still lists explicit legs (Type/date/strike), pull
+            #    them → we can fetch correct per-leg data; model assigns the net.
+            # 2) otherwise legs stay empty → emit the raw tape rows + strikes and let
+            #    the model build the whole block. Never a confident empty/guessed block.
+            legs = ac.extract_legs_generic(desc)
+            side = "Buyer" if ac.net_cash(fill) > 0 else "Seller"
+            # explicit per-leg signs are authoritative even under an unmapped name →
+            # still net reliably; otherwise defer to the model.
+            reliable = (bool(legs)
+                        and all(l.get("sign") is not None for l in legs)
+                        and not any(l["cp"] == "FUT" for l in legs))
+            unmapped = True
 
     # instruments: each option leg + the perp for spot
     syms = []
@@ -187,12 +219,18 @@ def main():
     result = {
         "asset": asset, "venue": prod["venue"], "structure": parsed["code"],
         "desc": desc, "side": side, "qty": qty, "reliable_signs": reliable,
-        "spot": spot, "quote": quote,
+        "unmapped": unmapped, "spot": spot, "quote": quote,
         "fill_net": round(fill_net, 6), "ref_net": round(ref_net, 6), "offset": off,
         "legs": [{"cp": l["cp"], "strike": l["strike"], "ratio": l["ratio"],
                   "sign": l["sign"], "expiry": l.get("expiry_c"), "sym": l.get("_sym"),
                   "tkr": tickers.get(l.get("_sym")), "trades": buckets.get(l.get("_sym"))}
                  for l in legs],
+        # raw tape rows — the authoritative ground truth for the model to build from
+        # in the unmapped/⚠ cases (always correct straight from the resolved block).
+        "fill_rows": [{"desc": r.get("DESCRIPTION"), "side": r.get("SIDE"),
+                       "qty": ac._f(r.get("QTY")), "price": ac._f(r.get("PRICE")),
+                       "ref": ac._f(r.get("REF_PRICE")), "product": r.get("PRODUCT")}
+                      for r in fill],
         "net_greeks": ng, "recurrence_blocks": recurrence, "warnings": WARN,
     }
 
@@ -230,17 +268,45 @@ def _struct_name(code, legs):
 def render(r) -> str:
     a = r["asset"]
     legs = r["legs"]
-    exp = legs[0]["expiry"] if legs else "?"
-    strikes = "/".join(_sk(l["strike"]) for l in legs if l["cp"] != "FUT")
     verb = "Paid" if r["fill_net"] >= 0 else "Recd"
     fillabs = abs(r["fill_net"])
+
+    # SAFE FALLBACK — structure not mapped AND no legs could be extracted. Do NOT
+    # emit a confident empty block: print the authoritative tape rows + recurrence and
+    # tell the model to build the analysis from them (correct data, slower).
+    if not legs:
+        L = [f"⚠ UNMAPPED STRUCTURE — build the block from the raw tape rows below "
+             f"(resolved & correct); infer legs from the description, fetch each leg on "
+             f"Deribit, net the greeks.",
+             "",
+             f"**{a} · {r['desc'].strip()} · ×{r['qty']:g} | {r['side']} | "
+             f"{verb} {fillabs:g} | {r['offset']['txt']} vs mark** · drfq/{r['venue']}",
+             "",
+             "```yaml",
+             f"[Tape]  {len(r['fill_rows'])} fill row(s):"]
+        for row in r["fill_rows"]:
+            L.append(f"        {row['side']} {row['qty']:g} @ {row['price']} "
+                     f"(ref {row['ref']}) · {row['desc']}")
+        L.append(f"[Recur] {r['recurrence_blocks']} same-structure block(s) on Paradigm 30d")
+        sp = f"{r['spot']:,.0f}" if r.get("spot") else "n/a"
+        L.append(f"[Spot]  {sp}")
+        L.append("```")
+        if r["warnings"]:
+            L.append(f"<!-- warnings: {'; '.join(r['warnings'])} -->")
+        return "\n".join(L)
+
+    exp = legs[0]["expiry"] if legs else "?"
+    strikes = "/".join(_sk(l["strike"]) for l in legs if l["cp"] != "FUT")
     struct = _struct_name(r["structure"], legs)
     L = []
     L.append(f"**{a} {exp} {strikes} {struct} · ×{r['qty']:g} | {r['side']} | "
              f"{verb} {fillabs:g} | {r['offset']['txt']} vs mark**")
     sp = f"{r['spot']:,.0f}" if r.get("spot") else "n/a"
     L.append("")
-    L.append(f"Spot {sp} · {struct} · {'signs verified' if r['reliable_signs'] else 'net greeks: confirm signs from legs below'} · drfq/{r['venue']}")
+    note = ("⚠ unmapped structure — verify legs & net signs from the data below"
+            if r.get("unmapped") else
+            ("signs verified" if r["reliable_signs"] else "net greeks: confirm signs from legs below"))
+    L.append(f"Spot {sp} · {struct} · {note} · drfq/{r['venue']}")
     L.append("")
     L.append("```yaml")
     # [Greeks]

@@ -132,5 +132,16 @@ ok(ac.legs_from_rows(ic_rows) is None, "combined-desc block → not per-leg (par
 ok(ac.net_cash([{"SIDE": "BUY", "PRICE": 2.9, "QTY": 10}]) == 29.0, "net_cash BUY debit")
 ok(ac.net_cash([{"SIDE": "SELL", "PRICE": 2.9, "QTY": 10}]) == -29.0, "net_cash SELL credit")
 
+# ── fallbacks for unmapped structures ──────────────────────────────────────────
+# a description that lists explicit legs (even under an unknown name) → extractable
+gl = ac.extract_legs_generic("Seagull -1 Put 31 Jul 26 55000 +1 Call 31 Jul 26 70000")
+ok(len(gl) == 2 and {l["cp"] for l in gl} == {"P", "C"}, "generic extract pulls explicit legs")
+ok(gl[0]["sign"] == -1 and gl[1]["sign"] == 1, "generic extract keeps explicit signs")
+# a named structure that lists only strikes (no per-leg types) → nothing to extract
+ok(ac.extract_legs_generic("Strangle 28 Aug 26 57000/68000") == [], "no explicit legs → empty (raw-rows fallback)")
+# an unmapped structure name → parse_description does NOT classify (→ fallback ladder)
+up = ac.parse_description("Seagull 31 Jul 26 55000/60000/70000")
+ok(up["classified"] is False, "unmapped name → not classified")
+
 print(f"\n{_p} passed, {_f} failed")
 sys.exit(1 if _f else 0)
