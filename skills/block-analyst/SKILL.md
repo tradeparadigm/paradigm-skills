@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.8"
+  version: "1.9"
 ---
 
 # Paradigm Block Trade Analyst
@@ -73,6 +73,15 @@ leg's ticker and every leg's Step 3b pull **in the same one batch** — put each
 pull in its **own parallel `exec`**, NOT a serial `for LEG in …` bash loop (a loop runs the
 1000-trade fetches back-to-back and is the main reason multi-leg felt slow). N legs → N
 concurrent execs, still one round. Do not add extra rounds per leg.
+
+> **⛔ BOUND THE ANALYSIS — this is a 4-row block, not a research note.** Do the *minimum*
+> reasoning needed to fill the rows, then emit. On multi-leg trades, unbounded deliberation
+> has exhausted the output budget and **truncated the block mid-row** — that is a failure.
+> In reasoning AND output, do **NOT**: compute P&L or mark-to-close, attribute P&L to
+> individual vol moves, model max-loss scenarios, or reconcile prior prints leg-by-leg.
+> Resolve structure/direction **once** (Step 1 convention), net the greeks **once** (Step 4),
+> read recurrence counts straight from the query's `HIST`/tape buckets. Do not re-derive or
+> second-guess. Keep internal reasoning tight — a calendar needs no more thinking than a call.
 
 **Combined tape read (run this exact `exec` — no need to open `references/rfq-lookup.md`
 on the hot path; it holds the field mapping + fallbacks only).** Substitute three tokens:
@@ -311,6 +320,11 @@ total contracts in each), so the reader sees whether this is fresh flow today or
 program — e.g. "24h: 3 blocks / 85x · 7d: 5 / 140x · 30d: 7 / 180x".
 
 ### 3c — Flow impact (when the structure printed in multiple clips recently)
+**Scope guard:** this clip-by-clip detail is for **single-leg / same-strike** accumulation. For
+**multi-leg** structures (calendars, spreads, flies) do NOT build a per-leg, per-clip vol/spread
+table — collapse it to one line (clip count + side + net level) and move on. The per-leg clip
+matrix is the biggest thinking-time sink and has truncated the block; keep it to a line.
+
 When a leg/structure has traded in several clips — especially same-day, same side — quantify the
 accumulation footprint (this is what matters when one taker is working an order):
 Show this clip-by-clip (a small table is fine here), and for **every clip include the traded
@@ -393,7 +407,10 @@ mark_pnl_per_unit   = structure_value_now - entry_cost
 total_pnl           = mark_pnl_per_unit × quantity × spot_price
 ```
 
-Only compute P&L when asked or when the trade was previously analyzed in session.
+Only compute P&L when asked or when the trade was previously analyzed in session. **Otherwise do
+not do P&L math even in your reasoning** — no mark-to-close, no per-leg vol-move P&L attribution.
+On a fresh `/analyze` the block has no P&L token, so computing it is pure wasted thinking time
+(and on multi-leg it has overrun the output budget). Skip it entirely unless the user asks.
 
 ## Step 7 — Output Format
 
