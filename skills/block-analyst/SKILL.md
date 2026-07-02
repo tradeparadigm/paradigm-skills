@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.3"
+  version: "1.4"
 ---
 
 # Paradigm Block Trade Analyst
@@ -52,38 +52,94 @@ greeks").
 > **Only emit the Step 7 unresolved-failure line after the suffix-tolerant query
 > genuinely returns zero rows on both the trade + RFQ tapes.**
 
+### Resolve by the ID FIRST — the description is NOT authoritative
+
+> **⚠️ The `<rfq_id>` is the ONLY authoritative input.** The `<rfq description>` after it
+> (`Call 31 Jul 26 88`) is **user reference only** — a human label that may omit the asset or
+> mis-state the strike/structure. **Never build instruments, tape filters, greeks, or the
+> output structure from the description.** Everything the block reports is derived from the
+> **resolved tape row**. (Deriving `BTC-…-88-C` from that text is exactly what turned a SOL
+> call into a hallucinated BTC straddle — so don't guess an instrument before the ID resolves.)
+
+### Live path — run ONE script, relay its output
+
+**If the trade row / block JSON is already injected in the prompt (evals, a terminal feed) or
+`exec`/`uv`/S3 aren't available, skip the script** and render the block directly from that data via
+Steps 1–7. Otherwise use the script:
+
+**Run one command and relay its stdout as your entire reply:**
+
+```bash
+bash scripts/analyze.sh <rfq_id>      # the id only; ignore any description after it
+```
+
+`analyze.sh` does everything — STS bootstrap, the single DuckDB tape scan (resolve the
+`FILL` row by `RFQ_ID` + the 30d same-structure `HIST`, ID-authoritative), then `analyze.py`
+(concurrent Deribit fetch of every leg's ticker + 30d trades, net greeks, fill-vs-mark offset
+in the right unit, recurrence) and prints the finished block. **Do not** re-fetch, reformat,
+recompute, add commentary, or run extra steps — its stdout already is the analysis. Deterministic
+and ~one round-trip; the only unavoidable cost is the tape scan.
+
+**Safe fallbacks (correctness > speed — finish these yourself; the script never guesses):**
+- `[Greeks] ⚠ net: confirm signs …` — signs not reliably derivable (risk reversals, calendars,
+  perp combos). The per-leg greeks are already printed; apply the signs and replace that one line.
+- `⚠ UNMAPPED STRUCTURE …` / `⚠ analysis hit an error …` — the script couldn't map the structure,
+  so it prints the **correct resolved tape rows** (`[Tape]`) + spot + recurrence. Build the full
+  4-row block from those: infer the legs from the description, fetch each leg on Deribit, net the
+  greeks, render. Slower, but the loaded data is authoritative — don't invent or skip.
+- `RFQ not resolved …` — relay as-is; never invent an asset/strike/structure.
+
+Single-leg, straddles/strangles, verticals, condors/flies (iron **and** call/put), explicit-sign
+customs, and per-leg-row combos come back **already-netted** — relay them verbatim.
+
+Steps 1–7 below are the **contract the script implements** and the **fallback** when scripts/tools
+are unavailable (then follow them by hand — the manual tape recipe is in
+[`references/rfq-lookup.md`](references/rfq-lookup.md)). You normally never need them on the live path.
+
 The input is **`/analyze <rfq_id> <rfq description>`**. Split it:
 
 - **`<rfq_id>`** — the first token after `/analyze`. This is the authoritative
-  key. **Resolve it by searching the Paradigm trade tape via the
-  `paradigm-data-discovery` skill** — query `paradigm_trade_tape_slim`
-  `WHERE RFQ_ID = '<rfq_id>'` to retrieve the cleared block: `DESCRIPTION`
-  (structure), `PRICE` (fill), `REF_PRICE` (mark), `QTY`, `SIDE`, `PRODUCT`
-  (venue + asset + kind), `QUOTE_CURRENCY`, `NOTIONAL_VOLUME_USD`. That skill
-  owns the S3 catalog, the IRSA credentials, and the DuckDB query path. Spot and
-  per-leg greeks/IV are **not** in the tape — pull them live in Step 2; infer
-  `strategy_code` from `DESCRIPTION`. The exact query, field mapping, and
-  fallback order (injected block-trade context → Deribit tape) are in
-  [`references/rfq-lookup.md`](references/rfq-lookup.md).
+  key. **Resolve it with the single combined tape read in
+  [`references/rfq-lookup.md`](references/rfq-lookup.md)** — that one `exec`
+  scans the gzipped tape **once** and returns BOTH the cleared block (`FILL`
+  row: `DESCRIPTION`, `PRICE`, `REF_PRICE`, `QTY`, `SIDE`, `PRODUCT`,
+  `QUOTE_CURRENCY`, `NOTIONAL_VOLUME_USD`) **and** the 30d recurrence of the
+  same structure (`HIST` rows — this IS the Step 3a answer). The STS/IRSA
+  credential bootstrap is inlined in that recipe, so **do not open
+  `paradigm-data-discovery`'s `SKILL.md` or `s3-access.md`** — read only this
+  skill's `references/rfq-lookup.md`. **Run the tape query exactly once**; never
+  issue a second tape scan in Step 3. Spot and per-leg greeks/IV are **not** in
+  the tape — pull them live in Step 2; infer `strategy_code` from `DESCRIPTION`.
+  Today's date is already in your context — **do not shell out to `date`.**
   - **Id normalization:** the resolved `RFQ_ID` may carry a `DRFQv2-`/`GRFQ-`
     routing prefix; the auction type (`AUCTION` = RFQ/OB) and the `drfq`/`grfq`
     read come from that prefix + `AUCTION` — surface as `drfq`/`grfq` in the
     output, don't echo the raw `DRFQv2-` tag.
-- **`<rfq description>`** — the free-text remainder. A human-readable **hint**,
-  not the source of truth: use it to cross-check the resolved record, to
-  disambiguate, and as a structure fallback if the lookup fails. **The retrieved
-  record always wins for numeric fields** — the description never overrides a
-  fetched number. If the id resolves to a trade that materially disagrees with
-  the description (different strikes/expiry/structure), say so rather than
-  silently proceeding.
+- **`<rfq description>`** — the free-text remainder. **User reference only — NOT an input to
+  the analysis.** Do not use it to pick the asset, build instrument names, filter the tape, or
+  determine the structure; all of that comes from the resolved `FILL` row. It may be incomplete
+  (omits the asset) or simply wrong. The one allowed use: if the resolved row materially
+  disagrees with what the description implied, you may add a short note that the id resolved to a
+  different trade — but the resolved row still governs every field. **Never** let the description
+  seed a live fetch before Round 1 resolves.
 
 Do the resolution **silently** (no "resolving the RFQ" narration) and feed the
 record into Step 1. If a full JSON is pasted directly instead of an `rfq_id`,
-skip the lookup and parse it as-is. **If the id cannot be resolved on any
-source** (tape unreachable / no credentials / not on the tape), do **not** invent
-the trade: fall back to the inline description for structure + live marks, and
-lead the output with the one-line failure note in Step 7 so the fill, mark, and
-spot read as *unavailable* rather than fabricated.
+skip the lookup and parse it as-is. **If the id cannot be resolved** (tape unreachable / no
+credentials / not on the tape), do **not** invent the trade and do **not** fall back to the
+`<rfq description>` to build a structure — with no resolved row you don't know the asset, so you
+can't build correct live instruments either. Emit only the Step 7 unresolved line (fill, mark,
+spot, size, side, structure all *unavailable*). An honest "unresolved" beats a fabricated block.
+
+> **Never fabricate the asset or structure.** Two hard rules, both from a real miss where a
+> SOL call got reported as a BTC straddle:
+> 1. **Get it right the first time — no wrong-then-"Wait, actually…" self-corrections in the
+>    output.** If you assumed an asset and the tape `PRODUCT` disagrees, that means you should
+>    have read `PRODUCT` first — do the resolution before emitting, not after. Only ONE block.
+> 2. If the FILL genuinely doesn't resolve **and the asset isn't determinable** from the
+>    description, you cannot build live marks either (you don't know the instrument). Say the
+>    RFQ is unresolved and stop — do **not** substitute BTC, do **not** invent a strike/expiry/
+>    structure. A confident wrong block is far worse than an honest "unresolved".
 
 ## Step 1 — Parse the Trade
 
@@ -100,8 +156,7 @@ Extract from the resolved trade-tape record (or the pasted JSON):
 | `index_price` | Spot at trade time. **Label this "Spot" in the output, never "Index".** |
 | `strategy_code` | Structure type (see references/strategy-codes.md) |
 | `rfqType` | `grfq` (multi-maker) or `drfq` (directed) |
-| `venue` | `DBT` = Deribit, `BIT` = Bit.com, `OKX` = OKX |
-| `product_codes` | `DO`/`EH` = BTC/ETH options; `DP`/`EP` = BTC/ETH perps |
+| `PRODUCT` | **Asset + kind + venue** — authoritative source of the underlying. `BTC OPTION - DBT`, `ETH OPTION - DBT`, `SOL OPTION - DBT`, `BTC PERPETUAL - DBT`. **Read the asset here; never default to BTC.** Venue suffix: `DBT` Deribit, `PRDX` Paradex, `BYB` Bybit, `OKX` OKX. |
 
 **Leg parsing from `description`:**
 - Format: `[+/-][ratio] [Type] [DD Mon YY] [Strike]`
@@ -121,6 +176,21 @@ The taker's real position comes from the **leg-level `side` fields** plus the si
   quote-convention", no BUY/SELL leg mechanics. That logic is internal; the reader sees the verdict.
 - Single-leg `description` is just the instrument name; for multi-leg, parse legs from the `legs`
   array (or `description`: `[+/-][ratio] [Type] [DD Mon YY] [Strike]`, one per line).
+
+**Multi-leg direction — resolve in ONE pass, then stop (do not enumerate interpretations).**
+When the tape gives a single combined `DESCRIPTION` row (no per-leg `side`), fix the taker's
+position from the row `SIDE` + the structure's standard convention below, sanity-check it once
+against the `MARK_OFFSET` sign (debit paid ⇒ net-long premium ⇒ `Buyer`; credit received ⇒
+`Seller`), commit, and compute net greeks **once**. Churning through "is it a reverse cal / which
+leg is long" across your reasoning is the main multi-leg latency leak — decide and move on.
+- **Calendar (`CA`/`CCal`/`PCal`):** `DESCRIPTION` lists **near expiry first, far second**.
+  `SIDE=BUY` = **long calendar** (long far / short near, pays debit, long vega). `SIDE=SELL` =
+  **short (reverse) calendar** (short far / long near, receives credit, short vega, long near-Γ).
+- **Vertical / ratio / fly / condor / RR:** the row `SIDE` applies to the structure as named; the
+  first-named leg is the "long" anchor unless a `-`/ratio prefix says otherwise. Net-greek sign
+  follows the resolved per-leg longs/shorts × ratio × qty (Step 4).
+State only the plain verdict in the header ("Short Call Calendar", "Call Ratio") — never the
+convention reasoning.
 
 ## Step 2 — Fetch Live Data
 
@@ -182,19 +252,38 @@ Two sources, both mandatory every time:
 ### 3a — Paradigm prior blocks (most important)
 Block recurrence on Paradigm is the strongest signal — a repeating block means a programmatic
 or conviction taker, not random flow.
-- **If a Paradigm block tape is injected** into the session (via a block-trade context tool or
-  equivalent feed): scan it for prior blocks matching this structure — same `strategy_code` +
-  same leg geometry (underlying, expiry pattern, strike/width or moneyness) within 30d. Report:
-  count of matching blocks, size range, most recent (date + level + side), and whether one-sided
-  (single taker building) or two-way.
-- **If no Paradigm tape is injected** (e.g. running outside the Dime terminal): say so in one
-  line and fall back to identifying Paradigm-routed prints on the Deribit tape (see 3b). Never
-  fabricate block counts.
+- **The `HIST` rows from the Step 0 combined tape read already answer this** — that single scan
+  returned the 30d matching-structure rows alongside the fill. Do **not** run another tape query.
+  Cluster the `HIST` rows by `BLOCK_TRADE_ID`, match the full leg set, and report: count of
+  matching blocks, size range, most recent (date + level + side), and whether one-sided (single
+  taker building) or two-way. Rows that share the strike/expiry but are a *different* structure
+  are strike-level context, not recurrence of this structure.
+- **If the tape read failed** (no credentials / DuckDB unavailable): say so in one line and fall
+  back to identifying Paradigm-routed prints on the Deribit tape (see 3b). Never fabricate counts.
 
 ### 3b — Deribit tape, always fetch (public, no auth)
-Per leg:
-`web_fetch GET /api/v2/public/get_last_trades_by_instrument?instrument_name=<leg>&count=1000&start_timestamp=<now_ms − 30d>&end_timestamp=<now_ms>&sorting=desc`
-(fall back to `count=100&sorting=desc` if the windowed pull returns nothing).
+**Fetch and aggregate in ONE `exec`** — never `web_fetch` 1000 raw trades into context and
+reason over them by hand (slow + run-to-run drift). For **multi-leg**, put every leg in the same
+`exec` and **background the curls (`&` … `wait`)** so all legs fetch concurrently — do NOT run
+them one-after-another. Only the buckets land in context:
+
+```bash
+NOW=$(date +%s%3N); START=$((NOW-30*24*3600*1000))
+summ() { python3 -c "
+import json,sys; t=json.load(sys.stdin).get('result',{}).get('trades',[])
+if not t: print(sys.argv[1],'no trades'); sys.exit()
+now=max(x['timestamp'] for x in t)
+def bucket(days):
+    c=now-days*864e5; w=[x for x in t if x['timestamp']>=c]; b=[x for x in w if x.get('block_trade_id')]
+    return len(w),len(b),sum(x['amount'] for x in w),sum(x['amount'] for x in b)
+print(sys.argv[1], {l:bucket(d) for d,l in [(1,'24h'),(7,'7d'),(30,'30d')]})
+print(' blocks:', [(x['timestamp'],x['amount'],x['price'],x.get('iv'),x['direction'],x.get('block_trade_id')) for x in t if x.get('block_trade_id')][:12])" "$1"; }
+for LEG in <leg1> <leg2> <leg3>; do   # one leg for single-leg trades
+  curl -s "https://www.deribit.com/api/v2/public/get_last_trades_by_instrument?instrument_name=${LEG}&count=1000&start_timestamp=${START}&end_timestamp=${NOW}&sorting=desc" | summ "$LEG" &
+done; wait
+```
+(fall back to `count=100&sorting=desc` if the windowed pull returns nothing.) You may run
+this in the same parallel first batch as the tape read and live tickers.
 
 **Identify Paradigm / block prints on the tape:** each trade carrying a `block_trade_id` field
 is a block trade — Paradigm-routed flow surfaces here as blocks (and multi-leg blocks share one
@@ -213,6 +302,11 @@ total contracts in each), so the reader sees whether this is fresh flow today or
 program — e.g. "24h: 3 blocks / 85x · 7d: 5 / 140x · 30d: 7 / 180x".
 
 ### 3c — Flow impact (when the structure printed in multiple clips recently)
+**Scope guard:** this clip-by-clip detail is for **single-leg / same-strike** accumulation. For
+**multi-leg** structures (calendars, spreads, flies) do NOT build a per-leg, per-clip vol/spread
+table — collapse it to one line (clip count + side + net level) and move on. The per-leg clip
+matrix is the biggest thinking-time sink and has truncated the block; keep it to a line.
+
 When a leg/structure has traded in several clips — especially same-day, same side — quantify the
 accumulation footprint (this is what matters when one taker is working an order):
 Show this clip-by-clip (a small table is fine here), and for **every clip include the traded
@@ -232,13 +326,19 @@ vol and the spread** — that is the signal Nic cares about most:
 Keep the *output* of this tight (one or two lines / a small table) — the depth is in the analysis,
 not the word count.
 
-### 3d — Where else did it trade (required, reported compactly)
-After Paradigm/Deribit, check whether the same structure/legs printed on the other venues so the
-output can answer "where else did this trade": **OKX** (`/api/v5/market/trades` per leg), **Bullish**
-(`/trading-api/v1/trades`), **Paradex** (`/v1/trades` public REST via `web_fetch` — esp. perp legs), and Bybit if relevant.
-See `references/venues.md` for naming/endpoints.
-Report as **ONE compact line**: name only the venues where it actually printed (with rough size),
-then a terse "not seen on X/Y" for the rest. Do NOT spend a row per empty venue — one line total.
+### 3d — Where else did it trade (best-effort, never blocks output)
+Paradigm + Deribit (3a/3b) are the authoritative recurrence sources. Cross-venue checks are
+**optional colour, not a gate** — they are the slowest and flakiest fetches and must never hold up
+the block. Rules:
+- **Perp legs:** one Paradex `/v1/trades` fetch is worth it (perps trade there).
+- **Option legs:** only bother with OKX (`/api/v5/market/trades` per leg) when Deribit recurrence
+  was thin AND the leg is liquid enough that OKX would plausibly show it. Skip Bullish/Bybit for
+  options by default — they almost never add signal. Do **at most one** extra venue fetch here.
+- If a cross-venue fetch errors, is slow, or returns nothing, **drop it silently** and move on —
+  do not retry, do not reformat the query, do not wait on it.
+Report as at most **ONE compact line**: name only venues where it actually printed (rough size). If
+you ran no cross-venue check (Deribit already answered), simply omit the "where else" token — do
+not add a row of "not seen on X/Y".
 
 ## Step 4 — Compute Net Greeks
 
@@ -270,11 +370,12 @@ live delta in the output — pick the live figure and state it once.
 - Cross-venue IV spread: flag if >2 vol points divergence between Deribit and OKX
 - Note if taker bought or sold the higher-IV leg (directional vs vol arb read)
 
-**Vol-surface impact (required when the trade had size / multiple clips):** did this flow move the
-surface, and how? Pull the **expiry's vol surface** — its ATM vol and skew (Deribit per-strike
-tickers, or OKX `opt-summary` which returns every strike's mark IV plus `volLv`, the expiry ATM
-level) — and compare where the traded strikes' IV and the expiry ATM/skew sit **now vs before the
-flow** (use the per-clip traded `iv` from Step 3c as the "before"). State it in one line, e.g.
+**Vol-surface impact (when the trade had size / multiple clips):** did this flow move the surface,
+and how? Answer this from data you **already have** — the per-clip traded `iv` from Step 3c (the
+"before") vs the current Deribit mark IV from Step 2 (the "now"). That comparison is the surface
+read; **do not fire an extra OKX `opt-summary` (or any new venue) call just for this** — it is slow
+and often returns nothing usable. Only pull OKX `volLv` if the Deribit IVs are genuinely missing.
+State it in one line, e.g.
 "lifted 6Jun ATM ~+0.8 vol and steepened call skew as the taker bought; rest of the surface
 unchanged" — or "no surface move, absorbed". Attribute the move to this flow only when timing/size
 support it; don't over-claim.
@@ -288,7 +389,10 @@ mark_pnl_per_unit   = structure_value_now - entry_cost
 total_pnl           = mark_pnl_per_unit × quantity × spot_price
 ```
 
-Only compute P&L when asked or when the trade was previously analyzed in session.
+Only compute P&L when asked or when the trade was previously analyzed in session. **Otherwise do
+not do P&L math even in your reasoning** — no mark-to-close, no per-leg vol-move P&L attribution.
+On a fresh `/analyze` the block has no P&L token, so computing it is pure wasted thinking time
+(and on multi-leg it has overrun the output budget). Skip it entirely unless the user asks.
 
 ## Step 7 — Output Format
 
@@ -303,13 +407,13 @@ The `yaml` fence renders the bracket rows in blue/teal in the terminal while the
 stay scannable as plain text outside it — matching the `paradigm-options-recap` style.
 
 **The one exception — RFQ not resolved (Step 0 lookup failed).** When the `rfq_id` could not be
-resolved on any source, lead with a single line stating so, then give the block built from the
-description + live marks with the unavailable fields marked, e.g.:
-`RFQ <id> not resolved (no Paradigm lookup available) — structure from description, live marks only; fill/mark/spot unavailable.`
-In that line and the block, **never invent** the fill price, trade-time mark, spot, size, or
-`markOffset` — those come only from the resolved record. Mark them `n/a`. The `[Greeks]`, `[Fair]`
-(IV only, no fill offset), and `[Live]` rows still render from live market data. This is the
-**only** text permitted before the block; when the RFQ *did* resolve, emit nothing before it.
+resolved, emit **only** a single line stating so — no bracket block. With no resolved row you
+don't know the asset, so you cannot build correct live instruments; do not fall back to the
+`<rfq description>` and do not default to BTC. e.g.:
+`RFQ <id> not resolved (not on Paradigm tape / id not ingested) — no asset/structure/fill available.`
+**Never invent** the asset, strike, expiry, structure, fill, mark, spot, size, or `markOffset`.
+This line is the entire response in the unresolved case; when the RFQ *did* resolve, emit nothing
+before the block.
 
 **Traders read this in seconds — facts only, zero commentary.** Every line is a terse string of
 data tokens separated by ` · ` or ` | `. Hard limits:
@@ -347,7 +451,8 @@ Spot 62,728 · 60k −4.3% OTM · long near-Γ / short far-vega · max loss at 6
 - Plain structure name ("Call Ratio", "Straddle", "Risk Reversal") — never the raw code (CS/SD/RR).
 - `Buyer` if the taker paid a net debit, `Seller` if they took in a net credit.
 - Size **per leg in coin** = block qty × each leg ratio (100 lots at 1×1.5 → `100/150 BTC`).
-- Premium: `Paid`/`Recd` <fill price>, then `±bps above/below mark` (`bps = |markOffset| × 10000`).
+- Premium: `Paid`/`Recd` <fill price>, then `±bps above/below mark` — use the query's
+  **precomputed `OFFSET_BPS`** verbatim (do not recompute by hand).
 
 **Line 2 — View, one clause:**
 `<spot + moneyness> · <exposure in greek shorthand> · <key level> · <flow type>`
@@ -374,7 +479,8 @@ Spot 62,728 · 60k −4.3% OTM · long near-Γ / short far-vega · max loss at 6
 - Drop a bracket row only if its data is genuinely unavailable — never pad, never invent.
 - Δ as the triangle; spell out vega/theta/gamma/vanna; theta & vega are USD ($/v, $/d), only Δ is coin.
 - `Δ %` = `net_delta_coin / block_qty × 100` (≈ `strategy_delta × 100`): ≈0% neutral, ±100% directional.
-- `bps from mid` = `|markOffset| × 10000`; neutral phrasing, never moralize about crossing the spread.
+- `bps vs mark` comes from the query's precomputed `OFFSET_BPS` (= `(PRICE−REF_PRICE)×10000`);
+  never recompute it mentally. Neutral phrasing, never moralize about crossing the spread.
 - Resolve Buyer/Seller and long/short from the leg sides + `strategy_delta` (per Step 1) silently —
   state only the verdict, never the convention reasoning.
 - Cite only real `block_trade_id`s; **never invent a `combo_id` — not in the output and not in your
