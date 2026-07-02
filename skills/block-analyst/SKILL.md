@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.13"
+  version: "1.14"
 ---
 
 # Paradigm Block Trade Analyst
@@ -82,7 +82,12 @@ this is the whole round, do not split it:
 
 **Do NOT open a second live round** (tickers now, trades later = the slow path that made a custom
 take 90s). Tickers and trades both need only the instrument name you already have — fetch them
-together. **Never call `session_status`, and never spend a whole turn on `date -u` to "check the year"** —
+together. **For live marks/greeks always use Deribit** (`deribit__get_ticker` / its public API),
+regardless of where the block executed — Deribit lists the same BTC/ETH strikes and is the fair-value
+reference. **Do NOT fire per-instrument Paradex or Bullish REST option lookups** (`api.prod.paradex.trade`,
+`api.exchange.bullish.com`): their option naming differs, the calls usually 404, and 4 of them
+serialized inside the exec is what stretched an iron-condor to ~45s. The fill benchmark is the tape
+`REF_PRICE`/`OFFSET_PCT` (already resolved) vs Deribit's live mark — that's enough. **Never call `session_status`, and never spend a whole turn on `date -u` to "check the year"** —
 today's date is in your context; those are pure wasted round-trips. (Using `date +%s%3N` *inside*
 the trades `exec` to build the 30d window is fine — that's not a separate round.) Confirm an
 instrument exists before treating an empty ticker as "no data".
