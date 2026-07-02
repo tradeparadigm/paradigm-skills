@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.5"
+  version: "1.6"
 ---
 
 # Paradigm Block Trade Analyst
@@ -69,8 +69,14 @@ those after it returns. This overlap is the single biggest latency win; sequenti
 fetching is the slow path.
 
 **Combined tape read (run this exact `exec` — no need to open `references/rfq-lookup.md`
-on the hot path; it holds the field mapping + fallbacks only).** Substitute `<CORE_ID>`
-(the `r_…` id, prefix stripped) and the `<EXPIRY>`/`<STRIKE>` tokens from the description:
+on the hot path; it holds the field mapping + fallbacks only).** Substitute three tokens:
+- `<CORE_ID>` — the `r_…` id with any `DRFQv2-`/`GRFQ-` prefix stripped.
+- `<EXPIRY_C>` — the expiry **compacted, uppercased, no spaces**: `31 Jul 26` → `31JUL26`.
+- `<STRIKE>` — the strike digits: `66000`.
+
+The recurrence match **normalizes `DESCRIPTION`** (strips spaces, uppercases) before
+comparing, so it matches whether the tape stores `Call 31 Jul 26 66000` or a compact form —
+**do not** paste the raw spaced expiry into the `LIKE`, use the compacted `<EXPIRY_C>`:
 
 ```bash
 TOKEN=$(cat "$AWS_WEB_IDENTITY_TOKEN_FILE")
@@ -84,14 +90,15 @@ SET s3_region='ap-northeast-1';
 SET s3_access_key_id='$AK'; SET s3_secret_access_key='$SK'; SET s3_session_token='$ST';
 CREATE TEMP TABLE tape AS
 SELECT DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE,
-       QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID
+       QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID,
+       UPPER(REPLACE(DESCRIPTION,' ','')) AS DESC_N
 FROM read_csv_auto('s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz')
 WHERE RFQ_ID LIKE '%<CORE_ID>%'
    OR (DATE >= (CURRENT_DATE - INTERVAL 30 DAY)
-       AND DESCRIPTION LIKE '%<EXPIRY>%' AND DESCRIPTION LIKE '%<STRIKE>%');
+       AND UPPER(REPLACE(DESCRIPTION,' ','')) LIKE '%<EXPIRY_C>%<STRIKE>%');
 SELECT 'FILL' tag, * FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%';
 SELECT 'HIST' tag, DATE, TIME, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, BLOCK_TRADE_ID
-FROM tape WHERE DESCRIPTION LIKE '%<EXPIRY>%' AND DESCRIPTION LIKE '%<STRIKE>%'
+FROM tape WHERE DESC_N LIKE '%<EXPIRY_C>%<STRIKE>%'
 ORDER BY DATE DESC, TIME DESC;
 "
 ```

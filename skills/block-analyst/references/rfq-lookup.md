@@ -21,8 +21,11 @@ that temp table. **Do not run a second tape query later** — this one covers bo
 This recipe is **self-contained**: the IRSA→STS bootstrap is inlined below, so you
 do **not** need to open `paradigm-data-discovery`'s `SKILL.md` or `s3-access.md`
 first. Substitute `<CORE_ID>` (the `r_…` id with any `DRFQv2-`/`GRFQ-` prefix
-stripped) and the `<EXPIRY>`/`<STRIKE>` tokens parsed from the `<rfq description>`
-(e.g. `31 Jul 26` and `66000`), then run it as one `exec`:
+stripped), `<EXPIRY_C>` (the expiry compacted+uppercased, no spaces: `31 Jul 26` →
+`31JUL26`) and `<STRIKE>` (`66000`). The recurrence match **normalizes `DESCRIPTION`**
+(`UPPER(REPLACE(DESCRIPTION,' ',''))`) so it matches the tape's spaced form
+(`Call 31 Jul 26 66000`) regardless — use the compacted `<EXPIRY_C>`, not a spaced
+token. Run it as one `exec`:
 
 ```bash
 TOKEN=$(cat "$AWS_WEB_IDENTITY_TOKEN_FILE")
@@ -37,17 +40,18 @@ SET s3_access_key_id='$AK'; SET s3_secret_access_key='$SK'; SET s3_session_token
 -- single decompress → temp table holding the target RFQ + 30d matching structures
 CREATE TEMP TABLE tape AS
 SELECT DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE,
-       QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID
+       QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID,
+       UPPER(REPLACE(DESCRIPTION,' ','')) AS DESC_N
 FROM read_csv_auto('s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz')
 WHERE RFQ_ID LIKE '%<CORE_ID>%'
    OR (DATE >= (CURRENT_DATE - INTERVAL 30 DAY)
-       AND DESCRIPTION LIKE '%<EXPIRY>%' AND DESCRIPTION LIKE '%<STRIKE>%');
+       AND UPPER(REPLACE(DESCRIPTION,' ','')) LIKE '%<EXPIRY_C>%<STRIKE>%');
 -- (a) the cleared block — authoritative for every numeric field
 SELECT 'FILL' tag, * FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%';
 -- (b) 30d recurrence of the same structure (Step 3a), newest first
 SELECT 'HIST' tag, DATE, TIME, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, BLOCK_TRADE_ID
 FROM tape
-WHERE DESCRIPTION LIKE '%<EXPIRY>%' AND DESCRIPTION LIKE '%<STRIKE>%'
+WHERE DESC_N LIKE '%<EXPIRY_C>%<STRIKE>%'
 ORDER BY DATE DESC, TIME DESC;
 "
 ```
