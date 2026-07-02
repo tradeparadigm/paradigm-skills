@@ -206,6 +206,34 @@ def _named_legs(name_up: str, ks: list[int], ec: str):
     return None
 
 
+def legs_from_rows(rows: list[dict]):
+    """When the tape has one row PER LEG (each a single-leg option DESCRIPTION, or a
+    perp/future row), build the legs with each leg's sign taken straight from its own
+    SIDE (BUY→+1 long, SELL→−1 short) — fully reliable, no convention guessing. This
+    covers risk reversals, spreads, calendars, and option+perp combos whose legs are
+    stored as separate rows. Returns None if the rows aren't in per-leg shape (then
+    the caller parses the combined DESCRIPTION instead)."""
+    if not rows or len(rows) < 2:
+        return None
+    out = []
+    for r in rows:
+        pr = parse_product(r.get("PRODUCT", ""))
+        sgn = 1 if (r.get("SIDE") or "BUY").upper() == "BUY" else -1
+        if pr["kind"] in ("PERPETUAL", "FUTURE"):
+            out.append({"cp": "FUT", "strike": 0.0, "ratio": 1.0, "sign": sgn,
+                        "expiry_c": None, "_row": r})
+            continue
+        d = parse_description(r.get("DESCRIPTION", ""))
+        if d["classified"] and len(d["legs"]) == 1 and d["code"] in ("CL", "PL"):
+            lg = d["legs"][0]
+            lg["sign"] = sgn
+            lg["_row"] = r
+            out.append(lg)
+        else:
+            return None                      # a combined-DESCRIPTION block, not per-leg
+    return out
+
+
 # ── direction / orientation ────────────────────────────────────────────────────
 
 def net_cash(rows: list[dict]) -> float:

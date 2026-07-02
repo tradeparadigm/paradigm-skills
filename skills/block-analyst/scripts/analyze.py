@@ -115,8 +115,19 @@ def main():
     desc = fill[0].get("DESCRIPTION", "")
     quote = (fill[0].get("QUOTE_CURRENCY") or "").upper()
     qty = ac._f(fill[0].get("QTY")) or 1.0
-    parsed = ac.parse_description(desc)
-    legs, side, reliable = ac.apply_orientation(parsed, fill)
+    # Two tape shapes: (a) one combined-DESCRIPTION block (ICondor/Cstm/single) →
+    # parse fill[0]; (b) one row PER LEG, each a single-leg desc or a perp/future →
+    # build legs from the rows, sign straight from each row's SIDE (most reliable).
+    legs = ac.legs_from_rows(fill)
+    if legs is not None:
+        side = "Buyer" if ac.net_cash(fill) > 0 else "Seller"
+        # per-leg option signs are exact; a perp leg needs delta sizing we don't do
+        # here, so defer the net to the model (⚠) when a future/perp leg is present.
+        reliable = not any(l["cp"] == "FUT" for l in legs)
+        parsed = {"code": "combo"}
+    else:
+        parsed = ac.parse_description(desc)
+        legs, side, reliable = ac.apply_orientation(parsed, fill)
 
     # instruments: each option leg + the perp for spot
     syms = []

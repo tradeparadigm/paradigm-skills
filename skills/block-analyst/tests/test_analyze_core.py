@@ -89,6 +89,23 @@ ok(sg[("C", 75000)] == (-1, 1.0), "Cstm 75kC short x1")
 _, _, reliable = ac.apply_orientation(p, [{"SIDE": "SELL", "PRICE": 0.069, "QTY": 50}])
 ok(reliable, "Cstm: explicit signs → reliable")
 
+# ── per-leg rows (RRPut stored as separate rows: a put, a call, a perp) ────────
+rr_rows = [
+    {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 31 Jul 26 50000", "SIDE": "BUY", "PRICE": 0.0091, "QTY": 200},
+    {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Call 31 Jul 26 70000", "SIDE": "SELL", "PRICE": 0.0037, "QTY": 200},
+    {"PRODUCT": "BTC PERPETUAL - DBT", "DESCRIPTION": "Perpetual", "SIDE": "BUY", "PRICE": 59324, "QTY": 232398},
+]
+lr = ac.legs_from_rows(rr_rows)
+ok(lr is not None and len(lr) == 3, "per-leg rows → 3 legs built")
+bykey = {(l["cp"], l["strike"]): l["sign"] for l in lr}
+ok(bykey[("P", 50000)] == 1, "per-leg: long 50k put (row SIDE BUY)")
+ok(bykey[("C", 70000)] == -1, "per-leg: short 70k call (row SIDE SELL)")
+ok(any(l["cp"] == "FUT" and l["sign"] == 1 for l in lr), "per-leg: long perp leg from perp row")
+# combined-description block (ICondor: same desc on every row) is NOT per-leg mode
+ic_rows = [{"PRODUCT": "BTC OPTION - PRDX", "DESCRIPTION": "ICondor 10 Jul 26 54000/56000/66000/67000",
+            "SIDE": "BUY", "PRICE": 65.56, "QTY": 5}] * 4
+ok(ac.legs_from_rows(ic_rows) is None, "combined-desc block → not per-leg (parse the structure)")
+
 # net_cash sign: BUY positive, SELL negative, ×qty
 ok(ac.net_cash([{"SIDE": "BUY", "PRICE": 2.9, "QTY": 10}]) == 29.0, "net_cash BUY debit")
 ok(ac.net_cash([{"SIDE": "SELL", "PRICE": 2.9, "QTY": 10}]) == -29.0, "net_cash SELL credit")
