@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.15"
+  version: "1.16"
 ---
 
 # Paradigm Block Trade Analyst
@@ -61,108 +61,35 @@ greeks").
 > **resolved tape row**. (Deriving `BTC-…-88-C` from that text is exactly what turned a SOL
 > call into a hallucinated BTC straddle — so don't guess an instrument before the ID resolves.)
 
-Two rounds — **resolve, then live** (do NOT fetch live data before Round 1 returns):
+### Live path — run ONE script, relay its output
 
-**Round 1 — resolve (one `exec`, one gzip scan).** Run the combined tape query below. Its only
-token is `<CORE_ID>` (the `r_…` id, any `DRFQv2-`/`GRFQ-` prefix stripped). It returns the
-authoritative **`FILL`** row(s) (matched by `RFQ_ID`) plus the 30d **`HIST`** recurrence — HIST
-self-matches the FILL's own `PRODUCT` + normalized `DESCRIPTION`, so **no description tokens are
-needed**. If `FILL` is empty, the RFQ isn't on the tape → Step 7 unresolved line; do not invent.
+**If the trade row / block JSON is already injected in the prompt (evals, a terminal feed) or
+`exec`/`uv`/S3 aren't available, skip the script** and render the block directly from that data via
+Steps 1–7. Otherwise use the script:
 
-**Round 2 — derive the structure from the FILL row, then fire ALL live data in ONE batch.**
-Read from the tape row: **asset** ← `PRODUCT` (`BTC OPTION - DBT` → BTC, `SOL OPTION - DBT` → SOL;
-**never assumed**); **legs / strikes / expiries** ← `DESCRIPTION`. Build Deribit instrument names:
-BTC/ETH `<ASSET>-DDMMMYY-STRIKE-C/P`; USDC-margined alts (SOL, XRP, …) `<ASSET>_USDC-DDMMMYY-STRIKE-C/P`
-(the `[Live]` line reads e.g. `SOL_USDC 88C`).
-
-Then fire **everything live in a SINGLE tool batch (one assistant turn, parallel tool calls)** —
-this is the whole round, do not split it:
-- per-leg ticker (`deribit__get_ticker` or `web_fetch`) + the perp/future for spot, **and**
-- the **one** Step 3b `exec` that pulls all legs' 30d trades concurrently (backgrounded curls).
-
-**Do NOT open a second live round** (tickers now, trades later = the slow path that made a custom
-take 90s). Tickers and trades both need only the instrument name you already have — fetch them
-together. **For live marks/greeks always use Deribit** (`deribit__get_ticker` / its public API),
-regardless of where the block executed — Deribit lists the same BTC/ETH strikes and is the fair-value
-reference. **Do NOT fire per-instrument Paradex or Bullish REST option lookups** (`api.prod.paradex.trade`,
-`api.exchange.bullish.com`): their option naming differs, the calls usually 404, and 4 of them
-serialized inside the exec is what stretched an iron-condor to ~45s. The fill benchmark is the tape
-`REF_PRICE`/`OFFSET_PCT` (already resolved) vs Deribit's live mark — that's enough. **Never call `session_status`, and never spend a whole turn on `date -u` to "check the year".**
-The tape and the pod clock are **in 2026 — that is the correct, current date, NOT the future**.
-Trades stamped `2026-07-…` are **today's live prints**; do not second-guess them or shell out to
-`date` to verify the year (that burns a whole round and recurs on every multi-leg). Today's date is
-already in your context — trust it. (Using `date +%s%3N` *inside* the trades `exec` to build the 30d
-window is fine — that's not a separate round.) Confirm an instrument exists before treating an empty
-ticker as "no data".
-
-**One live round, hard rule.** Tickers and 30d trades go in the **same** batch — do NOT fetch
-tickers, look at them, then fetch trades in a later turn. Each extra round adds ~10s. If you catch
-yourself about to open a second live turn, stop: you already have the instrument names; everything
-live could have gone together.
-
-> **⛔ BOUND THE ANALYSIS — this is a 4-row block, not a research note.** Do the *minimum*
-> reasoning needed to fill the rows, then emit. On multi-leg trades, unbounded deliberation
-> has exhausted the output budget and **truncated the block mid-row** — that is a failure.
-> In reasoning AND output, do **NOT**: compute P&L or mark-to-close, attribute P&L to
-> individual vol moves, model max-loss scenarios, or reconcile prior prints leg-by-leg.
-> Resolve structure/direction **once** (Step 1 convention), net the greeks **once** (Step 4),
-> read recurrence counts straight from the query's `HIST`/tape buckets. Do not re-derive or
-> second-guess. Keep internal reasoning tight — a calendar needs no more thinking than a call.
-
-**Combined tape read (Round 1 — run this exact `exec`; the STS bootstrap is inlined, so no need
-to open `references/rfq-lookup.md` on the hot path).** The **only** token is `<CORE_ID>` (the
-`r_…` id, any `DRFQv2-`/`GRFQ-` prefix stripped) — **no asset/strike/expiry from the description**.
-It scans the gzip once into a temp table, returns the `FILL` row(s) by `RFQ_ID`, then derives the
-`HIST` recurrence by self-matching the FILL's own `PRODUCT` + normalized `DESCRIPTION` (exact
-same structure — same legs/strikes/expiries — within the same coin; a short strike can't leak
-across assets because `PRODUCT` must match):
+**Run one command and relay its stdout as your entire reply:**
 
 ```bash
-TOKEN=$(cat "$AWS_WEB_IDENTITY_TOKEN_FILE")
-CREDS=$(curl -s "https://sts.ap-northeast-1.amazonaws.com/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=${AWS_ROLE_ARN}&RoleSessionName=duckdb&WebIdentityToken=${TOKEN}")
-AK=$(echo "$CREDS" | grep -o '<AccessKeyId>[^<]*' | cut -d'>' -f2)
-SK=$(echo "$CREDS" | grep -o '<SecretAccessKey>[^<]*' | cut -d'>' -f2)
-ST=$(echo "$CREDS" | grep -o '<SessionToken>[^<]*' | cut -d'>' -f2)
-duckdb -c "
-INSTALL httpfs; LOAD httpfs;
-SET s3_region='ap-northeast-1';
-SET s3_access_key_id='$AK'; SET s3_secret_access_key='$SK'; SET s3_session_token='$ST';
-CREATE TEMP TABLE tape AS
-SELECT DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE,
-       QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID,
-       UPPER(REPLACE(DESCRIPTION,' ','')) AS DESC_N
-FROM read_csv_auto('s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz')
-WHERE RFQ_ID LIKE '%<CORE_ID>%'
-   OR DATE >= (CURRENT_DATE - INTERVAL 30 DAY);
--- FILL: authoritative — asset from PRODUCT, structure from DESCRIPTION. Offsets precomputed:
--- OFFSET_BPS (×10000) is for COIN-quoted premiums (BTC/ETH, e.g. 0.0004 → 4 bps);
--- OFFSET_PCT (% of mark) is what to show for USD/USDC-quoted premiums (SOL/alts, dollar prices).
-SELECT 'FILL' tag, *,
-       ROUND(PRICE - REF_PRICE, 6) AS MARK_OFFSET,
-       ROUND((PRICE - REF_PRICE) * 10000, 1) AS OFFSET_BPS,
-       ROUND((PRICE - REF_PRICE) / NULLIF(REF_PRICE,0) * 100, 1) AS OFFSET_PCT
-FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%';
--- HIST: same structure recurring in 30d — self-derived from the FILL, no user text involved.
-SELECT 'HIST' tag, DATE, TIME, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, BLOCK_TRADE_ID
-FROM tape
-WHERE PRODUCT IN (SELECT PRODUCT FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%')
-  AND DESC_N  IN (SELECT DESC_N  FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%')
-ORDER BY DATE DESC, TIME DESC;
-"
+bash scripts/analyze.sh <rfq_id>      # the id only; ignore any description after it
 ```
 
-(If `FILL` comes back empty the id isn't on the tape — `HIST` will also be empty; report the RFQ
-unresolved per Step 7 and never substitute an asset/strike/structure.)
+`analyze.sh` does everything — STS bootstrap, the single DuckDB tape scan (resolve the
+`FILL` row by `RFQ_ID` + the 30d same-structure `HIST`, ID-authoritative), then `analyze.py`
+(concurrent Deribit fetch of every leg's ticker + 30d trades, net greeks, fill-vs-mark offset
+in the right unit, recurrence) and prints the finished block. **Do not** re-fetch, reformat,
+recompute, add commentary, or run extra steps — its stdout already is the analysis. Deterministic
+and ~one round-trip; the only unavoidable cost is the tape scan.
 
-**Fill-vs-mark token — pick the unit by `QUOTE_CURRENCY`, use the precomputed value verbatim
-(never hand-arithmetic):**
-- **Coin-quoted** (`QUOTE_CURRENCY` = BTC/ETH — premium is a coin fraction): use **`OFFSET_BPS`**
-  as `±N bps vs mark` (a −0.0004 offset is **−4 bps**, not −40).
-- **USD/USDC-quoted** (SOL and other alts — premium is a dollar price like 2.90): `OFFSET_BPS` is
-  meaningless (×10000 → absurd `+1506 bps`). Use **`OFFSET_PCT`** as `±N% vs mark` (optionally the
-  absolute `±$MARK_OFFSET`), e.g. `+5.5% vs mark`. Never print a bps figure for a USD-quoted premium.
+**The one thing you may finalise:** if a `[Greeks]` row is printed as `⚠ net: confirm signs …`
+(risk reversals, calendars, exotic customs — where the taker's per-leg long/short isn't reliably
+derivable from the tape), read the per-leg greeks the script already printed, apply the signs, and
+replace that one line. Single-leg, straddles/strangles, verticals, iron condors, and explicit-sign
+customs come back already-netted — relay them verbatim. If `analyze.sh` prints an `RFQ not resolved`
+line, relay it as-is (never invent an asset/strike/structure).
 
-`Paid`/`Recd` and `above`/`below` follow the sign of `MARK_OFFSET`.
+Steps 1–7 below are the **contract the script implements** and the **fallback** when scripts/tools
+are unavailable (then follow them by hand — the manual tape recipe is in
+[`references/rfq-lookup.md`](references/rfq-lookup.md)). You normally never need them on the live path.
 
 The input is **`/analyze <rfq_id> <rfq description>`**. Split it:
 
