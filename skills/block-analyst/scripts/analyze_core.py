@@ -129,11 +129,12 @@ def parse_description(desc: str) -> dict:
     if dm and ks:
         d, mon, yy = dm.groups()
         ec = compact_expiry(d, mon, yy)
-        legs = _named_legs(up, ks, ec)
-        if legs is not None:
+        nl = _named_legs(up, ks, ec)
+        if nl is not None:
+            legs, ref_is_debit = nl
             return {"code": _code_of(up), "legs": legs, "expiries": _uniq_exp(legs),
                     "perp": bool(re.search(r"Perp", raw, re.I)),
-                    "classified": True, "raw": raw}
+                    "ref_is_debit": ref_is_debit, "classified": True, "raw": raw}
 
     # Calendar: same strike, two expiries — "CCal 10 Jul 26 63000 / 31 Jul 26 63000"
     cal = re.findall(_DATE + r"\s+(\d+)", raw)
@@ -162,47 +163,51 @@ def _code_of(name_up: str) -> str:
         return "ST"
     if name_up.startswith("STRANGLE"):
         return "SN"
-    if name_up.startswith("RRCALL") or name_up.startswith("RRPUT") or name_up.startswith("RR"):
+    if name_up.startswith("RR"):
         return "RR"
-    if name_up.startswith("ICONDOR") or name_up.startswith("CONDOR"):
+    if "CONDOR" in name_up:
         return "CO"
-    if name_up.startswith("IFLY") or name_up.startswith("FLY") or name_up.startswith("BUTTERFLY"):
+    if "FLY" in name_up or "BUTTERFLY" in name_up:
         return "BF"
     return name_up[:4]
 
 
 def _named_legs(name_up: str, ks: list[int], ec: str):
-    """Canonical leg geometry (strike + type + ratio) for a named structure.
-    Signs are assigned later by apply_orientation() from the net-cash direction —
-    here we set the *relative* sign pattern via `sign` = +1 (wing/long-side) or
-    -1 (body/short-side) for a reference orientation.
+    """Canonical leg geometry for a named structure, returned as
+    (legs, ref_is_debit): the leg signs describe a REFERENCE orientation and
+    `ref_is_debit` says whether that reference is a net debit (taker pays) or a
+    net credit (taker receives). apply_orientation() flips the whole structure iff
+    the taker's actual cash sign differs. `ref_is_debit` is structure-specific —
+    e.g. a long iron condor is a CREDIT (sell near-money body, buy OTM wings), but a
+    long call condor is a DEBIT (the low-strike call it buys is the expensive leg).
     """
     def L(cp, k, sign, ratio=1.0):
         return _leg(cp, k, ratio, sign, ec)
 
     if name_up.startswith("STRADDLE") and len(ks) == 1:
-        return [L("C", ks[0], +1), L("P", ks[0], +1)]
+        return [L("C", ks[0], +1), L("P", ks[0], +1)], True          # long straddle = debit
     if name_up.startswith("STRANGLE") and len(ks) == 2:
         lo, hi = sorted(ks)
-        return [L("P", lo, +1), L("C", hi, +1)]
-    if (name_up.startswith("RRCALL") or name_up.startswith("RRPUT")
-            or name_up.startswith("RR")) and len(ks) == 2:
-        lo, hi = sorted(ks)
-        # RR: long the higher-strike call, short the lower-strike put (ref orientation)
-        return [L("P", lo, -1), L("C", hi, +1)]
-    if (name_up.startswith("ICONDOR") or name_up.startswith("CONDOR")) and len(ks) == 4:
-        k1, k2, k3, k4 = sorted(ks)
-        # iron condor: long wings (k1 put, k4 call), short body (k2 put, k3 call)
-        return [L("P", k1, +1), L("P", k2, -1), L("C", k3, -1), L("C", k4, +1)]
-    if (name_up.startswith("IFLY") or name_up.startswith("FLY")
-            or name_up.startswith("BUTTERFLY")) and len(ks) == 3:
+        return [L("P", lo, +1), L("C", hi, +1)], True                # long strangle = debit
+    if name_up.startswith("RR") and len(ks) == 2:
+        lo, hi = sorted(ks)                                          # (RR is reliable=False anyway)
+        return [L("P", lo, -1), L("C", hi, +1)], True
+    if name_up.startswith("ICONDOR") and len(ks) == 4:
+        k1, k2, k3, k4 = sorted(ks)                                  # iron condor (2P+2C)
+        return [L("P", k1, +1), L("P", k2, -1), L("C", k3, -1), L("C", k4, +1)], False  # long = credit
+    if (name_up.startswith("CCONDOR") or name_up.startswith("PCONDOR")
+            or name_up.startswith("CONDOR")) and len(ks) == 4:
+        k1, k2, k3, k4 = sorted(ks)                                  # single-type condor (4 calls or 4 puts)
+        cp = "P" if name_up.startswith("PCONDOR") else "C"
+        return [L(cp, k1, +1), L(cp, k2, -1), L(cp, k3, -1), L(cp, k4, +1)], True  # long = debit
+    if ("FLY" in name_up or "BUTTERFLY" in name_up) and len(ks) == 3:
         k1, k2, k3 = sorted(ks)
-        cp = "P" if name_up.startswith("IFLY") else "C"
-        return [L(cp, k1, +1), L(cp, k2, -2), L(cp, k3, +1)]
+        cp = "P" if (name_up.startswith("PFLY") or name_up.startswith("IFLY")) else "C"
+        return [L(cp, k1, +1), L(cp, k2, -1, 2), L(cp, k3, +1)], True  # long fly = debit (body ×2)
     if ("SPREAD" in name_up or name_up in ("CS", "PS")) and len(ks) == 2:
         lo, hi = sorted(ks)
         cp = "P" if name_up.startswith("P") else "C"
-        return [L(cp, lo, +1), L(cp, hi, -1)]
+        return [L(cp, lo, +1), L(cp, hi, -1)], True
     return None
 
 
@@ -250,13 +255,6 @@ def net_cash(rows: list[dict]) -> float:
     return tot
 
 
-# Per-structure REFERENCE leg signs (in _named_legs) correspond to a known cash
-# orientation. We flip the whole structure iff the taker's actual cash sign differs.
-#   True  → reference pattern is a net DEBIT (taker pays: long straddle, long fly, …)
-#   False → reference pattern is a net CREDIT (taker receives: the sold iron condor)
-_REF_IS_DEBIT = {"ST": True, "SN": True, "BF": True, "CO": False, "CS": True, "PS": True}
-
-
 def apply_orientation(parsed: dict, rows: list[dict]) -> tuple[list[dict], str, bool]:
     """Assign each leg the taker's real sign and return (legs, side_label, reliable).
 
@@ -282,13 +280,14 @@ def apply_orientation(parsed: dict, rows: list[dict]) -> tuple[list[dict], str, 
         legs[0]["sign"] = 1 if s == "BUY" else -1
         return legs, ("Buyer" if s == "BUY" else "Seller"), True
 
-    if code in _REF_IS_DEBIT:                             # symmetric named structure
-        if debit != _REF_IS_DEBIT[code]:
+    refdeb = parsed.get("ref_is_debit")
+    if code != "RR" and refdeb is not None and legs:    # named structure w/ known orientation
+        if debit != refdeb:                              # flip whole structure to actual side
             for l in legs:
                 l["sign"] = -l["sign"]
         return legs, side, True
 
-    # RR, calendar, unknowns: signs not reliably derivable → defer greeks to model
+    # RR, calendar, unclassified: signs not reliably derivable → defer greeks to model
     for l in legs:
         if l.get("sign") is None:
             l["sign"] = 1

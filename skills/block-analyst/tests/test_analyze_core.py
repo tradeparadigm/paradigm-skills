@@ -63,6 +63,28 @@ by = {(l["cp"], int(l["strike"])): l["sign"] for l in legs}
 ok(by[("P", 54000)] == 1 and by[("C", 67000)] == 1, "IC long the wings")
 ok(by[("P", 56000)] == -1 and by[("C", 66000)] == -1, "IC short the body")
 
+# ── call condor (real: CCondor 17 Jul 26 64000/66000/68000/70000) — long=debit ─
+p = ac.parse_description("CCondor 17 Jul 26 64000/66000/68000/70000")
+ok(p["code"] == "CO" and len(p["legs"]) == 4 and all(l["cp"] == "C" for l in p["legs"]),
+   "CCondor → 4 call legs")
+legs, side, reliable = ac.apply_orientation(p, [{"SIDE": "BUY", "PRICE": 0.0058, "QTY": 1000}])
+ok(side == "Buyer" and reliable, "call condor debit → Buyer, reliable")
+byc = {int(l["strike"]): l["sign"] for l in legs}
+ok(byc[64000] == 1 and byc[70000] == 1 and byc[66000] == -1 and byc[68000] == -1,
+   "long call condor: long wings / short body")
+
+# ── call fly (real: CFly 3 Jul 26 58000/60000/62000) ───────────────────────────
+p = ac.parse_description("CFly 3 Jul 26 58000/60000/62000")
+ok(p["code"] == "BF" and len(p["legs"]) == 3 and all(l["cp"] == "C" for l in p["legs"]),
+   "CFly → 3 call legs")
+mid = [l for l in p["legs"] if int(l["strike"]) == 60000][0]
+ok(mid["ratio"] == 2, "fly body ratio 2")
+
+# iron condor stays a credit structure (long wings / short body when Seller)
+p = ac.parse_description("ICondor 10 Jul 26 54000/56000/66000/67000")
+legs, side, _ = ac.apply_orientation(p, [{"SIDE": "SELL", "PRICE": 264.07, "QTY": 5}])
+ok(side == "Seller", "iron condor net credit → Seller")
+
 # ── RRPut — signs NOT reliably derivable from tape → defer to model ────────────
 p = ac.parse_description("RRPut 31 Jul 26 50000/70000")
 ok(p["code"] == "RR" and len(p["legs"]) == 2, "RRPut parsed to 2 legs")
