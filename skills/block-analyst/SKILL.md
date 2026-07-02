@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.9"
+  version: "1.10"
 ---
 
 # Paradigm Block Trade Analyst
@@ -55,18 +55,33 @@ greeks").
 ### Fast path — fire the slow calls IN PARALLEL on your first action
 
 The tape scan, the live Deribit marks, and the 30d Deribit trade tape are the three
-slow calls and they are **independent**: the leg instrument name is fully derivable
-from `<rfq description>` (`Call 31 Jul 26 66000` → `BTC-31JUL26-66000-C`,
-`Put 7 May 26 84000` → `BTC-7MAY26-84000-P`; ETH legs → `ETH-…`). So do **not** wait
-for the tape row before fetching live data. **In a single tool batch (parallel tool
-calls), immediately fire all of:**
+slow calls and they can run in parallel — but only once you know the **asset**.
+
+> **⚠️ ASSET FIRST — never assume BTC.** The `<rfq description>` frequently omits the
+> underlying (`Call 31 Jul 26 88` is a **SOL** call at strike 88, not BTC). The asset is
+> authoritative from the tape `PRODUCT` field (`SOL OPTION - DBT` → SOL; `ETH OPTION - DBT`
+> → ETH). **Tell:** a strike too small for BTC/ETH — roughly **< 1000** (`88`, `180`, `250`)
+> — is almost never BTC/ETH; it is an alt (SOL, XRP, DOGE, …). Building `BTC-…-88-C` is the
+> bug that produced a hallucinated BTC straddle for a SOL call. So:
+> - **Asset unambiguous** (named in the description, OR a clean BTC/ETH-magnitude strike
+>   ≥ ~1000): the leg name IS derivable (`Call 31 Jul 26 66000` → `BTC-31JUL26-66000-C`,
+>   `Put 7 May 26 2375` → `ETH-7MAY26-2375-P`) — fire everything in parallel now.
+> - **Asset ambiguous** (no asset named AND a sub-1000 strike, or any doubt): run the tape
+>   read **FIRST**, read `PRODUCT` for the asset + exact strikes, THEN fetch live. The one
+>   extra round is worth it — a wrong-asset guess fabricates the whole block.
+
+When the asset is unambiguous, **in a single tool batch (parallel tool calls), immediately
+fire all of:**
 1. the combined tape read below (one `exec`),
 2. `deribit__get_ticker` (or `web_fetch` ticker) for **each leg** + the perp for spot,
 3. the Step 3b trade-tape pull for **each leg**.
 
 Only the greek *scaling* (× qty) and the fill-vs-mark line need the tape row — compute
 those after it returns. This overlap is the single biggest latency win; sequential
-fetching is the slow path.
+fetching is the slow path. Deribit instrument naming per asset: BTC/ETH options are
+`<ASSET>-DDMMMYY-STRIKE-C/P`; USDC-margined alts (SOL, XRP, …) are `<ASSET>_USDC-DDMMMYY-STRIKE-C/P`
+(the `[Live]` line reads e.g. `SOL_USDC 88C`). Confirm the exact instrument exists before
+trusting an empty ticker as "no data".
 
 **Multi-leg (calendars, spreads, flies, RRs): keep it parallel and bounded.** Fire every
 leg's ticker and every leg's Step 3b pull **in the same one batch** — put each leg's tape
@@ -84,14 +99,19 @@ concurrent execs, still one round. Do not add extra rounds per leg.
 > second-guess. Keep internal reasoning tight — a calendar needs no more thinking than a call.
 
 **Combined tape read (run this exact `exec` — no need to open `references/rfq-lookup.md`
-on the hot path; it holds the field mapping + fallbacks only).** Substitute three tokens:
+on the hot path; it holds the field mapping + fallbacks only).** Substitute four tokens:
 - `<CORE_ID>` — the `r_…` id with any `DRFQv2-`/`GRFQ-` prefix stripped.
+- `<ASSET>` — `BTC` / `ETH` / `SOL` / … . If the description doesn't name it and the strike is
+  ambiguous, leave the recurrence's `PRODUCT` guard out on the first pass, read it from the
+  FILL row's `PRODUCT`, then it's known. When known, it keeps `%<STRIKE>%` from matching a
+  different asset (strike `88` would otherwise match BTC `88000`).
 - `<EXPIRY_C>` — the expiry **compacted, uppercased, no spaces**: `31 Jul 26` → `31JUL26`.
-- `<STRIKE>` — the strike digits: `66000`.
+- `<STRIKE>` — the strike digits: `66000` / `88`.
 
 The recurrence match **normalizes `DESCRIPTION`** (strips spaces, uppercases) before
 comparing, so it matches whether the tape stores `Call 31 Jul 26 66000` or a compact form —
-**do not** paste the raw spaced expiry into the `LIKE`, use the compacted `<EXPIRY_C>`:
+**do not** paste the raw spaced expiry into the `LIKE`, use the compacted `<EXPIRY_C>`. The
+`PRODUCT LIKE '%<ASSET> OPTION%'` guard stops a short strike from matching another coin:
 
 ```bash
 TOKEN=$(cat "$AWS_WEB_IDENTITY_TOKEN_FILE")
@@ -110,13 +130,14 @@ SELECT DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE,
 FROM read_csv_auto('s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz')
 WHERE RFQ_ID LIKE '%<CORE_ID>%'
    OR (DATE >= (CURRENT_DATE - INTERVAL 30 DAY)
+       AND PRODUCT LIKE '%<ASSET> OPTION%'
        AND UPPER(REPLACE(DESCRIPTION,' ','')) LIKE '%<EXPIRY_C>%<STRIKE>%');
 SELECT 'FILL' tag, *,
        ROUND(PRICE - REF_PRICE, 6) AS MARK_OFFSET,
        ROUND((PRICE - REF_PRICE) * 10000, 1) AS OFFSET_BPS
 FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%';
 SELECT 'HIST' tag, DATE, TIME, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, BLOCK_TRADE_ID
-FROM tape WHERE DESC_N LIKE '%<EXPIRY_C>%<STRIKE>%'
+FROM tape WHERE PRODUCT LIKE '%<ASSET> OPTION%' AND DESC_N LIKE '%<EXPIRY_C>%<STRIKE>%'
 ORDER BY DATE DESC, TIME DESC;
 "
 ```
@@ -161,6 +182,16 @@ the trade: fall back to the inline description for structure + live marks, and
 lead the output with the one-line failure note in Step 7 so the fill, mark, and
 spot read as *unavailable* rather than fabricated.
 
+> **Never fabricate the asset or structure.** Two hard rules, both from a real miss where a
+> SOL call got reported as a BTC straddle:
+> 1. **Get it right the first time — no wrong-then-"Wait, actually…" self-corrections in the
+>    output.** If you assumed an asset and the tape `PRODUCT` disagrees, that means you should
+>    have read `PRODUCT` first — do the resolution before emitting, not after. Only ONE block.
+> 2. If the FILL genuinely doesn't resolve **and the asset isn't determinable** from the
+>    description, you cannot build live marks either (you don't know the instrument). Say the
+>    RFQ is unresolved and stop — do **not** substitute BTC, do **not** invent a strike/expiry/
+>    structure. A confident wrong block is far worse than an honest "unresolved".
+
 ## Step 1 — Parse the Trade
 
 Extract from the resolved trade-tape record (or the pasted JSON):
@@ -176,8 +207,7 @@ Extract from the resolved trade-tape record (or the pasted JSON):
 | `index_price` | Spot at trade time. **Label this "Spot" in the output, never "Index".** |
 | `strategy_code` | Structure type (see references/strategy-codes.md) |
 | `rfqType` | `grfq` (multi-maker) or `drfq` (directed) |
-| `venue` | `DBT` = Deribit, `BIT` = Bit.com, `OKX` = OKX |
-| `product_codes` | `DO`/`EH` = BTC/ETH options; `DP`/`EP` = BTC/ETH perps |
+| `PRODUCT` | **Asset + kind + venue** — authoritative source of the underlying. `BTC OPTION - DBT`, `ETH OPTION - DBT`, `SOL OPTION - DBT`, `BTC PERPETUAL - DBT`. **Read the asset here; never default to BTC.** Venue suffix: `DBT` Deribit, `PRDX` Paradex, `BYB` Bybit, `OKX` OKX. |
 
 **Leg parsing from `description`:**
 - Format: `[+/-][ratio] [Type] [DD Mon YY] [Strike]`
