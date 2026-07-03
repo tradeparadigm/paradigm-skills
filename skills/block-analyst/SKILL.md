@@ -159,7 +159,7 @@ Extract from the resolved trade-tape record (or the pasted JSON):
 | `index_price` | Spot at trade time. **Label this "Spot" in the output, never "Index".** |
 | `strategy_code` | Structure type (see references/strategy-codes.md) |
 | `rfqType` | `grfq` (multi-maker) or `drfq` (directed) |
-| `PRODUCT` | **Asset + kind + venue** — authoritative source of the underlying. `BTC OPTION - DBT`, `ETH OPTION - DBT`, `SOL OPTION - DBT`, `BTC PERPETUAL - DBT`. **Read the asset here; never default to BTC.** Venue suffix: `DBT` Deribit, `PRDX` Paradex, `BYB` Bybit, `OKX` OKX. |
+| `PRODUCT` | **Asset + kind + venue** — authoritative source of the underlying. `BTC OPTION - DBT`, `ETH OPTION - DBT`, `SOL OPTION - DBT`, `BTC PERPETUAL - DBT`. **Read the asset here; never default to BTC.** Venue suffix = the token after ` - ` (e.g. `DBT` Deribit, `PRDX` Paradex, `BYB` Bybit, `OKX` OKX — non-exhaustive; surface an unrecognized suffix verbatim, never fail or guess on one). |
 
 **Leg parsing from `description`:**
 - Format: `[+/-][ratio] [Type] [DD Mon YY] [Strike]`

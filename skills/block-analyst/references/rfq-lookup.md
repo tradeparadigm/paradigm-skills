@@ -126,7 +126,7 @@ JSON. Map by the tape's actual columns:
 | `price` (fill) | `PRICE` (execution price, in `QUOTE_CURRENCY`) |
 | `mark_price` | `REF_PRICE` (reference/mark at trade time) |
 | `displayValues.markOffset` | computed: `PRICE − REF_PRICE` |
-| `venue` | from `PRODUCT` suffix — `DBT` Deribit, `PRDX` Paradex, `BYB` Bybit, `OKX` OKX |
+| `venue` | from `PRODUCT` suffix — the token after ` - ` (e.g. `DBT` Deribit, `PRDX` Paradex, `BYB` Bybit, `OKX` OKX; **non-exhaustive** — new venues appear over time. Surface an unrecognized suffix verbatim; never fail or guess on one) |
 | `product_codes` / asset + kind | from `PRODUCT` — e.g. `BTC OPTION - DBT`, `ETH PERPETUAL - DBT`, `BTC OPTION - PRDX` |
 | `quote_currency` | `QUOTE_CURRENCY` (`BTC` / `ETH` / `USD` …) |
 | USD notional | `NOTIONAL_VOLUME_USD` |
