@@ -126,6 +126,21 @@ legs, side, reliable = ac.apply_orientation(p, [{"SIDE": "SELL", "PRICE": 0.02, 
 ok(side == "Seller" and reliable, "put spread credit → Seller, reliable")
 byv = {int(l["strike"]): l["sign"] for l in legs}
 ok(byv[60000] == 1 and byv[65000] == -1, "bull put spread (credit): +lo / -hi")
+# the TAPE writes verticals as the abbreviation "PSpd"/"CSpd" (not the spelled-out
+# "Spread") — these must classify identically or they fall to the slow model
+# fallback. Regression guard for that exact gap.
+p = ac.parse_description("CSpd 31 Jul 26 60000/70000")
+ok(p["code"] == "CS" and p["classified"] and len(p["legs"]) == 2, "CSpd abbrev parses to a call spread")
+legs, side, reliable = ac.apply_orientation(p, [{"SIDE": "BUY", "PRICE": 0.02, "QTY": 100}])
+byv = {int(l["strike"]): l["sign"] for l in legs}
+ok(side == "Buyer" and reliable and byv[60000] == 1 and byv[70000] == -1,
+   "CSpd debit → Buyer, reliable, +lo / -hi")
+p = ac.parse_description("PSpd 25 Sep 26 52000/35000")
+ok(p["code"] == "PS" and p["classified"] and len(p["legs"]) == 2, "PSpd abbrev parses to a put spread")
+legs, side, reliable = ac.apply_orientation(p, [{"SIDE": "BUY", "PRICE": 0.0225, "QTY": 100}])
+byv = {int(l["strike"]): l["sign"] for l in legs}
+ok(side == "Buyer" and reliable and byv[52000] == 1 and byv[35000] == -1,
+   "PSpd bought (debit) → long hi put / short lo put")
 
 # ── ratio spreads are NOT 1:1 verticals → defer to the unmapped fallback ──────
 ok(ac.parse_description("CRatioSpread 27 Jun 26 60000/62000")["classified"] is False,

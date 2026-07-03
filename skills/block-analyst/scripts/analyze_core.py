@@ -195,7 +195,7 @@ def _code_of(name_up: str) -> str:
         return "CO"
     if "FLY" in name_up or "BUTTERFLY" in name_up:
         return "BF"
-    if "SPREAD" in name_up or name_up in ("CS", "PS"):
+    if "SPREAD" in name_up or name_up in ("CS", "PS", "CSPD", "PSPD"):
         return "PS" if name_up.startswith("P") else "CS"
     return name_up[:4]
 
@@ -237,7 +237,7 @@ def _named_legs(name_up: str, ks: list[int], ec: str):
         return [L(cp, k1, +1), L(cp, k2, -1, 2), L(cp, k3, +1)], True  # long fly = debit (body ×2)
     if "RATIO" in name_up:
         return None                                                  # ratio legs aren't 1:1 → defer (unmapped)
-    if ("SPREAD" in name_up or name_up in ("CS", "PS")) and len(ks) == 2:
+    if ("SPREAD" in name_up or name_up in ("CS", "PS", "CSPD", "PSPD")) and len(ks) == 2:
         lo, hi = sorted(ks)
         cp = "P" if name_up.startswith("P") else "C"
         # [+lo, -hi] is a debit for calls (lo call is the dear leg) but a CREDIT
