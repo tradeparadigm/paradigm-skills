@@ -6,6 +6,11 @@
 - Options: `BTC-DDMMMYY-STRIKE-C/P` → `BTC-7MAY26-81500-C`
 - Perpetuals: `BTC-PERPETUAL`, `ETH-PERPETUAL`
 - ETH options: `ETH-DDMMMYY-STRIKE-C/P` → `ETH-10MAY26-2375-C`
+- **Alt (USDC-margined) options — SOL, XRP, etc.:** `<ASSET>_USDC-DDMMMYY-STRIKE-C/P` →
+  `SOL_USDC-31JUL26-88-C` (the ticker/`[Live]` reads `SOL_USDC 88C`). The tape `PRODUCT`
+  (`SOL OPTION - DBT`) gives the asset — **never assume BTC**; a sub-1000 strike (`88`, `180`)
+  is the tell it's an alt, not BTC/ETH. Confirm the instrument exists before treating an empty
+  ticker as "no data" (a `BTC-…-88-C` guess returns empty because that strike is nonsensical for BTC).
 
 **Tool:** `deribit__get_ticker` (native — fastest, most complete)
 
@@ -171,7 +176,7 @@ Before calling Bybit options endpoints, follow the Bybit skill Module Router:
 | Data source method | `deribit__get_ticker` | `web_fetch` | `web_fetch` (+ skill module) |
 | Paradigm venue code | `DBT` | `OKX` | — |
 
-### Trade History (90-day tape check)
+### Trade History (30-day tape check)
 
 | Venue | Method | Granularity | Notes |
 |---|---|---|---|
