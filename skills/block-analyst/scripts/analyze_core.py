@@ -290,6 +290,33 @@ def net_cash(rows: list[dict]) -> float:
     return tot
 
 
+def struct_net(rows: list[dict], field: str) -> float:
+    """Per-structure net of `field` ('PRICE' or 'REF_PRICE'): Σ sign × (QTY/base) × value
+    over the OPTION legs, where base = the smallest option-leg QTY (the structure's unit).
+
+    This is the premium/mark used for the fill-vs-mark offset and the displayed
+    'Paid/Recd'. A plain per-row sum (Σ sign × value) is WRONG whenever legs trade in
+    unequal quantities: a 1×2×1 butterfly's body has QTY 2× the wings, so its premium
+    must count twice (net = +wing − 2×body + wing), and a ratioed Cstm likewise. Equal-
+    quantity structures (single leg, verticals, straddles, condors) have every weight = 1,
+    so their net is unchanged. Perp/future legs are EXCLUDED — a delta hedge executes at
+    spot and is not part of the option premium (including it leaked the perp price into
+    'Paid'). Falls back to all rows if there are no option legs."""
+    opt = [r for r in rows if parse_product(r.get("PRODUCT", "")).get("kind") == "OPTION"]
+    prem = opt or rows
+    qs = [q for q in (_f(r.get("QTY")) for r in prem) if q and q > 0]
+    base = min(qs) if qs else 1.0
+    tot = 0.0
+    for r in prem:
+        v = _f(r.get(field))
+        if v is None:
+            continue
+        sgn = 1 if (r.get("SIDE") or "").upper() == "BUY" else -1
+        w = (_f(r.get("QTY")) or base) / base
+        tot += sgn * w * v
+    return tot
+
+
 def apply_orientation(parsed: dict, rows: list[dict]) -> tuple[list[dict], str, bool]:
     """Assign each leg the taker's real sign and return (legs, side_label, reliable).
 

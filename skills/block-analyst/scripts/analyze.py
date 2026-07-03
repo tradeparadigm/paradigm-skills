@@ -207,11 +207,11 @@ def _run(args):
             greek_by_key[ac.leg_key(l)] = tt
     ng = ac.net_greeks(legs, greek_by_key, qty) if reliable else {}
 
-    # net fill vs mark (per unit), offset unit by quote
-    fill_net = sum((1 if (r.get("SIDE") or "").upper() == "BUY" else -1) * (ac._f(r.get("PRICE")) or 0)
-                   for r in fill)
-    ref_net = sum((1 if (r.get("SIDE") or "").upper() == "BUY" else -1) * (ac._f(r.get("REF_PRICE")) or 0)
-                  for r in fill)
+    # net fill vs mark (per structure unit), offset unit by quote. struct_net weights
+    # each option leg by its QTY relative to the structure's base unit, so a 1×2×1 fly's
+    # body counts twice (net = +wing − 2×body + wing); a plain per-row sum over-states it.
+    fill_net = ac.struct_net(fill, "PRICE")
+    ref_net = ac.struct_net(fill, "REF_PRICE")
     off = ac.offset(abs(fill_net), abs(ref_net), quote) if ref_net else {"txt": "n/a"}
 
     # recurrence: HIST blocks clustered by BLOCK_TRADE_ID

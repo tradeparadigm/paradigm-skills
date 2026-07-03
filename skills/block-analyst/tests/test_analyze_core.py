@@ -146,6 +146,26 @@ ok(side == "Buyer" and reliable and byv[52000] == 1 and byv[35000] == -1,
 ok(ac.parse_description("CRatioSpread 27 Jun 26 60000/62000")["classified"] is False,
    "ratio spread name → not classified (never netted 1:1)")
 
+# ── struct_net: per-structure premium must QTY-weight unequal legs ─────────────
+# Real 1×2×1 call fly (tape stores 3 per-leg rows; body QTY is 2× the wings). The net
+# debit is +wing − 2×body + wing, NOT a flat per-row sum (that over-states it and can
+# exceed the fly's max payoff — the bug this guards).
+_fly = [{"PRODUCT": "BTC OPTION - DBT", "SIDE": "BUY",  "QTY": 25, "PRICE": 0.0131, "REF_PRICE": 0.013},
+        {"PRODUCT": "BTC OPTION - DBT", "SIDE": "SELL", "QTY": 50, "PRICE": 0.0078, "REF_PRICE": 0.0081},
+        {"PRODUCT": "BTC OPTION - DBT", "SIDE": "BUY",  "QTY": 25, "PRICE": 0.0045, "REF_PRICE": 0.0043}]
+ok(abs(ac.struct_net(_fly, "PRICE") - 0.0020) < 1e-9, "fly net PRICE = +wing -2*body +wing = 0.0020")
+ok(abs(ac.struct_net(_fly, "REF_PRICE") - 0.0011) < 1e-9, "fly net REF = 0.0011 (body weighted 2x)")
+ok(ac.offset(abs(ac.struct_net(_fly, "PRICE")), abs(ac.struct_net(_fly, "REF_PRICE")), "BTC")["val"] == 9.0,
+   "fly offset = +9 bps (not the unweighted +6)")
+# perp/future legs are excluded from premium (a hedge is not premium)
+_combo = [{"PRODUCT": "BTC OPTION - DBT", "SIDE": "BUY", "QTY": 25, "PRICE": 0.10, "REF_PRICE": 0.10},
+          {"PRODUCT": "BTC PERPETUAL - DBT", "SIDE": "SELL", "QTY": 9000, "PRICE": 61000, "REF_PRICE": 61000}]
+ok(abs(ac.struct_net(_combo, "PRICE") - 0.10) < 1e-9, "perp leg excluded from option premium")
+# equal-quantity structures are unchanged (every weight = 1)
+_vert = [{"PRODUCT": "BTC OPTION - DBT", "SIDE": "BUY",  "QTY": 100, "PRICE": 0.02, "REF_PRICE": 0.02},
+         {"PRODUCT": "BTC OPTION - DBT", "SIDE": "SELL", "QTY": 100, "PRICE": 0.01, "REF_PRICE": 0.01}]
+ok(abs(ac.struct_net(_vert, "PRICE") - 0.01) < 1e-9, "equal-qty vertical net unchanged (+0.02 -0.01)")
+
 # ── 2-digit alt strikes parse; the date's YY is never swallowed as a strike ────
 p = ac.parse_description("Strangle 28 Aug 26 88/95")
 ok(p["classified"] and sorted(int(l["strike"]) for l in p["legs"]) == [88, 95],
