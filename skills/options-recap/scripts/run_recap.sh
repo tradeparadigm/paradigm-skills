@@ -51,6 +51,12 @@ esac
 [ -n "${RECAP_PRINT_PLAN:-}" ] && { echo "$ASSET $WIN $SECS $PRESET"; exit 0; }
 DIR="$(cd "$(dirname "$0")/.." && pwd)"      # skill dir (scripts/..)
 mkdir -p /tmp/recap
+# Clear stale CSVs from a prior run FIRST. Non-preset windows don't write the
+# hot__recap CSVs (dvol_spot/volume/surface), so a leftover set from an earlier
+# preset run would be read as fresh — recap.py would see DVOL present, skip the
+# Deribit reconstruction, and silently serve the previous window's data. Wiping
+# them forces load_hot to find them absent → reconstruct live for this window.
+rm -f /tmp/recap/*.csv
 
 # STS bootstrap (IRSA → temporary creds; see paradigm-data-discovery skill).
 TOKEN=$(cat "$AWS_WEB_IDENTITY_TOKEN_FILE")
