@@ -25,7 +25,7 @@ import recap  # noqa: E402
 from recap import (  # noqa: E402
     parse_window_ms, load_hot, build, build_block_flow, render_md,
     _leg_phrase, pct, dvol_label, spot_vol_label, fmt_hhmm, run_duckdb,
-    _load_surface_tickers, _delta_fmt, MAX_SURFACE_ROWS,
+    _load_surface_tickers, _delta_fmt, deribit_tape_volume, MAX_SURFACE_ROWS,
 )
 
 _passed = 0
@@ -418,6 +418,41 @@ def test_run_duckdb_invokes_binary():
             os.unlink(sqlp)
         check("mock duckdb → rc 0", rc == 0, rc)
         check("mock duckdb executed (marker written)", os.path.exists(marker))
+
+
+def test_deribit_tape_volume():
+    # Sums option contracts by call/put suffix; ignores non-option instruments.
+    trades = [
+        {"instrument_name": "BTC-25JUL26-60000-C", "amount": 10.0},
+        {"instrument_name": "BTC-25JUL26-60000-C", "amount": 5.0},
+        {"instrument_name": "BTC-25JUL26-55000-P", "amount": 8.0},
+        {"instrument_name": "BTC-PERPETUAL", "amount": 99.0},   # not an option
+        {"instrument_name": None, "amount": 3.0},               # defensive
+    ]
+    cv, pv = deribit_tape_volume(trades)
+    check("call contracts summed", cv == 15.0, cv)
+    check("put contracts summed", pv == 8.0, pv)
+    check("empty tape → (None, None)", deribit_tape_volume([]) == (None, None))
+
+
+def test_build_volume_fallback_when_hot_absent():
+    # Non-preset window: no hot `volume` row, so build() derives Deribit-only
+    # volume from the window tape and labels the venue Deribit.
+    recap.WARNINGS.clear()
+    deri = {
+        "closes_7d": [], "market": None,
+        "trades": [
+            {"instrument_name": "BTC-25JUL26-60000-C", "amount": 12.0},
+            {"instrument_name": "BTC-25JUL26-55000-P", "amount": 8.0},
+        ],
+    }
+    hot = {"tickers": {}, "spot_close": 60000, "dvol": None}  # no volume_btc
+    r = build("btc", "3h", 0, 10_800_000, deri, hot)
+    s = r["snapshot"]
+    # 20 contracts × $60k = $1.2M → 1 (rounded to $M)
+    check("volume from tape (Deribit-only)", s["volume_usd_m"] == 1, s["volume_usd_m"])
+    check("primary venue labeled Deribit", s["primary_venue"] == "Deribit", s["primary_venue"])
+    check("P/C from tape", s["pc_ratio"] == round(8.0 / 12.0, 2), s["pc_ratio"])
 
 
 def main():

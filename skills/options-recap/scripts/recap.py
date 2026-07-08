@@ -76,7 +76,7 @@ def parse_window_ms(window: str) -> int:
     units = {"m": 60_000, "h": 3600_000, "d": 86400_000}
     unit = w[-1]
     if unit not in units:
-        raise ValueError(f"bad window '{window}' — use 5m/1h/4h/8h/24h/1d")
+        raise ValueError(f"bad window '{window}' — use Nm/Nh/Nd, e.g. 30m/3h/8h/2d")
     return int(w[:-1]) * units[unit]
 
 
@@ -386,6 +386,24 @@ def spot_vol_label(spot_open, spot_close, dvol_open, dvol_close):
     return "vol faded with spot"
 
 
+def deribit_tape_volume(trades: list[dict]) -> tuple:
+    """Call/put option volume (BTC contracts) summed from the Deribit window tape.
+    The dynamic-window stand-in for the hot `volume` rows, which are pre-baked only
+    for preset windows. This matches the figure the hot path already renders — that
+    path filters `volume` rows to Deribit (see load_hot), so both are Deribit-only.
+    Deribit contracts are BTC-denominated, so notional = contracts × spot downstream,
+    the same derivation load_hot uses."""
+    cv = pv = 0.0
+    for t in trades:
+        nm = t.get("instrument_name") or ""
+        amt = t.get("amount") or 0
+        if nm.endswith("-C"):
+            cv += amt
+        elif nm.endswith("-P"):
+            pv += amt
+    return (cv or None, pv or None)
+
+
 def build(asset: str, window: str, start_ms: int, end_ms: int,
           deri: dict, hot: dict) -> dict:
     asset = asset.upper()
@@ -411,9 +429,18 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     rv = realized_vs_implied(deri.get("closes_7d") or [], dvol_close)
 
     # Volume / P/C — hot gives Deribit contracts (BTC); notional = contracts × spot.
+    # Non-preset windows have no hot `volume` row, so fall back to the Deribit
+    # window tape (already fetched for block flow) — same Deribit-only scope the
+    # hot path renders, just computed live for the arbitrary window.
     vol_btc = hot.get("volume_btc")
-    vol_usd = vol_btc * spot if (vol_btc and spot) else None
     pv, cv = hot.get("put_vol"), hot.get("call_vol")
+    primary_venue = hot.get("primary_venue")
+    if vol_btc is None:
+        cv, pv = deribit_tape_volume(deri.get("trades") or [])
+        vol_btc = ((cv or 0) + (pv or 0)) or None
+        if vol_btc is not None:
+            primary_venue = primary_venue or "Deribit"
+    vol_usd = vol_btc * spot if (vol_btc and spot) else None
     pc = round(pv / cv, 2) if pv and cv else None
 
     # Vol surface — v_vol_surface "now" snapshot is authoritative (it pairs with
@@ -441,7 +468,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "dvol_label": dvol_label(dvol_open, dvol_close),
         "rv_7d": rv.get("value"), "vrp": rv.get("vrp"), "vrp_label": rv.get("vrp_label"),
         "volume_usd_m": round(vol_usd / 1e6) if vol_usd else None,
-        "primary_venue": hot.get("primary_venue"),
+        "primary_venue": primary_venue,
         "pc_ratio": pc, "pc_dominant": ("puts" if pc and pc > 1 else "calls" if pc else None),
         "spot_vol_label": spot_vol_label(spot_open, spot_close, dvol_open, dvol_close),
     }

@@ -8,6 +8,7 @@ follows; everything an operator or contributor needs lives here.
 
 `/recap [asset] [window]` produces a fixed four-section options recap (Snapshot,
 Biggest Print, Block Flow, Vol Surface) for BTC/ETH over a window (default 24h).
+The window can be **any** `Nm`/`Nh`/`Nd` value — see "Windows" below.
 The live path renders the output in `scripts/recap.py` (`render_md`) and the
 agent relays it verbatim, so the format lives in code there. The exact template
 is also written out in `references/output-format.md` — the contract for the
@@ -43,6 +44,33 @@ bash scripts/run_recap.sh <ASSET> <WINDOW>
 - `references/output-format.md` — the fixed four-section template + formatting
   rules. The live path doesn't read it (the script emits the shape); it's the
   rendering contract for the injected/simulate modes and the eval harness.
+
+## Windows — presets vs. dynamic
+
+`run_recap.sh` parses the window generically into seconds (`Nm`/`Nh`/`Nd`), so
+**any** window renders. There are two paths:
+
+- **Presets** (`5m 10m 20m 1h 4h 8h 24h`) — a server-side `hot__recap_<win>.parquet`
+  is pre-aggregated, so DVOL/spot OHLC, volume, and the close-surface come from one
+  fast S3 read. `PRESET=1` in the script gates those COPYs.
+- **Dynamic** (any other window, e.g. `3h`, `90m`) — no pre-baked parquet exists,
+  so `recap.py` reconstructs the same sections live: DVOL/spot OHLC from the
+  Deribit index/chart APIs over `[start,end]`, Volume/P-C from the Deribit window
+  tape (`deribit_tape_volume`), and the vol surface + ΔATM/ΔRR/ΔFly from
+  `v_vol_surface` (the two `surface_now`/`surface_open` COPYs run for **every**
+  window). Slower (more Deribit round-trips) but the output shape is identical.
+
+Notes / non-obvious bits:
+- **Volume is Deribit-scoped on both paths.** The preset path already filters the
+  hot `volume` rows to Deribit (the multi-venue rows mix BTC/contract units and
+  over-count), so the dynamic Deribit-tape figure matches — no regression.
+- **The old bug:** a preset `case` mapped unknown windows to a silent 8h default,
+  so `hot__recap_3h.parquet` was read (missing → n/a Snapshot) and surface deltas
+  were computed against an 8h-old open. Fixed by parsing instead of enumerating.
+- **Bad windows** (`3x`, `0h`, …) exit `2` with a clear message before any network.
+- The raw per-venue tapes under `external/tardis/` are **not** a source here —
+  they don't replicate into the pod's bucket and are stale; Deribit's public API
+  covers the dynamic path instead.
 
 Why one command: an instrumented run showed ~86% of wall time was the model
 *generating* a ~50-line inline bootstrap+SQL block. Moving it into a wrapper
