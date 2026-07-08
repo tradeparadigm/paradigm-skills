@@ -442,18 +442,21 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
 
     rv = realized_vs_implied(deri.get("closes_7d") or [], dvol_close)
 
-    # Volume / P/C — hot gives Deribit contracts (BTC); notional = contracts × spot.
-    # Non-preset windows have no hot `volume` row, so fall back to the Deribit
-    # window tape (already fetched for block flow) — same Deribit-only scope the
-    # hot path renders, just computed live for the arbitrary window.
-    vol_btc = hot.get("volume_btc")
-    pv, cv = hot.get("put_vol"), hot.get("call_vol")
-    primary_venue = hot.get("primary_venue")
-    if vol_btc is None:
-        cv, pv = deribit_tape_volume(deri.get("trades") or [])
-        vol_btc = ((cv or 0) + (pv or 0)) or None
-        if vol_btc is not None:
-            primary_venue = primary_venue or "Deribit"
+    # Volume / P/C from the Deribit tape (screen + block, i.e. incl. Paradigm) for
+    # EVERY window. The tape is already fetched for Block Flow, and it's the
+    # authoritative figure: the hot `volume` parquet rows undercount by ~25% —
+    # they drop most block flow despite the recap's "incl. Paradigm" label (an 8h
+    # sample: tape 6712 BTC / 4202 trades vs hot 5059 / 3129). Using one source for
+    # all windows also fixes the non-monotonic volume across the preset/dynamic
+    # boundary (a 3h window reading more than a 4h one). Fall back to the hot rows
+    # only when the tape is empty (e.g. a Deribit fetch failure). Both are
+    # Deribit-denominated BTC contracts, so notional = contracts × spot.
+    cv, pv = deribit_tape_volume(deri.get("trades") or [])
+    primary_venue = "Deribit"
+    if cv is None and pv is None:  # tape unavailable → hot rows
+        cv, pv = hot.get("call_vol"), hot.get("put_vol")
+        primary_venue = hot.get("primary_venue")
+    vol_btc = ((cv or 0) + (pv or 0)) or None
     vol_usd = vol_btc * spot if (vol_btc and spot) else None
     pc = round(pv / cv, 2) if pv and cv else None
 

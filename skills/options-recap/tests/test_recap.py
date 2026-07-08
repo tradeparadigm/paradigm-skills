@@ -143,6 +143,7 @@ def test_volume_excludes_aggregate_and_other_venues():
 
 
 def test_volume_to_usd_is_sane():
+    # Empty tape → volume falls back to the hot rows (the fallback path).
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot(d)
         res = build("btc", "8h", 0, 8 * 3600_000,
@@ -153,6 +154,25 @@ def test_volume_to_usd_is_sane():
     check("volume not trillions", s["volume_usd_m"] < 100_000, s["volume_usd_m"])
     check("pc ratio 0.57", s["pc_ratio"] == 0.57, s["pc_ratio"])
     check("calls dominant", s["pc_dominant"] == "calls", s["pc_dominant"])
+
+
+def test_volume_prefers_tape_over_hot():
+    # When BOTH the hot volume rows and a live tape are present, the tape wins —
+    # it's the authoritative screen+block figure (hot undercounts ~25%). This is
+    # what keeps volume consistent/monotonic across the preset/dynamic boundary.
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot(d)  # hot: 4719.6 calls / 2702.9 puts
+    trades = ([{"instrument_name": "BTC-25JUL26-60000-C", "amount": 100.0}] * 1 +
+              [{"instrument_name": "BTC-25JUL26-55000-P", "amount": 40.0}] * 1)
+    res = build("btc", "8h", 0, 8 * 3600_000,
+                {"closes_7d": CLOSES_7D, "trades": trades, "market": None}, hot)
+    s = res["snapshot"]
+    spot = s["spot"]
+    # Volume must reflect the tape (140 BTC), NOT the hot rows (7422.5 BTC).
+    check("volume from tape not hot", round(140 * spot / 1e6) == s["volume_usd_m"],
+          (s["volume_usd_m"], spot))
+    check("pc ratio from tape (40/100=0.4)", s["pc_ratio"] == 0.4, s["pc_ratio"])
+    check("primary venue Deribit", s["primary_venue"] == "Deribit", s["primary_venue"])
 
 
 # ── load_hot: dvol/spot + surface parsing ───────────────────────────────────
@@ -350,8 +370,10 @@ def test_render_four_sections():
     for h in ("**Snapshot**", "**Biggest Print**", "**Block Flow", "**Vol Surface**"):
         check(f"render has {h}", h in md, md[:80])
     check("render title", md.startswith("**BTC Options · 8h Recap"), md[:40])
-    check("render volume line", "Volume" in md and "$449M" in md, "volume render")
-    check("render P/C 0.57x", "0.57x" in md)
+    # Volume/P-C now come from the tape (TRADES: 100C + 100P = 200 BTC × $60,468
+    # ≈ $12M, P/C 1.0), not the hot rows — one authoritative source for all windows.
+    check("render volume line", "Volume" in md and "$12M" in md, "volume render")
+    check("render P/C 1.0x", "1.0x" in md)
     check("render biggest Strangle/RR", "26JUN26 Strangle/RR" in md)
     # Vol-surface delta columns are always present in the header; with no
     # window-open surface (this fixture has none) the delta cells read n/a.

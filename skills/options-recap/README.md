@@ -61,9 +61,15 @@ bash scripts/run_recap.sh <ASSET> <WINDOW>
   window). Slower (more Deribit round-trips) but the output shape is identical.
 
 Notes / non-obvious bits:
-- **Volume is Deribit-scoped on both paths.** The preset path already filters the
-  hot `volume` rows to Deribit (the multi-venue rows mix BTC/contract units and
-  over-count), so the dynamic Deribit-tape figure matches — no regression.
+- **Volume/P-C come from the live Deribit tape for EVERY window** (screen + block,
+  i.e. incl. Paradigm) — `deribit_tape_volume`, not the hot `volume` parquet. The
+  hot rows undercount by ~25%: they drop most block flow despite the recap's
+  "incl. Paradigm" label (8h sample: tape 6712 BTC / 4202 trades vs hot 5059 /
+  3129), which made volume non-monotonic across the preset/dynamic boundary (a 3h
+  window reading more than a 4h one). The tape is already fetched for Block Flow,
+  so this is free. The hot `volume` rows are now only an empty-tape fallback (e.g.
+  a Deribit fetch failure). Root cause is the server-side `hot__recap` bake
+  dropping blocks; if fixed there, presets could read the parquet again.
 - **The old bug:** a preset `case` mapped unknown windows to a silent 8h default,
   so `hot__recap_3h.parquet` was read (missing → n/a Snapshot) and surface deltas
   were computed against an 8h-old open. Fixed by parsing instead of enumerating.
