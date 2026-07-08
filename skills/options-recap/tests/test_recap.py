@@ -25,7 +25,7 @@ import recap  # noqa: E402
 from recap import (  # noqa: E402
     parse_window_ms, load_hot, build, build_block_flow, render_md,
     _leg_phrase, pct, dvol_label, spot_vol_label, fmt_hhmm, run_duckdb,
-    _load_surface_tickers, _delta_fmt, MAX_SURFACE_ROWS,
+    _load_surface_tickers, _delta_fmt, deribit_tape_volume, MAX_SURFACE_ROWS,
 )
 
 _passed = 0
@@ -143,6 +143,7 @@ def test_volume_excludes_aggregate_and_other_venues():
 
 
 def test_volume_to_usd_is_sane():
+    # Empty tape → volume falls back to the hot rows (the fallback path).
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot(d)
         res = build("btc", "8h", 0, 8 * 3600_000,
@@ -153,6 +154,25 @@ def test_volume_to_usd_is_sane():
     check("volume not trillions", s["volume_usd_m"] < 100_000, s["volume_usd_m"])
     check("pc ratio 0.57", s["pc_ratio"] == 0.57, s["pc_ratio"])
     check("calls dominant", s["pc_dominant"] == "calls", s["pc_dominant"])
+
+
+def test_volume_prefers_tape_over_hot():
+    # When BOTH the hot volume rows and a live tape are present, the tape wins —
+    # it's the authoritative screen+block figure (hot undercounts ~25%). This is
+    # what keeps volume consistent/monotonic across the preset/dynamic boundary.
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot(d)  # hot: 4719.6 calls / 2702.9 puts
+    trades = ([{"instrument_name": "BTC-25JUL26-60000-C", "amount": 100.0}] * 1 +
+              [{"instrument_name": "BTC-25JUL26-55000-P", "amount": 40.0}] * 1)
+    res = build("btc", "8h", 0, 8 * 3600_000,
+                {"closes_7d": CLOSES_7D, "trades": trades, "market": None}, hot)
+    s = res["snapshot"]
+    spot = s["spot"]
+    # Volume must reflect the tape (140 BTC), NOT the hot rows (7422.5 BTC).
+    check("volume from tape not hot", round(140 * spot / 1e6) == s["volume_usd_m"],
+          (s["volume_usd_m"], spot))
+    check("pc ratio from tape (40/100=0.4)", s["pc_ratio"] == 0.4, s["pc_ratio"])
+    check("primary venue Deribit", s["primary_venue"] == "Deribit", s["primary_venue"])
 
 
 # ── load_hot: dvol/spot + surface parsing ───────────────────────────────────
@@ -350,8 +370,10 @@ def test_render_four_sections():
     for h in ("**Snapshot**", "**Biggest Print**", "**Block Flow", "**Vol Surface**"):
         check(f"render has {h}", h in md, md[:80])
     check("render title", md.startswith("**BTC Options · 8h Recap"), md[:40])
-    check("render volume line", "Volume" in md and "$449M" in md, "volume render")
-    check("render P/C 0.57x", "0.57x" in md)
+    # Volume/P-C now come from the tape (TRADES: 100C + 100P = 200 BTC × $60,468
+    # ≈ $12M, P/C 1.0), not the hot rows — one authoritative source for all windows.
+    check("render volume line", "Volume" in md and "$12M" in md, "volume render")
+    check("render P/C 1.0x", "1.0x" in md)
     check("render biggest Strangle/RR", "26JUN26 Strangle/RR" in md)
     # Vol-surface delta columns are always present in the header; with no
     # window-open surface (this fixture has none) the delta cells read n/a.
@@ -418,6 +440,129 @@ def test_run_duckdb_invokes_binary():
             os.unlink(sqlp)
         check("mock duckdb → rc 0", rc == 0, rc)
         check("mock duckdb executed (marker written)", os.path.exists(marker))
+
+
+def test_deribit_tape_volume():
+    # Sums option contracts by call/put suffix; ignores non-option instruments.
+    trades = [
+        {"instrument_name": "BTC-25JUL26-60000-C", "amount": 10.0},
+        {"instrument_name": "BTC-25JUL26-60000-C", "amount": 5.0},
+        {"instrument_name": "BTC-25JUL26-55000-P", "amount": 8.0},
+        {"instrument_name": "BTC-PERPETUAL", "amount": 99.0},   # not an option
+        {"instrument_name": None, "amount": 3.0},               # defensive
+    ]
+    cv, pv = deribit_tape_volume(trades)
+    check("call contracts summed", cv == 15.0, cv)
+    check("put contracts summed", pv == 8.0, pv)
+    check("empty tape → (None, None)", deribit_tape_volume([]) == (None, None))
+
+
+def test_build_volume_fallback_when_hot_absent():
+    # Non-preset window: no hot `volume` row, so build() derives Deribit-only
+    # volume from the window tape and labels the venue Deribit.
+    recap.WARNINGS.clear()
+    deri = {
+        "closes_7d": [], "market": None,
+        "trades": [
+            {"instrument_name": "BTC-25JUL26-60000-C", "amount": 12.0},
+            {"instrument_name": "BTC-25JUL26-55000-P", "amount": 8.0},
+        ],
+    }
+    hot = {"tickers": {}, "spot_close": 60000, "dvol": None}  # no volume_btc
+    r = build("btc", "3h", 0, 10_800_000, deri, hot)
+    s = r["snapshot"]
+    # 20 contracts × $60k = $1.2M → 1 (rounded to $M)
+    check("volume from tape (Deribit-only)", s["volume_usd_m"] == 1, s["volume_usd_m"])
+    check("primary venue labeled Deribit", s["primary_venue"] == "Deribit", s["primary_venue"])
+    check("P/C from tape", s["pc_ratio"] == round(8.0 / 12.0, 2), s["pc_ratio"])
+
+
+def test_header_dates_on_multiday_windows():
+    from recap import fmt_stamp
+    check("intraday: HH:MM only", fmt_stamp(0, False) == "00:00", fmt_stamp(0, False))
+    check("with_date: includes month/day", fmt_stamp(0, True) == "Jan 01 00:00", fmt_stamp(0, True))
+    # A 48h window (multiple of 24h) must NOT collapse to identical start==end.
+    recap.WARNINGS.clear()
+    end = 100 * 24 * 3600_000
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot(d)
+    res = build("btc", "48h", end - 48 * 3600_000, end,
+                {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
+    h = res["header"]
+    check("48h start != end in header", h["start_utc"] != h["end_utc"], h)
+    check("48h header carries a date", " " in h["start_utc"], h["start_utc"])
+    # Intraday window stays HH:MM only.
+    res8 = build("btc", "8h", end - 8 * 3600_000, end,
+                 {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
+    check("8h header HH:MM only", " " not in res8["header"]["start_utc"], res8["header"])
+
+
+def test_flow_horizon_banner_beyond_24h():
+    # A 72h window whose tape only reaches back ~24h → flow-horizon banner, and the
+    # header still says 72h (DVOL/spot/surface are full-window).
+    recap.WARNINGS.clear()
+    end = 100 * 3600_000
+    start = end - 72 * 3600_000          # 72h window
+    trades = [{"instrument_name": "BTC-25JUL26-60000-C", "amount": 5.0,
+               "timestamp": end - 23 * 3600_000},   # oldest trade ~23h back
+              {"instrument_name": "BTC-25JUL26-60000-C", "amount": 5.0, "timestamp": end}]
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot(d)
+    res = build("btc", "72h", start, end,
+                {"closes_7d": CLOSES_7D, "trades": trades, "market": None}, hot)
+    check("flow_horizon set", res["flow_horizon"] is not None, res["flow_horizon"])
+    check("covered ~23h", res["flow_horizon"]["covered_h"] == 23, res["flow_horizon"])
+    md = render_md(res)
+    check("banner rendered", "Deribit tape retention limit" in md, md[:200])
+    check("banner names full window", "full 72h" in md, md[:200])
+
+
+def test_no_flow_horizon_banner_within_24h():
+    # An 8h window whose tape spans it → no banner.
+    recap.WARNINGS.clear()
+    end = 100 * 3600_000
+    trades = [{"instrument_name": "BTC-25JUL26-60000-C", "amount": 5.0,
+               "timestamp": end - 7 * 3600_000},
+              {"instrument_name": "BTC-25JUL26-60000-P", "amount": 5.0, "timestamp": end}]
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot(d)
+    res = build("btc", "8h", end - 8 * 3600_000, end,
+                {"closes_7d": CLOSES_7D, "trades": trades, "market": None}, hot)
+    check("no flow_horizon within 24h", res["flow_horizon"] is None, res["flow_horizon"])
+    check("no banner in md", "tape retention" not in render_md(res))
+
+
+def test_market_fallback_skips_surface_when_not_wanted():
+    # The dynamic-window optimization: with want_surface=False the fallback must
+    # fetch DVOL+spot but make ZERO get_instruments/ticker calls (v_vol_surface
+    # supplies the surface). With want_surface=True the ticker calls happen.
+    calls = []
+    orig = recap._get
+
+    def fake_get(path, params, timeout=15):
+        calls.append(path)
+        if path == "get_volatility_index_data":
+            return {"data": [[0, 40.0, 41.0, 39.0, 40.5]]}
+        if path == "get_tradingview_chart_data":
+            return {"close": [60000.0], "open": [59000.0], "low": [58000.0]}
+        if path == "get_instruments":
+            return [{"expiration_timestamp": 1, "instrument_name": "BTC-1JAN27-60000-C"}]
+        if path == "ticker":
+            return {"mark_iv": 40.0, "greeks": {"delta": 0.5}}
+        return {}
+
+    recap._get = fake_get
+    try:
+        r = recap._fetch_market_fallback("BTC", 0, 1000, want_surface=False)
+        check("no ticker/instruments calls when want_surface=False",
+              "ticker" not in calls and "get_instruments" not in calls, calls)
+        check("DVOL+spot still fetched", bool(r["dvol"]) and bool(r["spot"]), r)
+        check("no surface tickers returned", r["tickers"] == {}, r["tickers"])
+        calls.clear()
+        recap._fetch_market_fallback("BTC", 0, 1000, want_surface=True)
+        check("ticker calls happen when want_surface=True", "ticker" in calls, calls)
+    finally:
+        recap._get = orig
 
 
 def main():

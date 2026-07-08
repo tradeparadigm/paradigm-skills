@@ -8,6 +8,7 @@ follows; everything an operator or contributor needs lives here.
 
 `/recap [asset] [window]` produces a fixed four-section options recap (Snapshot,
 Biggest Print, Block Flow, Vol Surface) for BTC/ETH over a window (default 24h).
+The window can be **any** `Nm`/`Nh`/`Nd` value — see "Windows" below.
 The live path renders the output in `scripts/recap.py` (`render_md`) and the
 agent relays it verbatim, so the format lives in code there. The exact template
 is also written out in `references/output-format.md` — the contract for the
@@ -43,6 +44,47 @@ bash scripts/run_recap.sh <ASSET> <WINDOW>
 - `references/output-format.md` — the fixed four-section template + formatting
   rules. The live path doesn't read it (the script emits the shape); it's the
   rendering contract for the injected/simulate modes and the eval harness.
+
+## Windows — presets vs. dynamic
+
+`run_recap.sh` parses the window generically into seconds (`Nm`/`Nh`/`Nd`), so
+**any** window renders. There are two paths:
+
+- **Presets** (`5m 10m 20m 1h 4h 8h 24h`) — a server-side `hot__recap_<win>.parquet`
+  is pre-aggregated, so DVOL/spot OHLC, volume, and the close-surface come from one
+  fast S3 read. `PRESET=1` in the script gates those COPYs.
+- **Dynamic** (any other window, e.g. `3h`, `90m`) — no pre-baked parquet exists,
+  so `recap.py` reconstructs the same sections live: DVOL/spot OHLC from the
+  Deribit index/chart APIs over `[start,end]`, Volume/P-C from the Deribit window
+  tape (`deribit_tape_volume`), and the vol surface + ΔATM/ΔRR/ΔFly from
+  `v_vol_surface` (the two `surface_now`/`surface_open` COPYs run for **every**
+  window). Slower (more Deribit round-trips) but the output shape is identical.
+
+Notes / non-obvious bits:
+- **Volume/P-C come from the live Deribit tape for EVERY window** (screen + block,
+  i.e. incl. Paradigm) — `deribit_tape_volume`, not the hot `volume` parquet. The
+  hot rows undercount by ~25%: they drop most block flow despite the recap's
+  "incl. Paradigm" label (8h sample: tape 6712 BTC / 4202 trades vs hot 5059 /
+  3129), which made volume non-monotonic across the preset/dynamic boundary (a 3h
+  window reading more than a 4h one). The tape is already fetched for Block Flow,
+  so this is free. The hot `volume` rows are now only an empty-tape fallback (e.g.
+  a Deribit fetch failure). Root cause is the server-side `hot__recap` bake
+  dropping blocks; if fixed there, presets could read the parquet again.
+- **The old bug:** a preset `case` mapped unknown windows to a silent 8h default,
+  so `hot__recap_3h.parquet` was read (missing → n/a Snapshot) and surface deltas
+  were computed against an 8h-old open. Fixed by parsing instead of enumerating.
+- **~24h flow horizon.** Volume / Biggest Print / Block Flow come from the Deribit
+  public tape, which only retains ~24h (empirically confirmed: both `get_last_trades*`
+  endpoints return 0 rows for ranges older than ~24h). DVOL/spot (OHLC) and the vol
+  surface (`v_vol_surface`) retain far longer. So for windows >24h, `build()` sets a
+  `flow_horizon` field and `render_md` prepends a one-line banner — the flow sections
+  cover ~24h, the rest spans the full window. The >24h data *does* exist in the cold
+  store (`paradigm_trade_tape_slim` for blocks, fresh; tardis for screen, ~2d stale)
+  but isn't wired in yet — that's the planned follow-up that will retire the banner.
+- **Bad windows** (`3x`, `0h`, …) exit `2` with a clear message before any network.
+- The raw per-venue tapes under `external/tardis/` are **not** a source here —
+  they don't replicate into the pod's bucket and are stale; Deribit's public API
+  covers the dynamic path instead.
 
 Why one command: an instrumented run showed ~86% of wall time was the model
 *generating* a ~50-line inline bootstrap+SQL block. Moving it into a wrapper

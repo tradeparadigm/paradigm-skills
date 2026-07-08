@@ -40,6 +40,15 @@ def resolve(*args):
     return r.stdout.strip(), r.returncode
 
 
+def plan(*args):
+    """Run with the print-plan hook; return ("ASSET WIN SECS PRESET", rc). Also
+    surfaces stderr on non-zero rc so bad-window guards are checkable."""
+    env = dict(os.environ, RECAP_PRINT_PLAN="1")
+    r = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True,
+                       env=env, timeout=20)
+    return (r.stdout.strip() or r.stderr.strip()), r.returncode
+
+
 def test_plain_args():
     out, rc = resolve("BTC", "8h")
     check("BTC 8h passes through", out == "BTC 8h", out)
@@ -71,6 +80,37 @@ def test_options_with_1d_window():
 def test_defaults():
     check("no args → BTC 8h", resolve()[0] == "BTC 8h")
     check("asset only → BTC 8h", resolve("btc")[0] == "BTC 8h")
+
+
+# ── Dynamic-window parsing + preset gating (RECAP_PRINT_PLAN) ────────────────
+# The old preset `case` silently defaulted any non-preset window (e.g. 3h) to
+# 8h, so surface deltas were computed against the wrong window-open and the
+# hot__recap_<win>.parquet read missed. Windows are now parsed generically.
+
+def test_preset_window_plan():
+    # Preset: SECS from the window, PRESET=1 (reads the pre-baked hot parquet).
+    check("8h → 28800s, preset", plan("btc", "8h") == ("BTC 8h 28800 1", 0))
+    check("1h → 3600s, preset", plan("btc", "1h") == ("BTC 1h 3600 1", 0))
+
+
+def test_dynamic_window_resolves_correctly():
+    # The bug: 3h must resolve to 10800s (not the old 8h/28800 default), PRESET=0.
+    check("3h → 10800s, non-preset", plan("btc", "3h") == ("BTC 3h 10800 0", 0))
+    check("90m → 5400s, non-preset", plan("btc", "90m") == ("BTC 90m 5400 0", 0))
+    check("2d → 172800s, non-preset", plan("eth", "2d") == ("ETH 2d 172800 0", 0))
+    check("6h → 21600s, non-preset", plan("btc", "6h") == ("BTC 6h 21600 0", 0))
+
+
+def test_1d_normalizes_to_preset():
+    # 1d → 24h happens before parsing, so it stays on the fast preset path.
+    check("1d → 24h, 86400s, preset", plan("btc", "1d") == ("BTC 24h 86400 1", 0))
+
+
+def test_bad_window_exits_2():
+    for w in ("3x", "foo", "0h", "h", "-2h"):
+        out, rc = plan("btc", w)
+        check(f"bad window '{w}' exits 2", rc == 2, f"rc={rc}")
+        check(f"bad window '{w}' names it", "bad window" in out, out)
 
 
 def main():

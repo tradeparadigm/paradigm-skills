@@ -12,7 +12,7 @@ compatibility: Deribit public API (curl), Paradigm hot surface (DuckDB+S3 via IR
   S3 hot surface requires the IRSA bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.4.2"
+  version: "1.5.0"
 ---
 
 # Options Recap
@@ -24,8 +24,19 @@ metadata:
 | Token | Examples | Default |
 |---|---|---|
 | `asset` | `btc`, `eth` | `btc` |
-| `window` | `1h`, `4h`, `8h`, `24h`, `1d` | `24h` |
+| `window` | any `Nm`/`Nh`/`Nd` — `30m`, `3h`, `8h`, `2d` (`1d`→`24h`) | `24h` |
 | `options` | the literal word `options` | ignored — a no-op keyword (this skill is always options); `run_recap.sh` strips it |
+
+Any window works. `5m/10m/20m/1h/4h/8h/24h` are **presets** — served from a
+pre-baked hot parquet (fast). Any other window (e.g. `3h`) is reconstructed live
+from Deribit + `v_vol_surface`: same four sections, slightly slower. A malformed
+window exits with a clear error.
+
+**Windows beyond ~24h:** Volume / Biggest Print / Block Flow come from the Deribit
+public tape, which only retains ~24h, so for a longer window those sections cover
+just the last ~24h while DVOL/spot/surface span the full window. `run_recap.sh`
+prepends a one-line `⚠ … tape retention limit …` banner in that case — **relay it
+verbatim** (don't drop or reword it).
 
 `/recap` alone = BTC options, last 24h. Still pass just `<ASSET> <WINDOW>` to
 `run_recap.sh` — it drops a stray `options`/`option` token, so `/recap btc
@@ -37,7 +48,7 @@ options 8h` and `/recap btc 8h` resolve identically.
 command and relay its stdout **verbatim** as your entire reply:
 
 ```bash
-bash scripts/run_recap.sh BTC 8h      # <ASSET> <WINDOW> from the command; 1d→24h
+bash scripts/run_recap.sh BTC 8h      # <ASSET> <WINDOW>; presets fast, any Nm/Nh/Nd works; 1d→24h
 ```
 
 That script does everything — STS bootstrap, the single DuckDB session over the

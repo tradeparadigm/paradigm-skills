@@ -76,7 +76,7 @@ def parse_window_ms(window: str) -> int:
     units = {"m": 60_000, "h": 3600_000, "d": 86400_000}
     unit = w[-1]
     if unit not in units:
-        raise ValueError(f"bad window '{window}' — use 5m/1h/4h/8h/24h/1d")
+        raise ValueError(f"bad window '{window}' — use Nm/Nh/Nd, e.g. 30m/3h/8h/2d")
     return int(w[:-1]) * units[unit]
 
 
@@ -157,8 +157,14 @@ def fetch_deribit(asset: str, start_ms: int, end_ms: int, want_market: bool) -> 
     return res
 
 
-def _fetch_market_fallback(asset: str, start_ms: int, end_ms: int) -> dict:
-    """DVOL + spot OHLC + a small ATM±4 surface from Deribit (test/no-S3 only)."""
+def _fetch_market_fallback(asset: str, start_ms: int, end_ms: int,
+                           want_surface: bool = True) -> dict:
+    """DVOL + spot OHLC from Deribit (these have no non-Deribit source), plus — only
+    when want_surface — a small ATM±4 per-strike surface. The surface is ~50 Deribit
+    `ticker` calls and dominates this call's latency, so callers that already hold a
+    v_vol_surface snapshot (the normal dynamic-window case) pass want_surface=False
+    and skip it entirely. When the surface IS needed, the ticker calls run
+    concurrently rather than one-at-a-time."""
     dvol = _get("get_volatility_index_data", {
         "currency": asset, "resolution": "3600",
         "start_timestamp": start_ms, "end_timestamp": end_ms,
@@ -169,10 +175,10 @@ def _fetch_market_fallback(asset: str, start_ms: int, end_ms: int) -> dict:
     })
     spot_now = (spot.get("close") or [None])[-1]
     tickers = {}
-    if spot_now:
+    if want_surface and spot_now:
         insts = _get("get_instruments", {"currency": asset, "kind": "option", "expired": "false"})
-        expiries = sorted(set(i["expiration_timestamp"] for i in insts))[:3]
-        for exp in expiries:
+        names: list[str] = []
+        for exp in sorted(set(i["expiration_timestamp"] for i in insts))[:3]:
             ex_insts = [i for i in insts if i["expiration_timestamp"] == exp]
             strikes = sorted(set(int(i["instrument_name"].split("-")[2]) for i in ex_insts))
             if not strikes:
@@ -183,14 +189,22 @@ def _fetch_market_fallback(asset: str, start_ms: int, end_ms: int) -> dict:
                     nm = next((i["instrument_name"] for i in ex_insts
                                if int(i["instrument_name"].split("-")[2]) == k
                                and i["instrument_name"].endswith(ot)), None)
-                    if not nm:
-                        continue
-                    try:
-                        t = _get("ticker", {"instrument_name": nm})
-                        tickers[nm] = {"mark_iv": t.get("mark_iv"),
-                                       "delta": (t.get("greeks") or {}).get("delta")}
-                    except Exception:
-                        pass
+                    if nm:
+                        names.append(nm)
+
+        def _one(nm: str):
+            try:
+                t = _get("ticker", {"instrument_name": nm})
+                return nm, {"mark_iv": t.get("mark_iv"),
+                            "delta": (t.get("greeks") or {}).get("delta")}
+            except Exception:
+                return nm, None
+
+        if names:
+            with ThreadPoolExecutor(max_workers=min(8, len(names))) as ex:
+                for nm, v in ex.map(_one, names):
+                    if v is not None:
+                        tickers[nm] = v
     return {"dvol": dvol, "spot": spot, "spot_now": spot_now, "tickers": tickers}
 
 
@@ -366,6 +380,14 @@ def fmt_hhmm(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%H:%M")
 
 
+def fmt_stamp(ms: int, with_date: bool) -> str:
+    """Header timestamp. Windows ≥24h span at least a day, and any multiple-of-24h
+    window has identical start/end clock times (e.g. 48h → 17:30–17:30), so include
+    the date once the window reaches a day; keep it HH:MM-only for intraday windows."""
+    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    return dt.strftime("%b %d %H:%M") if with_date else dt.strftime("%H:%M")
+
+
 def dvol_label(o, c):
     if o is None or c is None:
         return None
@@ -384,6 +406,24 @@ def spot_vol_label(spot_open, spot_close, dvol_open, dvol_close):
     if su and vu:
         return "vol bought through rally"
     return "vol faded with spot"
+
+
+def deribit_tape_volume(trades: list[dict]) -> tuple:
+    """Call/put option volume (BTC contracts) summed from the Deribit window tape.
+    The dynamic-window stand-in for the hot `volume` rows, which are pre-baked only
+    for preset windows. This matches the figure the hot path already renders — that
+    path filters `volume` rows to Deribit (see load_hot), so both are Deribit-only.
+    Deribit contracts are BTC-denominated, so notional = contracts × spot downstream,
+    the same derivation load_hot uses."""
+    cv = pv = 0.0
+    for t in trades:
+        nm = t.get("instrument_name") or ""
+        amt = t.get("amount") or 0
+        if nm.endswith("-C"):
+            cv += amt
+        elif nm.endswith("-P"):
+            pv += amt
+    return (cv or None, pv or None)
 
 
 def build(asset: str, window: str, start_ms: int, end_ms: int,
@@ -410,10 +450,22 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
 
     rv = realized_vs_implied(deri.get("closes_7d") or [], dvol_close)
 
-    # Volume / P/C — hot gives Deribit contracts (BTC); notional = contracts × spot.
-    vol_btc = hot.get("volume_btc")
+    # Volume / P/C from the Deribit tape (screen + block, i.e. incl. Paradigm) for
+    # EVERY window. The tape is already fetched for Block Flow, and it's the
+    # authoritative figure: the hot `volume` parquet rows undercount by ~25% —
+    # they drop most block flow despite the recap's "incl. Paradigm" label (an 8h
+    # sample: tape 6712 BTC / 4202 trades vs hot 5059 / 3129). Using one source for
+    # all windows also fixes the non-monotonic volume across the preset/dynamic
+    # boundary (a 3h window reading more than a 4h one). Fall back to the hot rows
+    # only when the tape is empty (e.g. a Deribit fetch failure). Both are
+    # Deribit-denominated BTC contracts, so notional = contracts × spot.
+    cv, pv = deribit_tape_volume(deri.get("trades") or [])
+    primary_venue = "Deribit"
+    if cv is None and pv is None:  # tape unavailable → hot rows
+        cv, pv = hot.get("call_vol"), hot.get("put_vol")
+        primary_venue = hot.get("primary_venue")
+    vol_btc = ((cv or 0) + (pv or 0)) or None
     vol_usd = vol_btc * spot if (vol_btc and spot) else None
-    pv, cv = hot.get("put_vol"), hot.get("call_vol")
     pc = round(pv / cv, 2) if pv and cv else None
 
     # Vol surface — v_vol_surface "now" snapshot is authoritative (it pairs with
@@ -426,7 +478,22 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     surf = compute_vol_surface(tickers, surf_spot) if tickers else None
     surf_open = compute_vol_surface(vs_open, surf_spot) if vs_open else None
 
-    block = build_block_flow(deri.get("trades") or [], hot, spot)
+    trades = deri.get("trades") or []
+    block = build_block_flow(trades, hot, spot)
+
+    # Flow-horizon check. Volume / Biggest Print / Block Flow come from the Deribit
+    # public tape, which only retains ~24h; DVOL/spot (OHLC) and the vol surface
+    # (v_vol_surface) retain much longer. So for a window past the tape horizon the
+    # flow sections silently cover less than the header claims. Detect it from the
+    # oldest trade actually returned and surface a banner (render_md). Cleared
+    # automatically once >24h flow is sourced from the cold store.
+    flow_horizon = None
+    window_h = (end_ms - start_ms) / 3600_000
+    if window_h > 24 and trades:
+        oldest = min(t.get("timestamp") or end_ms for t in trades)
+        covered_h = (end_ms - oldest) / 3600_000
+        if window_h - covered_h > 2:
+            flow_horizon = {"covered_h": round(covered_h), "window_h": round(window_h)}
 
     snapshot = {
         "spot": round(spot) if spot else None,
@@ -441,7 +508,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "dvol_label": dvol_label(dvol_open, dvol_close),
         "rv_7d": rv.get("value"), "vrp": rv.get("vrp"), "vrp_label": rv.get("vrp_label"),
         "volume_usd_m": round(vol_usd / 1e6) if vol_usd else None,
-        "primary_venue": hot.get("primary_venue"),
+        "primary_venue": primary_venue,
         "pc_ratio": pc, "pc_dominant": ("puts" if pc and pc > 1 else "calls" if pc else None),
         "spot_vol_label": spot_vol_label(spot_open, spot_close, dvol_open, dvol_close),
     }
@@ -474,12 +541,14 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
 
     return {
         "header": {"asset": asset, "window": window,
-                   "start_utc": fmt_hhmm(start_ms), "end_utc": fmt_hhmm(end_ms)},
+                   "start_utc": fmt_stamp(start_ms, window_h >= 24),
+                   "end_utc": fmt_stamp(end_ms, window_h >= 24)},
         "snapshot": snapshot,
         "biggest_print": block["biggest_print"],
         "block_flow": {"total_m": block["total_m"], "n_blocks": block["n_blocks"],
                        "rows": block["rows"]},
         "vol_surface": surface_out,
+        "flow_horizon": flow_horizon,
         "warnings": WARNINGS,
     }
 
@@ -525,6 +594,16 @@ def render_md(r: dict) -> str:
         k in w for k in ("missing", "unavailable", "failed"))]
     if crit and s.get("volume_usd_m") is None and vs is None:
         L.append("⚠ hot surface unavailable — affected sections read No data")
+        L.append("")
+
+    # >24h window: the flow sections only reach back ~24h (Deribit tape retention),
+    # while DVOL/spot/surface span the full window. Flag it so the header isn't read
+    # as covering the whole window for flow. Goes away once >24h flow comes from S3.
+    fh = r.get("flow_horizon")
+    if fh:
+        L.append(f"⚠ Volume · Biggest Print · Block Flow cover ~{fh['covered_h']}h "
+                 f"(Deribit tape retention limit); DVOL/spot/surface span the full "
+                 f"{fh['window_h']}h.")
         L.append("")
 
     L.append(f"**{h['asset']} Options · {h['window']} Recap · "
@@ -636,10 +715,16 @@ def main() -> None:
                 duck_fut.result()
             deri = deri_fut.result()
         hot = load_hot(args.csv_dir, ASSET)
-        # Rare hot miss (DuckDB failed/empty): fall back to Deribit market data.
+        # No hot dvol_spot row: either a rare full hot miss (DuckDB failed) or a
+        # non-preset window (no hot__recap parquet). Either way DVOL/spot must come
+        # from Deribit. Only pull the expensive per-strike ticker surface when
+        # v_vol_surface also gave us nothing — for a normal dynamic window vs_now
+        # is populated, so we skip ~50 serial ticker calls (the bulk of the cost).
         if hot.get("dvol") is None:
+            want_surface = not hot.get("vs_now")
             try:
-                deri["market"] = _fetch_market_fallback(ASSET, start_ms, now_ms)
+                deri["market"] = _fetch_market_fallback(
+                    ASSET, start_ms, now_ms, want_surface=want_surface)
             except Exception as e:  # noqa: BLE001
                 warn(f"deribit market fallback failed: {e}")
 
