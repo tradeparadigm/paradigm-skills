@@ -380,6 +380,14 @@ def fmt_hhmm(ms: int) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%H:%M")
 
 
+def fmt_stamp(ms: int, with_date: bool) -> str:
+    """Header timestamp. Windows ≥24h span at least a day, and any multiple-of-24h
+    window has identical start/end clock times (e.g. 48h → 17:30–17:30), so include
+    the date once the window reaches a day; keep it HH:MM-only for intraday windows."""
+    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    return dt.strftime("%b %d %H:%M") if with_date else dt.strftime("%H:%M")
+
+
 def dvol_label(o, c):
     if o is None or c is None:
         return None
@@ -533,7 +541,8 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
 
     return {
         "header": {"asset": asset, "window": window,
-                   "start_utc": fmt_hhmm(start_ms), "end_utc": fmt_hhmm(end_ms)},
+                   "start_utc": fmt_stamp(start_ms, window_h >= 24),
+                   "end_utc": fmt_stamp(end_ms, window_h >= 24)},
         "snapshot": snapshot,
         "biggest_print": block["biggest_print"],
         "block_flow": {"total_m": block["total_m"], "n_blocks": block["n_blocks"],

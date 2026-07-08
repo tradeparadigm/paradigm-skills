@@ -477,6 +477,26 @@ def test_build_volume_fallback_when_hot_absent():
     check("P/C from tape", s["pc_ratio"] == round(8.0 / 12.0, 2), s["pc_ratio"])
 
 
+def test_header_dates_on_multiday_windows():
+    from recap import fmt_stamp
+    check("intraday: HH:MM only", fmt_stamp(0, False) == "00:00", fmt_stamp(0, False))
+    check("with_date: includes month/day", fmt_stamp(0, True) == "Jan 01 00:00", fmt_stamp(0, True))
+    # A 48h window (multiple of 24h) must NOT collapse to identical start==end.
+    recap.WARNINGS.clear()
+    end = 100 * 24 * 3600_000
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot(d)
+    res = build("btc", "48h", end - 48 * 3600_000, end,
+                {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
+    h = res["header"]
+    check("48h start != end in header", h["start_utc"] != h["end_utc"], h)
+    check("48h header carries a date", " " in h["start_utc"], h["start_utc"])
+    # Intraday window stays HH:MM only.
+    res8 = build("btc", "8h", end - 8 * 3600_000, end,
+                 {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
+    check("8h header HH:MM only", " " not in res8["header"]["start_utc"], res8["header"])
+
+
 def test_flow_horizon_banner_beyond_24h():
     # A 72h window whose tape only reaches back ~24h → flow-horizon banner, and the
     # header still says 72h (DVOL/spot/surface are full-window).
