@@ -470,7 +470,22 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     surf = compute_vol_surface(tickers, surf_spot) if tickers else None
     surf_open = compute_vol_surface(vs_open, surf_spot) if vs_open else None
 
-    block = build_block_flow(deri.get("trades") or [], hot, spot)
+    trades = deri.get("trades") or []
+    block = build_block_flow(trades, hot, spot)
+
+    # Flow-horizon check. Volume / Biggest Print / Block Flow come from the Deribit
+    # public tape, which only retains ~24h; DVOL/spot (OHLC) and the vol surface
+    # (v_vol_surface) retain much longer. So for a window past the tape horizon the
+    # flow sections silently cover less than the header claims. Detect it from the
+    # oldest trade actually returned and surface a banner (render_md). Cleared
+    # automatically once >24h flow is sourced from the cold store.
+    flow_horizon = None
+    window_h = (end_ms - start_ms) / 3600_000
+    if window_h > 24 and trades:
+        oldest = min(t.get("timestamp") or end_ms for t in trades)
+        covered_h = (end_ms - oldest) / 3600_000
+        if window_h - covered_h > 2:
+            flow_horizon = {"covered_h": round(covered_h), "window_h": round(window_h)}
 
     snapshot = {
         "spot": round(spot) if spot else None,
@@ -524,6 +539,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "block_flow": {"total_m": block["total_m"], "n_blocks": block["n_blocks"],
                        "rows": block["rows"]},
         "vol_surface": surface_out,
+        "flow_horizon": flow_horizon,
         "warnings": WARNINGS,
     }
 
@@ -569,6 +585,16 @@ def render_md(r: dict) -> str:
         k in w for k in ("missing", "unavailable", "failed"))]
     if crit and s.get("volume_usd_m") is None and vs is None:
         L.append("⚠ hot surface unavailable — affected sections read No data")
+        L.append("")
+
+    # >24h window: the flow sections only reach back ~24h (Deribit tape retention),
+    # while DVOL/spot/surface span the full window. Flag it so the header isn't read
+    # as covering the whole window for flow. Goes away once >24h flow comes from S3.
+    fh = r.get("flow_horizon")
+    if fh:
+        L.append(f"⚠ Volume · Biggest Print · Block Flow cover ~{fh['covered_h']}h "
+                 f"(Deribit tape retention limit); DVOL/spot/surface span the full "
+                 f"{fh['window_h']}h.")
         L.append("")
 
     L.append(f"**{h['asset']} Options · {h['window']} Recap · "

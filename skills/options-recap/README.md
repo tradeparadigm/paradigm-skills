@@ -73,6 +73,14 @@ Notes / non-obvious bits:
 - **The old bug:** a preset `case` mapped unknown windows to a silent 8h default,
   so `hot__recap_3h.parquet` was read (missing → n/a Snapshot) and surface deltas
   were computed against an 8h-old open. Fixed by parsing instead of enumerating.
+- **~24h flow horizon.** Volume / Biggest Print / Block Flow come from the Deribit
+  public tape, which only retains ~24h (empirically confirmed: both `get_last_trades*`
+  endpoints return 0 rows for ranges older than ~24h). DVOL/spot (OHLC) and the vol
+  surface (`v_vol_surface`) retain far longer. So for windows >24h, `build()` sets a
+  `flow_horizon` field and `render_md` prepends a one-line banner — the flow sections
+  cover ~24h, the rest spans the full window. The >24h data *does* exist in the cold
+  store (`paradigm_trade_tape_slim` for blocks, fresh; tardis for screen, ~2d stale)
+  but isn't wired in yet — that's the planned follow-up that will retire the banner.
 - **Bad windows** (`3x`, `0h`, …) exit `2` with a clear message before any network.
 - The raw per-venue tapes under `external/tardis/` are **not** a source here —
   they don't replicate into the pod's bucket and are stale; Deribit's public API

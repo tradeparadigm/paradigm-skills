@@ -477,6 +477,41 @@ def test_build_volume_fallback_when_hot_absent():
     check("P/C from tape", s["pc_ratio"] == round(8.0 / 12.0, 2), s["pc_ratio"])
 
 
+def test_flow_horizon_banner_beyond_24h():
+    # A 72h window whose tape only reaches back ~24h → flow-horizon banner, and the
+    # header still says 72h (DVOL/spot/surface are full-window).
+    recap.WARNINGS.clear()
+    end = 100 * 3600_000
+    start = end - 72 * 3600_000          # 72h window
+    trades = [{"instrument_name": "BTC-25JUL26-60000-C", "amount": 5.0,
+               "timestamp": end - 23 * 3600_000},   # oldest trade ~23h back
+              {"instrument_name": "BTC-25JUL26-60000-C", "amount": 5.0, "timestamp": end}]
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot(d)
+    res = build("btc", "72h", start, end,
+                {"closes_7d": CLOSES_7D, "trades": trades, "market": None}, hot)
+    check("flow_horizon set", res["flow_horizon"] is not None, res["flow_horizon"])
+    check("covered ~23h", res["flow_horizon"]["covered_h"] == 23, res["flow_horizon"])
+    md = render_md(res)
+    check("banner rendered", "Deribit tape retention limit" in md, md[:200])
+    check("banner names full window", "full 72h" in md, md[:200])
+
+
+def test_no_flow_horizon_banner_within_24h():
+    # An 8h window whose tape spans it → no banner.
+    recap.WARNINGS.clear()
+    end = 100 * 3600_000
+    trades = [{"instrument_name": "BTC-25JUL26-60000-C", "amount": 5.0,
+               "timestamp": end - 7 * 3600_000},
+              {"instrument_name": "BTC-25JUL26-60000-P", "amount": 5.0, "timestamp": end}]
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot(d)
+    res = build("btc", "8h", end - 8 * 3600_000, end,
+                {"closes_7d": CLOSES_7D, "trades": trades, "market": None}, hot)
+    check("no flow_horizon within 24h", res["flow_horizon"] is None, res["flow_horizon"])
+    check("no banner in md", "tape retention" not in render_md(res))
+
+
 def test_market_fallback_skips_surface_when_not_wanted():
     # The dynamic-window optimization: with want_surface=False the fallback must
     # fetch DVOL+spot but make ZERO get_instruments/ticker calls (v_vol_surface
