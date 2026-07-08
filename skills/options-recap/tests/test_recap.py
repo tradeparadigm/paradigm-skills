@@ -455,6 +455,39 @@ def test_build_volume_fallback_when_hot_absent():
     check("P/C from tape", s["pc_ratio"] == round(8.0 / 12.0, 2), s["pc_ratio"])
 
 
+def test_market_fallback_skips_surface_when_not_wanted():
+    # The dynamic-window optimization: with want_surface=False the fallback must
+    # fetch DVOL+spot but make ZERO get_instruments/ticker calls (v_vol_surface
+    # supplies the surface). With want_surface=True the ticker calls happen.
+    calls = []
+    orig = recap._get
+
+    def fake_get(path, params, timeout=15):
+        calls.append(path)
+        if path == "get_volatility_index_data":
+            return {"data": [[0, 40.0, 41.0, 39.0, 40.5]]}
+        if path == "get_tradingview_chart_data":
+            return {"close": [60000.0], "open": [59000.0], "low": [58000.0]}
+        if path == "get_instruments":
+            return [{"expiration_timestamp": 1, "instrument_name": "BTC-1JAN27-60000-C"}]
+        if path == "ticker":
+            return {"mark_iv": 40.0, "greeks": {"delta": 0.5}}
+        return {}
+
+    recap._get = fake_get
+    try:
+        r = recap._fetch_market_fallback("BTC", 0, 1000, want_surface=False)
+        check("no ticker/instruments calls when want_surface=False",
+              "ticker" not in calls and "get_instruments" not in calls, calls)
+        check("DVOL+spot still fetched", bool(r["dvol"]) and bool(r["spot"]), r)
+        check("no surface tickers returned", r["tickers"] == {}, r["tickers"])
+        calls.clear()
+        recap._fetch_market_fallback("BTC", 0, 1000, want_surface=True)
+        check("ticker calls happen when want_surface=True", "ticker" in calls, calls)
+    finally:
+        recap._get = orig
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     print(f"Running {len(tests)} test functions...")

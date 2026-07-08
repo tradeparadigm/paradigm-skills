@@ -157,8 +157,14 @@ def fetch_deribit(asset: str, start_ms: int, end_ms: int, want_market: bool) -> 
     return res
 
 
-def _fetch_market_fallback(asset: str, start_ms: int, end_ms: int) -> dict:
-    """DVOL + spot OHLC + a small ATM±4 surface from Deribit (test/no-S3 only)."""
+def _fetch_market_fallback(asset: str, start_ms: int, end_ms: int,
+                           want_surface: bool = True) -> dict:
+    """DVOL + spot OHLC from Deribit (these have no non-Deribit source), plus — only
+    when want_surface — a small ATM±4 per-strike surface. The surface is ~50 Deribit
+    `ticker` calls and dominates this call's latency, so callers that already hold a
+    v_vol_surface snapshot (the normal dynamic-window case) pass want_surface=False
+    and skip it entirely. When the surface IS needed, the ticker calls run
+    concurrently rather than one-at-a-time."""
     dvol = _get("get_volatility_index_data", {
         "currency": asset, "resolution": "3600",
         "start_timestamp": start_ms, "end_timestamp": end_ms,
@@ -169,10 +175,10 @@ def _fetch_market_fallback(asset: str, start_ms: int, end_ms: int) -> dict:
     })
     spot_now = (spot.get("close") or [None])[-1]
     tickers = {}
-    if spot_now:
+    if want_surface and spot_now:
         insts = _get("get_instruments", {"currency": asset, "kind": "option", "expired": "false"})
-        expiries = sorted(set(i["expiration_timestamp"] for i in insts))[:3]
-        for exp in expiries:
+        names: list[str] = []
+        for exp in sorted(set(i["expiration_timestamp"] for i in insts))[:3]:
             ex_insts = [i for i in insts if i["expiration_timestamp"] == exp]
             strikes = sorted(set(int(i["instrument_name"].split("-")[2]) for i in ex_insts))
             if not strikes:
@@ -183,14 +189,22 @@ def _fetch_market_fallback(asset: str, start_ms: int, end_ms: int) -> dict:
                     nm = next((i["instrument_name"] for i in ex_insts
                                if int(i["instrument_name"].split("-")[2]) == k
                                and i["instrument_name"].endswith(ot)), None)
-                    if not nm:
-                        continue
-                    try:
-                        t = _get("ticker", {"instrument_name": nm})
-                        tickers[nm] = {"mark_iv": t.get("mark_iv"),
-                                       "delta": (t.get("greeks") or {}).get("delta")}
-                    except Exception:
-                        pass
+                    if nm:
+                        names.append(nm)
+
+        def _one(nm: str):
+            try:
+                t = _get("ticker", {"instrument_name": nm})
+                return nm, {"mark_iv": t.get("mark_iv"),
+                            "delta": (t.get("greeks") or {}).get("delta")}
+            except Exception:
+                return nm, None
+
+        if names:
+            with ThreadPoolExecutor(max_workers=min(8, len(names))) as ex:
+                for nm, v in ex.map(_one, names):
+                    if v is not None:
+                        tickers[nm] = v
     return {"dvol": dvol, "spot": spot, "spot_now": spot_now, "tickers": tickers}
 
 
@@ -663,10 +677,16 @@ def main() -> None:
                 duck_fut.result()
             deri = deri_fut.result()
         hot = load_hot(args.csv_dir, ASSET)
-        # Rare hot miss (DuckDB failed/empty): fall back to Deribit market data.
+        # No hot dvol_spot row: either a rare full hot miss (DuckDB failed) or a
+        # non-preset window (no hot__recap parquet). Either way DVOL/spot must come
+        # from Deribit. Only pull the expensive per-strike ticker surface when
+        # v_vol_surface also gave us nothing — for a normal dynamic window vs_now
+        # is populated, so we skip ~50 serial ticker calls (the bulk of the cost).
         if hot.get("dvol") is None:
+            want_surface = not hot.get("vs_now")
             try:
-                deri["market"] = _fetch_market_fallback(ASSET, start_ms, now_ms)
+                deri["market"] = _fetch_market_fallback(
+                    ASSET, start_ms, now_ms, want_surface=want_surface)
             except Exception as e:  # noqa: BLE001
                 warn(f"deribit market fallback failed: {e}")
 
