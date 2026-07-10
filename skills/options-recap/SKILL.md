@@ -11,7 +11,7 @@ compatibility: Deribit public API (web_fetch), Paradigm block tape (if injected)
   OKX/Bullish/IBIT public APIs (web_fetch). No authentication required.
 metadata:
   author: tradeparadigm
-  version: "1.3"
+  version: "1.4"
 ---
 
 # Options Recap
@@ -29,33 +29,42 @@ metadata:
 
 ## Data Fetches
 
-**Two hot reads cover the whole recap. They are authoritative — never
+**Three hot reads cover the whole recap. They are authoritative — never
 `web_fetch` anything they already carry** (DVOL, spot, window volume,
 ATM IV, per-contract flow, vol surface). Mixing live-API values into a
 hot-file recap is the #1 cause of inconsistent reports. `web_fetch` is
-for the two things hot never has, plus stale-file recovery.
+for the two things hot never has, plus stale-file recovery. All three
+files live under `s3://dt-exchange-venue-data/hot/`; every row carries
+`instrument_kind` (`option`/`perp`/`spot`/`index`) — filter to
+`instrument_kind = 'option'` for the options recap.
 
 **Read 1 — snapshot (the "now" anchor).** One DuckDB read of
-`s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet`:
+`s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet`:
 current DVOL, spot per venue, last-minute volume + call/put split, current
-ATM IV per expiry (`atm_call_iv`/`atm_put_iv` for skew), recent block
-activity. Filter by `signal_type`.
+ATM IV per expiry (`atm_call_iv`/`atm_put_iv` for skew), funding, recent
+block activity, per-stream freshness. Filter by `signal_type`.
 
-**Read 2 — recap window (everything over the window).** One DuckDB read of
-`s3://terminal-dime-prod/paradigm_data/hot/hot__recap_<window>.parquet` for
+**Read 2 — recap window (flow/volume/blocks over the window).** One DuckDB
+read of `s3://dt-exchange-venue-data/hot/hot__recap_<window>.parquet` for
 the recap `window` (`1h`/`4h`/`8h`/`24h`; `1d`→`24h`; `5m`/`10m`/`20m` also
-exist). Pick rows by `row_type` — this map is the contract:
+exist). Pick rows by `row_type`:
 
 | Recap section | `row_type` | Columns to read |
 |---|---|---|
 | Snapshot — DVOL/spot OHLC | `dvol_spot` | `metric` (`dvol`\|`spot`), `open`, `close`, `high`, `low` |
-| Snapshot — Volume + P/C | `volume` | `volume_sum`, `notional`, `buy_volume`, `sell_volume`, `trade_count` (P/C via `optionType`) |
-| Themes (screen flow) | `flow` | `expiry`, `strike`, `optionType`, `side`, `volume_sum`, `avg_iv` |
-| Block Flow (ranking) | `block` | `block_id`, `notional`, `volume_sum`, `leg_count`, `avg_iv` |
-| Vol Surface | `surface` | `expiry`, `strike`, `optionType`, `markIV_close`, `delta`, `openInterest`, `underlying_price` |
+| Snapshot — Volume + P/C | `volume` | `volume_sum`, `notional_usd`, `buy_volume`, `sell_volume`, `trade_count` (P/C via `optionType`) |
+| Themes (screen flow) | `flow` | `expiry`, `strike`, `optionType`, `side`, `volume_sum`, `avg_iv` (long tail folded into `expiry='OTHER'`) |
+| Block Flow (ranking) | `block` | `block_id`, `notional_usd`, `volume_sum`, `leg_count`, `avg_iv` |
 
-IV on `flow`/`block` rows is `avg_iv`; `markIV_close`/`delta` are on
-`surface` rows only (null on `flow`). `at` is Unix ms.
+IV on `flow`/`block` rows is `avg_iv`. `at`/`window_start` are Unix ms.
+
+**Read 3 — vol surface (its own file now).** The per-strike surface is
+**no longer embedded in the recap** — it's the standalone
+`s3://dt-exchange-venue-data/hot/hot__vol_surface.parquet` (point-in-time,
+refreshed every 5 min). `row_type = 'strike'` carries
+`expiry`, `strike`, `optionType`, `mark_iv` (vol points), `greek_delta`,
+`open_interest`, `underlying_price`; `row_type = 'expiry'` carries
+`call_oi`/`put_oi`/`total_oi`, `max_pain_strike`, `dte`.
 
 **`web_fetch` — only these two (hot never carries them):**
 
@@ -94,7 +103,7 @@ and `trades` come from `web_fetch` (omit any field to skip that section):
 |---|---|
 | `dvol_close` | snapshot `dvol` row (or recap `dvol_spot`/`dvol` `close`) |
 | `spot` | snapshot `spot` row |
-| `tickers` (`{sym: {mark_iv, delta}}`) | recap **`surface` rows** — `mark_iv`=`markIV_close`, `delta`=`delta`. Build `sym` as the Deribit instrument name `{asset}-{expiry}-{int(strike)}-{C\|P}` (the script parses expiry/type from this key, so it must be exact; `surface.expiry` is already Deribit-native, e.g. `3JUL26`). Filter to `exchange='deribit'`. No instrument-list/ticker fan-out. |
+| `tickers` (`{sym: {mark_iv, delta}}`) | **`hot__vol_surface.parquet` `strike` rows** — `mark_iv`=`mark_iv`, `delta`=`greek_delta`. Build `sym` as the Deribit instrument name `{asset}-{expiry}-{int(strike)}-{C\|P}` (the script parses expiry/type from this key, so it must be exact). NOTE: `expiry` on the surface is now ISO `YYYY-MM-DD` — reformat to the Deribit-native token (e.g. `2026-07-03` → `3JUL26`) when building `sym`. Filter to `exchange='deribit'` and `optionType` populated. No instrument-list/ticker fan-out. |
 | `spot_closes_7d` | `web_fetch` 7d spot `close[]` |
 | `trades` | `web_fetch` window option trades (block clustering for `flow_greeks`/`top_blocks`) |
 
@@ -109,7 +118,7 @@ Returns `realized_vol`, `flow_greeks`, `top_blocks`, `vol_surface`. If a `derive
 
 RV must be 7-day trailing window. Read from `derived.realized_vol` or the script — never estimate.
 
-**Block Flow** — rank from the recap `block` rows (sort by `notional`); the `$XM / N blocks` header is their sum/count. For the biggest few, pull leg geometry (strikes × size × side × IV) from the one `web_fetch` trades pull, clustered by `block_trade_id` → feed to the script's `top_blocks`. Mark `two-way`/one-sided from the field — do not infer.
+**Block Flow** — rank from the recap `block` rows (`instrument_kind='option'`, sort by `notional_usd`); the `$XM / N blocks` header is their sum/count. For the biggest few, pull leg geometry (strikes × size × side × IV) from the one `web_fetch` trades pull, clustered by `block_trade_id` → feed to the script's `top_blocks`. Mark `two-way`/one-sided from the field — do not infer.
 
 Dealer positioning from `flow_greeks.positioning_label`:
 - short gamma → chase spot, amplify moves
@@ -118,8 +127,8 @@ Dealer positioning from `flow_greeks.positioning_label`:
 
 **Themes** — group the recap `flow` rows (screen, non-block) by expiry/strike/direction; size is `volume_sum`, IV is `avg_iv`. 2–4 bullets. Named, factual, no intent inference.
 
-**Vol Surface** — built from the recap `surface` rows, **not** a fetch:
-1. Feed the `surface` rows as the script's `tickers` (`mark_iv`=`markIV_close`, `delta`=`delta`) plus `spot`.
+**Vol Surface** — built from the `hot__vol_surface.parquet` `strike` rows (Read 3), **not** a fetch:
+1. Feed the `strike` rows as the script's `tickers` (`mark_iv`=`mark_iv`, `delta`=`greek_delta`) plus `spot`.
 2. Read `atm_iv`, `rr_25d`, `butterfly_25d`, `term_structure` back. Note `wings_extrapolated` if set.
 
 ## Output Format — FIXED

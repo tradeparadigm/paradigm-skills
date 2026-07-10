@@ -1,30 +1,30 @@
 ---
 name: paradigm-data-discovery
 description: >
-  Catalog and query-launcher for market data in S3
-  (s3://terminal-dime-prod) — both historical and near-real-time
-  hot surface. ALWAYS load this skill before concluding any dataset is
-  out of scope — do not dismiss based on asset class or venue
-  assumptions. Covers: Paradigm RFQ block-trade tape, Paradigm RFQ
-  activity tape, Deribit/OKX option trades + combo quotes + future
-  top-of-book quotes, Bullish option chain snapshots (native
-  greeks/IV) + orderbook history, IBIT ETF options trades (equity-side
-  vol cross-reference; DO NOT dismiss as out of scope — it lives in
-  this S3 bucket), on-chain Paradex perp historical trade tape,
-  and the hot surface (live 1-minute snapshot of
-  spot, ATM IV, DVOL, last-minute volume, and block-trade activity,
-  plus trailing-window recaps). Fires for any
-  retrospective "what data do we have" question AND for "what's
-  happening right now" questions answerable from it — returns S3
-  path + ready-to-run DuckDB query. Does NOT cover live Paradex
-  markets, positions, vaults, or order placement.
+  Catalog and query-launcher for market data in S3 (the dt-* buckets:
+  dt-exchange-venue-data, dt-paradigm-data, dt-paradex-data) — both
+  historical tapes and the near-real-time hot surface. ALWAYS load this
+  skill before concluding any dataset is out of scope — do not dismiss
+  based on asset class or venue assumptions. Covers: the exchange venue
+  data pipeline (Deribit/OKX/Bybit/Bullish real-time options + perps +
+  spot, raw + normalized per-period substrate) and its hot surface (live
+  1-minute snapshot of spot, ATM IV, DVOL, funding, last-minute volume,
+  block activity, per-stream freshness, plus trailing-window recaps and a
+  point-in-time vol surface); Paradigm RFQ block-trade + activity tapes;
+  Bullish option chain snapshots (native greeks/IV); IBIT ETF options
+  trades (equity-side vol cross-reference; DO NOT dismiss — it lives in
+  these buckets); and the on-chain Paradex perp historical trade tape.
+  Fires for any retrospective "what data do we have" question AND for
+  "what's happening right now" questions answerable from it — returns S3
+  path + ready-to-run DuckDB query. Does NOT cover live Paradex markets,
+  positions, vaults, or order placement.
 compatibility: Read-only data catalog. No authentication required to view the
   catalog itself. Running the suggested DuckDB/S3 queries requires IRSA
   credentials (AWS_WEB_IDENTITY_TOKEN_FILE, AWS_ROLE_ARN) — see
   references/s3-access.md for the credential bootstrap.
 metadata:
   author: tradeparadigm
-  version: "1.2"
+  version: "2.0"
 ---
 
 ## Hard Rules
@@ -32,10 +32,11 @@ metadata:
 1. **Never dismiss a data query without reading this skill first.**
    Domain assumptions ("IBIT is TradFi", "that's not a Paradigm product",
    "that venue isn't supported") are NOT a valid substitute for checking
-   the catalog. All five dataset families live under
-   `s3://terminal-dime-prod` regardless of the instrument's native
-   venue or asset class.
-2. **IBIT is in scope.** `paradigm_data/ibit_options_trades/` contains
+   the catalog. Every dataset family lives under the `dt-*` buckets
+   (`dt-exchange-venue-data`, `dt-paradigm-data`, `dt-paradex-data`)
+   regardless of the instrument's native venue or asset class.
+2. **IBIT is in scope.**
+   `s3://dt-paradigm-data/paradigm_data/ibit_options_trades/` contains
    IBIT ETF option trades. Used for equity-side BTC vol
    cross-referencing. Always surface it when the user asks about IBIT,
    ETF options, or equity vol vs crypto vol comparisons.
@@ -46,11 +47,11 @@ metadata:
 
 # Paradigm Data Discovery
 
-Reference catalog **and entry-point** for historical S3-backed datasets the
-agent can query through DuckDB. Scope: everything under
-`s3://terminal-dime-prod` — Paradigm RFQ tapes, exchange market data
-(options + futures), Bullish option chain + orderbook, IBIT ETF options
-trades, and the on-chain Paradex perp trade tape.
+Reference catalog **and entry-point** for the S3-backed datasets the
+agent can query through DuckDB. Scope: the `dt-*` buckets — the exchange
+venue data pipeline + its hot surface (`dt-exchange-venue-data`),
+Paradigm RFQ tapes + Bullish option chain + IBIT (`dt-paradigm-data`),
+and the on-chain Paradex perp trade tape (`dt-paradex-data`).
 
 Two jobs:
 
@@ -66,12 +67,15 @@ Two jobs:
 
 ## Scope — S3-backed market data (historical + near-real-time hot surface)
 
-In scope: anything stored under `s3://terminal-dime-prod` —
-Paradigm block-trade tapes, Deribit/OKX option and combo data,
-Deribit/Bybit/OKX future quotes, Bullish option chain snapshots +
-orderbook history, IBIT ETF option trades, the historical Paradex perp
-trade tape (`paradex_data/paradex_trade_tape.csv.gz`), and the
-near-real-time **hot surface** (`paradigm_data/hot/hot__market_signals_1m.parquet`).
+In scope: anything under the `dt-*` buckets — the exchange venue data
+substrate (Deribit/OKX/Bybit/Bullish real-time options + perps + spot,
+raw + normalized), Bullish option chain snapshots + orderbook history,
+Paradigm block-trade + RFQ tapes, IBIT ETF option trades, the historical
+Paradex perp trade tape
+(`s3://dt-paradex-data/paradex_data/paradex_trade_tape.csv.gz`, bucket
+TBC), and the near-real-time **hot surface**
+(`s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet` +
+`hot__recap_<window>` + `hot__vol_surface`).
 
 Out of scope: anything **live** that isn't in the hot surface — live Paradex
 markets, positions, funding, vaults, raw orderbook, order placement,
@@ -100,15 +104,17 @@ families:
 what coverage":
 
 - "What Paradigm / S3 / DuckDB data do we have?"
-- "Where does the <Paradigm tape | option trades | combo quotes | Paradex
-  trade tape> live in S3?"
-- "What columns does the <Paradigm trade tape | RFQ tape | option trades
-  | Paradex trade tape | IBIT trades | Bullish chain> have?"
-- "What's the date range for <Deribit combo quotes | OKX option trades |
+- "Where does the <Paradigm tape | exchange option data | hot surface |
+  Paradex trade tape> live in S3?"
+- "What columns does the <Paradigm trade tape | RFQ tape | hot snapshot |
+  recap window | vol surface | Paradex trade tape | IBIT | Bullish chain>
+  have?"
+- "What's the date range / latest data for <exchange option_summary |
   Paradex trade tape | IBIT options>?"
-- "Do we have <OKX combos | Bybit options | AVAX options | Paradex perp
+- "Do we have <OKX options | Bybit options | Bullish spot | Paradex perp
   trades> in S3?"
-- "What's the schema for `paradigm_trade_tape_slim` / `paradex_trade_tape`?"
+- "What's the schema for `hot__market_signals_1m` / the normalized
+  `option_summary` agg / `paradex_trade_tape`?"
 
 **(B) Historical Paradigm-flow analysis** — retrospective questions over
 a date range / period that the Paradigm tape can answer:
@@ -121,13 +127,14 @@ a date range / period that the Paradigm tape can answer:
 - "Top counterparties / largest single trades / unfilled RFQ ratio in <period>"
 - "Compare Paradigm flow across DBT/PRDX/BYB for <period>"
 
-**(C) Exchange market-data analysis** — retrospective questions over option
-trades, combo quotes, or future quotes:
+**(C) Exchange venue-data analysis** — right-now / recent-window questions
+over the live pipeline (options + perps + spot + DVOL + funding):
 
-- "Most-traded Deribit options on <date>"
-- "OKX option trade volume in <period>"
-- "Top combo quote activity on <date>"
-- "Bybit/Deribit/OKX future top-of-book on <date>"
+- "Current ATM IV / DVOL / spot across venues" (hot snapshot)
+- "Options volume / flow / biggest blocks in the last <5m–24h>" (hot recap)
+- "Full vol surface / skew / term structure right now" (hot__vol_surface)
+- "Is any venue's feed stale?" (coverage rows)
+- "Most-traded Deribit/OKX/Bybit options over <custom window>" (substrate)
 
 **(D) Paradex DEX historical trade tape** — retrospective questions about
 *on-chain Paradex perp* trades that the historical tape can answer:
@@ -171,40 +178,49 @@ Do **not** fire for:
 
 Pull from `references/datasets.md`. Grouped into:
 
-1. **Paradigm Block Trade Tape** (`paradigm_data/`)
+1. **Exchange Venue Data** (`s3://dt-exchange-venue-data/`) — the live
+   Deribit/OKX/Bybit/Bullish pipeline
+   - `raw/` + `normalized/` — per-period substrate (option_trade,
+     option_summary, perp_trade, spot_trade, dvol, perp_summary), Hive
+     layout `exchange=/data_type=/currency=/level=/year=/…`, kind
+     `rows`/`agg`
+   - `meta/instruments/` — per-venue contract conventions
+   - `market_aggregates_5m/` — retained 5m bucket series
+2. **Hot Surface** (`s3://dt-exchange-venue-data/hot/`) — LLM-shaped,
+   near-real-time
+   - `hot__market_signals_1m.parquet` — live snapshot, 7 `signal_type`s
+     (spot / atm_iv / dvol / funding / volume_last_min / block_summary /
+     coverage); clobbered every 60 s
+   - `hot__recap_<window>.parquet` — trailing windows
+     (`5m`/`10m`/`20m`/`1h`/`4h`/`8h`/`24h`): DVOL+spot OHLC, volume,
+     per-contract flow, per-block flow; `row_type` discriminator;
+     refreshed every 5 min
+   - `hot__vol_surface.parquet` — point-in-time per-strike vol surface +
+     per-expiry summary (split out of the recaps); every 5 min
+   - **Every hot row carries `instrument_kind`** (option/perp/spot/index)
+3. **Paradigm Block Trade Tape** (`s3://dt-paradigm-data/paradigm_data/`)
+   — **live, hourly rewrite, trailing ~6 months**
    - `paradigm_trade_tape_slim` — executed RFQ block trades
    - `paradigm_rfq_tape_slim` — RFQ activity including unfilled
-2. **Exchange Market Data** (`external/tardis/v1/`)
-   - Deribit option trades
-   - Deribit option quotes (sparse)
-   - Deribit combo quotes (densest dataset)
-   - OKX option trades
-   - Future quotes (Deribit, Bybit, OKX) — top-of-book for dated +
-     perpetual futures
-3. **Bullish (Options)** (`paradigm_data/bullish_*`)
-   - `bullish_option_chain_snapshots` — chain snapshots with **native
-     greeks and IV** (only dataset in the catalog with these)
-   - `bullish_options_orderbook_historical` — top-2-level orderbook
-     history
-4. **IBIT ETF Options Trades** (`paradigm_data/ibit_options_trades/`)
-   - IBIT (Bitcoin ETF) option trades — equity-side vol
-     cross-reference for crypto BTC options
-5. **Paradex DEX Trade Tape** (`paradex_data/`)
+4. **Bullish Options — static historical load**
+   (`s3://dt-paradigm-data/paradigm_data/bullish_*`) — one-shot load
+   written 2026-05-11, **not refreshing**
+   - `bullish_option_chain_snapshots` — chain with **native greeks + IV**
+     (ends 2026-05-09; distinct from the Dataset 1 bullish spot/perp feed)
+   - plus static option trades / orderbook / spot siblings (see catalog)
+5. **IBIT ETF Options Trades**
+   (`s3://dt-paradigm-data/paradigm_data/ibit_options_trades/`) —
+   equity-side vol cross-reference; **stalled, data ends 2026-06-01**
+6. **Paradex DEX Trade Tape** (`s3://dt-paradex-data/paradex_data/`,
+   **bucket TBC**)
    - `paradex_trade_tape.csv.gz` — on-chain Paradex perp trades
      (historical only; live Paradex state is out of scope)
-6. **Hot Surface** (`paradigm_data/hot/`)
-   - `hot__market_signals_1m.parquet` — single-file LLM-shaped live
-     snapshot (spot / ATM IV / DVOL / 1-min volume / block activity);
-     clobbered every 60 s. The catalog's only near-real-time entry.
-   - `hot__recap_<window>.parquet` — trailing-window aggregates
-     (`5m`/`10m`/`20m`/`1h`/`4h`/`8h`/`24h`): DVOL+spot OHLC, volume by
-     venue, per-contract flow, **per-block flow, and the full per-strike
-     vol surface** over the window; refreshed every 5 min. See Dataset 6b
-     for the (different) window schema — note its five `row_type`s.
 
-For each, report: S3 path (with the correct partition pattern —
-`YYYY/MM/DD/` for option/future market data, `date=YYYY-MM-DD/` Hive-style for Bullish/IBIT,
-flat file for Paradigm and Paradex tapes), last verified coverage, schema,
+For each, report: S3 path (with the correct pattern — the Hive
+`exchange=/…/level=/YYYY/MM/DD/` tree for the exchange substrate,
+stable clobbered keys for the hot surface, `date=YYYY-MM-DD/` for
+Bullish-chain/IBIT, flat file for Paradigm and Paradex tapes), last
+verified coverage, schema,
 notable filters (e.g. `WHERE PRODUCT LIKE '%OPTION%'` for Paradigm,
 `WHERE NOT IS_TRADEBUST` for Paradex tape).
 
@@ -214,7 +230,7 @@ When the user asks about a specific date or recent data, include the glob
 date-range probe. Use the regex that matches the dataset's partition
 layout:
 
-**Daily-partitioned (`YYYY/MM/DD/`) — option/future market data:**
+**Daily-partitioned (`YYYY/MM/DD/`) — exchange venue substrate:**
 
 ```sql
 SELECT
@@ -260,7 +276,7 @@ INSTALL httpfs; LOAD httpfs;
 SELECT
   DATE, TIME, PRODUCT, DESCRIPTION, QTY, PRICE,
   NOTIONAL_VOLUME_USD, SIDE, RFQ_ID
-FROM read_csv_auto('s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz')
+FROM read_csv_auto('s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz')
 WHERE DATE BETWEEN DATE '2026-03-01' AND DATE '2026-03-31'
   AND PRODUCT LIKE '%OPTION%'   -- or drop this filter for all products
 ORDER BY NOTIONAL_VOLUME_USD DESC
@@ -275,7 +291,7 @@ INSTALL httpfs; LOAD httpfs;
 SELECT
   TRADE_AT, MARKET, PRICE, SIZE, TAKER_SIDE,
   PRICE * SIZE AS NOTIONAL_USD
-FROM read_csv_auto('s3://terminal-dime-prod/paradex_data/paradex_trade_tape.csv.gz')
+FROM read_csv_auto('s3://dt-paradex-data/paradex_data/paradex_trade_tape.csv.gz')  -- bucket TBC
 WHERE NOT IS_TRADEBUST
   AND TRADE_AT >= TIMESTAMP '2026-04-01'
   AND TRADE_AT <  TIMESTAMP '2026-05-01'
@@ -294,9 +310,16 @@ Query-template guidelines:
   `paradex_data/paradex_trade_tape.csv.gz`. **Always filter
   `WHERE NOT IS_TRADEBUST`**. Compute notional as `PRICE * SIZE` — there
   is no precomputed USD notional column.
-- For **option/future market data** questions, use the daily-partitioned path with a glob over
-  the date range; remember timestamps are µs (`to_timestamp(ts / 1e6)`).
-- For **Bullish chain** questions, prefer this dataset for greeks/IV.
+- For **live / recent exchange** questions (right-now or last-window),
+  reach for the **hot surface** first (Dataset 2) — one read of
+  `hot__market_signals_1m` / `hot__recap_<window>` / `hot__vol_surface`.
+  Filter on `instrument_kind` to separate options from perp/spot/index.
+- For **deeper / custom-window exchange** questions, glob the
+  `dt-exchange-venue-data` substrate over the Hive
+  `exchange=/data_type=/currency=/level=/YYYY/MM/DD/` tree; the
+  `normalized` `agg` files are the cross-venue aggregates.
+- For **Bullish chain greeks/IV** questions, use the Dataset 4 chain
+  snapshots (distinct from the Dataset 1 bullish spot/perp feed).
 - For **IBIT** questions, expect the equity calendar (no weekends).
 - Filter by `PRODUCT LIKE '%OPTION%'` only if the user specifically asked
   about options; otherwise leave it open so perps/futures are included.
@@ -314,21 +337,33 @@ questions, give the path + query + a one-line interpretation.
 
 ## Notes
 
-- **Bucket:** `s3://terminal-dime-prod`, region `ap-northeast-1`.
+- **Buckets:** `s3://dt-exchange-venue-data` (exchange data + hot),
+  `s3://dt-paradigm-data` (Paradigm tapes, Bullish chain, IBIT),
+  `s3://dt-paradex-data` (Paradex DEX tape, **bucket TBC**). Region
+  assumed `ap-northeast-1` — **verify per bucket** and `SET s3_region`
+  accordingly.
 - **Auth:** IRSA (web identity → STS AssumeRoleWithWebIdentity) — see
   `references/s3-access.md`. Tokens expire ~1 hour; refresh on
   HTTP 400 `InvalidToken`.
 - **DuckDB:** `INSTALL httpfs; LOAD httpfs;` every new session.
 - **Unit gotchas to flag when relevant:**
-  - Option/future feed timestamps are microseconds → `to_timestamp(ts / 1e6)`.
-  - Deribit option prices are in BTC/ETH (index currency), not USD.
-  - Deribit amounts are contracts (1 BTC contract = 1 BTC notional).
+  - Hot-surface `at` / `window_start` are epoch **ms**
+    (`to_timestamp(at / 1000)`); each row also has an `_iso` string.
+  - The hot surface is harmonized — notional USD, volume coin, IV vol
+    points. The `dt-exchange-venue-data` substrate is closer to
+    venue-native (deribit prices in index currency, OKX size in
+    contracts) — prefer the hot surface for comparable numbers.
+  - `instrument_kind` (option/perp/spot/index) marks options vs not on
+    every hot row — use it, don't infer.
 - **Join keys across Paradigm tapes:** `RFQ_ID`, `BLOCK_TRADE_ID`.
 - **Paradigm exchange suffixes:** `DBT` = Deribit, `PRDX` = Paradex,
   `BYB` = Bybit.
-- **What is NOT here** (call out when asked): Deribit option quotes beyond
-  2026-01-01 are sparse, OKX combo quotes are absent, Greeks/IV are not in
-  the raw option/future feed data, Paradex options excluded (everlasting/perpetual style).
+- **What is NOT here** (call out when asked): the legacy Tardis.dev CSV
+  exchange feed (`external/tardis/v1/` combo/future quotes) is **gone** —
+  superseded by the live exchange venue data; Bullish **options** are not
+  on the exchange feed yet (spot/perp only — use the Bullish chain
+  snapshots for greeks/IV); Bybit blocks can't be de-legged (no group id);
+  Paradex options excluded (everlasting/perpetual style).
 - This skill is a catalog and query-launcher. For analysis of a single
   pasted trade JSON, hand off to `paradigm-block-analyst`. For execution of
   the SQL queries this skill emits, use whatever DuckDB tool the agent has
