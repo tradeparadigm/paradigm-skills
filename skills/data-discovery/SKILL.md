@@ -2,22 +2,20 @@
 name: paradigm-data-discovery
 description: >
   Catalog and query-launcher for market data in S3 (the dt-* buckets:
-  dt-exchange-venue-data, dt-paradigm-data, dt-paradex-data) — both
-  historical tapes and the near-real-time hot surface. ALWAYS load this
-  skill before concluding any dataset is out of scope — do not dismiss
-  based on asset class or venue assumptions. Covers: the exchange venue
-  data pipeline (Deribit/OKX/Bybit/Bullish real-time options + perps +
-  spot, raw + normalized per-period substrate) and its hot surface (live
-  1-minute snapshot of spot, ATM IV, DVOL, funding, last-minute volume,
-  block activity, per-stream freshness, plus trailing-window recaps and a
-  point-in-time vol surface); Paradigm RFQ block-trade + activity tapes;
-  Bullish option chain snapshots (native greeks/IV); IBIT ETF options
-  trades (equity-side vol cross-reference; DO NOT dismiss — it lives in
-  these buckets); and the on-chain Paradex perp historical trade tape.
-  Fires for any retrospective "what data do we have" question AND for
-  "what's happening right now" questions answerable from it — returns S3
-  path + ready-to-run DuckDB query. Does NOT cover live Paradex markets,
-  positions, vaults, or order placement.
+  dt-exchange-venue-data, dt-paradigm-data, dt-paradex-data) — historical
+  tapes plus the near-real-time hot surface. ALWAYS load this skill before
+  concluding a dataset is out of scope — don't dismiss on asset-class or
+  venue assumptions. Covers: the exchange venue data pipeline
+  (Deribit/OKX/Bybit/Bullish options + perps + spot, raw + normalized
+  substrate) and its hot surface (live 1-min snapshot of spot, ATM IV,
+  DVOL, funding, volume, blocks, per-stream freshness, plus
+  trailing-window recaps and a point-in-time vol surface); Paradigm RFQ
+  block-trade + activity tapes; Bullish option chain snapshots; IBIT ETF
+  options trades (DO NOT dismiss — equity-side vol, in these buckets); and
+  the Paradex perp trade tape. Fires for retrospective "what data do we
+  have" AND live "what's happening now" questions answerable from it —
+  returns an S3 path + ready-to-run DuckDB query. Does NOT cover live
+  Paradex markets, positions, vaults, or order placement.
 compatibility: Read-only data catalog. No authentication required to view the
   catalog itself. Running the suggested DuckDB/S3 queries requires IRSA
   credentials (AWS_WEB_IDENTITY_TOKEN_FILE, AWS_ROLE_ARN) — see
