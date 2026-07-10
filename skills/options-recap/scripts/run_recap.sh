@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# run_recap.sh — the entire live recap in one command, so the agent types one
+# short line instead of regenerating a ~50-line bootstrap+SQL block (that
+# generation was ~12s of the old run). Does: STS bootstrap, one DuckDB session
+# into CSVs, then recap.py --render. Its stdout IS the final four-section recap.
+#
+# Usage: bash scripts/run_recap.sh <ASSET> <WINDOW>     e.g. run_recap.sh BTC 8h
+set -uo pipefail
+
+# Some users type the no-op keyword "options" (/recap btc options 8h). This skill
+# is always options, so drop any "options"/"option" token before assigning
+# asset/window — otherwise a stray token lands in the window slot and breaks
+# parsing (hot__recap_options.parquet doesn't exist; parse_window_ms raises).
+ARGS=""
+for a in "$@"; do
+  case "$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')" in
+    options|option) ;;                       # no-op keyword — drop
+    *) ARGS="$ARGS $a" ;;
+  esac
+done
+set -- $ARGS
+
+ASSET=$(printf '%s' "${1:-BTC}" | tr '[:lower:]' '[:upper:]')
+WIN="${2:-8h}"; WIN="${WIN/1d/24h}"          # 1d → 24h
+
+# Window → seconds, parsed GENERICALLY (Nm/Nh/Nd) so any window works — not just
+# the presets that have a server-side pre-baked hot__recap_<win>.parquet. The old
+# preset `case` silently defaulted unknown windows (e.g. 3h) to 8h, so surface
+# deltas were computed against the wrong window-open. Parse instead of enumerate.
+WL=$(printf '%s' "$WIN" | tr '[:upper:]' '[:lower:]')
+WN=${WL%[mhd]}; WU=${WL##*[0-9]}             # magnitude / unit
+case "$WU" in
+  m) SECS=$((WN * 60));; h) SECS=$((WN * 3600));; d) SECS=$((WN * 86400));;
+  *) SECS=0;;
+esac
+if ! [ "$WN" -gt 0 ] 2>/dev/null || [ "$SECS" -le 0 ]; then
+  echo "recap: bad window '$WIN' — use e.g. 30m, 3h, 8h, 2d" >&2; exit 2
+fi
+# Preset windows read the pre-aggregated hot__recap_<win>.parquet (fast path);
+# any other window is reconstructed live from Deribit + v_vol_surface in recap.py
+# (slower, but renders the same sections). PRESET gates the hot__recap COPYs below.
+case "$WIN" in
+  5m|10m|20m|1h|4h|8h|24h) PRESET=1;; *) PRESET=0;;
+esac
+
+# Testability hooks: echo resolved state and exit before any STS/DuckDB work (no
+# creds/network needed). Used by tests/test_run_recap.py.
+#   RECAP_PRINT_ARGS → "ASSET WIN"          (arg normalization)
+#   RECAP_PRINT_PLAN → "ASSET WIN SECS PRESET"  (window parsing + preset gating)
+[ -n "${RECAP_PRINT_ARGS:-}" ] && { echo "$ASSET $WIN"; exit 0; }
+[ -n "${RECAP_PRINT_PLAN:-}" ] && { echo "$ASSET $WIN $SECS $PRESET"; exit 0; }
+DIR="$(cd "$(dirname "$0")/.." && pwd)"      # skill dir (scripts/..)
+mkdir -p /tmp/recap
+# Clear stale CSVs from a prior run FIRST. Non-preset windows don't write the
+# hot__recap CSVs (dvol_spot/volume/surface), so a leftover set from an earlier
+# preset run would be read as fresh — recap.py would see DVOL present, skip the
+# Deribit reconstruction, and silently serve the previous window's data. Wiping
+# them forces load_hot to find them absent → reconstruct live for this window.
+rm -f /tmp/recap/*.csv
+
+# STS bootstrap (IRSA → temporary creds; see paradigm-data-discovery skill).
+TOKEN=$(cat "$AWS_WEB_IDENTITY_TOKEN_FILE")
+CREDS=$(curl -s "https://sts.ap-northeast-1.amazonaws.com/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=${AWS_ROLE_ARN}&RoleSessionName=duckdb&WebIdentityToken=${TOKEN}")
+AK=$(printf '%s' "$CREDS" | grep -o '<AccessKeyId>[^<]*'     | cut -d'>' -f2)
+SK=$(printf '%s' "$CREDS" | grep -o '<SecretAccessKey>[^<]*' | cut -d'>' -f2)
+ST=$(printf '%s' "$CREDS" | grep -o '<SessionToken>[^<]*'    | cut -d'>' -f2)
+
+
+# Vol-surface deltas (ΔATM/ΔRR/ΔFly) need a window-OPEN surface, which the hot
+# recap parquet doesn't carry (it's close-only). Read the consolidated per-strike
+# store v_vol_surface instead: its rolling _hot.parquet holds ~2h of 1-min
+# snapshots (covers windows ≤1h — both endpoints in one file), and older opens
+# come from the cold hour-partition that contains window-start. "Now" is always
+# _hot.parquet's latest snapshot, so open+close share one pipeline (clean deltas).
+# SECS is already parsed above (works for any window, not just presets).
+NOW_S=$(date -u +%s); START_S=$((NOW_S - SECS)); START_MS=$((START_S * 1000))
+VS_HOT=s3://dt-paradigm-data/paradigm_data/v_vol_surface/_hot.parquet
+if [ "$SECS" -le 3600 ]; then
+  VS_OPEN=$VS_HOT                                   # window-start within _hot's buffer
+else                                                # cold partition at window-start hour
+  SY=$(date -u -d "@$START_S" +%Y 2>/dev/null || date -u -r "$START_S" +%Y)
+  SM=$(date -u -d "@$START_S" +%m 2>/dev/null || date -u -r "$START_S" +%m)
+  SD=$(date -u -d "@$START_S" +%d 2>/dev/null || date -u -r "$START_S" +%d)
+  SH=$(date -u -d "@$START_S" +%H 2>/dev/null || date -u -r "$START_S" +%H)
+  VS_OPEN=s3://dt-paradigm-data/paradigm_data/v_vol_surface/base=${ASSET}/year=${SY}/month=${SM}/day=${SD}/hour=${SH}/v_vol_surface.parquet
+fi
+
+# hot__recap_<win> COPYs — ONLY for preset windows (the parquet is pre-baked per
+# preset; hot__recap_3h.parquet doesn't exist). For any other window these are
+# omitted and recap.py reconstructs DVOL/spot (Deribit OHLC), volume (Deribit
+# tape), and surface (v_vol_surface, below) live. The v_vol_surface COPYs run for
+# EVERY window, so surface + ΔATM/ΔRR/ΔFly work regardless of preset-ness.
+REC_COPIES=""
+if [ "$PRESET" = "1" ]; then
+REC=s3://dt-exchange-venue-data/hot/hot__recap_${WIN}.parquet
+# recap.py reads dvol_spot.csv + volume.csv from here. Block flow is rebuilt from
+# the live Deribit tape (the hot block rows are distrusted), so no block COPY; the
+# per-strike surface + its deltas come from v_vol_surface (surface_now/open, below)
+# on one pipeline for clean window-over-window deltas, not from the recap parquet
+# (which no longer embeds a 'surface' row_type). notional_usd is aliased to the
+# `notional` header recap.py's CSV parser expects.
+REC_COPIES=$(cat <<REC_SQL
+COPY (SELECT exchange, metric, open, close, high, low FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot') TO '/tmp/recap/dvol_spot.csv' (HEADER, DELIMITER ',');
+COPY (SELECT exchange, optionType, volume_sum, notional_usd AS notional, buy_volume, sell_volume, trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume') TO '/tmp/recap/volume.csv' (HEADER, DELIMITER ',');
+REC_SQL
+)
+fi
+
+# One DuckDB session → CSVs. One statement per line; `at` is reserved → alias it.
+cat > /tmp/recap.sql <<SQL
+INSTALL httpfs; LOAD httpfs;
+SET s3_region='ap-northeast-1';
+SET s3_access_key_id='${AK}';
+SET s3_secret_access_key='${SK}';
+SET s3_session_token='${ST}';
+${REC_COPIES}
+COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '/tmp/recap/surface_now.csv' (HEADER, DELIMITER ',');
+COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_OPEN}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '/tmp/recap/surface_open.csv' (HEADER, DELIMITER ',');
+SQL
+
+# recap.py runs this DuckDB session in a thread concurrent with the Deribit fetch.
+cd "$DIR" && exec uv run scripts/recap.py \
+  --asset "$ASSET" --window "$WIN" --csv-dir /tmp/recap --duckdb-sql /tmp/recap.sql --render

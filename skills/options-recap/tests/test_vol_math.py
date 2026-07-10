@@ -2,7 +2,7 @@
 """
 Unit tests for vol_math.py — no network, no auth, no deps.
 
-Run: python3 scripts/test_vol_math.py
+Run: python3 tests/test_vol_math.py
 These pin the formulas so the production CLI and the eval fixture generator
 can't drift, and so a human can verify the math once by inspection.
 """
@@ -11,7 +11,7 @@ import math
 import sys
 import os
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 from vol_math import (
     compute_realized_vol,
     realized_vs_implied,

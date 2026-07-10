@@ -3,197 +3,82 @@ name: paradigm-options-recap
 description: >
   Options market recap for a user-specified window, invoked via /recap. Parses
   "/recap [asset] [options] [window]" (e.g. "/recap btc options 8h") and produces
-  a fixed-format recap: snapshot block, biggest print, block flow table, themes,
-  vol surface, and bottom line. Use when the user types /recap or asks for
-  a market recap, options flow summary, "what happened in BTC options", or "last Xh of flow".
-  The output format is fixed — always the same sections in the same order.
-compatibility: Deribit public API (web_fetch), Paradigm block tape (if injected),
-  OKX/Bullish/IBIT public APIs (web_fetch). No authentication required.
+  a fixed-format recap with four sections: snapshot, biggest print, block flow,
+  and vol surface. Use when the user types /recap or asks for a market recap,
+  options flow summary, "what happened in BTC options", or "last Xh of flow".
+  The output format is fixed — always the same four sections in the same order.
+compatibility: Deribit public API (curl), Paradigm hot surface (DuckDB+S3 via IRSA),
+  OKX/Bullish/IBIT public APIs. No authentication required for public APIs;
+  S3 hot surface requires the IRSA bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.4"
+  version: "1.6.0"
 ---
 
 # Options Recap
 
 ## Command Syntax
 
-`/recap [asset] [window]` — order-independent, all optional.
+`/recap [asset] [options] [window]` — order-independent, all optional.
 
 | Token | Examples | Default |
 |---|---|---|
 | `asset` | `btc`, `eth` | `btc` |
-| `window` | `1h`, `4h`, `8h`, `24h`, `1d` | `24h` |
+| `window` | any `Nm`/`Nh`/`Nd` — `30m`, `3h`, `8h`, `2d` (`1d`→`24h`) | `24h` |
+| `options` | the literal word `options` | ignored — a no-op keyword (this skill is always options); `run_recap.sh` strips it |
 
-`/recap` alone = BTC options, last 24h.
+Any window works. `5m/10m/20m/1h/4h/8h/24h` are **presets** — served from a
+pre-baked hot parquet (fast). Any other window (e.g. `3h`) is reconstructed live
+from Deribit + `v_vol_surface`: same four sections, slightly slower. A malformed
+window exits with a clear error.
 
-## Data Fetches
+**Windows beyond ~24h:** Volume / Biggest Print / Block Flow come from the Deribit
+public tape, which only retains ~24h, so for a longer window those sections cover
+just the last ~24h while DVOL/spot/surface span the full window. `run_recap.sh`
+prepends a one-line `⚠ … tape retention limit …` banner in that case — **relay it
+verbatim** (don't drop or reword it).
 
-**Three hot reads cover the whole recap. They are authoritative — never
-`web_fetch` anything they already carry** (DVOL, spot, window volume,
-ATM IV, per-contract flow, vol surface). Mixing live-API values into a
-hot-file recap is the #1 cause of inconsistent reports. `web_fetch` is
-for the two things hot never has, plus stale-file recovery. All three
-files live under `s3://dt-exchange-venue-data/hot/`; every row carries
-`instrument_kind` (`option`/`perp`/`spot`/`index`) — filter to
-`instrument_kind = 'option'` for the options recap.
+`/recap` alone = BTC options, last 24h. Still pass just `<ASSET> <WINDOW>` to
+`run_recap.sh` — it drops a stray `options`/`option` token, so `/recap btc
+options 8h` and `/recap btc 8h` resolve identically.
 
-**Read 1 — snapshot (the "now" anchor).** One DuckDB read of
-`s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet`:
-current DVOL, spot per venue, last-minute volume + call/put split, current
-ATM IV per expiry (`atm_call_iv`/`atm_put_iv` for skew), funding, recent
-block activity, per-stream freshness. Filter by `signal_type`.
+## How to run it — pick the mode, then emit the four sections
 
-**Read 2 — recap window (flow/volume/blocks over the window).** One DuckDB
-read of `s3://dt-exchange-venue-data/hot/hot__recap_<window>.parquet` for
-the recap `window` (`1h`/`4h`/`8h`/`24h`; `1d`→`24h`; `5m`/`10m`/`20m` also
-exist). Pick rows by `row_type`:
-
-| Recap section | `row_type` | Columns to read |
-|---|---|---|
-| Snapshot — DVOL/spot OHLC | `dvol_spot` | `metric` (`dvol`\|`spot`), `open`, `close`, `high`, `low` |
-| Snapshot — Volume + P/C | `volume` | `volume_sum`, `notional_usd`, `buy_volume`, `sell_volume`, `trade_count` (P/C via `optionType`) |
-| Themes (screen flow) | `flow` | `expiry`, `strike`, `optionType`, `side`, `volume_sum`, `avg_iv` (long tail folded into `expiry='OTHER'`) |
-| Block Flow (ranking) | `block` | `block_id`, `notional_usd`, `volume_sum`, `leg_count`, `avg_iv` |
-
-IV on `flow`/`block` rows is `avg_iv`. `at`/`window_start` are Unix ms.
-
-**Read 3 — vol surface (its own file now).** The per-strike surface is
-**no longer embedded in the recap** — it's the standalone
-`s3://dt-exchange-venue-data/hot/hot__vol_surface.parquet` (point-in-time,
-refreshed every 5 min). `row_type = 'strike'` carries
-`expiry`, `strike`, `optionType`, `mark_iv` (vol points), `greek_delta`,
-`open_interest`, `underlying_price`; `row_type = 'expiry'` carries
-`call_oi`/`put_oi`/`total_oi`, `max_pain_strike`, `dte`.
-
-**`web_fetch` — only these two (hot never carries them):**
-
-| Data | Endpoint | Used for |
-|---|---|---|
-| Spot 7d | `/api/v2/public/get_tradingview_chart_data?instrument_name=BTC-PERPETUAL&resolution=60&start_timestamp=<7d-ago>&end_timestamp=<now>` → `result.close[]` | realized vol (hot maxes at 24h) |
-| Window option trades | `/api/v2/public/get_last_trades_by_currency?currency=BTC&kind=option&count=1000&start_timestamp=<ms>&sorting=desc` | block leg detail (biggest print) + flow-greeks clustering by `block_trade_id` |
-
-**Hot-only — no live reconstruction of these metrics.** The hot files are
-the single source for DVOL/spot/volume/flow/surface; never rebuild them
-from exchange APIs (a Deribit-only, unharmonized rebuild is a different,
-lower-quality report wearing the same format). Handle freshness by the
-`at` timestamp, not by falling back:
-- **Stale** (file present, `at` behind wall-clock): proceed from it and
-  prepend one line — `⚠ hot data ~N min old`. A few-minute-old window file
-  is fine for an hours-long recap.
-- **Absent** (read 404s): emit the fixed format with the affected sections
-  marked `No data` and prepend `⚠ hot surface unavailable`. Do not
-  fabricate from live APIs.
-
-The only `web_fetch`es in a recap are the two required pulls above (7d
-spot, window trades) — those are data hot never carries, not a fallback.
-
-## Computing the numbers
-
-Realized vol, flow greeks (Black-76), and surface skew are math that LLMs get wrong by estimating. **Always use the bundled script; never hand-compute these.**
+**Live (real `/recap`, tools available) — this is the normal path.** Run ONE
+command and relay its stdout **verbatim** as your entire reply:
 
 ```bash
-uv run scripts/paradigm_options_recap.py --data snapshot.json
+bash scripts/run_recap.sh BTC 8h      # <ASSET> <WINDOW>; presets fast, any Nm/Nh/Nd works; 1d→24h
 ```
 
-Build `snapshot.json` **mostly from the hot rows** — only `spot_closes_7d`
-and `trades` come from `web_fetch` (omit any field to skip that section):
+That script does everything — STS bootstrap, the single DuckDB session over the
+hot surface, the Deribit tape (7d closes + window trades via concurrent,
+time-sliced pagination), the vol math, and final formatting — and prints the
+finished four-section recap. **Do not** add commentary, reformat it, re-fetch
+anything, or run extra steps. Its output already is the recap. If the first
+line is a `⚠ …` banner, keep it. Target: well under 30s; the heavy lifting is
+~2.5s and the rest is just this one round-trip.
 
-| Field | Source |
-|---|---|
-| `dvol_close` | snapshot `dvol` row (or recap `dvol_spot`/`dvol` `close`) |
-| `spot` | snapshot `spot` row |
-| `tickers` (`{sym: {mark_iv, delta}}`) | **`hot__vol_surface.parquet` `strike` rows** — `mark_iv`=`mark_iv`, `delta`=`greek_delta`. Build `sym` as the Deribit instrument name `{asset}-{expiry}-{int(strike)}-{C\|P}` (the script parses expiry/type from this key, so it must be exact). NOTE: `expiry` on the surface is now ISO `YYYY-MM-DD` — reformat to the Deribit-native token (e.g. `2026-07-03` → `3JUL26`) when building `sym`. Filter to `exchange='deribit'` and `optionType` populated. No instrument-list/ticker fan-out. |
-| `spot_closes_7d` | `web_fetch` 7d spot `close[]` |
-| `trades` | `web_fetch` window option trades (block clustering for `flow_greeks`/`top_blocks`) |
+**Injected data (a `<market_data>` block with `derived` is in context).** No
+tools — render the four sections yourself from `derived.realized_vol` (RV/VRP),
+`derived.top_blocks` (Biggest Print + Block Flow), and `derived.vol_surface`
+(skew/term + per-expiry ATM/RR/Fly, plus ΔATM/ΔRR/ΔFly when present — else `n/a`),
+reading DVOL open/close and the spot range from the raw `dvol`/`spot` tape.
+Follow the exact template in `references/output-format.md`. Report those figures
+directly; do not recompute them and do not add a disclaimer.
 
-Returns `realized_vol`, `flow_greeks`, `top_blocks`, `vol_surface`. If a `derived` block is already injected into context, read it and skip the script. **Themes need no script** — group the `flow` rows directly.
+**Simulate (no tools and no injected data).** Produce the four sections with
+plausible example values following `references/output-format.md` exactly, and
+prepend one line: `⚠ Data estimated — no live feed available.`
 
-## Analysis
+## Output Format
 
-**Snapshot** — pull spot, DVOL open→close, RV(7d) vs implied. VRP = implied − realized. Label:
-- spot↑ vol↓ → "vol sold through rally"
-- spot↓ vol↑ → "vol bid into weakness"
-- spot↑ vol↑ → "vol bought through rally"
+Four sections, this exact order, every recap: **Snapshot · Biggest Print ·
+Block Flow · Vol Surface**. Never reorder, add, or drop sections. **Do not emit
+Themes, Dealer positioning, or a Bottom Line.** Work silently — no narration.
 
-RV must be 7-day trailing window. Read from `derived.realized_vol` or the script — never estimate.
-
-**Block Flow** — rank from the recap `block` rows (`instrument_kind='option'`, sort by `notional_usd`); the `$XM / N blocks` header is their sum/count. For the biggest few, pull leg geometry (strikes × size × side × IV) from the one `web_fetch` trades pull, clustered by `block_trade_id` → feed to the script's `top_blocks`. Mark `two-way`/one-sided from the field — do not infer.
-
-Dealer positioning from `flow_greeks.positioning_label`:
-- short gamma → chase spot, amplify moves
-- long gamma → fade moves
-- balanced → no decisive positioning
-
-**Themes** — group the recap `flow` rows (screen, non-block) by expiry/strike/direction; size is `volume_sum`, IV is `avg_iv`. 2–4 bullets. Named, factual, no intent inference.
-
-**Vol Surface** — built from the `hot__vol_surface.parquet` `strike` rows (Read 3), **not** a fetch:
-1. Feed the `strike` rows as the script's `tickers` (`mark_iv`=`mark_iv`, `delta`=`greek_delta`) plus `spot`.
-2. Read `atm_iv`, `rr_25d`, `butterfly_25d`, `term_structure` back. Note `wings_extrapolated` if set.
-
-## Output Format — FIXED
-
-Six sections, this exact order, every recap. Never reorder, add, or drop sections.
-
-Work silently — no narration. If the hot files are stale or absent, prepend the matching banner from Data Fetches (`⚠ hot data ~N min old` / `⚠ hot surface unavailable`).
-
----
-
-**Shape to mirror:**
-
-**[ASSET] Options · [WINDOW] Recap · [HH:MM]–[HH:MM] UTC**
-
-**Snapshot**
-
-```yaml
-Spot      $[X]        [up/down X%] (from $[Y])
-DVOL      [X]v        [flat/rising/falling] ([open] -> [close])
-RV 7d     [X]v        implied [CHEAP/RICH/IN LINE] vs realized
-VRP       [±X]v       vol [underpriced/overpriced] vs delivered
-Volume    $[X]M       [primary venue] (incl. Paradigm)
-P/C       [X.Xx]x     [calls/puts] dominant
-```
-
-**Biggest Print**
-
-```yaml
-[DDMMMYY] [structure]   [Nx]   $[X]M   [HH:MM] UTC   via [Venue]
-```
-
-**Block Flow — $[X]M / [N] blocks**
-
-```yaml
-#  Structure            Notl     Detail
--  -------------------  -------  ------------------------------------------
-1  [structure]          $[X]M    [strikes] x[size] - [SIDE] [IV]v [two-way/one-sided]
-2  …
-```
-
-Dealer positioning: [short/long] vega + [short/long] gamma → [mechanical read]; [implication].
-
-**Themes**
-1. [Theme name] — [structure, strikes, size, IV, side]. [One factual line.]
-2. …
-
-[2–4 themes. Facts only — no intent inference.]
-
-**Vol Surface**
-Skew: front 25Δ RR [±X]v → [puts bid / calls bid] · Term: [front]v → [back]v → [contango / flat / backwardation]
-
-```yaml
-Expiry     ATM                  25d RR               Fly
----------  -------------------  -------------------  -------------------
-[DDMMMYY]  [X.X] → [Y.Y]v      [±X.X] → [±Y.Y]v    [X.X] → [Y.Y]v
-…
-```
-
-`* wings extrapolated` (if applicable)
-
-**Bottom Line**
-[1–2 sentences. Calls/puts lead, volume, dominant block structure. Dealer positioning vs vol surface vs RV/IV gap. No forecasts.]
-
----
-
-## Thin Window
-
-(< 2h, no blocks, < 20 screen trades) — output all six sections; mark empty ones `No data`.
+In the live path `run_recap.sh` already prints exactly this shape, so you just
+relay it. The full template, per-field formatting, the Vol Surface delta columns,
+and the thin-window (`< 2h`) rules are the contract the script implements — see
+`references/output-format.md`. Read it only when **you** render (the injected and
+simulate modes); the live path never needs it.
