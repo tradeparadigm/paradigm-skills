@@ -65,7 +65,6 @@ AK=$(printf '%s' "$CREDS" | grep -o '<AccessKeyId>[^<]*'     | cut -d'>' -f2)
 SK=$(printf '%s' "$CREDS" | grep -o '<SecretAccessKey>[^<]*' | cut -d'>' -f2)
 ST=$(printf '%s' "$CREDS" | grep -o '<SessionToken>[^<]*'    | cut -d'>' -f2)
 
-SIG=s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet
 
 # Vol-surface deltas (ΔATM/ΔRR/ΔFly) need a window-OPEN surface, which the hot
 # recap parquet doesn't carry (it's close-only). Read the consolidated per-strike
@@ -75,7 +74,7 @@ SIG=s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet
 # _hot.parquet's latest snapshot, so open+close share one pipeline (clean deltas).
 # SECS is already parsed above (works for any window, not just presets).
 NOW_S=$(date -u +%s); START_S=$((NOW_S - SECS)); START_MS=$((START_S * 1000))
-VS_HOT=s3://terminal-dime-prod/paradigm_data/v_vol_surface/_hot.parquet
+VS_HOT=s3://dt-paradigm-data/paradigm_data/v_vol_surface/_hot.parquet
 if [ "$SECS" -le 3600 ]; then
   VS_OPEN=$VS_HOT                                   # window-start within _hot's buffer
 else                                                # cold partition at window-start hour
@@ -83,7 +82,7 @@ else                                                # cold partition at window-s
   SM=$(date -u -d "@$START_S" +%m 2>/dev/null || date -u -r "$START_S" +%m)
   SD=$(date -u -d "@$START_S" +%d 2>/dev/null || date -u -r "$START_S" +%d)
   SH=$(date -u -d "@$START_S" +%H 2>/dev/null || date -u -r "$START_S" +%H)
-  VS_OPEN=s3://terminal-dime-prod/paradigm_data/v_vol_surface/base=${ASSET}/year=${SY}/month=${SM}/day=${SD}/hour=${SH}/v_vol_surface.parquet
+  VS_OPEN=s3://dt-paradigm-data/paradigm_data/v_vol_surface/base=${ASSET}/year=${SY}/month=${SM}/day=${SD}/hour=${SH}/v_vol_surface.parquet
 fi
 
 # hot__recap_<win> COPYs — ONLY for preset windows (the parquet is pre-baked per
@@ -93,12 +92,16 @@ fi
 # EVERY window, so surface + ΔATM/ΔRR/ΔFly work regardless of preset-ness.
 REC_COPIES=""
 if [ "$PRESET" = "1" ]; then
-REC=s3://terminal-dime-prod/paradigm_data/hot/hot__recap_${WIN}.parquet
+REC=s3://dt-exchange-venue-data/hot/hot__recap_${WIN}.parquet
+# recap.py reads dvol_spot.csv + volume.csv from here. Block flow is rebuilt from
+# the live Deribit tape (the hot block rows are distrusted), so no block COPY; the
+# per-strike surface + its deltas come from v_vol_surface (surface_now/open, below)
+# on one pipeline for clean window-over-window deltas, not from the recap parquet
+# (which no longer embeds a 'surface' row_type). notional_usd is aliased to the
+# `notional` header recap.py's CSV parser expects.
 REC_COPIES=$(cat <<REC_SQL
 COPY (SELECT exchange, metric, open, close, high, low FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot') TO '/tmp/recap/dvol_spot.csv' (HEADER, DELIMITER ',');
-COPY (SELECT exchange, optionType, volume_sum, notional, buy_volume, sell_volume, trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume') TO '/tmp/recap/volume.csv' (HEADER, DELIMITER ',');
-COPY (SELECT block_id, notional, volume_sum, leg_count, avg_iv FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='block') TO '/tmp/recap/block.csv' (HEADER, DELIMITER ',');
-COPY (SELECT expiry, strike, optionType, markIV_close, delta, openInterest, underlying_price FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='surface' AND exchange='deribit') TO '/tmp/recap/surface.csv' (HEADER, DELIMITER ',');
+COPY (SELECT exchange, optionType, volume_sum, notional_usd AS notional, buy_volume, sell_volume, trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume') TO '/tmp/recap/volume.csv' (HEADER, DELIMITER ',');
 REC_SQL
 )
 fi
@@ -110,7 +113,6 @@ SET s3_region='ap-northeast-1';
 SET s3_access_key_id='${AK}';
 SET s3_secret_access_key='${SK}';
 SET s3_session_token='${ST}';
-COPY (SELECT signal_type, exchange, expiry, value, atm_call_iv, atm_put_iv, underlying_price, call_volume, put_volume, buy_volume, sell_volume, notional, trade_count, "at" AS at_ms FROM read_parquet('${SIG}') WHERE asset='${ASSET}') TO '/tmp/recap/snapshot.csv' (HEADER, DELIMITER ',');
 ${REC_COPIES}
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '/tmp/recap/surface_now.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_OPEN}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '/tmp/recap/surface_open.csv' (HEADER, DELIMITER ',');

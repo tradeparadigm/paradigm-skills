@@ -5,45 +5,45 @@
     {
       "id": 1,
       "prompt": "what data do we have available to query?",
-      "expected_output": "An inventory-style response listing the dataset families: Paradigm block trade tape (executed and RFQ) under s3://terminal-dime-prod/paradigm_data/, and exchange market data under external/tardis/v1/ covering Deribit option trades, Deribit option quotes, Deribit combo quotes, and OKX option trades. Mentions the bucket name, region (ap-northeast-1), and that access goes via DuckDB + IRSA-issued STS credentials. Stays concise — does not dump full schemas unless asked.",
+      "expected_output": "An inventory-style response listing the dataset families across the dt-* buckets: the exchange venue data pipeline in s3://dt-exchange-venue-data (Deribit/OKX/Bybit/Bullish real-time options + perps + spot, raw + normalized per-period substrate) and its near-real-time hot surface (live 1-minute snapshot, trailing-window recaps, point-in-time vol surface); the Paradigm block-trade and RFQ tapes in s3://dt-paradigm-data/paradigm_data/; Bullish option chain snapshots; IBIT ETF option trades; and the Paradex perp historical trade tape. Notes access is via DuckDB + IRSA-issued STS credentials. Stays concise — does not dump full schemas unless asked.",
       "assertions": [
-        "Response names the S3 bucket s3://terminal-dime-prod",
-        "Response lists at least four dataset families: Paradigm trade tape, Paradigm RFQ tape, Deribit options, OKX options",
-        "Response mentions that combo quotes are also available for Deribit",
-        "Response does not invent datasets that are not in references/datasets.md (no OKX combos, no Paradex options, no Greeks/IV)",
+        "Response names the dt-* buckets — at least s3://dt-exchange-venue-data and s3://dt-paradigm-data",
+        "Response lists the major dataset families: the exchange venue data pipeline (Deribit/OKX/Bybit/Bullish) and its hot surface, the Paradigm block-trade tape, and the Paradigm RFQ tape",
+        "Response distinguishes the near-real-time hot surface from the historical tapes / per-period substrate",
+        "Response does not present the retired Tardis feed (external/tardis) as a live source, and does not invent datasets absent from references/datasets.md",
         "Response is structured as a catalog summary, not a query — it does not attempt to run SQL"
       ]
     },
     {
       "id": 2,
       "prompt": "do we have OKX combo quotes?",
-      "expected_output": "A direct answer: no, OKX combo quotes are not in the catalog. Notes that OKX option trades are available (under external/tardis/v1/trades/option/okex-options/) but combo quotes from OKX are absent. Points the user at Deribit combo quotes (external/tardis/v1/quotes/combo/deribit/) as the only combo-quote dataset available.",
+      "expected_output": "A direct answer: there is no dedicated OKX combo-quotes dataset — combo / multi-leg quote feeds were part of the retired Tardis.dev feed and are not in the current catalog. OKX options data IS available through the exchange venue data pipeline: s3://dt-exchange-venue-data, exchange=okex-options, data_type option_trade / option_summary. Points the user there rather than fabricating a combo-quote path.",
       "assertions": [
-        "Response clearly states OKX combo quotes are not available",
-        "Response identifies that Deribit combo quotes are available as the alternative",
-        "Response does not fabricate an S3 path for OKX combo quotes"
+        "Response states there is no dedicated OKX combo-quotes dataset in the current catalog",
+        "Response identifies that OKX options data is available via the exchange venue data pipeline (s3://dt-exchange-venue-data, exchange=okex-options, data_type option_trade/option_summary)",
+        "Response does not fabricate an S3 path for OKX combo quotes and does not present the retired Tardis feed as a live source"
       ]
     },
     {
       "id": 3,
       "prompt": "what columns does the Paradigm trade tape have and where does it live?",
-      "expected_output": "Response gives the S3 path s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz, last verified coverage 2025-11-09 to 2026-05-09, and lists the columns: DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID. Notes that PRODUCT taxonomy includes BTC/ETH/SOL/XRP options on Deribit, BTC options on Paradex, plus perps and futures. Mentions the join key RFQ_ID links to the RFQ tape.",
+      "expected_output": "Response gives the S3 path s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz, notes it is LIVE (a Snowflake→S3 egress rewrites it hourly, trailing ~6 months of coverage), and lists the columns: DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID. Notes that PRODUCT taxonomy includes BTC/ETH options on Deribit (- DBT), Paradex (- PRDX), and Bybit (- BYB), plus perps. Mentions the join key RFQ_ID links to the RFQ tape.",
       "assertions": [
-        "Response returns the correct S3 path: s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz",
+        "Response returns the correct S3 path: s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz",
         "Response lists the schema columns including DATE, PRODUCT, DESCRIPTION, PRICE, NOTIONAL_VOLUME_USD, RFQ_ID, BLOCK_TRADE_ID",
         "Response mentions or implies how to filter for options only (e.g. PRODUCT LIKE '%OPTION%')",
-        "Response notes the dataset is a single flat CSV.gz (not date-partitioned)"
+        "Response notes the dataset is a single flat CSV.gz rewritten hourly (LIVE, trailing ~6 months), not date-partitioned"
       ]
     },
     {
       "id": 4,
       "prompt": "what's the latest Deribit option trade data available?",
-      "expected_output": "Response gives the path pattern s3://terminal-dime-prod/external/tardis/v1/trades/option/deribit/YYYY/MM/DD/deribit-OPTIONS-YYYY-MM-DD.csv.gz and the last verified coverage (2026-02-01 to 2026-04-30 as of catalog verification). Because the user is asking about latest data, the response also includes the glob date-range probe SQL so they can confirm whether more recent files exist.",
+      "expected_output": "Response points at the exchange venue data pipeline for Deribit option trades: the Hive-partitioned path s3://dt-exchange-venue-data/normalized/exchange=deribit/data_type=option_trade/currency=<ccy>/level=<1m|5m|1h>/year=YYYY/month=MM/day=DD/hour=HH/... (a raw form lives under raw/ too). Notes the feed is near-real-time / always-current, so instead of a fixed end-date it recommends the glob date-range probe (glob() + regexp_extract for the MAX partition) to confirm the latest files.",
       "assertions": [
-        "Response returns the correct path pattern for Deribit option trades, including the YYYY/MM/DD partition",
-        "Response cites the last verified date range from the catalog (2026-02-01 → 2026-04-30 or equivalent point-in-time note)",
-        "Response includes or recommends running the glob date-range probe to confirm latest availability (mentions glob() with regexp_extract for MIN/MAX dates)",
-        "Response does not claim a hard end-date without flagging that coverage may have advanced"
+        "Response points at the exchange venue data pipeline for Deribit option trades: s3://dt-exchange-venue-data with exchange=deribit and data_type=option_trade (normalized or raw), Hive-partitioned by currency/level/year/month/day/hour",
+        "Response notes the feed is near-real-time / always-current, not a fixed historical end-date",
+        "Response includes or recommends the glob date-range probe (glob() with regexp_extract / MAX) to confirm the latest available period",
+        "Response does not cite the retired Tardis path (external/tardis) or a stale hard end-date"
       ]
     }
   ],

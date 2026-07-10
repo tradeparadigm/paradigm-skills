@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.4"
+  version: "1.5"
 ---
 
 # Paradigm Block Trade Analyst
@@ -204,16 +204,18 @@ convention reasoning.
 **Step 2a — surface anchor (one DuckDB read).** Read the hot snapshot
 for the current ATM IV per venue + recent block activity before
 hitting per-leg endpoints:
-`s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet`.
-See `paradigm-data-discovery` Dataset 6 for the schema. Use to anchor
+`s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet`.
+See `paradigm-data-discovery` Dataset 2 for the schema. Use to anchor
 each leg's IV against the venue's current ATM (rich/cheap framing) and
-to surface recent block activity (`signal_type = 'block_summary'`,
-covering deribit/okex/bullish) that may contextualise the trade. For the
-full per-strike surface over a trailing window (Step 5 vol-surface
-impact), read `row_type = 'surface'` from
-`paradigm_data/hot/hot__recap_<window>.parquet` instead of fetching it.
-The snapshot does NOT replace per-leg fetches — block-analyst still needs
-specific instrument marks for fill benchmarking.
+to surface recent block activity (`signal_type = 'block_summary'`;
+option blocks carry `instrument_kind = 'option'`, bullish OTC carries
+`perp`/`spot`) that may contextualise the trade. For the full per-strike
+surface (Step 5 vol-surface impact), read the standalone
+`s3://dt-exchange-venue-data/hot/hot__vol_surface.parquet`
+(`row_type = 'strike'`: `mark_iv`, `greek_delta`, `open_interest`,
+`underlying_price`) instead of fetching it — it's no longer embedded in
+the recap windows. The snapshot does NOT replace per-leg fetches —
+block-analyst still needs specific instrument marks for fill benchmarking.
 
 **Step 2b — per-leg fetches.** For each leg, fetch its current mark from the venues below in
 parallel, in priority order: Deribit first (primary venue), then OKX and/or Bybit only when you

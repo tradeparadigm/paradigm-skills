@@ -102,16 +102,24 @@ files are authoritative for DVOL/spot/volume/surface;** Deribit supplies only th
 | Section | `row_type` | Key columns |
 |---|---|---|
 | Snapshot DVOL/spot | `dvol_spot` | `metric`, `open`, `close`, `high`, `low` |
-| Snapshot volume/P-C | `volume` | `exchange`, `optionType`, `volume_sum`, `notional` |
-| Block Flow | `block` | `block_id`, `notional`, `volume_sum`, `leg_count`, `avg_iv` |
-| Vol Surface | `surface` | `expiry`, `strike`, `optionType`, `markIV_close`, `delta` |
+| Snapshot volume/P-C | `volume` | `exchange`, `optionType`, `volume_sum`, `notional_usd` |
+| Block Flow | `block` | `block_id`, `notional_usd`, `volume_sum`, `leg_count`, `avg_iv` |
 
-`hot__market_signals_1m.parquet` is the "now" anchor (current DVOL/spot, ATM IV).
-S3 access (IRSA STS bootstrap) is documented in the `paradigm-data-discovery` skill.
+The per-strike vol surface is **no longer embedded in the recap**. The canonical
+multi-venue surface is the standalone `hot__vol_surface.parquet` (`row_type='strike'`:
+`expiry`, `strike`, `optionType`, `mark_iv`, `greek_delta`, `underlying_price`),
+consumed by other skills. The recap itself reads its surface from `v_vol_surface`
+(see the deltas note below) so the "now" and window-"open" endpoints share one
+pipeline. `hot__market_signals_1m.parquet` is the "now" anchor (current DVOL/spot,
+ATM IV) for other skills. The recap / signals / surface hot files live under
+`s3://dt-exchange-venue-data/hot/`. S3 access (IRSA STS bootstrap) is documented in
+the `paradigm-data-discovery` skill.
 
-**Vol-surface deltas (ΔATM/ΔRR/ΔFly).** The hot recap parquet's `surface` rows are
-close-only, so window-over-window deltas read the consolidated per-strike store
-`v_vol_surface` instead (columns `symbol`, `type`, `mark_iv`, `delta`, `at`, …;
+**Vol-surface deltas (ΔATM/ΔRR/ΔFly).** The standalone surface file is point-in-time
+(no window-open snapshot), so window-over-window deltas read the consolidated
+per-strike store `v_vol_surface` at
+`s3://dt-paradigm-data/paradigm_data/v_vol_surface/` instead (columns `symbol`,
+`type`, `mark_iv`, `delta`, `at`, …;
 Deribit basis = `symbol LIKE '<ASSET>-%'`, dropping the `<ASSET>_USDC-` legs):
 
 - **now** = the latest snapshot in the rolling `v_vol_surface/_hot.parquet`.
@@ -123,7 +131,7 @@ Deribit basis = `symbol LIKE '<ASSET>-%'`, dropping the `<ASSET>_USDC-` legs):
 Both endpoints come from one pipeline, so the deltas carry no inter-feed noise;
 the displayed level also comes from this `now` snapshot. Missing/empty either CSV
 (`surface_now.csv`/`surface_open.csv`) degrades gracefully — the deltas read `n/a`
-and `recap.py` falls back to the hot `surface.csv` for the displayed values. The
+and the Vol Surface section reads `No data` rather than mixing feeds. The
 table is capped to the front `MAX_SURFACE_ROWS` expiries.
 
 ## Known hot-data quirk (important)
