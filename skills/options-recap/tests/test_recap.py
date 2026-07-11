@@ -133,13 +133,23 @@ def test_volume_excludes_aggregate_and_other_venues():
     recap.WARNINGS.clear()
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot(d)
-    # Only the two Deribit per-optionType rows count: 4719.6 + 2702.9.
+    # Dollar volume stays Deribit-scoped: only the two Deribit rows: 4719.6 + 2702.9.
     check("call_vol = deribit calls", hot["call_vol"] == 4719.6, hot["call_vol"])
     check("put_vol = deribit puts", hot["put_vol"] == 2702.9, hot["put_vol"])
     check("volume_btc = deribit only", abs(hot["volume_btc"] - 7422.5) < 1e-6, hot["volume_btc"])
     check("aggregate row (163M) excluded", hot["volume_btc"] < 1000 * 1000, hot["volume_btc"])
-    check("primary_venue Deribit", hot["primary_venue"] == "Deribit", hot["primary_venue"])
     check("no legacy volume_usd key", "volume_usd" not in hot)
+    # Activity/P-C: trade_count across ALL venues, blank-optionType aggregates dropped.
+    # Kept rows: deribit 2652+1844, bybit 8315+7135, okex 2138+2779 = 24863 trades.
+    check("trades_total all venues", hot["trades_total"] == 24863, hot["trades_total"])
+    check("blank-optionType aggregates excluded (bullish 801870, deribit 47759)",
+          hot["trades_total"] < 100000, hot["trades_total"])
+    check("put_trades all venues", hot["put_trades"] == 1844 + 7135 + 2779, hot["put_trades"])
+    check("call_trades all venues", hot["call_trades"] == 2652 + 8315 + 2138, hot["call_trades"])
+    check("trades_by_venue has 3 venues", len(hot["trades_by_venue"]) == 3, hot["trades_by_venue"])
+    check("bybit leads by trades",
+          max(hot["trades_by_venue"], key=hot["trades_by_venue"].get) == "bybit-options",
+          hot["trades_by_venue"])
 
 
 def test_volume_to_usd_is_sane():
@@ -148,11 +158,17 @@ def test_volume_to_usd_is_sane():
         res = build("btc", "8h", 0, 8 * 3600_000,
                     {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
     s = res["snapshot"]
-    # 7422.5 BTC × $60,468 ≈ $448.9M — NOT the old $9.8T.
+    # Dollar Volume is Deribit-scoped: 7422.5 BTC × $60,468 ≈ $448.9M — NOT the old $9.8T.
     check("volume_usd_m ~ 449", 440 <= s["volume_usd_m"] <= 460, s["volume_usd_m"])
     check("volume not trillions", s["volume_usd_m"] < 100_000, s["volume_usd_m"])
-    check("pc ratio 0.57", s["pc_ratio"] == 0.57, s["pc_ratio"])
+    # P/C now trade-count-based across all venues: 11758 puts / 13105 calls = 0.90.
+    check("pc ratio 0.90 (by trades, all venues)", s["pc_ratio"] == 0.90, s["pc_ratio"])
     check("calls dominant", s["pc_dominant"] == "calls", s["pc_dominant"])
+    # Multi-venue activity present; split sums ~100%, Bybit leads by trade count.
+    check("activity_trades 24863", s["activity_trades"] == 24863, s["activity_trades"])
+    check("activity split ~100%", abs(sum(v["pct"] for v in s["activity_split"]) - 100) <= 2,
+          s["activity_split"])
+    check("bybit leads activity", s["activity_split"][0]["venue"] == "Bybit", s["activity_split"])
 
 
 # ── load_hot: dvol/spot + surface parsing ───────────────────────────────────
@@ -350,8 +366,10 @@ def test_render_four_sections():
     for h in ("**Snapshot**", "**Biggest Print**", "**Block Flow", "**Vol Surface**"):
         check(f"render has {h}", h in md, md[:80])
     check("render title", md.startswith("**BTC Options · 8h Recap"), md[:40])
-    check("render volume line", "Volume" in md and "$449M" in md, "volume render")
-    check("render P/C 0.57x", "0.57x" in md)
+    check("render volume line (Deribit-scoped)",
+          "Volume" in md and "$449M" in md and "Deribit only" in md, "volume render")
+    check("render multi-venue Activity line", "Activity" in md and "Bybit" in md, "activity render")
+    check("render P/C 0.9x", "0.9x" in md)
     check("render biggest Strangle/RR", "26JUN26 Strangle/RR" in md)
     # Vol-surface delta columns are always present in the header; with no
     # window-open surface (this fixture has none) the delta cells read n/a.

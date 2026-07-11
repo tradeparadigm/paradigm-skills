@@ -52,24 +52,46 @@ script (agent types one short line) and pre-rendering the markdown in `recap.py`
 
 ## Data sources
 
-Two authoritative hot reads (one DuckDB session) plus the Deribit tape. **Hot
-files are authoritative for DVOL/spot/volume/surface;** Deribit supplies only the
-7d realized-vol closes and block-leg geometry (hot carries neither). The
-`row_type` map in `hot__recap_<window>.parquet`:
+The recap aggregates file + the `v_vol_surface` store (one DuckDB session) plus
+the Deribit tape. **These are authoritative for DVOL/spot/volume/surface;**
+Deribit supplies only the 7d realized-vol closes and block-leg geometry (the hot
+files carry neither). `recap.py` reads the `dvol_spot` + `volume` rows from the
+recap file, and the surface from `v_vol_surface`. The
+`row_type` map in `hot__recap_aggregates_5m_24h.parquet` (a single rolling file
+of 5-min buckets over the trailing 24h; the window is applied at query time via
+`WHERE bucket_at >= now - window` + aggregation):
 
 | Section | `row_type` | Key columns |
 |---|---|---|
-| Snapshot DVOL/spot | `dvol_spot` | `metric`, `open`, `close`, `high`, `low` |
-| Snapshot volume/P-C | `volume` | `exchange`, `optionType`, `volume_sum`, `notional` |
-| Block Flow | `block` | `block_id`, `notional`, `volume_sum`, `leg_count`, `avg_iv` |
-| Vol Surface | `surface` | `expiry`, `strike`, `optionType`, `markIV_close`, `delta` |
+| Snapshot DVOL/spot | `dvol_spot` | `metric`, `open`, `close`, `high`, `low` (OHLC: `arg_min(open,bucket_at)` / `arg_max(close,bucket_at)` / `max(high)` / `min(low)`) |
+| Snapshot volume/P-C | `volume` | `exchange`, `optionType`, `volume_sum`, `notional_usd`, `trade_count` |
+| Block Flow | `block` | `block_id`, `notional_usd`, `volume_sum`, `leg_count`, `iv_sum`/`iv_count` |
 
-`hot__market_signals_1m.parquet` is the "now" anchor (current DVOL/spot, ATM IV).
+There is **no `surface` `row_type`** — the vol surface lives in `v_vol_surface`
+(see below). `notional` is now `notional_usd`; IV is `iv_sum`/`iv_count` (no `avg_iv`).
+
+**Multi-venue representation (truthful + consistent).** The `volume` rows span
+Deribit, OKX, Bybit, Bullish, but their units aren't comparable: `volume_sum` is
+each venue's native contract unit and `notional_usd` isn't yet cross-venue
+normalized. So the recap only aggregates across venues on a **unit-free** basis —
+**`trade_count`** — which drives the multi-venue **Activity** line (total trades +
+per-venue share) and the **P/C** ratio (put vs call trades, all venues). The
+dollar **Volume** line stays **Deribit-scoped** (the one venue we can price in USD
+reliably: 1 contract = 1 BTC) and is labeled as such — we never sum `volume_sum`
+or `notional_usd` across venues. When the pipeline later emits a normalized
+cross-venue USD field, the Volume line upgrades to a true market total; until then
+nothing is overstated. **No venue contract multipliers are hardcoded anywhere.**
+
+The "now" values (latest DVOL/spot close, current surface) come from the newest
+`bucket_at` in the recap file and the latest `v_vol_surface/_hot` snapshot.
+(`hot__market_signals_1m.parquet` is the live signals heartbeat used by
+`paradigm-block-analyst`; `/recap` no longer reads it.)
 S3 access (IRSA STS bootstrap) is documented in the `paradigm-data-discovery` skill.
 
-**Vol-surface deltas (ΔATM/ΔRR/ΔFly).** The hot recap parquet's `surface` rows are
-close-only, so window-over-window deltas read the consolidated per-strike store
-`v_vol_surface` instead (columns `symbol`, `type`, `mark_iv`, `delta`, `at`, …;
+**Vol-surface deltas (ΔATM/ΔRR/ΔFly).** The recap aggregates file carries no
+surface rows, so the full surface and window-over-window deltas read the
+consolidated per-strike store `v_vol_surface` (on `dt-paradigm-data`) instead
+(columns `symbol`, `type`, `mark_iv`, `delta`, `at`, …;
 Deribit basis = `symbol LIKE '<ASSET>-%'`, dropping the `<ASSET>_USDC-` legs):
 
 - **now** = the latest snapshot in the rolling `v_vol_surface/_hot.parquet`.
@@ -86,7 +108,7 @@ table is capped to the front `MAX_SURFACE_ROWS` expiries.
 
 ## Known hot-data quirk (important)
 
-`hot__recap_<window>.parquet` `volume`/`block` rows have **inconsistent units**
+`hot__recap_aggregates_5m_24h.parquet` `volume`/`block` rows have **inconsistent units**
 and **aggregate/corrupt rows** that, summed naively, produced absurd numbers
 (Volume ~$9.8T, a single $5.1B block) in early versions:
 

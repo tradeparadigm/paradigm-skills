@@ -23,7 +23,7 @@ INSTALL httpfs; LOAD httpfs;
 
 SELECT DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE,
        SIDE, QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID
-FROM read_csv_auto('s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz')
+FROM read_csv_auto('s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz')
 -- rfq_id may arrive bare (r_...) or prefixed (DRFQv2-r_...); match either form
 WHERE RFQ_ID = '<rfq_id>'
    OR RFQ_ID = 'DRFQv2-' || '<rfq_id>'

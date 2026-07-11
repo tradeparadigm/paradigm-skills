@@ -5,9 +5,9 @@
     {
       "id": 1,
       "prompt": "what data do we have available to query?",
-      "expected_output": "An inventory-style response listing the dataset families: Paradigm block trade tape (executed and RFQ) under s3://terminal-dime-prod/paradigm_data/, and exchange market data under external/tardis/v1/ covering Deribit option trades, Deribit option quotes, Deribit combo quotes, and OKX option trades. Mentions the bucket name, region (ap-northeast-1), and that access goes via DuckDB + IRSA-issued STS credentials. Stays concise — does not dump full schemas unless asked.",
+      "expected_output": "An inventory-style response listing the dataset families across the three market-data buckets: the Paradigm executed block trade tape and RFQ activity tape under s3://dt-paradigm-data/paradigm_data/, the hot surface + recap aggregates under s3://dt-exchange-venue-data/hot/, and exchange market data under s3://terminal-dime-prod/external/tardis/v1/ covering Deribit option trades, Deribit option quotes, Deribit combo quotes, and OKX option trades. Mentions the bucket names, region (ap-northeast-1), and that access goes via DuckDB + IRSA-issued STS credentials. Stays concise — does not dump full schemas unless asked.",
       "assertions": [
-        "Response names the S3 bucket s3://terminal-dime-prod",
+        "Response names the S3 buckets (s3://dt-paradigm-data, s3://dt-exchange-venue-data, s3://terminal-dime-prod)",
         "Response lists at least four dataset families: Paradigm trade tape, Paradigm RFQ tape, Deribit options, OKX options",
         "Response mentions that combo quotes are also available for Deribit",
         "Response does not invent datasets that are not in references/datasets.md (no OKX combos, no Paradex options, no Greeks/IV)",
@@ -27,9 +27,9 @@
     {
       "id": 3,
       "prompt": "what columns does the Paradigm trade tape have and where does it live?",
-      "expected_output": "Response gives the S3 path s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz, last verified coverage 2025-11-09 to 2026-05-09, and lists the columns: DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID. Notes that PRODUCT taxonomy includes BTC/ETH/SOL/XRP options on Deribit, BTC options on Paradex, plus perps and futures. Mentions the join key RFQ_ID links to the RFQ tape.",
+      "expected_output": "Response gives the S3 path s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz, last verified coverage 2025-11-09 to 2026-05-09, and lists the columns: DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID. Notes that PRODUCT taxonomy includes BTC/ETH/SOL/XRP options on Deribit, BTC options on Paradex, plus perps and futures. Mentions the join key RFQ_ID links to the RFQ tape.",
       "assertions": [
-        "Response returns the correct S3 path: s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz",
+        "Response returns the correct S3 path: s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz",
         "Response lists the schema columns including DATE, PRODUCT, DESCRIPTION, PRICE, NOTIONAL_VOLUME_USD, RFQ_ID, BLOCK_TRADE_ID",
         "Response mentions or implies how to filter for options only (e.g. PRODUCT LIKE '%OPTION%')",
         "Response notes the dataset is a single flat CSV.gz (not date-partitioned)"
