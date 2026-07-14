@@ -45,7 +45,7 @@ if [ -z "$AK" ] || [ -z "$SK" ] || [ -z "$ST" ]; then
   echo "STS bootstrap failed: $(printf '%s' "$CREDS" | head -c 200)"; exit 1
 fi
 
-TAPE=s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz
+TAPE=s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz
 # `_` is a LIKE wildcard and ids are r_…-style — escape it so the match is literal.
 CORE_SQL=${CORE//_/\\_}
 

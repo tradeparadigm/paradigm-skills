@@ -20,8 +20,9 @@ Spot      $[X]        [up/down X%] (from $[Y], low $[Z])
 DVOL      [X]v        [flat/rising/falling] ([open] -> [close])
 RV 7d     [X]v        implied [CHEAP/RICH/IN LINE] vs realized
 VRP       [±X]v       vol [underpriced/overpriced] vs delivered
-Volume    $[X]M       [primary venue] (incl. Paradigm)
-P/C       [X.Xx]      [calls/puts] dominant
+Activity  [Nk]        trades — [Venue X% · Venue Y% · ...]
+Volume    $[X]M       Deribit only (cross-venue $ pending)
+P/C       [X.Xx]      [calls/puts] dominant (all venues, by trades)
 ```
 
 **Biggest Print**

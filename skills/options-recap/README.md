@@ -45,42 +45,37 @@ bash scripts/run_recap.sh <ASSET> <WINDOW>
   rules. The live path doesn't read it (the script emits the shape); it's the
   rendering contract for the injected/simulate modes and the eval harness.
 
-## Windows — presets vs. dynamic
+## Windows
 
 `run_recap.sh` parses the window generically into seconds (`Nm`/`Nh`/`Nd`), so
-**any** window renders. There are two paths:
-
-- **Presets** (`5m 10m 20m 1h 4h 8h 24h`) — a server-side `hot__recap_<win>.parquet`
-  is pre-aggregated, so DVOL/spot OHLC, volume, and the close-surface come from one
-  fast S3 read. `PRESET=1` in the script gates those COPYs.
-- **Dynamic** (any other window, e.g. `3h`, `90m`) — no pre-baked parquet exists,
-  so `recap.py` reconstructs the same sections live: DVOL/spot OHLC from the
-  Deribit index/chart APIs over `[start,end]`, Volume/P-C from the Deribit window
-  tape (`deribit_tape_volume`), and the vol surface + ΔATM/ΔRR/ΔFly from
-  `v_vol_surface` (the two `surface_now`/`surface_open` COPYs run for **every**
-  window). Slower (more Deribit round-trips) but the output shape is identical.
+**any** window renders — there is a single data path. DVOL/spot OHLC and the
+volume/`trade_count` rows come from ONE rolling file, `hot__recap_aggregates_5m_24h.parquet`
+(5-min buckets over the trailing 24h), windowed at query time by `WHERE bucket_at
+>= now - window` + aggregation; the vol surface + ΔATM/ΔRR/ΔFly come from
+`v_vol_surface`. The Deribit public API adds only the 7d realized-vol closes,
+the block-leg geometry (Biggest Print / Block Flow), and a live DVOL/spot fallback
+if the S3 read fails.
 
 Notes / non-obvious bits:
-- **Volume/P-C come from the live Deribit tape for EVERY window** (screen + block,
-  i.e. incl. Paradigm) — `deribit_tape_volume`, not the hot `volume` parquet. The
-  hot rows undercount by ~25%: they drop most block flow despite the recap's
-  "incl. Paradigm" label (8h sample: tape 6712 BTC / 4202 trades vs hot 5059 /
-  3129), which made volume non-monotonic across the preset/dynamic boundary (a 3h
-  window reading more than a 4h one). The tape is already fetched for Block Flow,
-  so this is free. The hot `volume` rows are now only an empty-tape fallback (e.g.
-  a Deribit fetch failure). Root cause is the server-side `hot__recap` bake
-  dropping blocks; if fixed there, presets could read the parquet again.
+- **`PRESET` is just a label now.** The canonical windows (`5m 10m 20m 1h 4h 8h
+  24h`) set `PRESET=1`, but since every window reads the same rolling file this no
+  longer gates the data path — it's retained for the plan/test hook and as an
+  observability signal (canonical vs ad-hoc window).
+- **Dollar Volume is Deribit-scoped; Activity/P-C span all venues.** See "Data
+  sources" below — `volume_sum` units differ per venue so the `$` Volume line uses
+  only the exact-`deribit` rows (1 contract = 1 BTC), while the unit-free
+  `trade_count` drives the multi-venue Activity line and the P/C ratio.
 - **The old bug:** a preset `case` mapped unknown windows to a silent 8h default,
-  so `hot__recap_3h.parquet` was read (missing → n/a Snapshot) and surface deltas
-  were computed against an 8h-old open. Fixed by parsing instead of enumerating.
-- **~24h flow horizon.** Volume / Biggest Print / Block Flow come from the Deribit
-  public tape, which only retains ~24h (empirically confirmed: both `get_last_trades*`
-  endpoints return 0 rows for ranges older than ~24h). DVOL/spot (OHLC) and the vol
-  surface (`v_vol_surface`) retain far longer. So for windows >24h, `build()` sets a
+  so surface deltas were computed against an 8h-old open. Fixed by parsing the
+  window into seconds instead of enumerating presets.
+- **~24h flow horizon.** The flow sections only reach back ~24h: Volume / Activity /
+  P-C come from the rolling recap-aggregates file (trailing 24h) and Biggest Print /
+  Block Flow from the Deribit public tape (also ~24h retention — both `get_last_trades*`
+  endpoints return 0 rows older than ~24h). DVOL/spot (OHLC) and the vol surface
+  (`v_vol_surface`) retain far longer. So for windows >24h, `build()` sets a
   `flow_horizon` field and `render_md` prepends a one-line banner — the flow sections
-  cover ~24h, the rest spans the full window. The >24h data *does* exist in the cold
-  store (`paradigm_trade_tape_slim` for blocks, fresh; tardis for screen, ~2d stale)
-  but isn't wired in yet — that's the planned follow-up that will retire the banner.
+  cover ~24h, the rest spans the full window. The >24h flow data *does* exist in the
+  cold store but isn't wired in yet — the planned follow-up that will retire the banner.
 - **Bad windows** (`3x`, `0h`, …) exit `2` with a clear message before any network.
 - The raw per-venue tapes under `external/tardis/` are **not** a source here —
   they don't replicate into the pod's bucket and are stale; Deribit's public API
@@ -94,24 +89,46 @@ script (agent types one short line) and pre-rendering the markdown in `recap.py`
 
 ## Data sources
 
-Two authoritative hot reads (one DuckDB session) plus the Deribit tape. **Hot
-files are authoritative for DVOL/spot/volume/surface;** Deribit supplies only the
-7d realized-vol closes and block-leg geometry (hot carries neither). The
-`row_type` map in `hot__recap_<window>.parquet`:
+The recap aggregates file + the `v_vol_surface` store (one DuckDB session) plus
+the Deribit tape. **These are authoritative for DVOL/spot/volume/surface;**
+Deribit supplies only the 7d realized-vol closes and block-leg geometry (the hot
+files carry neither). `recap.py` reads the `dvol_spot` + `volume` rows from the
+recap file, and the surface from `v_vol_surface`. The
+`row_type` map in `hot__recap_aggregates_5m_24h.parquet` (a single rolling file
+of 5-min buckets over the trailing 24h; the window is applied at query time via
+`WHERE bucket_at >= now - window` + aggregation):
 
 | Section | `row_type` | Key columns |
 |---|---|---|
-| Snapshot DVOL/spot | `dvol_spot` | `metric`, `open`, `close`, `high`, `low` |
-| Snapshot volume/P-C | `volume` | `exchange`, `optionType`, `volume_sum`, `notional` |
-| Block Flow | `block` | `block_id`, `notional`, `volume_sum`, `leg_count`, `avg_iv` |
-| Vol Surface | `surface` | `expiry`, `strike`, `optionType`, `markIV_close`, `delta` |
+| Snapshot DVOL/spot | `dvol_spot` | `metric`, `open`, `close`, `high`, `low` (OHLC: `arg_min(open,bucket_at)` / `arg_max(close,bucket_at)` / `max(high)` / `min(low)`) |
+| Snapshot volume/P-C | `volume` | `exchange`, `optionType`, `volume_sum`, `notional_usd`, `trade_count` |
+| Block Flow | `block` | `block_id`, `notional_usd`, `volume_sum`, `leg_count`, `iv_sum`/`iv_count` |
 
-`hot__market_signals_1m.parquet` is the "now" anchor (current DVOL/spot, ATM IV).
+There is **no `surface` `row_type`** — the vol surface lives in `v_vol_surface`
+(see below). `notional` is now `notional_usd`; IV is `iv_sum`/`iv_count` (no `avg_iv`).
+
+**Multi-venue representation (truthful + consistent).** The `volume` rows span
+Deribit, OKX, Bybit, Bullish, but their units aren't comparable: `volume_sum` is
+each venue's native contract unit and `notional_usd` isn't yet cross-venue
+normalized. So the recap only aggregates across venues on a **unit-free** basis —
+**`trade_count`** — which drives the multi-venue **Activity** line (total trades +
+per-venue share) and the **P/C** ratio (put vs call trades, all venues). The
+dollar **Volume** line stays **Deribit-scoped** (the one venue we can price in USD
+reliably: 1 contract = 1 BTC) and is labeled as such — we never sum `volume_sum`
+or `notional_usd` across venues. When the pipeline later emits a normalized
+cross-venue USD field, the Volume line upgrades to a true market total; until then
+nothing is overstated. **No venue contract multipliers are hardcoded anywhere.**
+
+The "now" values (latest DVOL/spot close, current surface) come from the newest
+`bucket_at` in the recap file and the latest `v_vol_surface/_hot` snapshot.
+(`hot__market_signals_1m.parquet` is the live signals heartbeat used by
+`paradigm-block-analyst`; `/recap` no longer reads it.)
 S3 access (IRSA STS bootstrap) is documented in the `paradigm-data-discovery` skill.
 
-**Vol-surface deltas (ΔATM/ΔRR/ΔFly).** The hot recap parquet's `surface` rows are
-close-only, so window-over-window deltas read the consolidated per-strike store
-`v_vol_surface` instead (columns `symbol`, `type`, `mark_iv`, `delta`, `at`, …;
+**Vol-surface deltas (ΔATM/ΔRR/ΔFly).** The recap aggregates file carries no
+surface rows, so the full surface and window-over-window deltas read the
+consolidated per-strike store `v_vol_surface` (on `dt-paradigm-data`) instead
+(columns `symbol`, `type`, `mark_iv`, `delta`, `at`, …;
 Deribit basis = `symbol LIKE '<ASSET>-%'`, dropping the `<ASSET>_USDC-` legs):
 
 - **now** = the latest snapshot in the rolling `v_vol_surface/_hot.parquet`.
@@ -128,7 +145,7 @@ table is capped to the front `MAX_SURFACE_ROWS` expiries.
 
 ## Known hot-data quirk (important)
 
-`hot__recap_<window>.parquet` `volume`/`block` rows have **inconsistent units**
+`hot__recap_aggregates_5m_24h.parquet` `volume`/`block` rows have **inconsistent units**
 and **aggregate/corrupt rows** that, summed naively, produced absurd numbers
 (Volume ~$9.8T, a single $5.1B block) in early versions:
 
