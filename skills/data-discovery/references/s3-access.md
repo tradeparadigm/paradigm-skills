@@ -2,10 +2,12 @@
 
 The agent stack runs on EKS with IRSA (IAM Roles for Service Accounts). To
 query the market-data buckets (`s3://dt-paradigm-data`,
-`s3://dt-exchange-venue-data`, and `s3://terminal-dime-prod` — same region
-and same role) from DuckDB, exchange
+`s3://dt-exchange-venue-data`, and the **deprecated** `s3://terminal-dime-prod`
+— all same region and same role) from DuckDB, exchange
 the projected web identity token for temporary STS credentials, then load
-them into DuckDB's `httpfs` extension.
+them into DuckDB's `httpfs` extension. `terminal-dime-prod` is being wound
+down (only the Tardis tree and the not-yet-re-homed Paradex tape remain) —
+do not build new dependencies on it.
 
 ## Bootstrap (run once per session)
 

@@ -88,7 +88,7 @@ def test_defaults():
 # hot__recap_<win>.parquet read missed. Windows are now parsed generically.
 
 def test_preset_window_plan():
-    # Preset: SECS from the window, PRESET=1 (reads the pre-baked hot parquet).
+    # Preset: SECS from the window, PRESET=1 (label only — same rolling-file path).
     check("8h → 28800s, preset", plan("btc", "8h") == ("BTC 8h 28800 1", 0))
     check("1h → 3600s, preset", plan("btc", "1h") == ("BTC 1h 3600 1", 0))
 
