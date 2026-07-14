@@ -229,16 +229,38 @@ def _num(row: dict, *keys):
     return None
 
 
+# Maps a venue id to its display label. deribit and deribit-usdc are distinct
+# production venues (BTC-inverse vs USDC-linear) that both render as "Deribit" —
+# activity is aggregated by this label so they collapse into one Activity entry.
+_VENUE_LABELS = {"deribit": "Deribit", "deribit-usdc": "Deribit",
+                 "okex-options": "OKX", "bybit-options": "Bybit",
+                 "bullish": "Bullish"}
+
+
+def _venue_label(exchange: str) -> str:
+    """Short display label for a venue id (e.g. okex-options -> OKX). Unknown/future
+    venues degrade to a readable stem (e.g. cme-options -> Cme) — never crashes,
+    never collides with a mapped label."""
+    e = (exchange or "").lower()
+    return _VENUE_LABELS.get(e, (exchange or "?").split("-")[0].title())
+
+
 def load_hot(csv_dir: str, asset: str) -> dict:
     """Parse the hot CSVs defensively — tolerate missing files/columns by
     leaving the field null and recording a warning, never crashing."""
     out = {"dvol": None, "dvol_open": None, "dvol_low": None, "dvol_high": None,
            "spot_close": None, "spot_open": None, "spot_low": None,
            "volume_btc": None, "put_vol": None, "call_vol": None,
-           "tickers": {}, "vs_now": {}, "vs_open": {}, "primary_venue": None}
+           "trades_by_venue": {}, "trades_total": None,
+           "put_trades": None, "call_trades": None,
+           "tickers": {}, "vs_now": {}, "vs_open": {}}
 
     ds = _read_csv(csv_dir, "dvol_spot.csv")
-    for r in ds:
+    # DVOL/spot are Deribit-only today. If a future venue ever emits dvol/spot rows,
+    # this per-metric assignment would be last-row-wins (nondeterministic), so sort
+    # Deribit rows last — they then win under the loop's overwrite. When no Deribit
+    # row exists we still read whatever is present rather than crash/blank.
+    for r in sorted(ds, key=lambda r: (r.get("exchange") or "").lower() == "deribit"):
         metric = (r.get("metric") or "").lower()
         if metric == "dvol":
             out["dvol"] = _num(r, "close"); out["dvol_open"] = _num(r, "open")
@@ -249,31 +271,41 @@ def load_hot(csv_dir: str, asset: str) -> dict:
     if not ds:
         warn("hot dvol_spot.csv missing — DVOL/spot from snapshot or fallback")
 
-    # Volume / P/C. The hot recap carries per-(exchange,optionType) rows PLUS a
-    # per-exchange aggregate row (blank optionType) whose notional double-counts,
-    # and `volume_sum` units differ by venue (Deribit/Bullish in BTC, OKX/Bybit in
-    # contracts) — summing across them produced absurd ($10T) totals. Restrict to
-    # Deribit, the canonical BTC-denominated options venue, and derive the notional
-    # ourselves as contracts × spot. Drop the blank-optionType aggregate rows.
+    # Volume / P/C. Two reads, each on a basis that's honest for its scope:
+    #   • Dollar volume — ONLY Deribit is priced in USD reliably (1 contract = 1 BTC,
+    #     confirmed from the venue instrument feed). `volume_sum` units differ by
+    #     venue and `notional_usd` isn't yet cross-venue-normalized, so we do NOT
+    #     sum $ across venues; the Volume line is explicitly Deribit-scoped.
+    #   • Activity + P/C — `trade_count` is unit-free (a trade is a trade), so it
+    #     aggregates across ALL venues truthfully, with no contract multiplier.
+    # Blank-optionType rows are per-exchange aggregates that double-count — drop them.
     vol = [r for r in _read_csv(csv_dir, "volume.csv") if (r.get("optionType") or "").strip()]
     if vol:
-        deri = [r for r in vol if (r.get("exchange") or "").lower().startswith("deribit")]
-        use = deri or vol
-        out["call_vol"] = sum(_num(r, "volume_sum") or 0 for r in use
+        # Exact "deribit" only — NOT startswith: the sibling venue deribit-usdc is
+        # USDC-linear (a different contract unit), so folding it into this
+        # BTC-inverse dollar-volume sum would contaminate the Volume line.
+        deri = [r for r in vol if (r.get("exchange") or "").lower() == "deribit"]
+        out["call_vol"] = sum(_num(r, "volume_sum") or 0 for r in deri
                               if (r.get("optionType") or "").upper().startswith("C")) or None
-        out["put_vol"] = sum(_num(r, "volume_sum") or 0 for r in use
+        out["put_vol"] = sum(_num(r, "volume_sum") or 0 for r in deri
                              if (r.get("optionType") or "").upper().startswith("P")) or None
         out["volume_btc"] = ((out["call_vol"] or 0) + (out["put_vol"] or 0)) or None
-        if deri:
-            out["primary_venue"] = "Deribit"
-        else:
-            byv = defaultdict(float)
-            for r in use:
-                byv[r.get("exchange") or "?"] += _num(r, "volume_sum") or 0
-            out["primary_venue"] = max(byv, key=byv.get) if byv else None
+        byv = defaultdict(float)
+        for r in vol:
+            byv[r.get("exchange") or "?"] += _num(r, "trade_count") or 0
+        out["trades_by_venue"] = dict(byv)
+        out["trades_total"] = sum(byv.values()) or None
+        out["put_trades"] = sum(_num(r, "trade_count") or 0 for r in vol
+                                if (r.get("optionType") or "").upper().startswith("P")) or None
+        out["call_trades"] = sum(_num(r, "trade_count") or 0 for r in vol
+                                 if (r.get("optionType") or "").upper().startswith("C")) or None
     else:
         warn("hot volume.csv missing — volume/P/C unavailable")
 
+    # surface.csv is a legacy fallback source for out["tickers"]; post-migration
+    # run_recap.sh no longer emits it (the recap aggregates file has no surface
+    # rows), so surf is normally empty and vs_now (below) drives the surface. The
+    # reader is kept for back-compat and unit coverage — a no-op when absent.
     surf = _read_csv(csv_dir, "surface.csv")
     spot_for_surf = out["spot_close"]
     for r in surf:
@@ -408,24 +440,6 @@ def spot_vol_label(spot_open, spot_close, dvol_open, dvol_close):
     return "vol faded with spot"
 
 
-def deribit_tape_volume(trades: list[dict]) -> tuple:
-    """Call/put option volume (BTC contracts) summed from the Deribit window tape.
-    The dynamic-window stand-in for the hot `volume` rows, which are pre-baked only
-    for preset windows. This matches the figure the hot path already renders — that
-    path filters `volume` rows to Deribit (see load_hot), so both are Deribit-only.
-    Deribit contracts are BTC-denominated, so notional = contracts × spot downstream,
-    the same derivation load_hot uses."""
-    cv = pv = 0.0
-    for t in trades:
-        nm = t.get("instrument_name") or ""
-        amt = t.get("amount") or 0
-        if nm.endswith("-C"):
-            cv += amt
-        elif nm.endswith("-P"):
-            pv += amt
-    return (cv or None, pv or None)
-
-
 def build(asset: str, window: str, start_ms: int, end_ms: int,
           deri: dict, hot: dict) -> dict:
     asset = asset.upper()
@@ -450,23 +464,27 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
 
     rv = realized_vs_implied(deri.get("closes_7d") or [], dvol_close)
 
-    # Volume / P/C from the Deribit tape (screen + block, i.e. incl. Paradigm) for
-    # EVERY window. The tape is already fetched for Block Flow, and it's the
-    # authoritative figure: the hot `volume` parquet rows undercount by ~25% —
-    # they drop most block flow despite the recap's "incl. Paradigm" label (an 8h
-    # sample: tape 6712 BTC / 4202 trades vs hot 5059 / 3129). Using one source for
-    # all windows also fixes the non-monotonic volume across the preset/dynamic
-    # boundary (a 3h window reading more than a 4h one). Fall back to the hot rows
-    # only when the tape is empty (e.g. a Deribit fetch failure). Both are
-    # Deribit-denominated BTC contracts, so notional = contracts × spot.
-    cv, pv = deribit_tape_volume(deri.get("trades") or [])
-    primary_venue = "Deribit"
-    if cv is None and pv is None:  # tape unavailable → hot rows
-        cv, pv = hot.get("call_vol"), hot.get("put_vol")
-        primary_venue = hot.get("primary_venue")
-    vol_btc = ((cv or 0) + (pv or 0)) or None
+    # Volume ($) is Deribit-scoped — the only venue we can price in USD reliably.
+    vol_btc = hot.get("volume_btc")
     vol_usd = vol_btc * spot if (vol_btc and spot) else None
-    pc = round(pv / cv, 2) if pv and cv else None
+    # Activity + P/C use trade_count — unit-free, so they span ALL venues truthfully.
+    pt, ct = hot.get("put_trades"), hot.get("call_trades")
+    pc = round(pt / ct, 2) if pt and ct else None
+    tt = hot.get("trades_total")
+    activity_split = None
+    if tt:
+        # Fold raw venue ids into display labels FIRST, so venues that share a label
+        # (deribit + deribit-usdc → "Deribit") collapse into a single entry before
+        # pct/sort — otherwise "Deribit" appears twice and the [:4] display cap can
+        # push a real venue off the line. tt already spans all raw venues, so the
+        # per-label pcts remain a correct share of total activity.
+        by_label: dict[str, float] = defaultdict(float)
+        for v, n in (hot.get("trades_by_venue") or {}).items():
+            by_label[_venue_label(v)] += n
+        activity_split = [
+            {"venue": lbl, "pct": round(100 * n / tt)}
+            for lbl, n in sorted(by_label.items(), key=lambda kv: -kv[1])
+        ]
 
     # Vol surface — v_vol_surface "now" snapshot is authoritative (it pairs with
     # the "open" snapshot for consistent window-over-window deltas); fall back to
@@ -481,11 +499,13 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     trades = deri.get("trades") or []
     block = build_block_flow(trades, hot, spot)
 
-    # Flow-horizon check. Volume / Biggest Print / Block Flow come from the Deribit
-    # public tape, which only retains ~24h; DVOL/spot (OHLC) and the vol surface
-    # (v_vol_surface) retain much longer. So for a window past the tape horizon the
-    # flow sections silently cover less than the header claims. Detect it from the
-    # oldest trade actually returned and surface a banner (render_md). Cleared
+    # Flow-horizon check. The flow sections only reach back ~24h: Volume / Activity /
+    # P/C come from the rolling recap-aggregates file (trailing 24h) and Biggest
+    # Print / Block Flow from the Deribit public tape (also ~24h retention); DVOL/spot
+    # (OHLC) and the vol surface (v_vol_surface) retain much longer. So for a window
+    # past that horizon the flow sections silently cover less than the header claims.
+    # The tape's oldest trade is the tightest available proxy for the covered span
+    # (both flow sources cap near 24h). Surface a banner (render_md). Cleared
     # automatically once >24h flow is sourced from the cold store.
     flow_horizon = None
     window_h = (end_ms - start_ms) / 3600_000
@@ -508,7 +528,8 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "dvol_label": dvol_label(dvol_open, dvol_close),
         "rv_7d": rv.get("value"), "vrp": rv.get("vrp"), "vrp_label": rv.get("vrp_label"),
         "volume_usd_m": round(vol_usd / 1e6) if vol_usd else None,
-        "primary_venue": primary_venue,
+        "activity_trades": tt,
+        "activity_split": activity_split,
         "pc_ratio": pc, "pc_dominant": ("puts" if pc and pc > 1 else "calls" if pc else None),
         "spot_vol_label": spot_vol_label(spot_open, spot_close, dvol_open, dvol_close),
     }
@@ -596,14 +617,15 @@ def render_md(r: dict) -> str:
         L.append("⚠ hot surface unavailable — affected sections read No data")
         L.append("")
 
-    # >24h window: the flow sections only reach back ~24h (Deribit tape retention),
-    # while DVOL/spot/surface span the full window. Flag it so the header isn't read
-    # as covering the whole window for flow. Goes away once >24h flow comes from S3.
+    # >24h window: the flow sections only reach back ~24h (rolling recap-aggregates
+    # file + Deribit tape both cap near 24h), while DVOL/spot/surface span the full
+    # window. Flag it so the header isn't read as covering the whole window for flow.
+    # Goes away once >24h flow comes from the cold store.
     fh = r.get("flow_horizon")
     if fh:
-        L.append(f"⚠ Volume · Biggest Print · Block Flow cover ~{fh['covered_h']}h "
-                 f"(Deribit tape retention limit); DVOL/spot/surface span the full "
-                 f"{fh['window_h']}h.")
+        L.append(f"⚠ Volume · Activity · Biggest Print · Block Flow cover "
+                 f"~{fh['covered_h']}h (~24h flow-data horizon); DVOL/spot/surface "
+                 f"span the full {fh['window_h']}h.")
         L.append("")
 
     L.append(f"**{h['asset']} Options · {h['window']} Recap · "
@@ -637,10 +659,17 @@ def render_md(r: dict) -> str:
            "overpriced" if vrp is not None and vrp > 0 else "fair")
     L.append(f"{'VRP':<9} {vrp_txt:<11} vol {upo} vs delivered")
 
+    if s.get("activity_trades"):
+        tt = s["activity_trades"]
+        tnum = (f"{tt / 1e6:.1f}M" if tt >= 1e6 else
+                f"{round(tt / 1e3)}k" if tt >= 1e3 else f"{int(tt)}")
+        split = " · ".join(f"{v['venue']} {v['pct']}%"
+                           for v in (s.get("activity_split") or [])[:4])
+        L.append(f"{'Activity':<9} {tnum:<11} trades — {split}")
     vol = f"${s['volume_usd_m']}M" if s.get("volume_usd_m") else "n/a"
-    L.append(f"{'Volume':<9} {vol:<11} {s.get('primary_venue') or 'n/a'} (incl. Paradigm)")
+    L.append(f"{'Volume':<9} {vol:<11} Deribit only (cross-venue $ pending)")
     pc = f"{s['pc_ratio']}x" if s.get("pc_ratio") is not None else "n/a"
-    L.append(f"{'P/C':<9} {pc:<11} {s.get('pc_dominant') or ''} dominant")
+    L.append(f"{'P/C':<9} {pc:<11} {s.get('pc_dominant') or ''} dominant (all venues, by trades)")
     L += ["```", "", "**Biggest Print**", "", "```yaml"]
 
     if bp:
@@ -715,8 +744,8 @@ def main() -> None:
                 duck_fut.result()
             deri = deri_fut.result()
         hot = load_hot(args.csv_dir, ASSET)
-        # No hot dvol_spot row: either a rare full hot miss (DuckDB failed) or a
-        # non-preset window (no hot__recap parquet). Either way DVOL/spot must come
+        # No hot dvol_spot row: the DuckDB read of the rolling recap-aggregates file
+        # failed or returned nothing for this window. Either way DVOL/spot must come
         # from Deribit. Only pull the expensive per-strike ticker surface when
         # v_vol_surface also gave us nothing — for a normal dynamic window vs_now
         # is populated, so we skip ~50 serial ticker calls (the bulk of the cost).

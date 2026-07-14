@@ -25,7 +25,7 @@ import recap  # noqa: E402
 from recap import (  # noqa: E402
     parse_window_ms, load_hot, build, build_block_flow, render_md,
     _leg_phrase, pct, dvol_label, spot_vol_label, fmt_hhmm, run_duckdb,
-    _load_surface_tickers, _delta_fmt, deribit_tape_volume, MAX_SURFACE_ROWS,
+    _load_surface_tickers, _delta_fmt, _venue_label, MAX_SURFACE_ROWS,
 )
 
 _passed = 0
@@ -57,6 +57,13 @@ CORRUPT_VOLUME_CSV = (
     "okex-options,call,188346.0,1841.07,97495.0,90851.0,2138\n"
     "deribit,,163448320.0,9803096239210.0,81069170.0,82379150.0,47759\n"
     "bybit-options,call,3044.33,1413683.95,1670.2,1374.13,8315\n"
+    # deribit-usdc: a real 5th production venue (USDC-linear). volume_sum is in a
+    # DIFFERENT contract unit than deribit's BTC-inverse rows, so it MUST NOT enter
+    # the Deribit dollar-volume sum; its trades DO count toward activity, folded
+    # into the single "Deribit" display label. Placed apart from the deribit rows
+    # on purpose — the label-collapse must not depend on row order.
+    "deribit-usdc,call,15.3,14740.6,11.61,3.69,83\n"
+    "deribit-usdc,put,51.0,25581.55,8.01,42.99,50\n"
 )
 DVOL_SPOT_CSV = (
     "exchange,metric,open,close,high,low\n"
@@ -133,46 +140,88 @@ def test_volume_excludes_aggregate_and_other_venues():
     recap.WARNINGS.clear()
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot(d)
-    # Only the two Deribit per-optionType rows count: 4719.6 + 2702.9.
-    check("call_vol = deribit calls", hot["call_vol"] == 4719.6, hot["call_vol"])
-    check("put_vol = deribit puts", hot["put_vol"] == 2702.9, hot["put_vol"])
+    # Dollar volume stays Deribit-scoped: ONLY the two exact-"deribit" rows, 4719.6 +
+    # 2702.9. deribit-usdc (USDC-linear, different unit) must NOT contaminate it —
+    # its 15.3 call + 51.0 put volume_sum are excluded despite the "deribit" prefix.
+    check("call_vol = deribit calls (excl deribit-usdc)", hot["call_vol"] == 4719.6, hot["call_vol"])
+    check("put_vol = deribit puts (excl deribit-usdc)", hot["put_vol"] == 2702.9, hot["put_vol"])
     check("volume_btc = deribit only", abs(hot["volume_btc"] - 7422.5) < 1e-6, hot["volume_btc"])
+    check("deribit-usdc volume excluded (would be 7488.8 if summed in)",
+          abs(hot["volume_btc"] - (7422.5 + 15.3 + 51.0)) > 1.0, hot["volume_btc"])
     check("aggregate row (163M) excluded", hot["volume_btc"] < 1000 * 1000, hot["volume_btc"])
-    check("primary_venue Deribit", hot["primary_venue"] == "Deribit", hot["primary_venue"])
     check("no legacy volume_usd key", "volume_usd" not in hot)
+    # Activity/P-C: trade_count across ALL venues, blank-optionType aggregates dropped.
+    # Kept rows: deribit 2652+1844, bybit 8315+7135, okex 2138+2779, deribit-usdc
+    # 83+50 = 24996 trades. deribit-usdc trades DO count (unit-free).
+    check("trades_total all venues", hot["trades_total"] == 24996, hot["trades_total"])
+    check("blank-optionType aggregates excluded (bullish 801870, deribit 47759)",
+          hot["trades_total"] < 100000, hot["trades_total"])
+    check("put_trades all venues", hot["put_trades"] == 1844 + 7135 + 2779 + 50, hot["put_trades"])
+    check("call_trades all venues", hot["call_trades"] == 2652 + 8315 + 2138 + 83, hot["call_trades"])
+    # trades_by_venue is keyed by RAW venue id, so deribit and deribit-usdc are two
+    # separate entries here (4 total); they only collapse to one "Deribit" label in
+    # build()'s activity_split (see test_activity_split_collapses_deribit_venues).
+    check("trades_by_venue has 4 raw venues", len(hot["trades_by_venue"]) == 4, hot["trades_by_venue"])
+    check("deribit-usdc present as its own raw venue",
+          hot["trades_by_venue"].get("deribit-usdc") == 133, hot["trades_by_venue"])
+    check("bybit leads by trades",
+          max(hot["trades_by_venue"], key=hot["trades_by_venue"].get) == "bybit-options",
+          hot["trades_by_venue"])
 
 
 def test_volume_to_usd_is_sane():
-    # Empty tape → volume falls back to the hot rows (the fallback path).
+    # Dollar Volume is always the Deribit-scoped hot rows; the tape is irrelevant.
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot(d)
         res = build("btc", "8h", 0, 8 * 3600_000,
                     {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
     s = res["snapshot"]
-    # 7422.5 BTC × $60,468 ≈ $448.9M — NOT the old $9.8T.
+    # Dollar Volume is Deribit-scoped: 7422.5 BTC × $60,468 ≈ $448.9M — NOT the old $9.8T.
     check("volume_usd_m ~ 449", 440 <= s["volume_usd_m"] <= 460, s["volume_usd_m"])
     check("volume not trillions", s["volume_usd_m"] < 100_000, s["volume_usd_m"])
-    check("pc ratio 0.57", s["pc_ratio"] == 0.57, s["pc_ratio"])
+    # P/C now trade-count-based across all venues: 11808 puts / 13188 calls = 0.90.
+    check("pc ratio 0.90 (by trades, all venues)", s["pc_ratio"] == 0.90, s["pc_ratio"])
     check("calls dominant", s["pc_dominant"] == "calls", s["pc_dominant"])
+    # Multi-venue activity present; split sums ~100%, Bybit leads by trade count.
+    check("activity_trades 24996", s["activity_trades"] == 24996, s["activity_trades"])
+    check("activity split ~100%", abs(sum(v["pct"] for v in s["activity_split"]) - 100) <= 2,
+          s["activity_split"])
+    check("bybit leads activity", s["activity_split"][0]["venue"] == "Bybit", s["activity_split"])
 
 
-def test_volume_prefers_tape_over_hot():
-    # When BOTH the hot volume rows and a live tape are present, the tape wins —
-    # it's the authoritative screen+block figure (hot undercounts ~25%). This is
-    # what keeps volume consistent/monotonic across the preset/dynamic boundary.
+def test_activity_split_collapses_deribit_venues():
+    # deribit + deribit-usdc share the "Deribit" display label, so the Activity line
+    # must show ONE "Deribit" entry whose share includes BOTH venues' trades.
     with tempfile.TemporaryDirectory() as d:
-        hot = _full_hot(d)  # hot: 4719.6 calls / 2702.9 puts
-    trades = ([{"instrument_name": "BTC-25JUL26-60000-C", "amount": 100.0}] * 1 +
-              [{"instrument_name": "BTC-25JUL26-55000-P", "amount": 40.0}] * 1)
-    res = build("btc", "8h", 0, 8 * 3600_000,
-                {"closes_7d": CLOSES_7D, "trades": trades, "market": None}, hot)
+        hot = _full_hot(d)
+        res = build("btc", "8h", 0, 8 * 3600_000,
+                    {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
     s = res["snapshot"]
-    spot = s["spot"]
-    # Volume must reflect the tape (140 BTC), NOT the hot rows (7422.5 BTC).
-    check("volume from tape not hot", round(140 * spot / 1e6) == s["volume_usd_m"],
-          (s["volume_usd_m"], spot))
-    check("pc ratio from tape (40/100=0.4)", s["pc_ratio"] == 0.4, s["pc_ratio"])
-    check("primary venue Deribit", s["primary_venue"] == "Deribit", s["primary_venue"])
+    split = s["activity_split"]
+    deribit_entries = [v for v in split if v["venue"] == "Deribit"]
+    check("exactly one Deribit entry in split", len(deribit_entries) == 1, split)
+    # Combined Deribit share = (4496 + 133) / 24996 = 18.5% → 19; NOT 4496/24996 → 18.
+    check("deribit-usdc folded into Deribit share (19%, not 18%)",
+          deribit_entries[0]["pct"] == round(100 * (4496 + 133) / 24996), deribit_entries[0])
+    check("deribit-usdc raises the Deribit share",
+          deribit_entries[0]["pct"] > round(100 * 4496 / 24996), deribit_entries[0])
+    # And in the rendered line the token "Deribit" appears exactly once.
+    md = render_md(res)
+    activity_line = next(ln for ln in md.splitlines() if ln.strip().startswith("Activity"))
+    check("rendered Activity line has one 'Deribit'", activity_line.count("Deribit") == 1, activity_line)
+    check("no raw 'deribit-usdc' leaks into render", "deribit-usdc" not in md, activity_line)
+
+
+def test_venue_label_degrades_for_unknown_venue():
+    # A future venue absent from _VENUE_LABELS must degrade to a readable, non-empty
+    # label without crashing and without colliding with a mapped label.
+    check("known: okex-options → OKX", _venue_label("okex-options") == "OKX")
+    check("known: deribit-usdc → Deribit", _venue_label("deribit-usdc") == "Deribit")
+    check("unknown: cme-options → Cme", _venue_label("cme-options") == "Cme")
+    check("unknown single token: kraken → Kraken", _venue_label("kraken") == "Kraken")
+    check("empty/None degrades to '?' not crash", _venue_label("") == "?" and _venue_label(None) == "?")
+    check("unknown label != any mapped label",
+          _venue_label("cme-options") not in ("Deribit", "OKX", "Bybit", "Bullish"))
 
 
 # ── load_hot: dvol/spot + surface parsing ───────────────────────────────────
@@ -184,6 +233,36 @@ def test_dvol_spot_parsing():
     check("dvol open", hot["dvol_open"] == 45.41, hot["dvol_open"])
     check("spot close", hot["spot_close"] == 60468, hot["spot_close"])
     check("spot open", hot["spot_open"] == 59362, hot["spot_open"])
+
+
+def test_dvol_spot_prefers_deribit_over_future_venue():
+    # Hardening: DVOL/spot are Deribit-only today. If a future venue ever emits
+    # dvol/spot rows too, the Deribit row must still win deterministically — a naive
+    # last-row-wins loop would let whichever row sorts last (here deribit-usdc,
+    # listed AFTER deribit) silently override the canonical Deribit figure.
+    recap.WARNINGS.clear()
+    contaminated = (
+        "exchange,metric,open,close,high,low\n"
+        "deribit,dvol,45.41,43.34,45.5,43.0\n"
+        "deribit,spot,59362,60468,60500,59000\n"
+        "deribit-usdc,dvol,90.0,91.0,92.0,89.0\n"      # bogus alt-venue rows, listed last
+        "deribit-usdc,spot,1.0,1.01,1.02,0.99\n"
+    )
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "volume.csv", CORRUPT_VOLUME_CSV)
+        _write(d, "dvol_spot.csv", contaminated)
+        hot = load_hot(d, "BTC")
+    check("dvol from deribit, not deribit-usdc", hot["dvol"] == 43.34, hot["dvol"])
+    check("dvol_open from deribit", hot["dvol_open"] == 45.41, hot["dvol_open"])
+    check("spot from deribit, not deribit-usdc", hot["spot_close"] == 60468, hot["spot_close"])
+    check("spot_open from deribit", hot["spot_open"] == 59362, hot["spot_open"])
+    # Degrade gracefully: with ONLY a non-deribit row present, still read it (no crash/blank).
+    only_alt = ("exchange,metric,open,close,high,low\n"
+                "okex-options,spot,100,110,120,90\n")
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "dvol_spot.csv", only_alt)
+        hot2 = load_hot(d, "BTC")
+    check("falls back to sole non-deribit spot row", hot2["spot_close"] == 110, hot2["spot_close"])
 
 
 def test_surface_sym_construction():
@@ -370,10 +449,10 @@ def test_render_four_sections():
     for h in ("**Snapshot**", "**Biggest Print**", "**Block Flow", "**Vol Surface**"):
         check(f"render has {h}", h in md, md[:80])
     check("render title", md.startswith("**BTC Options · 8h Recap"), md[:40])
-    # Volume/P-C now come from the tape (TRADES: 100C + 100P = 200 BTC × $60,468
-    # ≈ $12M, P/C 1.0), not the hot rows — one authoritative source for all windows.
-    check("render volume line", "Volume" in md and "$12M" in md, "volume render")
-    check("render P/C 1.0x", "1.0x" in md)
+    check("render volume line (Deribit-scoped)",
+          "Volume" in md and "$449M" in md and "Deribit only" in md, "volume render")
+    check("render multi-venue Activity line", "Activity" in md and "Bybit" in md, "activity render")
+    check("render P/C 0.9x", "0.9x" in md)
     check("render biggest Strangle/RR", "26JUN26 Strangle/RR" in md)
     # Vol-surface delta columns are always present in the header; with no
     # window-open surface (this fixture has none) the delta cells read n/a.
@@ -442,41 +521,6 @@ def test_run_duckdb_invokes_binary():
         check("mock duckdb executed (marker written)", os.path.exists(marker))
 
 
-def test_deribit_tape_volume():
-    # Sums option contracts by call/put suffix; ignores non-option instruments.
-    trades = [
-        {"instrument_name": "BTC-25JUL26-60000-C", "amount": 10.0},
-        {"instrument_name": "BTC-25JUL26-60000-C", "amount": 5.0},
-        {"instrument_name": "BTC-25JUL26-55000-P", "amount": 8.0},
-        {"instrument_name": "BTC-PERPETUAL", "amount": 99.0},   # not an option
-        {"instrument_name": None, "amount": 3.0},               # defensive
-    ]
-    cv, pv = deribit_tape_volume(trades)
-    check("call contracts summed", cv == 15.0, cv)
-    check("put contracts summed", pv == 8.0, pv)
-    check("empty tape → (None, None)", deribit_tape_volume([]) == (None, None))
-
-
-def test_build_volume_fallback_when_hot_absent():
-    # Non-preset window: no hot `volume` row, so build() derives Deribit-only
-    # volume from the window tape and labels the venue Deribit.
-    recap.WARNINGS.clear()
-    deri = {
-        "closes_7d": [], "market": None,
-        "trades": [
-            {"instrument_name": "BTC-25JUL26-60000-C", "amount": 12.0},
-            {"instrument_name": "BTC-25JUL26-55000-P", "amount": 8.0},
-        ],
-    }
-    hot = {"tickers": {}, "spot_close": 60000, "dvol": None}  # no volume_btc
-    r = build("btc", "3h", 0, 10_800_000, deri, hot)
-    s = r["snapshot"]
-    # 20 contracts × $60k = $1.2M → 1 (rounded to $M)
-    check("volume from tape (Deribit-only)", s["volume_usd_m"] == 1, s["volume_usd_m"])
-    check("primary venue labeled Deribit", s["primary_venue"] == "Deribit", s["primary_venue"])
-    check("P/C from tape", s["pc_ratio"] == round(8.0 / 12.0, 2), s["pc_ratio"])
-
-
 def test_header_dates_on_multiday_windows():
     from recap import fmt_stamp
     check("intraday: HH:MM only", fmt_stamp(0, False) == "00:00", fmt_stamp(0, False))
@@ -513,7 +557,7 @@ def test_flow_horizon_banner_beyond_24h():
     check("flow_horizon set", res["flow_horizon"] is not None, res["flow_horizon"])
     check("covered ~23h", res["flow_horizon"]["covered_h"] == 23, res["flow_horizon"])
     md = render_md(res)
-    check("banner rendered", "Deribit tape retention limit" in md, md[:200])
+    check("banner rendered", "flow-data horizon" in md, md[:200])
     check("banner names full window", "full 72h" in md, md[:200])
 
 
@@ -529,7 +573,7 @@ def test_no_flow_horizon_banner_within_24h():
     res = build("btc", "8h", end - 8 * 3600_000, end,
                 {"closes_7d": CLOSES_7D, "trades": trades, "market": None}, hot)
     check("no flow_horizon within 24h", res["flow_horizon"] is None, res["flow_horizon"])
-    check("no banner in md", "tape retention" not in render_md(res))
+    check("no banner in md", "flow-data horizon" not in render_md(res))
 
 
 def test_market_fallback_skips_surface_when_not_wanted():

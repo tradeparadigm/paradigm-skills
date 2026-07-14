@@ -7,12 +7,13 @@ description: >
   and vol surface. Use when the user types /recap or asks for a market recap,
   options flow summary, "what happened in BTC options", or "last Xh of flow".
   The output format is fixed — always the same four sections in the same order.
-compatibility: Deribit public API (curl), Paradigm hot surface (DuckDB+S3 via IRSA),
-  OKX/Bullish/IBIT public APIs. No authentication required for public APIs;
-  S3 hot surface requires the IRSA bootstrap (see paradigm-data-discovery skill).
+compatibility: Deribit public API (curl) for the tape; Paradigm hot data (DuckDB+S3
+  via IRSA) for DVOL/spot, multi-venue volume/activity, and the vol surface. No
+  authentication required for the public API; the S3 reads require the IRSA
+  bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.5.0"
+  version: "1.6"
 ---
 
 # Options Recap
@@ -27,16 +28,17 @@ metadata:
 | `window` | any `Nm`/`Nh`/`Nd` — `30m`, `3h`, `8h`, `2d` (`1d`→`24h`) | `24h` |
 | `options` | the literal word `options` | ignored — a no-op keyword (this skill is always options); `run_recap.sh` strips it |
 
-Any window works. `5m/10m/20m/1h/4h/8h/24h` are **presets** — served from a
-pre-baked hot parquet (fast). Any other window (e.g. `3h`) is reconstructed live
-from Deribit + `v_vol_surface`: same four sections, slightly slower. A malformed
-window exits with a clear error.
+Any `Nm`/`Nh`/`Nd` window works and all render identically: DVOL/spot and the
+multi-venue volume/activity come from one rolling hot aggregates file sliced to
+the window at query time, the surface (and its Δ columns) from `v_vol_surface`,
+and block flow from the Deribit tape. A malformed window exits with a clear error.
 
-**Windows beyond ~24h:** Volume / Biggest Print / Block Flow come from the Deribit
-public tape, which only retains ~24h, so for a longer window those sections cover
-just the last ~24h while DVOL/spot/surface span the full window. `run_recap.sh`
-prepends a one-line `⚠ … tape retention limit …` banner in that case — **relay it
-verbatim** (don't drop or reword it).
+**Windows beyond ~24h:** the hot aggregates file and the Deribit tape each retain
+only ~24h, so a longer window (e.g. `2d`) still renders but Volume / Activity /
+DVOL / spot / Biggest Print / Block Flow reflect only the ~24h the sources hold
+(the vol-surface Δs do span the full window via cold partitions). `run_recap.sh`
+prepends a one-line `⚠ Volume · Activity · Biggest Print · Block Flow cover …`
+banner in that case — **relay it verbatim** (don't drop or reword it).
 
 `/recap` alone = BTC options, last 24h. Still pass just `<ASSET> <WINDOW>` to
 `run_recap.sh` — it drops a stray `options`/`option` token, so `/recap btc
@@ -48,7 +50,7 @@ options 8h` and `/recap btc 8h` resolve identically.
 command and relay its stdout **verbatim** as your entire reply:
 
 ```bash
-bash scripts/run_recap.sh BTC 8h      # <ASSET> <WINDOW>; presets fast, any Nm/Nh/Nd works; 1d→24h
+bash scripts/run_recap.sh BTC 8h      # <ASSET> <WINDOW>; any Nm/Nh/Nd works; 1d→24h
 ```
 
 That script does everything — STS bootstrap, the single DuckDB session over the

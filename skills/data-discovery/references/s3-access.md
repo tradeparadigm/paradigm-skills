@@ -1,9 +1,13 @@
 # S3 Access — IRSA Credential Bootstrap for DuckDB
 
 The agent stack runs on EKS with IRSA (IAM Roles for Service Accounts). To
-query `s3://terminal-dime-prod` from DuckDB, exchange the projected web
-identity token for temporary STS credentials, then load them into DuckDB's
-`httpfs` extension.
+query the market-data buckets (`s3://dt-paradigm-data`,
+`s3://dt-exchange-venue-data`, and the **deprecated** `s3://terminal-dime-prod`
+— all same region and same role) from DuckDB, exchange
+the projected web identity token for temporary STS credentials, then load
+them into DuckDB's `httpfs` extension. `terminal-dime-prod` is being wound
+down (only the Tardis tree and the not-yet-re-homed Paradex tape remain) —
+do not build new dependencies on it.
 
 ## Bootstrap (run once per session)
 
@@ -40,15 +44,17 @@ SET s3_session_token='<ST>';
 ## Verifying access
 
 After bootstrap, the cheapest reachability check is a read of a known
-stable key in the replicated set:
+stable key — the hot surface, which is clobbered every 60 s and always
+present:
 
 ```sql
-SELECT COUNT(*) FROM read_parquet('s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet');
+SELECT COUNT(*) FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet');
 ```
 
-A non-zero count confirms credentials and network path are good. (Use a
-`paradigm_data/` key, not `external/` — only `paradigm_data/` and
-`paradex_data/` replicate into this bucket, so `external/` may be absent.)
+A non-zero count confirms credentials and network path are good. (Prefer
+this `dt-exchange-venue-data` key over an `external/` path — the
+`external/tardis/v1/` tree on `terminal-dime-prod` may be absent, so it's a
+poor reachability probe.)
 
 ## Coverage probe pattern
 

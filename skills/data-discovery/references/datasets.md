@@ -1,9 +1,8 @@
 # Available Market Data — S3 Catalog
 
 Comprehensive map of market data accessible via DuckDB + S3. Covers crypto
-options (Paradigm RFQ flow, exchange option data, Bullish), ETF
-options (IBIT), crypto futures top-of-book, and the on-chain Paradex perp
-trade tape.
+options (Paradigm RFQ flow, exchange option data), crypto futures top-of-book,
+and the on-chain Paradex perp trade tape.
 
 > **Date ranges below are point-in-time as of last verification: 2026-05-11.**
 > Coverage expands over time — for any "recent date" question, run the glob
@@ -11,16 +10,37 @@ trade tape.
 
 ---
 
-## S3 Bucket
+## S3 Buckets
 
-- **Bucket:** `s3://terminal-dime-prod`
-- **Region:** `ap-northeast-1`
-- **Auth:** IRSA (EKS web identity → STS) — see `s3-access.md`.
-- **How it's populated:** `paradigm_data/` and `paradex_data/` are
-  cross-region **replicated** into this bucket from the source datalake
-  (`paradigm-datalake-public-data-us-east-1`), landing at the **same
-  keys**. Anything outside those two prefixes (notably `external/`) is
-  **not** replicated — see the Dataset 2 caveat.
+Market data is spread across **three buckets**, all in region
+`ap-northeast-1` and reachable with the **same IRSA credentials** (EKS
+web identity → STS) — see `s3-access.md`:
+
+- **`s3://dt-paradigm-data`** — the Paradigm datasets, **keeping the
+  `paradigm_data/` prefix**: the executed block-trade tape
+  (`paradigm_data/paradigm_trade_tape_slim.csv.gz`), the RFQ activity tape
+  (`paradigm_data/paradigm_rfq_tape_slim.csv.gz`), and the consolidated
+  vol surface (`paradigm_data/v_vol_surface/`).
+- **`s3://dt-exchange-venue-data`** — the near-real-time hot surface at the
+  **bucket root** (no `paradigm_data/` prefix): the live signals snapshot
+  (`hot/hot__market_signals_1m.parquet`) and the rolling recap aggregates
+  (`hot/hot__recap_aggregates_5m_24h.parquet`).
+- **`s3://terminal-dime-prod`** — **DEPRECATED bucket, being retired.** Do
+  **not** build new dependencies on it. Its only remaining contents are the
+  Paradex DEX trade tape (`paradex_data/paradex_trade_tape.csv.gz`, itself
+  unavailable pending re-home — see Dataset 3) and the Tardis exchange market
+  data (`external/tardis/v1/...`, Dataset 2), both awaiting re-home to
+  `dt-exchange-venue-data`.
+
+> **Migration note:** the Paradigm tapes + vol surface now live on
+> `dt-paradigm-data` (`paradigm_data/` prefix preserved); the hot surface +
+> recap aggregates moved to `dt-exchange-venue-data` (prefix dropped). The
+> former Bullish (`bullish_*`) and IBIT (`ibit_options_trades`) datasets have
+> been **removed** — verified 2026-07-14, they no longer exist in any bucket
+> (Bullish still appears as a *venue* inside the hot surface + recap
+> aggregates; that is unrelated to the deleted standalone datasets). Anything
+> still on `terminal-dime-prod` (Paradex tape, `external/` Tardis tree) is on
+> the deprecated bucket pending re-home — do not build dependencies on it.
 
 ---
 
@@ -31,7 +51,7 @@ Paradigm across Deribit, Paradex, and Bybit.
 
 ### 1a. `paradigm_trade_tape_slim` — Executed Block Trades
 
-- **Path:** `s3://terminal-dime-prod/paradigm_data/paradigm_trade_tape_slim.csv.gz`
+- **Path:** `s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz`
 - **Last verified coverage:** 2025-11-09 → 2026-05-09
 - **Layout:** Single flat CSV — all dates in one file. Coverage likely extends forward.
 
@@ -86,7 +106,7 @@ Paradigm across Deribit, Paradex, and Bybit.
 
 ### 1b. `paradigm_rfq_tape_slim` — RFQ Activity (including unfilled)
 
-- **Path:** `s3://terminal-dime-prod/paradigm_data/paradigm_rfq_tape_slim.csv.gz`
+- **Path:** `s3://dt-paradigm-data/paradigm_data/paradigm_rfq_tape_slim.csv.gz`
 - **Last verified coverage:** 2025-11-09 → 2026-05-09
 - **Layout:** Single flat CSV. Includes both completed and expired/uncompleted RFQs.
 
@@ -122,13 +142,14 @@ Paradigm across Deribit, Paradex, and Bybit.
 Raw exchange market data. Useful for vol surface
 construction, execution benchmarking, and Greeks calculation.
 
-> **⚠ Replication caveat:** these datasets live under `external/`, which
-> is **not** in the replicated set (only `paradigm_data/` + `paradex_data/`
-> replicate into `terminal-dime-prod`). The `external/tardis/v1/` tree is
+> **⚠ Availability caveat:** these datasets live under `external/` on
+> `s3://terminal-dime-prod` and were **not** part of the venue-data
+> migration to `dt-exchange-venue-data`. The `external/tardis/v1/` tree is
 > either static historical data loaded directly into the bucket or
 > unavailable — **probe with a `glob()` before relying on it**, and don't
 > assume it refreshes. For live/recent IV and flow, prefer the hot surface
-> (Dataset 6) and `v_vol_surface` (Dataset 3-adjacent), which do replicate.
+> (Dataset 4) on `s3://dt-exchange-venue-data` and `v_vol_surface` on
+> `s3://dt-paradigm-data`.
 
 ### 2a. Deribit — Option Trades
 
@@ -246,105 +267,21 @@ the option datasets.
 
 ---
 
-## Dataset 3 — Bullish (Options)
-
-Live snapshots of option chain and order book from the Bullish exchange.
-Unlike the option/future feed data, the chain snapshot dataset includes **greeks and IV directly**.
-
-### 3a. Bullish — Option Chain Snapshots
-
-- **Path:** `s3://terminal-dime-prod/paradigm_data/bullish_option_chain_snapshots/date=YYYY-MM-DD/*.csv.gz`
-- **Last verified coverage:** 2026-05-07 → 2026-05-11 (very recent, ongoing)
-- **Layout:** Hive-style date partition (`date=YYYY-MM-DD`).
-
-| Column | Type | Notes |
-|---|---|---|
-| `SNAPSHOT_AT` | timestamp | Snapshot time (UTC) |
-| `SYMBOL` | varchar | Bullish option symbol |
-| `BASE_SYMBOL` | varchar | Underlying (e.g. `BTC`) |
-| `EXPIRY` | timestamp/date | Option expiry |
-| `STRIKE` | double | |
-| `OPTION_TYPE` | varchar | `CALL` / `PUT` |
-| `BID` | double | |
-| `BID_QTY` | double | |
-| `ASK` | double | |
-| `ASK_QTY` | double | |
-| `BID_IV_PCT` | double | Bid IV (percent) |
-| `ASK_IV_PCT` | double | Ask IV (percent) |
-| `IV` | double | Mid/mark IV |
-| `MARK_PRICE` | double | |
-| `LAST` | double | Last trade price |
-| `OPEN_INTEREST` | double | |
-| `OPEN_INTEREST_USD` | double | |
-| `UNDERLYING_PRICE` | double | |
-| `SETTLEMENT_ASSET` | varchar | |
-| `DELTA` | double | |
-| `GAMMA` | double | |
-| `THETA` | double | |
-| `VEGA` | double | |
-
-This is the **only dataset in the catalog with native greeks/IV** — preferred
-over computing them from raw option trades when Bullish coverage applies.
-
----
-
-### 3b. Bullish — Options Order Book (Historical, Top-2 Levels)
-
-- **Path:** `s3://terminal-dime-prod/paradigm_data/bullish_options_orderbook_historical/date=YYYY-MM-DD/*.csv.gz`
-- **Last verified coverage:** 2026-02-01 → 2026-04-25 (~84 files)
-- **Layout:** Hive-style date partition (`date=YYYY-MM-DD`).
-- **Depth:** Top-2 bid + top-2 ask levels.
-
-| Column | Type | Notes |
-|---|---|---|
-| `SNAPSHOT_TIME` | timestamp | When snapshot was taken |
-| `EXCHANGE_TIMESTAMP` | timestamp | Bullish-side timestamp |
-| `MARKET_PAIR` | varchar | Bullish market pair identifier |
-| `ASK1_PRICE` | double | Best ask price |
-| `ASK1_QTY` | double | Best ask size |
-| `ASK2_PRICE` | double | Second-best ask price |
-| `ASK2_QTY` | double | Second-best ask size |
-| `BID1_PRICE` | double | Best bid price |
-| `BID1_QTY` | double | Best bid size |
-| `BID2_PRICE` | double | Second-best bid price |
-| `BID2_QTY` | double | Second-best bid size |
-
----
-
-## Dataset 4 — IBIT ETF Options Trades
-
-Equity-side vol data: trades on options for the IBIT Bitcoin ETF.
-Not crypto-native — useful as a cross-asset reference against Deribit
-BTC option flow.
-
-- **Path:** `s3://terminal-dime-prod/paradigm_data/ibit_options_trades/date=YYYY-MM-DD/*.csv.gz`
-- **Last verified coverage:** 2025-12-01 → 2026-05-08 (~110 files, trading-day partitioned)
-- **Layout:** Hive-style date partition. Weekends/holidays absent (US equity calendar).
-
-| Column | Type | Notes |
-|---|---|---|
-| `TRADE_DATE` | date | |
-| `TS_RECV` | timestamp | Receipt timestamp |
-| `SYMBOL` | varchar | IBIT option symbol (OCC-style) |
-| `PRICE` | double | Trade price (USD) |
-| `SIZE` | bigint | Contracts (1 contract = 100 shares) |
-| `SIDE` | varchar | `BUY` / `SELL` |
-
-**Use cases:** ETF vs crypto-native skew comparison, weekend-gap analysis,
-spot-ETF flow vs crypto-spot flow.
-
----
-
-## Dataset 5 — Paradex DEX Trade Tape
+## Dataset 3 — Paradex DEX Trade Tape
 
 On-chain Paradex perpetual trades — the *executed-trade* tape of the
-Paradex DEX. This is **historical Paradex trade data** and is in scope for
-this catalog; live Paradex markets, positions, orderbook, funding, and
-account data remain out of scope — those belong to live trading/market
-tooling, not this historical catalog.
+Paradex DEX. This is **historical Paradex trade data**; live Paradex markets,
+positions, orderbook, funding, and account data remain out of scope — those
+belong to live trading/market tooling, not this historical catalog.
 
-- **Path:** `s3://terminal-dime-prod/paradex_data/paradex_trade_tape.csv.gz`
-  (plus Parquet parts in the same prefix)
+> **⚠ DEPRECATED — on `terminal-dime-prod`, do not build dependencies.** This
+> tape is on the deprecated `terminal-dime-prod` bucket and is currently
+> **unavailable pending re-home to `dt-exchange-venue-data`**. The entry is
+> kept for reference (schema + join semantics) but must not be wired into new
+> workflows until the re-home lands and this warning is removed.
+
+- **Path (deprecated):** `s3://terminal-dime-prod/paradex_data/paradex_trade_tape.csv.gz`
+  (plus Parquet parts in the same prefix) — pending re-home to `dt-exchange-venue-data`.
 - **Last verified coverage:** starts 2024-12-26 (full range TBC — run the
   coverage probe before assuming an end-date).
 - **Layout:** Flat CSV + Parquet parts. Confirm with `glob()` before querying.
@@ -362,7 +299,7 @@ tooling, not this historical catalog.
 
 ---
 
-## Dataset 6 — Hot Surface (Live Snapshot + Trailing Windows)
+## Dataset 4 — Hot Surface (Live Snapshot + Trailing Windows)
 
 Single-file LLM-shaped market snapshot. The fastest way to answer
 "what's happening right now" without scanning per-period data —
@@ -373,9 +310,9 @@ or live block-trade activity.
 This is the only dataset in this catalog that is **near-real-time**
 (1-minute cadence). All other datasets are historical-only.
 
-### 6a. `hot__market_signals_1m` — Live Market Heartbeat
+### 4a. `hot__market_signals_1m` — Live Market Heartbeat
 
-- **Path:** `s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet`
+- **Path:** `s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet`
 - **Refresh:** every 60 s (clobbered in place; bucket versioning retains
   prior snapshots recoverably for ~24 h)
 - **Row count:** ~50–70 (bounded by design; fits in any LLM context)
@@ -413,7 +350,7 @@ INSTALL httpfs; LOAD httpfs;
 -- What's BTC ATM IV across venues right now?
 SELECT exchange, expiry, atm_strike, value AS atm_iv_vol_points,
        atm_call_iv, atm_put_iv, open_interest, delta_1m
-FROM read_parquet('s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet')
+FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet')
 WHERE signal_type = 'atm_iv' AND asset = 'BTC'
 ORDER BY expiry;
 
@@ -421,13 +358,13 @@ ORDER BY expiry;
 SELECT exchange, asset, value AS total_volume,
        call_volume, put_volume, buy_volume, sell_volume,
        notional, trade_count
-FROM read_parquet('s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet')
+FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet')
 WHERE signal_type = 'volume_last_min';
 
 -- Block activity in the last minute (Deribit only today)
 SELECT exchange, asset, value AS block_count,
        block_total_notional, block_largest_notional
-FROM read_parquet('s3://terminal-dime-prod/paradigm_data/hot/hot__market_signals_1m.parquet')
+FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet')
 WHERE signal_type = 'block_summary';
 ```
 
@@ -451,73 +388,97 @@ for the same data; one S3 read replaces several round-trips.
   native block/OTC id). Bybit is excluded — it exposes only an
   is-block flag with no group id, so its blocks can't be de-legged.
 - The snapshot does **not** carry the full vol surface — only ATM. For
-  the full surface across strikes/expiries you have two options that
-  both replicate: (1) the trailing-window files (Dataset 6b) embed it as
-  `row_type = 'surface'` rows; (2) the standalone single-GET file
-  `s3://terminal-dime-prod/paradigm_data/v_vol_surface/_hot.parquet`
-  (stable key, refreshed ~5 min).
+  the full surface across strikes/expiries, read the consolidated
+  single-GET file
+  `s3://dt-paradigm-data/paradigm_data/v_vol_surface/_hot.parquet`
+  (stable key, refreshed ~5 min; per-strike `mark_iv`/`delta` keyed by
+  instrument `symbol`), plus its hourly cold partitions
+  `.../v_vol_surface/base=<ASSET>/year=/month=/day=/hour=/` for historical
+  window-open snapshots. (The recap aggregates file, Dataset 4b, no longer
+  carries `surface` rows.)
 
-### 6b. Hot Windows — Trailing Aggregates
+### 4b. Hot Recap Aggregates — 5-min Rolling Window Source
 
-Alongside the snapshot, the hot surface publishes pre-aggregated
-**trailing windows** — same prefix, one file per window:
+A single rolling file of **5-minute aggregate buckets over the trailing
+24h** — the query-time source for "last `<window>`" recaps (it replaces
+the old per-window `hot__recap_<window>` files, which no longer exist).
 
-- **Path:** `s3://terminal-dime-prod/paradigm_data/hot/hot__recap_<window>.parquet`
-- **Windows:** `5m`, `10m`, `20m`, `1h`, `4h`, `8h`, `24h`
-- **Refresh:** every 5 minutes (clobbered in place)
+- **Path:** `s3://dt-exchange-venue-data/hot/hot__recap_aggregates_5m_24h.parquet`
+- **Granularity:** one row-set per 5-min bucket (`bucket_at`, Unix ms); ~289 buckets ≈ 24h
+- **Refresh:** every ~5 minutes (clobbered in place at a stable key)
+- **Windowing:** apply the window **yourself** — filter
+  `bucket_at >= <now_ms> - <window_ms>` then aggregate. Any window ≤24h,
+  arbitrary lengths supported.
 
-Each file holds exactly one trailing window (the `window` column equals
-the file's window). Unlike the snapshot's `signal_type` shape, windows
-use a **`row_type`** discriminator with **five** kinds:
+**Venues (5).** `exchange` is one of `deribit`, `deribit-usdc`, `okex-options`,
+`bybit-options`, `bullish`. `deribit` is the BTC-inverse venue; `deribit-usdc`
+is its USDC-linear sibling (a *distinct* venue with a different contract unit)
+and is the **only** source of alt options here — **AVAX, HYPE, SOL, TRX, XRP**
+appear only under `deribit-usdc`. `dvol_spot` rows are **Deribit-only** (no
+other venue emits DVOL/spot), so key them off `exchange = 'deribit'` explicitly
+rather than assuming a single row per metric.
+
+Rows use a **`row_type`** discriminator with **four** kinds — **no
+`surface`** (the vol surface lives in `v_vol_surface`; see the Dataset 4a note):
 
 | `row_type` | What | Key columns |
 |---|---|---|
-| `dvol_spot` | DVOL + spot OHLC over the window | `metric` (`dvol`\|`spot`), `open`, `close`, `high`, `low` |
-| `volume` | Per (exchange, asset) traded volume | `volume_sum`, `notional`, `buy_volume`, `sell_volume`, `trade_count` |
-| `flow` | Per-contract screen flow | `exchange`, `asset`, `optionType`, `expiry`, `strike`, `side`, `volume_sum`, `trade_count`, `avg_iv` |
-| `block` | Per-block trade flow over the window | `exchange`, `block_id`, `asset`, `notional`, `volume_sum`, `leg_count`, `avg_iv` |
-| `surface` | Full per-strike vol surface (point-in-time, stamped each tick) | `exchange`, `asset`, `expiry`, `strike`, `optionType`, `markIV_close`, `delta`, `openInterest`, `underlying_price` |
+| `dvol_spot` | DVOL + spot OHLC per 5-min bucket | `metric` (`dvol`\|`spot`), `open`, `close`, `high`, `low` |
+| `volume` | Per (exchange, optionType) traded volume | `volume_sum`, `notional_usd`, `buy_volume`, `sell_volume`, `trade_count` |
+| `flow` | Per-contract screen flow | `exchange`, `optionType`, `expiry`, `strike`, `side`, `volume_sum`, `trade_count`, `iv_sum`, `iv_count` |
+| `block` | Per-block trade flow | `exchange`, `block_id`, `notional_usd`, `volume_sum`, `leg_count`, `iv_sum`, `iv_count` |
 
-Common cols: `row_type`, `window`, `exchange`, `asset`, `window_start`
-(Unix ms), `at` (Unix ms, window end).
+Common cols: `row_type`, `exchange`, `asset`, `bucket_at` (Unix ms),
+`instrument_kind`, `underlying_price`.
 
-**IV lives in different columns per `row_type` — read the right one:**
-- `flow` and `block` rows carry IV as **`avg_iv`** (= `iv_sum`/`iv_count`).
-- `markIV_close`, `delta`, `openInterest`, `underlying_price` are
-  populated **ONLY on `surface` rows** — they are **null on `flow` rows**.
-  Do not read `markIV_close` off a `flow` row.
-- `block` rows are the window's block-trade tape (one row per
-  `block_id`); use these for "blocks in the last `<window>`" instead of a
-  `web_fetch`.
-- `surface` rows give the whole vol surface in the same file — no
-  separate fetch needed for skew/term structure.
+**Gotchas:**
+- Timestamp is **`bucket_at`** (Unix ms) — filter/aggregate on it.
+- **Never sum `volume_sum` OR `notional_usd` across venues or across assets.**
+  `volume_sum` is in each venue's **native contract unit** (OKX/Bybit in
+  contracts, Deribit in coin, deribit-usdc USDC-linear). `notional_usd` is the
+  option **premium** in USD (NOT underlying notional), and its per-contract
+  basis differs by venue and by asset — so a cross-venue or cross-asset sum of
+  either column is meaningless. Aggregate only *within* a single
+  `(exchange, asset)`; for a cross-venue total use the unit-free `trade_count`.
+- IV is `iv_sum`/`iv_count` on `flow`/`block` rows — compute
+  `iv_sum/iv_count`; there is no `avg_iv` column.
+- OHLC over a window: `arg_min(open, bucket_at)` = window open,
+  `arg_max(close, bucket_at)` = window close, `max(high)`, `min(low)`.
+- No `surface` rows — for the vol surface read
+  `s3://dt-paradigm-data/paradigm_data/v_vol_surface/` (Dataset 4a note).
 
-**Read pattern (DuckDB):**
+**Read pattern (DuckDB) — roll the window up in-query:**
 
 ```sql
 INSTALL httpfs; LOAD httpfs;
 
 -- DVOL + spot OHLC over the last hour
-SELECT exchange, asset, metric, open, close, high, low
-FROM read_parquet('s3://terminal-dime-prod/paradigm_data/hot/hot__recap_1h.parquet')
-WHERE row_type = 'dvol_spot';
+SELECT exchange, metric,
+  arg_min(open, bucket_at) AS open, arg_max(close, bucket_at) AS close,
+  max(high) AS high, min(low) AS low
+FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__recap_aggregates_5m_24h.parquet')
+WHERE row_type = 'dvol_spot' AND asset = 'BTC'
+  AND bucket_at >= (SELECT max(bucket_at) - 3600*1000
+                    FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__recap_aggregates_5m_24h.parquet'))
+GROUP BY exchange, metric;
 
--- Volume by venue over the last 24h
-SELECT exchange, asset, volume_sum, notional, buy_volume, sell_volume, trade_count
-FROM read_parquet('s3://terminal-dime-prod/paradigm_data/hot/hot__recap_24h.parquet')
-WHERE row_type = 'volume';
-
--- Full vol surface (skew/term structure) over the last hour — no extra fetch
-SELECT exchange, asset, expiry, strike, optionType,
-       markIV_close, delta, openInterest, underlying_price
-FROM read_parquet('s3://terminal-dime-prod/paradigm_data/hot/hot__recap_1h.parquet')
-WHERE row_type = 'surface';
+-- Volume by venue over the last 24h. GROUP BY exchange keeps each venue's
+-- native-unit sums separate — do NOT collapse volume_sum/notional_usd across
+-- venues (units differ; notional_usd is premium). trade_count is the only
+-- column safe to total across venues.
+SELECT exchange, optionType, sum(volume_sum) AS volume_sum,
+       sum(notional_usd) AS notional_usd_premium, sum(trade_count) AS trade_count
+FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__recap_aggregates_5m_24h.parquet')
+WHERE row_type = 'volume' AND asset = 'BTC'
+  AND bucket_at >= (SELECT max(bucket_at) - 24*3600*1000
+                    FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__recap_aggregates_5m_24h.parquet'))
+GROUP BY exchange, optionType;
 ```
 
 **When to use:** a "last `<window>`" question (volume / flow / blocks /
-DVOL move / vol surface over 5m–24h) — one S3 read of the matching
-`hot__recap_<window>` file instead of multiple API round-trips. For
-anything beyond 24h, use the historical per-period datasets above.
+DVOL move over 5m–24h) — one S3 read of this file, filtered + aggregated
+to the window. For the vol surface use `v_vol_surface`; for anything
+beyond 24h, use the historical per-period datasets above.
 
 ---
 
@@ -526,16 +487,16 @@ anything beyond 24h, use the historical per-period datasets above.
 - **Deribit option quotes beyond 2026-01-01** — only trades are consistently available.
 - **OKX combo quotes** — not present.
 - **OKX option quotes** — not present in this catalog.
-- **Greeks / IV in the option/future feed data** — not present; either compute them from
-  trades/underlying, or use Bullish option chain snapshots (Dataset 3a) where
-  coverage overlaps.
+- **Greeks / IV in the option/future feed data** — not present; compute them from
+  trades/underlying. (For a live ATM-IV / DVOL read across venues use the hot
+  surface, Dataset 4a; for the full per-strike surface use `v_vol_surface`.)
 - **Paradex options data** — Paradex options are everlasting/perpetual style
   with no expiry date and are excluded from this catalog. Paradex options
   *block-trade* flow is visible in the Paradigm trade tape under
-  `BTC OPTION - PRDX`. Paradex *perp* trade flow is in Dataset 5.
+  `BTC OPTION - PRDX`. Paradex *perp* trade flow is in Dataset 3.
 - **Live exchange streams / raw orderbook / account state** — for raw
   exchange tick streams, live order books, and account state, route to
-  the live-data skills. Dataset 6 (hot surface) is this
+  the live-data skills. Dataset 4 (hot surface) is this
   catalog's only near-real-time entry and serves the "what's happening
   right now" use case at 1-minute grain.
 
@@ -547,33 +508,14 @@ anything beyond 24h, use the historical per-period datasets above.
   - Option/future market data (`timestamp`, `local_timestamp`): **microseconds** since epoch →
     `to_timestamp(timestamp / 1e6)` in DuckDB.
   - Paradigm tapes: split `DATE` + `TIME` columns.
-  - Bullish, IBIT, Paradex tape: native `timestamp` types (seconds resolution).
+  - Paradex tape: native `timestamp` types (seconds resolution).
 - **Deribit option price units:** **index currency** (BTC for BTC options,
   ETH for ETH options), not USD.
 - **Deribit amount units:** contracts (1 BTC contract = 1 BTC notional;
   1 ETH contract = 1 ETH notional).
-- **IBIT amount units:** US-equity-option contracts (1 contract = 100 shares).
 - **Joining Paradigm + market data:** Use `RFQ_ID` / `BLOCK_TRADE_ID` on the
   Paradigm side; join to the option/future market data by symbol + timestamp
-  window for market context. For Bullish or IBIT cross-references, join on
-  symbol + snapshot time.
+  window for market context.
 - **Paradigm options filter:** `WHERE PRODUCT LIKE '%OPTION%'`.
 - **Paradigm exchange suffix:** `DBT` = Deribit, `PRDX` = Paradex,
   `BYB` = Bybit.
-- **Greeks/IV preference:** Bullish chain snapshots (Dataset 3a) are the
-  only source of native greeks/IV. Where coverage overlaps with the
-  option/future market data, prefer Bullish for delta/gamma/theta/vega/IV
-  rather than computing.
-- **Hive-style partitions:** IBIT, Bullish chain, Bullish orderbook use
-  `date=YYYY-MM-DD/` prefixes (different from the daily `YYYY/MM/DD/`
-  partition used for option/future market data). The coverage-probe regex
-  in `SKILL.md` Step 3 only matches the daily layout — for Hive-partitioned
-  datasets, use:
-
-  ```sql
-  SELECT
-    MIN(regexp_extract(file, 'date=(\d{4}-\d{2}-\d{2})', 1)) AS earliest,
-    MAX(regexp_extract(file, 'date=(\d{4}-\d{2}-\d{2})', 1)) AS latest,
-    COUNT(*) AS file_count
-  FROM glob('<path-with-**>');
-  ```
