@@ -25,21 +25,20 @@ metadata:
 | Token | Examples | Default |
 |---|---|---|
 | `asset` | `btc`, `eth` | `btc` |
-| `window` | any `Nm`/`Nh`/`Nd` — `30m`, `3h`, `8h`, `2d` (`1d`→`24h`) | `24h` |
+| `window` | any `Nm`/`Nh`/`Nd` up to 24h — `30m`, `3h`, `8h` (`1d`→`24h`) | `24h` |
 | `options` | the literal word `options` | ignored — a no-op keyword (this skill is always options); `run_recap.sh` strips it |
 
-Any `Nm`/`Nh`/`Nd` window works and all render identically: DVOL/spot and the
-multi-venue volume/activity come from one rolling hot aggregates file sliced to
-the window at query time, the surface (and its Δ columns) from `v_vol_surface`,
-and block flow from the Deribit tape. A malformed window exits with a clear error.
+Any `Nm`/`Nh`/`Nd` window up to 24h works and all render identically: DVOL/spot
+and the multi-venue volume/activity come from one rolling hot aggregates file
+sliced to the window at query time, the surface (and its Δ columns) from
+`v_vol_surface`, and block flow from the Deribit tape. A malformed window exits
+with a clear error.
 
-**Windows beyond ~24h:** the hot aggregates file and the Deribit tape each retain
-only ~24h, so a longer window (e.g. `2d`) still renders but Volume / Activity /
-Biggest Print / Block Flow reflect only the ~24h the flow sources hold. DVOL,
-spot, and the vol-surface Δs DO span the full window (DVOL/spot switch to the
-full-history Deribit series past 24h; the Δs read cold partitions). `run_recap.sh`
-prepends a one-line `⚠ Volume · Activity · Biggest Print · Block Flow cover …`
-banner in that case — **relay it verbatim** (don't drop or reword it).
+**Windows beyond 24h:** every flow source (the rolling hot aggregates file, the
+Deribit public tape) retains only ~24h, so `run_recap.sh` caps any longer window
+(e.g. `2d`) at 24h and prepends a one-line `⚠ window capped at 24h — …` banner
+as the first line of its output — **relay it verbatim** (don't drop or reword
+it). The cap lifts once >24h flow is wired to the cold store.
 
 `/recap` alone = BTC options, last 24h. Still pass just `<ASSET> <WINDOW>` to
 `run_recap.sh` — it drops a stray `options`/`option` token, so `/recap btc

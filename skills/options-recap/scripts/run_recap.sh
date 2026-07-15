@@ -21,7 +21,9 @@ done
 set -- $ARGS
 
 ASSET=$(printf '%s' "${1:-BTC}" | tr '[:lower:]' '[:upper:]')
-WIN="${2:-8h}"; WIN="${WIN/1d/24h}"          # 1d → 24h
+WIN="${2:-8h}"
+[ "$WIN" = "1d" ] && WIN=24h                 # exact match — the old substring
+                                             # substitution turned 31d into 324h
 
 # Window → seconds, parsed GENERICALLY (Nm/Nh/Nd) so any window works. The rolling
 # recap-aggregates file is windowed by bucket_at at query time, so there are no
@@ -35,7 +37,16 @@ case "$WU" in
   *) SECS=0;;
 esac
 if ! [ "$WN" -gt 0 ] 2>/dev/null || [ "$SECS" -le 0 ]; then
-  echo "recap: bad window '$WIN' — use e.g. 30m, 3h, 8h, 2d" >&2; exit 2
+  echo "recap: bad window '$WIN' — use e.g. 30m, 3h, 8h, 24h" >&2; exit 2
+fi
+# Cap at 24h. Every flow source (rolling recap-aggregates file, Deribit public
+# tape) holds only ~24h, so a longer window rendered partially-covered flow
+# under a full-window header. Until >24h flow is wired to the cold store,
+# clamp and DISCLOSE — the banner line below is part of the recap output.
+CAP_NOTE=""
+if [ "$SECS" -gt 86400 ]; then
+  CAP_NOTE="⚠ window capped at 24h — $WIN exceeds the ~24h data horizon."
+  WIN=24h; SECS=86400
 fi
 # PRESET flags the canonical windows. Since the migration to the single rolling
 # recap-aggregates file every window reads the same source (bucket_at-windowed), so
@@ -113,5 +124,6 @@ SQL
 
 # recap.py runs this DuckDB session in a thread concurrent with the Deribit fetch.
 # No exec — the EXIT trap must fire to clean up $WORK.
+[ -n "$CAP_NOTE" ] && { echo "$CAP_NOTE"; echo; }
 cd "$DIR" && uv run scripts/recap.py \
   --asset "$ASSET" --window "$WIN" --csv-dir "$WORK" --duckdb-sql "$WORK/recap.sql" --render
