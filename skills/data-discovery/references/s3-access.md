@@ -2,12 +2,10 @@
 
 The agent stack runs on EKS with IRSA (IAM Roles for Service Accounts). To
 query the market-data buckets (`s3://dt-paradigm-data`,
-`s3://dt-exchange-venue-data`, and the **deprecated** `s3://terminal-dime-prod`
-— all same region and same role) from DuckDB, exchange
+`s3://dt-exchange-venue-data`, and `s3://dt-paradex-data` — all same region
+and same role) from DuckDB, exchange
 the projected web identity token for temporary STS credentials, then load
-them into DuckDB's `httpfs` extension. `terminal-dime-prod` is being wound
-down (only the Tardis tree and the not-yet-re-homed Paradex tape remain) —
-do not build new dependencies on it.
+them into DuckDB's `httpfs` extension.
 
 ## Bootstrap (run once per session)
 
@@ -51,22 +49,16 @@ present:
 SELECT COUNT(*) FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet');
 ```
 
-A non-zero count confirms credentials and network path are good. (Prefer
-this `dt-exchange-venue-data` key over an `external/` path — the
-`external/tardis/v1/` tree on `terminal-dime-prod` may be absent, so it's a
-poor reachability probe.)
+A non-zero count confirms credentials and network path are good.
 
 ## Coverage probe pattern
 
-For any partitioned dataset (paths containing `YYYY/MM/DD`):
+The catalog's verified date ranges are point-in-time; the tapes grow forward.
+Confirm current coverage by reading the date column directly:
 
 ```sql
-SELECT
-  MIN(regexp_extract(file, '/(\d{4}/\d{2}/\d{2})/', 1)) AS earliest,
-  MAX(regexp_extract(file, '/(\d{4}/\d{2}/\d{2})/', 1)) AS latest,
-  COUNT(*) AS file_count
-FROM glob('<s3-path-with-**>');
+SELECT min(DATE) AS earliest, max(DATE) AS latest
+FROM read_csv_auto('s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz');
 ```
 
-Use this before concluding "no data" for a recent date — the catalog's
-verified ranges are point-in-time and the bucket grows forward.
+Use this before concluding "no data" for a recent date.

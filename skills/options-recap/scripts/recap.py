@@ -398,7 +398,8 @@ def _strike_label(raw: str) -> str:
 def _leg_phrase(legs: list[dict], size: float | None = None,
                 iv_label: str | None = None) -> str:
     """One-line human detail for a block cluster, e.g.
-    'sold 75KC / bought 90KC x150 42.3v'.
+    'sold 75KC / bought 90KC x150 42.3v', or, for a multi-expiry block,
+    'sold 27JUN26 65KC / bought 25JUL26 65KC x30'.
 
     Directional verbs come from the per-leg taker `direction` field. If any leg
     lacks one, no direction is asserted: legs render neutrally ('75KC vs 90KC')
@@ -407,17 +408,25 @@ def _leg_phrase(legs: list[dict], size: float | None = None,
     values when the row aggregates several clips of a worked order (iv_label
     then carries the clip range, e.g. '36.5–37.0')."""
     directional = all(l.get("direction") in ("buy", "sell") for l in legs)
+    # When the block spans more than one expiry (calendar/diagonal), strike+type
+    # alone collapses distinct legs to the same label ('65KC / 65KC') — the expiry
+    # IS the differentiator, so prefix each leg with it. Same-expiry structures
+    # (straddle/strangle/spread/fly) don't need it: strike+type is unambiguous and
+    # the expiry would just be repeated noise.
+    multi_exp = len({leg["instrument_name"].split("-")[1] for leg in legs
+                     if len(leg["instrument_name"].split("-")) >= 2}) > 1
     parts = []
     for leg in sorted(legs, key=lambda l: -l.get("amount", 0))[:4]:
         seg = leg["instrument_name"].split("-")
         if len(seg) < 4:
             continue
         strike_k = _strike_label(seg[2])
+        label = f"{seg[1]} {strike_k}{seg[3]}" if multi_exp else f"{strike_k}{seg[3]}"
         if directional:
             verb = "bought" if leg["direction"] == "buy" else "sold"
-            parts.append(f"{verb} {strike_k}{seg[3]}")
+            parts.append(f"{verb} {label}")
         else:
-            parts.append(f"{strike_k}{seg[3]}")
+            parts.append(label)
     if size is None:
         # Structure UNIT size (base-leg count), matching summarize_blocks'
         # unit_size — never the leg-sum, which overstates a 4-leg fly 4×.
