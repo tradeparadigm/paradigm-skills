@@ -21,7 +21,7 @@ compatibility: Read-only data catalog. No authentication required to view the
   references/s3-access.md for the credential bootstrap.
 metadata:
   author: tradeparadigm
-  version: "1.3"
+  version: "1.4"
 ---
 
 ## Hard Rules

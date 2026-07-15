@@ -316,36 +316,50 @@ This is the only dataset in this catalog that is **near-real-time**
 - **Refresh:** every 60 s (clobbered in place; bucket versioning retains
   prior snapshots recoverably for ~24 h)
 - **Row count:** ~50–70 (bounded by design; fits in any LLM context)
-- **Schema:** 20 cols, polymorphic via `signal_type`
+- **Schema:** ~30 cols, polymorphic via `signal_type`; most columns are
+  populated only on the rows that need them (see per-type notes)
+
+Common columns (every row): `signal_type`, `exchange`, `value`, `unit`
+(**unit of `value`, carried explicitly**), `delta_1m`, `at` (Unix **ms**),
+`at_iso` (ISO-8601), `generated_at` (Unix ms), `instrument_kind`.
 
 | Column | Type | Notes |
 |---|---|---|
-| `signal_type` | varchar | Discriminator: `spot` \| `atm_iv` \| `dvol` \| `volume_last_min` \| `block_summary` |
-| `exchange` | varchar | Source venue (`deribit`, `okex-options`, `bybit-options`, `bullish`) |
-| `asset` | varchar | `BTC` or `ETH` |
-| `expiry` | varchar | Venue-native expiry (populated for `atm_iv`; null otherwise) |
-| `value` | double | Primary metric — interpretation depends on `signal_type` |
-| `delta_1m` | double | Change in `value` vs 1 minute ago (null on first run / after gaps) |
-| `at` | bigint | Unix **milliseconds** — source period_start (not ISO string) |
-| `atm_call_iv`, `atm_put_iv`, `atm_strike`, `underlying_price`, `open_interest` | double | `atm_iv` rows only; null elsewhere |
-| `call_volume`, `put_volume`, `buy_volume`, `sell_volume`, `notional` | double | `volume_last_min` rows only |
-| `trade_count` | bigint | `volume_last_min` rows only |
-| `block_total_notional`, `block_largest_notional` | double | `block_summary` rows only (deribit + okex + bullish) |
+| `signal_type` | varchar | Discriminator: `spot` \| `atm_iv` \| `dvol` \| `funding` \| `volume_last_min` \| `coverage` |
+| `exchange` | varchar | Source venue (`deribit`, `deribit-usdc`, `okex-options`, `bybit-options`, `bullish`) |
+| `asset` | varchar | e.g. `BTC`, `ETH` (null on `coverage` rows) |
+| `instrument_kind` | varchar | `spot` \| `option` \| `index` \| `perp` |
+| `unit` | varchar | Unit of `value` — **read it, don't infer per venue** |
+| `expiry`, `atm_call_iv`, `atm_put_iv`, `atm_strike`, `underlying_price`, `open_interest` | | `atm_iv` rows only |
+| `underlying_price`, `funding_8h`, `mark_price`, `perp_open_interest`, `symbol` | | `funding` rows only |
+| `call_volume`, `put_volume`, `buy_volume`, `sell_volume`, `notional_usd`, `trade_count` | | `volume_last_min` rows only |
+| `data_type`, `stream_kind` | varchar | `coverage` rows only (which upstream stream; `continuous`\|`intermittent`) |
 
-**`value` semantics per signal_type:**
+**`value` semantics per signal_type (unit is in the `unit` column):**
 
-| `signal_type` | `value` is… | Units |
+| `signal_type` | `value` is… | `unit` |
 |---|---|---|
-| `spot` | Spot/perp close price | Venue-native |
-| `atm_iv` | ATM strike's `markIV_close` | **Vol points uniformly** (OKX/Bybit decimal IVs pre-scaled ×100) |
-| `dvol` | Latest DVOL index value | Vol points |
-| `volume_last_min` | Total `amount` traded in the minute | Venue-native |
-| `block_summary` | Block count in the minute | Integer (stored as double) |
+| `spot` | Spot/perp close price | `usd` |
+| `atm_iv` | ATM strike mark IV (per expiry) | `vol_points` (venue decimal IVs pre-scaled ×100) |
+| `dvol` | Latest DVOL index value | `vol_points` |
+| `funding` | Current perp funding rate (8h rate in `funding_8h`) | `rate` |
+| `volume_last_min` | Total volume in the minute (USD in `notional_usd`) | `coin` |
+| `coverage` | **Stream lag — seconds the feed is behind now** (freshness) | `seconds_behind` |
+
+> **`block_summary` is gone** from this file — per-block flow now lives only in
+> the recap aggregates (Dataset 4b, `row_type = 'block'`).
 
 **Read pattern (DuckDB):**
 
 ```sql
 INSTALL httpfs; LOAD httpfs;
+
+-- FRESHNESS FIRST: coverage.value = seconds each stream is behind now.
+-- More than a couple of minutes behind = stale; fall back to a live read.
+SELECT exchange, data_type, stream_kind, value AS seconds_behind
+FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet')
+WHERE signal_type = 'coverage'
+ORDER BY value DESC;
 
 -- What's BTC ATM IV across venues right now?
 SELECT exchange, expiry, atm_strike, value AS atm_iv_vol_points,
@@ -354,39 +368,31 @@ FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parque
 WHERE signal_type = 'atm_iv' AND asset = 'BTC'
 ORDER BY expiry;
 
--- What just printed in the last minute?
+-- What just printed in the last minute? (value = coin volume; notional_usd = USD)
 SELECT exchange, asset, value AS total_volume,
        call_volume, put_volume, buy_volume, sell_volume,
-       notional, trade_count
+       notional_usd, trade_count
 FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet')
 WHERE signal_type = 'volume_last_min';
-
--- Block activity in the last minute (Deribit only today)
-SELECT exchange, asset, value AS block_count,
-       block_total_notional, block_largest_notional
-FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet')
-WHERE signal_type = 'block_summary';
 ```
 
-**When to use:** front-month ATM IV across venues, current spot,
-last-minute volume + call/put split, DVOL, block activity — any "right
-now" question. Reach for the snapshot **before** doing exchange `web_fetch`
-for the same data; one S3 read replaces several round-trips.
+**When to use:** front-month ATM IV across venues, current spot, DVOL,
+perp funding, last-minute volume + call/put split, and a feed-freshness
+check (`coverage`) — any "right now" question. Reach for the snapshot
+**before** doing exchange `web_fetch` for the same data; one S3 read
+replaces several round-trips. (Per-block flow lives in Dataset 4b.)
 
 **Caveats:**
 
-- `at` is **Unix milliseconds**, not an ISO string. Convert via
-  `to_timestamp(at / 1000)`.
-- IV columns are uniformly in **vol points** — `atm_call_iv` from OKX
-  reads `38.03`, not `0.38`, despite OKX's wire format using decimals.
-  The snapshot pre-scales them at materialisation time. (The per-period
-  source files keep venue-native units — don't cross-join the snapshot
-  with those without conversion.)
+- **Check freshness first.** The `coverage` rows carry `seconds_behind` per
+  upstream stream — if the feed is behind, fall back to a live venue read.
+  `at`/`at_iso` give the snapshot time (`at` is Unix ms →
+  `to_timestamp(at / 1000)`).
+- **Units are explicit — read the `unit` column, don't infer.** IV is
+  `vol_points` (venue decimal IVs pre-scaled ×100), spot `usd`, volume `coin`
+  with USD alongside in `notional_usd`.
 - `expiry` is venue-native (`20JUN26` from Deribit, `260620` from OKX).
   Parse per-venue for canonical dates.
-- `block_summary` covers **Deribit, OKX, and Bullish** (each venue's
-  native block/OTC id). Bybit is excluded — it exposes only an
-  is-block flag with no group id, so its blocks can't be de-legged.
 - The snapshot does **not** carry the full vol surface — only ATM. For
   the full surface across strikes/expiries, read the consolidated
   single-GET file
@@ -400,8 +406,11 @@ for the same data; one S3 read replaces several round-trips.
 ### 4b. Hot Recap Aggregates — 5-min Rolling Window Source
 
 A single rolling file of **5-minute aggregate buckets over the trailing
-24h** — the query-time source for "last `<window>`" recaps (it replaces
-the old per-window `hot__recap_<window>` files, which no longer exist).
+24h** — the query-time source for "last `<window>`" recaps of an arbitrary
+length. The per-window `hot__recap_<window>` files (`5m`/`10m`/`20m`/`1h`/
+`4h`/`8h`/`24h`) **also still exist** and are refreshed each cycle (the
+`/recap` skill reads those pre-baked windows directly); use this aggregates
+file when you need a window the pre-baked set doesn't cover.
 
 - **Path:** `s3://dt-exchange-venue-data/hot/hot__recap_aggregates_5m_24h.parquet`
 - **Granularity:** one row-set per 5-min bucket (`bucket_at`, Unix ms); ~289 buckets ≈ 24h
