@@ -415,6 +415,37 @@ def test_leg_phrase():
     check("leg phrase avg iv 66.0v", "66.0v" in phrase, phrase)
 
 
+def test_leg_phrase_calendar_shows_expiry():
+    # Same strike, different expiries (a calendar). Without the expiry prefix both
+    # legs render identically ('65KC / 65KC') and the detail is unreadable; the
+    # phrase must disambiguate them by expiry.
+    legs = [
+        {"instrument_name": "BTC-27JUN26-65000-C", "direction": "sell",
+         "amount": 30, "iv": 60.0},
+        {"instrument_name": "BTC-25JUL26-65000-C", "direction": "buy",
+         "amount": 30, "iv": 62.0},
+    ]
+    phrase = _leg_phrase(legs)
+    check("calendar shows near expiry", "27JUN26 65KC" in phrase, phrase)
+    check("calendar shows far expiry", "25JUL26 65KC" in phrase, phrase)
+    check("calendar legs distinct", phrase.count("65KC") == 2
+          and "27JUN26" in phrase and "25JUL26" in phrase, phrase)
+
+
+def test_leg_phrase_single_expiry_omits_expiry():
+    # Single-expiry structure: strike+type is unambiguous, so no expiry noise.
+    legs = [
+        {"instrument_name": "BTC-26JUN26-55000-P", "direction": "buy",
+         "amount": 100, "iv": 72.0},
+        {"instrument_name": "BTC-26JUN26-65000-C", "direction": "sell",
+         "amount": 100, "iv": 60.0},
+    ]
+    phrase = _leg_phrase(legs)
+    check("single-expiry omits expiry token", "26JUN26" not in phrase, phrase)
+    check("single-expiry keeps strike+type", "bought 55KP" in phrase
+          and "sold 65KC" in phrase, phrase)
+
+
 # ── Snapshot helper labels ──────────────────────────────────────────────────
 
 def test_helpers():

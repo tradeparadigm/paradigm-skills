@@ -353,7 +353,15 @@ def _load_surface_tickers(csv_dir: str, name: str) -> dict:
 
 def _leg_phrase(legs: list[dict]) -> str:
     """One-line human detail for a block cluster, e.g.
-    'sold 75C / bought 90C x150 two-way 42.3v'."""
+    'sold 75C / bought 90C x150 two-way 42.3v', or, for a multi-expiry block,
+    'sold 27JUN 65KC / bought 25JUL 65KC x30 two-way'."""
+    # When the block spans more than one expiry (calendar/diagonal), strike+type
+    # alone collapses distinct legs to the same label ('65KC / 65KC') — the expiry
+    # IS the differentiator, so prefix each leg with it. Same-expiry structures
+    # (straddle/strangle/spread/fly) don't need it: strike+type is unambiguous and
+    # the expiry would just be repeated noise.
+    multi_exp = len({leg["instrument_name"].split("-")[1] for leg in legs
+                     if len(leg["instrument_name"].split("-")) >= 2}) > 1
     parts = []
     for leg in sorted(legs, key=lambda l: -l.get("amount", 0))[:4]:
         seg = leg["instrument_name"].split("-")
@@ -361,7 +369,8 @@ def _leg_phrase(legs: list[dict]) -> str:
             continue
         verb = "bought" if leg.get("direction") == "buy" else "sold"
         strike_k = f"{int(int(seg[2]) / 1000)}K" if seg[2].isdigit() else seg[2]
-        parts.append(f"{verb} {strike_k}{seg[3]}")
+        label = f"{seg[1]} {strike_k}{seg[3]}" if multi_exp else f"{strike_k}{seg[3]}"
+        parts.append(f"{verb} {label}")
     size = round(sum(l.get("amount", 0) for l in legs), 1)
     side = dominant_side(legs).lower()
     ivs = [l["iv"] for l in legs if l.get("iv") is not None]
