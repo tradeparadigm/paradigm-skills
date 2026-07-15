@@ -17,12 +17,14 @@ not paginate, merge, cluster, or hand-assemble a snapshot — all of that is her
 
 Pipeline (concurrent where independent):
   • Deribit 7d hourly closes        → realized vol
-  • Deribit window option trades    → biggest print + block flow leg geometry
-  • hot CSVs in --csv-dir (DuckDB)  → DVOL/spot OHLC, volume+P/C, block totals,
+  • Deribit window option trades    → $ Volume, biggest print + block flow legs
+  • hot CSVs in --csv-dir (DuckDB)  → DVOL/spot OHLC, activity+P/C trade counts,
                                       vol surface (markIV/delta per strike)
 
-Hot CSVs are authoritative for DVOL/spot/volume/surface. Deribit is used only
-for the 7d realized-vol input and block leg detail (hot never carries those).
+Hot CSVs are authoritative for DVOL/spot/activity/P-C/surface. The Volume $
+figure is tape-PRIMARY (the hot rollup head-lags the tape ~10-15 min and only
+serves as fallback); Deribit also supplies the 7d realized-vol input and block
+leg detail (hot never carries those).
 
 Usage:
     uv run scripts/recap.py --asset btc --window 8h --csv-dir /tmp/recap
@@ -37,6 +39,7 @@ On any single-source failure the affected fields are null and a line is added to
 import argparse
 import csv
 import json
+import math
 import os
 import subprocess
 import sys
@@ -547,6 +550,17 @@ def spot_vol_label(spot_open, spot_close, dvol_open, dvol_close):
     return "vol faded with spot"
 
 
+def tape_deribit_volume_usd(trades):
+    """Deribit $ volume straight from the window tape — every trade carries amount +
+    index_price. The hot aggregates file head-lags the tape by ~10-15 min (measured
+    2026-07-15), so on a thin window it misses the newest prints and Volume could fall
+    BELOW the same reply's block-flow total. The tape is already fetched for Block Flow,
+    is Deribit-scoped (same universe as the line's "Deribit only" label), and prices each
+    trade at its prevailing index instead of one end-of-window spot."""
+    total = sum((t.get("amount") or 0) * (t.get("index_price") or 0) for t in trades)
+    return total or None
+
+
 def build(asset: str, window: str, start_ms: int, end_ms: int,
           deri: dict, hot: dict) -> dict:
     asset = asset.upper()
@@ -578,9 +592,16 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
 
     rv = realized_vs_implied(deri.get("closes_7d") or [], dvol_close)
 
-    # Volume ($) is Deribit-scoped — the only venue we can price in USD reliably.
-    vol_btc = hot.get("volume_btc")
-    vol_usd = vol_btc * spot if (vol_btc and spot) else None
+    # Volume ($) is Deribit-scoped. The window tape is PRIMARY — every trade carries
+    # amount + index_price, so it prices each print at its prevailing index and never
+    # head-lags the live prints the way the hot rollup does (~10-15 min measured). The
+    # hot BTC×spot figure is the fallback when the tape is empty. hot volume.csv is
+    # still authoritative for Activity + P/C below (trade_count), so it's read either way.
+    trades = deri.get("trades") or []
+    vol_usd = tape_deribit_volume_usd(trades)
+    if vol_usd is None:
+        vol_btc = hot.get("volume_btc")
+        vol_usd = vol_btc * spot if (vol_btc and spot) else None
     # Activity + P/C use trade_count — unit-free, so they span ALL venues truthfully.
     pt, ct = hot.get("put_trades"), hot.get("call_trades")
     pc = round(pt / ct, 2) if pt and ct else None
@@ -613,8 +634,18 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
             if tickers else None)
     surf_open = compute_vol_surface(vs_open, surf_spot) if vs_open else None
 
-    trades = deri.get("trades") or []
     block = build_block_flow(trades, hot, spot)
+
+    # Internal-consistency tripwire: blocks are a subset of tape volume, so Volume can
+    # never legitimately read below the same reply's block-flow total. UNREACHABLE with
+    # a real tape — block flow is built from the SAME `trades`, and an empty tape zeroes
+    # both sides — so this defends only a future regression (e.g. someone re-inverting
+    # the source priority). Floor to the next whole million so the invariant survives
+    # Volume's integer-million rounding vs Block Flow's 0.1M rendering.
+    if vol_usd is not None and block["total_m"] * 1e6 > vol_usd:
+        warn(f"volume ${vol_usd / 1e6:.1f}M below block-flow total ${block['total_m']}M "
+             "— flooring Volume at block total (stale hot rollup?)")
+        vol_usd = math.ceil(block["total_m"]) * 1e6
 
     # Flow-horizon check. The flow sections only reach back ~24h: Volume / Activity /
     # P/C come from the rolling recap-aggregates file (trailing 24h) and Biggest
