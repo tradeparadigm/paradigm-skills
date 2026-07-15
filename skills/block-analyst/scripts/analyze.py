@@ -207,9 +207,13 @@ def _run(args):
             greek_by_key[ac.leg_key(l)] = tt
     ng = ac.net_greeks(legs, greek_by_key, qty) if reliable else {}
 
-    # net fill vs mark (per structure unit), offset unit by quote. struct_net weights
-    # each option leg by its QTY relative to the structure's base unit, so a 1×2×1 fly's
-    # body counts twice (net = +wing − 2×body + wing); a plain per-row sum over-states it.
+    # Net package offset (SKILL Step 7, the ONE convention) — per structure unit, unit by quote.
+    # struct_net weights each option leg by its QTY relative to the structure's base unit, so a
+    # 1×2×1 fly's body counts twice (net = +wing − 2×body + wing); a plain per-row sum over-states
+    # it. The offset compares |net_fill| vs |net_mark| — the displayed Paid/Recd magnitude — so a
+    # positive result always means the fill was richer than mark (above), negative cheaper (below),
+    # deterministically, regardless of debit/credit. Never a per-leg OFFSET_BPS. Single-leg reduces
+    # to (PRICE − REF_PRICE) × 10000 (backward compatible).
     fill_net = ac.struct_net(fill, "PRICE")
     ref_net = ac.struct_net(fill, "REF_PRICE")
     off = ac.offset(abs(fill_net), abs(ref_net), quote) if ref_net else {"txt": "n/a"}
@@ -290,6 +294,18 @@ def _struct_name(code, legs):
     return base + perp
 
 
+def _offset_txt(off) -> str:
+    """'-6 bps below mark' — the net package offset rendered with its direction word.
+    Direction from the sign of (|net_fill| − |net_mark|): above = fill richer than mark,
+    below = cheaper, at = equal. Neutral token — above/below is a fact, never an edge/against
+    judgement (SKILL Step 7 forbids moralizing)."""
+    t = off.get("txt", "n/a")
+    if t == "n/a":
+        return "n/a vs mark"
+    s = off.get("sign", 0)
+    return f"{t} {'above' if s > 0 else 'below' if s < 0 else 'at'} mark"
+
+
 def render(r) -> str:
     a = r["asset"]
     legs = r["legs"]
@@ -305,7 +321,7 @@ def render(r) -> str:
              f"user's inline text), fetch each leg on Deribit, net the greeks.",
              "",
              f"**{a} · {r['desc'].strip()} · ×{r['qty']:g} | {r['side']} | "
-             f"{verb} {fillabs:g} | {r['offset']['txt']} vs mark** · {r['rfq_kind']}/{r['venue']}",
+             f"{verb} {fillabs:g} | {_offset_txt(r['offset'])}** · {r['rfq_kind']}/{r['venue']}",
              "",
              "```yaml",
              f"[Tape]  {len(r['fill_rows'])} fill row(s):"]
@@ -325,7 +341,7 @@ def render(r) -> str:
     struct = _struct_name(r["structure"], legs)
     L = []
     L.append(f"**{a} {exp} {strikes} {struct} · ×{r['qty']:g} | {r['side']} | "
-             f"{verb} {fillabs:g} | {r['offset']['txt']} vs mark**")
+             f"{verb} {fillabs:g} | {_offset_txt(r['offset'])}**")
     sp = f"{r['spot']:,.0f}" if r.get("spot") else "n/a"
     L.append("")
     note = ("⚠ unmapped structure — verify legs & net signs from the data below"
@@ -349,7 +365,7 @@ def render(r) -> str:
     # [Fair]
     ivs = " / ".join(f"{_leg_lbl(l, multi_exp)} {(l['tkr'] or {}).get('iv')}v"
                      for l in legs if l["cp"] != "FUT" and l.get("tkr"))
-    L.append(f"[Fair]     {r['offset']['txt']} vs mark · {ivs}")
+    L.append(f"[Fair]     {_offset_txt(r['offset'])} · {ivs}")
     # [History]
     d30 = sum((l["trades"] or {}).get("30d", (0, 0, 0))[1] for l in legs if l.get("trades"))
     L.append(f"[History]  {r['recurrence_blocks']} same-structure block(s) on Paradigm 30d · "

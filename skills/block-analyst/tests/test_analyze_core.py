@@ -216,6 +216,19 @@ ic_rows = [{"PRODUCT": "BTC OPTION - PRDX", "DESCRIPTION": "ICondor 10 Jul 26 54
             "SIDE": "BUY", "PRICE": 65.56, "QTY": 5}] * 4
 ok(ac.legs_from_rows(ic_rows) is None, "combined-desc block → not per-leg (parse the structure)")
 
+# ── package net offset (multi-leg): (|net_fill| − |net_mark|) in the displayed ──
+# Paid/Recd orientation — the ONE convention. Real RRPut (Seller, per-leg option
+# rows + a perp hedge): Recd 0.0009 net credit vs mark 0.0015 → −6 bps BELOW mark
+# (received less than mark; against the taker). The five near-identical fills of
+# this structure must all land on this same sign — never the +1/+7 per-leg split.
+_rr_off = [{"PRODUCT": "BTC OPTION - DBT", "SIDE": "SELL", "QTY": 200, "PRICE": 0.0177, "REF_PRICE": 0.0176},
+           {"PRODUCT": "BTC OPTION - DBT", "SIDE": "BUY",  "QTY": 200, "PRICE": 0.0168, "REF_PRICE": 0.0161},
+           {"PRODUCT": "BTC PERPETUAL - DBT", "SIDE": "BUY", "QTY": 300000, "PRICE": 61000, "REF_PRICE": 61000}]
+ok(abs(ac.struct_net(_rr_off, "PRICE") - (-0.0009)) < 1e-9, "RRPut net credit executed = -0.0009 (perp excluded)")
+ok(abs(ac.struct_net(_rr_off, "REF_PRICE") - (-0.0015)) < 1e-9, "RRPut net credit at mark = -0.0015")
+_rroff = ac.offset(abs(ac.struct_net(_rr_off, "PRICE")), abs(ac.struct_net(_rr_off, "REF_PRICE")), "BTC")
+ok(_rroff["val"] == -6.0 and _rroff["sign"] == -1, "RRPut package offset = -6 bps, below mark (not +1/+7 per-leg)")
+
 # net_cash sign: BUY positive, SELL negative, ×qty
 ok(ac.net_cash([{"SIDE": "BUY", "PRICE": 2.9, "QTY": 10}]) == 29.0, "net_cash BUY debit")
 ok(ac.net_cash([{"SIDE": "SELL", "PRICE": 2.9, "QTY": 10}]) == -29.0, "net_cash SELL credit")

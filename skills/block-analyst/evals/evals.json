@@ -41,6 +41,31 @@
         "Response correctly identifies the structure as a risk reversal with taker long 90000-C and short 80000-P",
         "The [Live] row benchmarks the fill against the current screen (bid/ask or mid) so the reader can judge execution quality"
       ]
+    },
+    {
+      "id": 4,
+      "prompt": "/analyze rfq_rr55x75 RRPut 25 Sep 26 55000/75000 + perp\n\n(paradigm-data-discovery → paradigm_trade_tape_slim WHERE RFQ_ID='rfq_rr55x75' returned 3 rows: [{\"DATE\": \"2026-07-15\", \"TIME\": \"06:50:01\", \"AUCTION\": \"RFQ\", \"PRODUCT\": \"BTC OPTION - DBT\", \"DESCRIPTION\": \"RRPut  25 Sep 26  55000/75000 +0.31…  Perpetual  65,000\", \"QTY\": 100, \"PRICE\": 0.0177, \"REF_PRICE\": 0.0176, \"SIDE\": \"SELL\", \"QUOTE_CURRENCY\": \"BTC\", \"NOTIONAL_VOLUME_USD\": 6491801, \"RFQ_ID\": \"rfq_rr55x75\", \"TRADE_ID\": \"t_4a\", \"BLOCK_TRADE_ID\": \"b_4\", \"OFFSET_BPS\": 1.0}, {\"DATE\": \"2026-07-15\", \"TIME\": \"06:50:01\", \"AUCTION\": \"RFQ\", \"PRODUCT\": \"BTC OPTION - DBT\", \"DESCRIPTION\": \"RRPut  25 Sep 26  55000/75000 +0.31…  Perpetual  65,000\", \"QTY\": 100, \"PRICE\": 0.0168, \"REF_PRICE\": 0.0161, \"SIDE\": \"BUY\", \"QUOTE_CURRENCY\": \"BTC\", \"NOTIONAL_VOLUME_USD\": 6491801, \"RFQ_ID\": \"rfq_rr55x75\", \"TRADE_ID\": \"t_4b\", \"BLOCK_TRADE_ID\": \"b_4\", \"OFFSET_BPS\": 7.0}, {\"DATE\": \"2026-07-15\", \"TIME\": \"06:50:01\", \"AUCTION\": \"RFQ\", \"PRODUCT\": \"BTC PERPETUAL - DBT\", \"DESCRIPTION\": \"RRPut  25 Sep 26  55000/75000 +0.31…  Perpetual  65,000\", \"QTY\": 207000, \"PRICE\": 65000, \"REF_PRICE\": 64955.57, \"SIDE\": \"SELL\", \"QUOTE_CURRENCY\": \"BTC\", \"NOTIONAL_VOLUME_USD\": 2070000, \"RFQ_ID\": \"rfq_rr55x75\", \"TRADE_ID\": \"t_4c\", \"BLOCK_TRADE_ID\": \"b_4\"}])",
+      "expected_output": "A terse block trade analysis of a delta-hedged put risk reversal resolved from per-leg tape rows. Header: Seller, net credit Recd 0.0009 (sold leg 0.0177 minus bought leg 0.0168), offset −6 bps below mark (net fill credit 0.0009 vs net mark credit 0.0015) — NOT the per-leg +1 or +7 values, and not '+6 bps'. Perp row treated as the delta hedge, excluded from the premium netting. yaml block with [Greeks] (net incl. perp hedge), [Fair] repeating −6 bps below mark with per-leg IVs, [History], [Live].",
+      "assertions": [
+        "Response nets the two option legs to a package price of 0.0009 BTC net credit (0.0177 sold − 0.0168 bought) and presents the taker as Seller / Recd",
+        "Response reports the package offset as −6 bps below mark (net credit 0.0009 received vs 0.0015 at mark) — the header and [Fair] row agree on this one number",
+        "Response does NOT present the fill as above mark or as positive edge (no '+6 bps', '+1 bps', or '+7 bps' as the package offset) — the per-leg OFFSET_BPS values (+1, +7) must not appear as the package offset",
+        "Response excludes the perpetual row from the premium/offset netting (the perp is the delta hedge), while still acknowledging the perp leg in the structure or greeks",
+        "Response includes a yaml code block with [Greeks], [Fair], [History], and [Live] rows",
+        "Response derives structure and legs from the resolved rows (25 Sep 26 55000/75000 put risk reversal + perp), not from the user's inline description"
+      ]
+    },
+    {
+      "id": 5,
+      "prompt": "/analyze rfq_cstm2x1 custom put ratio 24 Jul\n\n(paradigm-data-discovery → paradigm_trade_tape_slim WHERE RFQ_ID='rfq_cstm2x1' returned 2 rows: [{\"DATE\": \"2026-07-15\", \"TIME\": \"06:48:10\", \"AUCTION\": \"RFQ\", \"PRODUCT\": \"BTC OPTION - DBT\", \"DESCRIPTION\": \"Cstm  -2.00  Put  24 Jul 26  59000       +1.00  Put  24 Jul 26  65000\", \"QTY\": 40, \"PRICE\": 0.0023, \"REF_PRICE\": 0.0021, \"SIDE\": \"BUY\", \"QUOTE_CURRENCY\": \"BTC\", \"NOTIONAL_VOLUME_USD\": 1291204, \"RFQ_ID\": \"rfq_cstm2x1\", \"TRADE_ID\": \"t_5a\", \"BLOCK_TRADE_ID\": \"b_5\", \"OFFSET_BPS\": 2.0}, {\"DATE\": \"2026-07-15\", \"TIME\": \"06:48:10\", \"AUCTION\": \"RFQ\", \"PRODUCT\": \"BTC OPTION - DBT\", \"DESCRIPTION\": \"Cstm  -2.00  Put  24 Jul 26  59000       +1.00  Put  24 Jul 26  65000\", \"QTY\": 20, \"PRICE\": 0.0210, \"REF_PRICE\": 0.0212, \"SIDE\": \"SELL\", \"QUOTE_CURRENCY\": \"BTC\", \"NOTIONAL_VOLUME_USD\": 1291204, \"RFQ_ID\": \"rfq_cstm2x1\", \"TRADE_ID\": \"t_5b\", \"BLOCK_TRADE_ID\": \"b_5\", \"OFFSET_BPS\": -2.0}])",
+      "expected_output": "A terse block trade analysis of a −2/+1 put ratio (long 2× 59000 P per short 1× 65000 P, per the leg QTYs 40 vs 20). Package qty-weights the legs 2:1 against the base (smallest) QTY of 20: net fill = 2×0.0023 − 0.0210 = −0.0164 credit, net mark = 2×0.0021 − 0.0212 = −0.0170 → header Seller, Recd 0.0164, −6 bps below mark. Not a per-leg ±2 bps value. yaml block with the four bracket rows.",
+      "assertions": [
+        "Response qty-weights the legs by their QTY ratio (40 vs 20 → 2:1) and nets the package to 0.0164 BTC credit received (2×0.0023 paid vs 0.0210 collected)",
+        "Response reports the package offset as −6 bps below mark (0.0164 received vs 0.0170 at mark), the same number in the header and the [Fair] row",
+        "Response does not use a per-leg OFFSET_BPS value (±2 bps) as the package offset and does not present the fill as above mark",
+        "Response identifies the structure from the resolved DESCRIPTION as a −2/+1 put ratio (structure qty 20: long 40× 59000 P, short 20× 65000 P from the taker's perspective per leg SIDEs)",
+        "Response includes a yaml code block with [Greeks], [Fair], [History], and [Live] rows"
+      ]
     }
   ],
   "trigger_evals": [
