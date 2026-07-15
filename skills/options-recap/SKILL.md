@@ -7,13 +7,13 @@ description: >
   and vol surface. Use when the user types /recap or asks for a market recap,
   options flow summary, "what happened in BTC options", or "last Xh of flow".
   The output format is fixed — always the same four sections in the same order.
-compatibility: Deribit public API (curl) for the tape; Paradigm hot data (DuckDB+S3
-  via IRSA) for DVOL/spot, multi-venue volume/activity, and the vol surface. No
-  authentication required for the public API; the S3 reads require the IRSA
-  bootstrap (see paradigm-data-discovery skill).
+compatibility: Deribit public API (curl) for the tape (7d closes, block flow, and the
+  Volume line's $ figure); Paradigm hot data (DuckDB+S3 via IRSA) for DVOL/spot,
+  multi-venue activity/P-C, and the vol surface. No authentication required for the
+  public API; the S3 reads require the IRSA bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.7"
+  version: "1.8"
 ---
 
 # Options Recap
@@ -25,20 +25,23 @@ metadata:
 | Token | Examples | Default |
 |---|---|---|
 | `asset` | `btc`, `eth` | `btc` |
-| `window` | any `Nm`/`Nh`/`Nd` — `30m`, `3h`, `8h`, `2d` (`1d`→`24h`) | `24h` |
+| `window` | any `Nm`/`Nh`/`Nd` up to 24h — `30m`, `3h`, `8h` (`1d`→`24h`) | `24h` |
 | `options` | the literal word `options` | ignored — a no-op keyword (this skill is always options); `run_recap.sh` strips it |
 
-Any `Nm`/`Nh`/`Nd` window works and all render identically: DVOL/spot and the
-multi-venue volume/activity come from one rolling hot aggregates file sliced to
-the window at query time, the surface (and its Δ columns) from `v_vol_surface`,
-and block flow from the Deribit tape. A malformed window exits with a clear error.
+Any `Nm`/`Nh`/`Nd` window up to 24h works and all render identically: DVOL/spot
+and the multi-venue activity/P-C come from one rolling hot aggregates file sliced
+to the window at query time, the surface (and its Δ columns) from `v_vol_surface`,
+and the Volume ($) line and block flow both from the Deribit tape — the hot
+aggregates file head-lags the live prints by ~10-15 min, so on a thin window it
+under-reports $ volume (potentially below the block-flow total); the tape carries
+every print with its index price and is authoritative for the Volume figure. A
+malformed window exits with a clear error.
 
-**Windows beyond ~24h:** the hot aggregates file and the Deribit tape each retain
-only ~24h, so a longer window (e.g. `2d`) still renders but Volume / Activity /
-DVOL / spot / Biggest Print / Block Flow reflect only the ~24h the sources hold
-(the vol-surface Δs do span the full window via cold partitions). `run_recap.sh`
-prepends a one-line `⚠ Volume · Activity · Biggest Print · Block Flow cover …`
-banner in that case — **relay it verbatim** (don't drop or reword it).
+**Windows beyond 24h:** every flow source (the rolling hot aggregates file, the
+Deribit public tape) retains only ~24h, so `run_recap.sh` caps any longer window
+(e.g. `2d`) at 24h and prepends a one-line `⚠ window capped at 24h — …` banner
+as the first line of its output — **relay it verbatim** (don't drop or reword
+it). The cap lifts once >24h flow is wired to the cold store.
 
 `/recap` alone = BTC options, last 24h. Still pass just `<ASSET> <WINDOW>` to
 `run_recap.sh` — it drops a stray `options`/`option` token, so `/recap btc
@@ -57,9 +60,13 @@ That script does everything — STS bootstrap, the single DuckDB session over th
 hot surface, the Deribit tape (7d closes + window trades via concurrent,
 time-sliced pagination), the vol math, and final formatting — and prints the
 finished four-section recap. **Do not** add commentary, reformat it, re-fetch
-anything, or run extra steps. Its output already is the recap. If the first
-line is a `⚠ …` banner, keep it. Target: well under 30s; the heavy lifting is
-~2.5s and the rest is just this one round-trip.
+anything, or run extra steps. Its output already is the recap. Your reply must
+BEGIN with the script's first output line (the `⚠ …` banner when present, else
+the bold header) — no preamble like "I'll run the recap", no trailing notes or
+follow-up offers. If the script exits non-zero (e.g. `recap: bad window '5x'`),
+**relay that error message verbatim and stop** — do not substitute a different
+window, retry with defaults, or render a recap anyway. Target: well under 30s;
+the heavy lifting is ~2.5s and the rest is just this one round-trip.
 
 **Injected data (a `<market_data>` block with `derived` is in context).** No
 tools — render the four sections yourself from `derived.realized_vol` (RV/VRP),
