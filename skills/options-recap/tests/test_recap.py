@@ -443,10 +443,9 @@ def test_pc_descriptor_bands():
     check("None → None", pc_descriptor(None) is None)
 
 
-def test_block_flow_header_reconciles_with_rows():
+def test_block_flow_caps_rows_at_top_n():
     # 10 distinct straddles (unique strikes → unique signatures, no clip
-    # merging) at descending size. top_n=8 must disclose the 2 omitted blocks,
-    # and header count/total must cover all 10 — same ≥min_btc basis as rows.
+    # merging) at descending size: rows cap at 8, header still counts all 10.
     trades = []
     for i in range(10):
         sz = 100 - i * 5
@@ -461,16 +460,6 @@ def test_block_flow_header_reconciles_with_rows():
     bf = build_block_flow(trades, {}, spot=60000)
     check("8 rows shown", len(bf["rows"]) == 8, len(bf["rows"]))
     check("header counts all 10", bf["n_blocks"] == 10, bf["n_blocks"])
-    check("2 blocks disclosed as omitted", bf["omitted_blocks"] == 2, bf)
-    shown_m = round(sum(r["notl_m"] for r in bf["rows"]), 1)
-    check("rows + omitted = header total",
-          abs(shown_m + bf["omitted_m"] - bf["total_m"]) < 0.15, bf)
-    md = render_md({"header": {"asset": "BTC", "window": "1h", "start_utc": "01:00",
-                               "end_utc": "02:00"},
-                    "snapshot": {}, "biggest_print": bf["biggest_print"],
-                    "block_flow": bf, "vol_surface": None, "flow_horizon": None,
-                    "warnings": []})
-    check("truncation disclosed in render", "+2 more blocks" in md, md)
 
 
 def test_block_flow_aggregates_clips_in_rows():

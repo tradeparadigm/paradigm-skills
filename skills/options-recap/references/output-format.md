@@ -42,15 +42,12 @@ Mixed-direction structures (any spread) carry no side tag — never write
 -  -------------------  -------  ------------------------------------------
 1  [structure]          $[X]M    bought [K1][C/P] / sold [K2][C/P] x[size] [(N clips) ][IV]v
 2  …
-…  +[N] more blocks     $[X]M
 ```
 
 Detail rules: per-leg `bought`/`sold` verbs appear only when the tape discloses
 every leg's direction; otherwise legs render neutrally (`[K1]P vs [K2]P`)
 tagged ` two-way`. Repeated prints of one worked order (same legs, directions,
-and size ratio) collapse into a single row with a `(N clips)` count. The header
-count/total covers ALL qualifying blocks; when the table is truncated, the
-final `… +N more blocks $[X]M` line reconciles it.
+and size ratio) collapse into a single row with a `(N clips)` count.
 
 **Vol Surface**
 Skew: front 25Δ RR [±X]v → [puts bid / calls bid] · Term: [front]v → [back]v → [contango / flat / backwardation / humped — peak at [DDMMMYY] / dished — trough at [DDMMMYY]]

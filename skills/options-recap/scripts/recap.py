@@ -388,10 +388,9 @@ def _leg_phrase(legs: list[dict], size: float | None = None,
 def build_block_flow(trades: list[dict], hot: dict, spot: float | None,
                      top_n: int = 8, min_btc: float = 5.0) -> dict:
     clusters = cluster_blocks(trades)
-    # One qualified basis (≥min_btc) for the header count/total AND the rows,
-    # so the header always reconciles with the table. Identical clips of one
-    # worked order then collapse into a single ranked row; the header keeps
-    # counting raw blocks, and clip counts on the rows make up the difference.
+    # Identical clips of one worked order collapse into a single ranked row;
+    # the header keeps counting raw blocks, and the rows' clip counts carry
+    # the difference.
     ranked_all = summarize_blocks(clusters, top_n=10**9, min_btc=min_btc)
     grouped = aggregate_clips(ranked_all, clusters)
     rows = []
@@ -410,9 +409,8 @@ def build_block_flow(trades: list[dict], hot: dict, spot: float | None,
     # Header totals from the same Deribit clustering that produced the rows. The
     # hot block.csv has unit-corrupt rows (one block at $5B) that inflate the sum,
     # so we don't trust it here.
-    total_usd = sum(b["notional_usd"] for b in ranked_all)
-    n_blocks = len(ranked_all)
-    omitted = grouped[top_n:]
+    total_usd = sum(b["notional_usd"] for b in summarize_blocks(clusters, top_n=10**9, min_btc=0))
+    n_blocks = len(clusters)
     biggest = None
     if ranked_all:
         b0 = ranked_all[0]  # largest single print, not the clip aggregate
@@ -424,8 +422,6 @@ def build_block_flow(trades: list[dict], hot: dict, spot: float | None,
     return {
         "total_m": round((total_usd or 0) / 1e6, 1), "n_blocks": n_blocks,
         "rows": rows, "biggest_print": biggest,
-        "omitted_blocks": sum(g["clip_count"] for g in omitted),
-        "omitted_m": round(sum(g["notional_usd"] for g in omitted) / 1e6, 1),
     }
 
 
@@ -613,9 +609,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "snapshot": snapshot,
         "biggest_print": block["biggest_print"],
         "block_flow": {"total_m": block["total_m"], "n_blocks": block["n_blocks"],
-                       "rows": block["rows"],
-                       "omitted_blocks": block["omitted_blocks"],
-                       "omitted_m": block["omitted_m"]},
+                       "rows": block["rows"]},
         "vol_surface": surface_out,
         "flow_horizon": flow_horizon,
         "warnings": WARNINGS,
@@ -739,9 +733,6 @@ def render_md(r: dict) -> str:
     for row in bf["rows"]:
         notl = f"${row['notl_m']}M"
         L.append(f"{str(row['rank']):<3}{row['structure']:<27}{notl:<9}{row['detail']}")
-    if bf.get("omitted_blocks"):
-        more = f"+{bf['omitted_blocks']} more blocks"
-        L.append(f"{'…':<3}{more:<27}${bf['omitted_m']}M")
     L += ["```", "", "**Vol Surface**"]
 
     if vs and vs.get("rows"):
