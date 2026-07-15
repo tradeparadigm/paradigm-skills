@@ -34,13 +34,10 @@ web identity → STS) — see `s3-access.md`:
 
 > **Migration note:** the Paradigm tapes + vol surface now live on
 > `dt-paradigm-data` (`paradigm_data/` prefix preserved); the hot surface +
-> recap aggregates moved to `dt-exchange-venue-data` (prefix dropped). The
-> former Bullish (`bullish_*`) and IBIT (`ibit_options_trades`) datasets have
-> been **removed** — verified 2026-07-14, they no longer exist in any bucket
-> (Bullish still appears as a *venue* inside the hot surface + recap
-> aggregates; that is unrelated to the deleted standalone datasets). Anything
-> still on `terminal-dime-prod` (Paradex tape, `external/` Tardis tree) is on
-> the deprecated bucket pending re-home — do not build dependencies on it.
+> recap aggregates moved to `dt-exchange-venue-data` (prefix dropped).
+> Anything still on `terminal-dime-prod` (Paradex tape, `external/` Tardis
+> tree) is on the deprecated bucket pending re-home — do not build
+> dependencies on it.
 
 ---
 
