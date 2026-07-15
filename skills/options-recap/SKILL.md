@@ -13,7 +13,7 @@ compatibility: Deribit public API (curl) for the tape; Paradigm hot data (DuckDB
   bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.7"
+  version: "1.8"
 ---
 
 # Options Recap
@@ -35,8 +35,9 @@ and block flow from the Deribit tape. A malformed window exits with a clear erro
 
 **Windows beyond ~24h:** the hot aggregates file and the Deribit tape each retain
 only ~24h, so a longer window (e.g. `2d`) still renders but Volume / Activity /
-DVOL / spot / Biggest Print / Block Flow reflect only the ~24h the sources hold
-(the vol-surface Δs do span the full window via cold partitions). `run_recap.sh`
+Biggest Print / Block Flow reflect only the ~24h the flow sources hold. DVOL,
+spot, and the vol-surface Δs DO span the full window (DVOL/spot switch to the
+full-history Deribit series past 24h; the Δs read cold partitions). `run_recap.sh`
 prepends a one-line `⚠ Volume · Activity · Biggest Print · Block Flow cover …`
 banner in that case — **relay it verbatim** (don't drop or reword it).
 
@@ -57,9 +58,13 @@ That script does everything — STS bootstrap, the single DuckDB session over th
 hot surface, the Deribit tape (7d closes + window trades via concurrent,
 time-sliced pagination), the vol math, and final formatting — and prints the
 finished four-section recap. **Do not** add commentary, reformat it, re-fetch
-anything, or run extra steps. Its output already is the recap. If the first
-line is a `⚠ …` banner, keep it. Target: well under 30s; the heavy lifting is
-~2.5s and the rest is just this one round-trip.
+anything, or run extra steps. Its output already is the recap. Your reply must
+BEGIN with the script's first output line (the `⚠ …` banner when present, else
+the bold header) — no preamble like "I'll run the recap", no trailing notes or
+follow-up offers. If the script exits non-zero (e.g. `recap: bad window '5x'`),
+**relay that error message verbatim and stop** — do not substitute a different
+window, retry with defaults, or render a recap anyway. Target: well under 30s;
+the heavy lifting is ~2.5s and the rest is just this one round-trip.
 
 **Injected data (a `<market_data>` block with `derived` is in context).** No
 tools — render the four sections yourself from `derived.realized_vol` (RV/VRP),

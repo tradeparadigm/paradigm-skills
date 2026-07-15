@@ -205,6 +205,18 @@ def test_classify_structure():
            _leg("BTC-3JUL26-60000-C", "sell", 10)]
     check("diff expiries same strike → Calendar", classify_structure(cal) == "Calendar",
           classify_structure(cal))
+    # Short straddle + long wings = iron fly. The ≥3-leg check must beat the
+    # C&P branch — this printed as "Strangle/RR" in a live ETH recap.
+    ironfly = [_leg("ETH-16JUL26-1875-C", "sell", 63),
+               _leg("ETH-16JUL26-1875-P", "sell", 63),
+               _leg("ETH-16JUL26-1925-C", "buy", 63),
+               _leg("ETH-16JUL26-1825-P", "buy", 63)]
+    check("4-leg iron fly → Butterfly/Condor",
+          classify_structure(ironfly) == "Butterfly/Condor", classify_structure(ironfly))
+    diag = [_leg("ETH-24JUL26-1900-C", "buy", 6400),
+            _leg("ETH-28AUG26-2100-C", "sell", 6400)]
+    check("2 legs diff expiry+strike → Diagonal", classify_structure(diag) == "Diagonal",
+          classify_structure(diag))
 
 
 def test_dominant_side():
@@ -233,10 +245,36 @@ def test_summarize_blocks_ranks_and_describes():
     top = blocks[0]
     check("largest by notional first (the RR)", top["block_trade_id"] == "RR", top)
     check("largest size is 200 BTC", top["size_btc"] == 200.0, top)
+    check("unit size is 100 (per-leg, not leg-sum)", top["unit_size"] == 100.0, top)
     check("largest classified Strangle/RR", top["structure"] == "Strangle/RR", top)
     check("largest is mixed-direction", top["side"] == "Mixed", top)
     check("largest expiry 26JUN26", top["expiry"] == "26JUN26", top)
     check("notional ranks RR above outright", top["notional_usd"] > blocks[1]["notional_usd"], blocks)
+
+
+def test_summarize_blocks_multi_expiry_label():
+    # A cross-expiry structure names its near AND far tenor, chronologically —
+    # a legs[0]-based label let identical structures render under different
+    # expiries depending on tape order.
+    a = [_leg("BTC-26MAR27-4200-C", "buy", 270, bid="D1"),
+         _leg("BTC-25JUN27-2000-C", "buy", 270, bid="D1")]
+    b = list(reversed([_leg("BTC-26MAR27-4200-C", "buy", 250, bid="D2"),
+                       _leg("BTC-25JUN27-2000-C", "buy", 250, bid="D2")]))
+    rows = summarize_blocks(cluster_blocks(a + b), top_n=10, min_btc=5.0)
+    labels = {r["expiry"] for r in rows}
+    check("multi-expiry label near/far", labels == {"26MAR27/25JUN27"}, labels)
+    check("same structure → same label regardless of leg order", len(labels) == 1, labels)
+
+
+def test_vrp_reconciles_with_displayed_lines():
+    # VRP must equal the difference of the DISPLAY-rounded DVOL and RV, so the
+    # rendered Snapshot reconciles line-to-line — live recaps showed VRP 0.1v
+    # off the visible DVOL−RV arithmetic. Boundary-ish dvol values included.
+    closes = [60000 + (i % 5) * 50 for i in range(60)]
+    for dvol in (36.38, 48.1499, 33.2501, 51.05):
+        r = realized_vs_implied(closes, dvol)
+        check(f"VRP({dvol}) = displayed DVOL − displayed RV",
+              r["vrp"] == round(round(dvol, 1) - r["value"], 1), r)
 
 
 def test_summarize_blocks_empty():
@@ -318,6 +356,24 @@ def test_surface_term_structure_reads_whole_curve():
           "flat" in (shallow["term_structure"] or ""), shallow)
 
 
+def test_labels_are_contract_tokens_only():
+    # The skew/term labels render verbatim inside a FIXED template
+    # (references/output-format.md) — no explanatory suffixes. Live recaps
+    # leaked "(35.2v), non-monotonic" and ", downside skew" into the output.
+    humped = compute_vol_surface(_atm_only_tickers([
+        ("15JUL26", 33.3), ("16JUL26", 35.6), ("24JUL26", 33.7)]), spot=60000)
+    check("humped label is exactly the contract token",
+          humped["term_structure"] == "humped — peak at 16JUL26", humped["term_structure"])
+    up = compute_vol_surface(_atm_only_tickers([
+        ("15JUL26", 30.0), ("16JUL26", 31.5), ("18JUL26", 33.0)]), spot=60000)
+    check("contango label is bare", up["term_structure"] == "contango", up["term_structure"])
+    s = compute_vol_surface(_surface_tickers(), spot=62000)
+    check("skew label matches template (no prose suffix)",
+          s["skew_label"] == f"front 25Δ RR {s['expiries'][0]['rr_25d']:+}v → puts bid",
+          s["skew_label"])
+    check("no 'downside skew' suffix", "downside" not in s["skew_label"], s["skew_label"])
+
+
 def test_aggregate_clips_merges_worked_order():
     # Three clips of the same 2:1 put spread (differing only in size) + one
     # distinct straddle. The clips collapse to one entry; the straddle stays.
@@ -338,6 +394,7 @@ def test_aggregate_clips_merges_worked_order():
     spread = next(g for g in grouped if g["structure"] == "Spread")
     check("clip_count 3", spread["clip_count"] == 3, spread)
     check("sizes summed (150+30+30)", spread["size_btc"] == 210.0, spread)
+    check("unit sizes summed (50+10+10)", spread["unit_size"] == 70.0, spread)
     check("keeps largest clip's id", spread["block_trade_id"] == "C1", spread)
     check("iv size-weighted toward big clip", 36.5 <= spread["avg_iv"] <= 36.7, spread)
     straddle = next(g for g in grouped if g["structure"] == "Straddle")

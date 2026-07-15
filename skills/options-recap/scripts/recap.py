@@ -245,6 +245,25 @@ def _venue_label(exchange: str) -> str:
     return _VENUE_LABELS.get(e, (exchange or "?").split("-")[0].title())
 
 
+def _own_asset_rows(rows: list[dict], asset: str, name: str) -> list[dict]:
+    """Keep only rows whose `asset` column matches the recap's asset. The SQL
+    already filters by asset, so a mismatched row means the CSV is not this
+    run's slice (wrong file, stale state, cross-run contamination) — exactly
+    the corruption that once put an ETH Snapshot inside a BTC recap. Dropping
+    the rows sends the field down the null → Deribit-fallback path with a loud
+    warning instead of rendering the wrong asset's numbers. CSVs without the
+    column (older fixtures) pass through untouched."""
+    if not rows or "asset" not in rows[0]:
+        return rows
+    keep = [r for r in rows if (r.get("asset") or "").upper() == asset]
+    if len(keep) != len(rows):
+        others = sorted({(r.get("asset") or "?") for r in rows
+                         if (r.get("asset") or "").upper() != asset})
+        warn(f"hot {name}: dropped {len(rows) - len(keep)} rows for "
+             f"{'/'.join(others)} (expected {asset}) — cross-run contamination?")
+    return keep
+
+
 def load_hot(csv_dir: str, asset: str) -> dict:
     """Parse the hot CSVs defensively — tolerate missing files/columns by
     leaving the field null and recording a warning, never crashing."""
@@ -255,7 +274,7 @@ def load_hot(csv_dir: str, asset: str) -> dict:
            "put_trades": None, "call_trades": None,
            "tickers": {}, "vs_now": {}, "vs_open": {}}
 
-    ds = _read_csv(csv_dir, "dvol_spot.csv")
+    ds = _own_asset_rows(_read_csv(csv_dir, "dvol_spot.csv"), asset, "dvol_spot.csv")
     # DVOL/spot are Deribit-only today. If a future venue ever emits dvol/spot rows,
     # this per-metric assignment would be last-row-wins (nondeterministic), so sort
     # Deribit rows last — they then win under the loop's overwrite. When no Deribit
@@ -279,7 +298,8 @@ def load_hot(csv_dir: str, asset: str) -> dict:
     #   • Activity + P/C — `trade_count` is unit-free (a trade is a trade), so it
     #     aggregates across ALL venues truthfully, with no contract multiplier.
     # Blank-optionType rows are per-exchange aggregates that double-count — drop them.
-    vol = [r for r in _read_csv(csv_dir, "volume.csv") if (r.get("optionType") or "").strip()]
+    vol = [r for r in _own_asset_rows(_read_csv(csv_dir, "volume.csv"), asset, "volume.csv")
+           if (r.get("optionType") or "").strip()]
     if vol:
         # Exact "deribit" only — NOT startswith: the sibling venue deribit-usdc is
         # USDC-linear (a different contract unit), so folding it into this
@@ -329,35 +349,59 @@ def load_hot(csv_dir: str, asset: str) -> dict:
     # v_vol_surface snapshots (consolidated per-strike IV+delta) for the window-
     # over-window deltas: surface_now.csv = latest snapshot, surface_open.csv =
     # snapshot nearest window-start. Both optional — absent → deltas read n/a.
-    out["vs_now"] = _load_surface_tickers(csv_dir, "surface_now.csv")
-    out["vs_open"] = _load_surface_tickers(csv_dir, "surface_open.csv")
+    out["vs_now"] = _load_surface_tickers(csv_dir, "surface_now.csv", asset)
+    out["vs_open"] = _load_surface_tickers(csv_dir, "surface_open.csv", asset)
     return out
 
 
-def _load_surface_tickers(csv_dir: str, name: str) -> dict:
+def _load_surface_tickers(csv_dir: str, name: str, asset: str | None = None) -> dict:
     """Read a v_vol_surface CSV (symbol, mark_iv, delta) into a ticker map keyed
     by the full instrument symbol — the shape compute_vol_surface expects. Each
     symbol is e.g. BTC-1JUL26-58000-C, so its expiry/type parse exactly as the
-    Deribit instrument names the surface math already handles."""
+    Deribit instrument names the surface math already handles. When `asset` is
+    given, symbols for any other asset are dropped with a warning — same
+    contamination guard as _own_asset_rows, keyed on the symbol prefix."""
     out: dict[str, dict] = {}
+    dropped = 0
     for r in _read_csv(csv_dir, name):
         sym = r.get("symbol")
         iv = _num(r, "mark_iv")
         if not sym or iv is None:
             continue
+        if asset and not sym.upper().startswith(f"{asset.upper()}-"):
+            dropped += 1
+            continue
         out[sym] = {"mark_iv": iv, "delta": _num(r, "delta")}
+    if dropped:
+        warn(f"hot {name}: dropped {dropped} symbols not for {asset} — "
+             "cross-run contamination?")
     return out
 
 
 # ── Block-flow leg detail ───────────────────────────────────────────────────
 
+def _strike_label(raw: str) -> str:
+    """Compact strike text. Clean thousands abbreviate (68000 → 68K, 62500 →
+    62.5K); anything that would lose precision stays raw — ETH strikes like
+    1825/1875/1925 all truncated to "1K" before, so a four-strike iron fly
+    rendered as buying and selling the same strike."""
+    if not raw.isdigit():
+        return raw
+    v = int(raw)
+    if v % 1000 == 0:
+        return f"{v // 1000}K"
+    if v >= 10_000:
+        return f"{v / 1000:g}K"
+    return str(v)
+
+
 def _leg_phrase(legs: list[dict], size: float | None = None,
                 iv_label: str | None = None) -> str:
     """One-line human detail for a block cluster, e.g.
-    'sold 75C / bought 90C x150 42.3v'.
+    'sold 75KC / bought 90KC x150 42.3v'.
 
     Directional verbs come from the per-leg taker `direction` field. If any leg
-    lacks one, no direction is asserted: legs render neutrally ('75C vs 90C')
+    lacks one, no direction is asserted: legs render neutrally ('75KC vs 90KC')
     tagged "two-way" — the desk term for an undisclosed side, which must never
     appear next to bought/sold. `size`/`iv_label` override the single-cluster
     values when the row aggregates several clips of a worked order (iv_label
@@ -368,14 +412,19 @@ def _leg_phrase(legs: list[dict], size: float | None = None,
         seg = leg["instrument_name"].split("-")
         if len(seg) < 4:
             continue
-        strike_k = f"{int(int(seg[2]) / 1000)}K" if seg[2].isdigit() else seg[2]
+        strike_k = _strike_label(seg[2])
         if directional:
             verb = "bought" if leg["direction"] == "buy" else "sold"
             parts.append(f"{verb} {strike_k}{seg[3]}")
         else:
             parts.append(f"{strike_k}{seg[3]}")
     if size is None:
-        size = round(sum(l.get("amount", 0) for l in legs), 1)
+        # Structure UNIT size (base-leg count), matching summarize_blocks'
+        # unit_size — never the leg-sum, which overstates a 4-leg fly 4×.
+        by_inst: dict[str, float] = defaultdict(float)
+        for l in legs:
+            by_inst[l["instrument_name"]] += l.get("amount", 0)
+        size = round(min(by_inst.values()), 1) if by_inst else 0
     if iv_label is None:
         ivs = [l["iv"] for l in legs if l.get("iv") is not None]
         iv_label = f"{round(sum(ivs) / len(ivs), 1)}" if ivs else None
@@ -416,7 +465,7 @@ def build_block_flow(trades: list[dict], hot: dict, spot: float | None,
             "structure": f"{exp} {b['structure']}".strip(),
             "notl_m": round(b["notional_usd"] / 1e6, 1),
             "blocks": b["clip_count"],
-            "detail": _leg_phrase(legs, size=b["size_btc"], iv_label=_iv_label(b)),
+            "detail": _leg_phrase(legs, size=b["unit_size"], iv_label=_iv_label(b)),
             "side": b["side"], "avg_iv": b["avg_iv"], "time_utc": b["time_utc"],
         })
     total_usd = sum(b["notional_usd"] for b in ranked_all)
@@ -425,7 +474,7 @@ def build_block_flow(trades: list[dict], hot: dict, spot: float | None,
         b0 = ranked_all[0]  # largest single print, not the clip aggregate
         biggest = {
             "expiry": b0.get("expiry"), "structure": b0["structure"],
-            "size": b0["size_btc"], "notional_m": round(b0["notional_usd"] / 1e6, 1),
+            "size": b0["unit_size"], "notional_m": round(b0["notional_usd"] / 1e6, 1),
             "time_utc": b0["time_utc"], "side": b0["side"], "avg_iv": b0["avg_iv"],
         }
     return {
@@ -493,17 +542,24 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
           deri: dict, hot: dict) -> dict:
     asset = asset.upper()
     mkt = deri.get("market")
+    window_h = (end_ms - start_ms) / 3600_000
 
-    # DVOL / spot: hot authoritative; fall back to Deribit market only if absent.
+    # DVOL / spot: hot authoritative for windows the rolling aggregates file
+    # actually spans (~24h); fall back to Deribit market if hot is absent.
+    # PAST ~24h the hot OHLC silently covers only the file's retention — a 2d
+    # recap once quoted a 24h-scoped low under a banner claiming full-window
+    # spot — so for >24h windows the Deribit market fetch (full history) is
+    # authoritative instead, with hot as the fallback.
+    prefer_mkt = window_h > 24
     dvol_close = hot.get("dvol"); dvol_open = hot.get("dvol_open")
     dvol_low, dvol_high = hot.get("dvol_low"), hot.get("dvol_high")
     spot_close = hot.get("spot_close"); spot_open = hot.get("spot_open")
     spot_low = hot.get("spot_low")
-    if dvol_close is None and mkt and mkt.get("dvol"):
+    if (dvol_close is None or prefer_mkt) and mkt and mkt.get("dvol"):
         d = mkt["dvol"]
         dvol_open = d[0][1]; dvol_close = d[-1][4]
         dvol_low = min(r[3] for r in d); dvol_high = max(r[2] for r in d)
-    if spot_close is None and mkt and mkt.get("spot"):
+    if (spot_close is None or prefer_mkt) and mkt and mkt.get("spot"):
         s = mkt["spot"]
         spot_open = (s.get("open") or [None])[0]
         spot_close = (s.get("close") or [None])[-1]
@@ -560,7 +616,6 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     # (both flow sources cap near 24h). Surface a banner (render_md). Cleared
     # automatically once >24h flow is sourced from the cold store.
     flow_horizon = None
-    window_h = (end_ms - start_ms) / 3600_000
     if window_h > 24 and trades:
         oldest = min(t.get("timestamp") or end_ms for t in trades)
         covered_h = (end_ms - oldest) / 3600_000
@@ -571,7 +626,11 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "spot": round(spot) if spot else None,
         "spot_from": round(spot_open) if spot_open else None,
         "spot_low": round(spot_low) if spot_low else None,
-        "spot_change_pct": pct(spot_close, spot_open),
+        # % from the ROUNDED display prices, so the line reconciles with the
+        # two dollar figures it sits next to (unrounded inputs once produced
+        # "down 0.1%" beside prices whose own arithmetic gives 0.2%).
+        "spot_change_pct": pct(round(spot_close) if spot_close else None,
+                               round(spot_open) if spot_open else None),
         "dvol": round(dvol_close, 1) if dvol_close is not None else None,
         "dvol_open": round(dvol_open, 2) if dvol_open is not None else None,
         "dvol_close": round(dvol_close, 2) if dvol_close is not None else None,
@@ -711,6 +770,8 @@ def render_md(r: dict) -> str:
            "overpriced" if vrp is not None and vrp > 0 else "fair")
     L.append(f"{'VRP':<9} {vrp_txt:<11} vol {upo} vs delivered")
 
+    # Activity always renders — an empty window reads n/a like Volume/P-C do;
+    # silently dropping the line makes the Snapshot shape depend on the data.
     if s.get("activity_trades"):
         tt = s["activity_trades"]
         tnum = (f"{tt / 1e6:.1f}M" if tt >= 1e6 else
@@ -718,6 +779,8 @@ def render_md(r: dict) -> str:
         split = " · ".join(f"{v['venue']} {v['pct']}%"
                            for v in (s.get("activity_split") or [])[:4])
         L.append(f"{'Activity':<9} {tnum:<11} trades — {split} (by trade count)")
+    else:
+        L.append(f"{'Activity':<9} {'n/a':<11} trades (by trade count)")
     vol = f"${s['volume_usd_m']}M" if s.get("volume_usd_m") else "n/a"
     L.append(f"{'Volume':<9} {vol:<11} Deribit only (cross-venue $ pending)")
     pc = f"{s['pc_ratio']}x" if s.get("pc_ratio") is not None else "n/a"
@@ -739,8 +802,9 @@ def render_md(r: dict) -> str:
         L.append("No data")
     n_struct = bf.get("n_structures", len(bf["rows"]))
     struct_word = "structure" if n_struct == 1 else "structures"
+    block_word = "block" if bf["n_blocks"] == 1 else "blocks"
     trunc = f" (top {len(bf['rows'])} by notional)" if n_struct > len(bf["rows"]) else ""
-    L += ["```", "", f"**Block Flow — ${bf['total_m']}M / {bf['n_blocks']} blocks / "
+    L += ["```", "", f"**Block Flow — ${bf['total_m']}M / {bf['n_blocks']} {block_word} / "
           f"{n_struct} {struct_word}{trunc}**",
           "", "```yaml", f"{'#':<3}{'Structure':<27}{'Notl':<9}{'Blocks':<8}Detail",
           f"{'-':<3}{'-' * 25:<27}{'-' * 7:<9}{'-' * 6:<8}{'-' * 44}"]
@@ -809,10 +873,13 @@ def main() -> None:
         hot = load_hot(args.csv_dir, ASSET)
         # No hot dvol_spot row: the DuckDB read of the rolling recap-aggregates file
         # failed or returned nothing for this window. Either way DVOL/spot must come
-        # from Deribit. Only pull the expensive per-strike ticker surface when
-        # v_vol_surface also gave us nothing — for a normal dynamic window vs_now
-        # is populated, so we skip ~50 serial ticker calls (the bulk of the cost).
-        if hot.get("dvol") is None:
+        # from Deribit. Also fetch for any >24h window — the rolling file only
+        # retains ~24h, so its OHLC silently under-covers longer windows (build()
+        # then prefers the full-span Deribit series). Only pull the expensive
+        # per-strike ticker surface when v_vol_surface also gave us nothing — for
+        # a normal dynamic window vs_now is populated, so we skip ~50 serial
+        # ticker calls (the bulk of the cost).
+        if hot.get("dvol") is None or (now_ms - start_ms) > 24 * 3600_000:
             want_surface = not hot.get("vs_now")
             try:
                 deri["market"] = _fetch_market_fallback(

@@ -13,6 +13,10 @@ silently — no narration.
 
 **[ASSET] Options · [WINDOW] Recap · [HH:MM]–[HH:MM] UTC**
 
+Windows of 24h or more stamp a date on each time (`Jul 14 05:22–Jul 15 05:22
+UTC`) — any multiple of 24h has identical start/end clock times, so bare HH:MM
+would read as a zero-length window. Intraday windows stay HH:MM-only.
+
 **Snapshot**
 
 ```yaml
@@ -34,6 +38,12 @@ P/C       [X.Xx]      [descriptor] (all venues, by trades)
 The side word appears only when the whole block is one-directional (Buy/Sell).
 Mixed-direction structures (any spread) carry no side tag — never write
 "two-way" here; that means "aggressor undisclosed", which this is not.
+
+`[Nx]` is the structure UNIT size — the base (ratio-1) leg count of the
+package, e.g. a 4×63-lot iron fly is `63x`, a 600-per-leg calendar is `600x`.
+Never the leg-sum, which overstates a 4-leg package 4×. The same convention
+applies to the `x[size]` in Block Flow details (there it is the unit size
+summed across the row's clips).
 
 **Block Flow — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)]**
 
@@ -59,12 +69,15 @@ tagged ` two-way`. Multi-block rows show the clip IV range (`36.5–37.0v`)
 when clips printed at different vols, a single value otherwise.
 
 **Vol Surface**
-Skew: front 25Δ RR [±X]v → [puts bid / calls bid] · Term: [front]v → [back]v → [contango / flat / backwardation / humped — peak at [DDMMMYY] / dished — trough at [DDMMMYY]]
+Skew: front 25Δ RR [±X]v → [puts bid / calls bid / flat] · Term: [front]v → [back]v → [contango / flat / backwardation / humped — peak at [DDMMMYY] / dished — trough at [DDMMMYY]]
 
 Term reads the whole listed curve, front to last expiry — monotonic (±0.2v
 tolerance) with >1v span is contango/backwardation; non-monotonic curves are
 humped/dished and name the interior peak/trough. `[back]` is the LAST listed
-expiry's ATM, not the second.
+expiry's ATM, not the second. The skew side word is the RR's sign (negative →
+puts bid, positive → calls bid, zero → flat); extrapolated wings put a `*` on
+the RR figure (`+1.3v*`), never prose. These slots take exactly these tokens —
+no suffixes like "downside skew", "(35.2v)", or "non-monotonic".
 
 ```yaml
 Expiry     ATM      ΔATM     25d RR    ΔRR      Fly     ΔFly

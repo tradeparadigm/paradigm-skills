@@ -52,13 +52,14 @@ esac
 [ -n "${RECAP_PRINT_ARGS:-}" ] && { echo "$ASSET $WIN"; exit 0; }
 [ -n "${RECAP_PRINT_PLAN:-}" ] && { echo "$ASSET $WIN $SECS $PRESET"; exit 0; }
 DIR="$(cd "$(dirname "$0")/.." && pwd)"      # skill dir (scripts/..)
-mkdir -p /tmp/recap
-# Clear stale CSVs from a prior run FIRST. If this run's DuckDB read fails or
-# returns no rows (S3 hiccup, empty window), a leftover set from an earlier run
-# would be read as fresh — recap.py would see DVOL present and silently serve the
-# previous window's/asset's data. Wiping forces load_hot to find them absent →
-# fall back to live Deribit market data for this window.
-rm -f /tmp/recap/*.csv
+# Per-invocation workdir. The old fixed /tmp/recap + /tmp/recap.sql were shared
+# state: two concurrent recaps (e.g. BTC and ETH fired from separate sessions)
+# raced on the SQL file and CSVs, and one recap silently rendered the other's
+# asset/window slice (exit 0, no warning). A fresh mktemp dir per run isolates
+# them completely; it also supersedes the old stale-CSV wipe — nothing stale can
+# exist in a directory this run just created.
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/recap.XXXXXX") || { echo "recap: mktemp failed" >&2; exit 1; }
+trap 'rm -rf "$WORK"' EXIT
 
 # STS bootstrap (IRSA → temporary creds; see paradigm-data-discovery skill).
 TOKEN=$(cat "$AWS_WEB_IDENTITY_TOKEN_FILE")
@@ -96,18 +97,21 @@ fi
 # One DuckDB session → CSVs. One statement per line; `at` is reserved → alias it.
 # dvol_spot + volume come from the rolling recap-aggregates file, windowed at query
 # time by bucket_at (>= START_MS) — one file serves every window, preset or not.
-cat > /tmp/recap.sql <<SQL
+# Each COPY echoes `asset` through so recap.py can assert the slice is for THIS
+# asset (defense in depth against any future shared-state/wrong-file regression).
+cat > "$WORK/recap.sql" <<SQL
 INSTALL httpfs; LOAD httpfs;
 SET s3_region='ap-northeast-1';
 SET s3_access_key_id='${AK}';
 SET s3_secret_access_key='${SK}';
 SET s3_session_token='${ST}';
-COPY (SELECT exchange, metric, arg_min(open, bucket_at) AS open, arg_max(close, bucket_at) AS close, max(high) AS high, min(low) AS low FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot' AND bucket_at >= ${START_MS} GROUP BY exchange, metric) TO '/tmp/recap/dvol_spot.csv' (HEADER, DELIMITER ',');
-COPY (SELECT exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY exchange, optionType) TO '/tmp/recap/volume.csv' (HEADER, DELIMITER ',');
-COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '/tmp/recap/surface_now.csv' (HEADER, DELIMITER ',');
-COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_OPEN}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '/tmp/recap/surface_open.csv' (HEADER, DELIMITER ',');
+COPY (SELECT asset, exchange, metric, arg_min(open, bucket_at) AS open, arg_max(close, bucket_at) AS close, max(high) AS high, min(low) AS low FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, metric) TO '${WORK}/dvol_spot.csv' (HEADER, DELIMITER ',');
+COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
+COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '${WORK}/surface_now.csv' (HEADER, DELIMITER ',');
+COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_OPEN}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '${WORK}/surface_open.csv' (HEADER, DELIMITER ',');
 SQL
 
 # recap.py runs this DuckDB session in a thread concurrent with the Deribit fetch.
-cd "$DIR" && exec uv run scripts/recap.py \
-  --asset "$ASSET" --window "$WIN" --csv-dir /tmp/recap --duckdb-sql /tmp/recap.sql --render
+# No exec — the EXIT trap must fire to clean up $WORK.
+cd "$DIR" && uv run scripts/recap.py \
+  --asset "$ASSET" --window "$WIN" --csv-dir "$WORK" --duckdb-sql "$WORK/recap.sql" --render
