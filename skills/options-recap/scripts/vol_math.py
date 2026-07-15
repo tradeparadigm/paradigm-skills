@@ -53,7 +53,10 @@ def realized_vs_implied(closes: list[float], dvol_close: float | None) -> dict:
     vrp = None
     label = None
     if value is not None and dvol_close is not None:
-        vrp = round(dvol_close - value, 1)
+        # Difference of the DISPLAY-rounded figures, so the rendered Snapshot
+        # reconciles line-to-line (DVOL 36.4 − RV 33.1 = VRP +3.3, not +3.2 from
+        # the unrounded inputs — a 0.1v mismatch readers flag as an error).
+        vrp = round(round(dvol_close, 1) - value, 1)
         if vrp > 1:
             label = "implied rich vs realized — vol overpriced vs delivered"
         elif vrp < -1:
@@ -183,9 +186,11 @@ def cluster_blocks(trades: list[dict]) -> dict[str, list]:
 def classify_structure(legs: list[dict]) -> str:
     """Name a block cluster's structure from its leg instruments.
 
-    same expiry + C&P + same strike → Straddle; C&P + diff strikes →
-    Strangle/RR; same type + diff strikes → Spread; diff expiries + same
-    strike → Calendar; ≥3 legs → Butterfly/Condor."""
+    Same expiry: ≥3 legs → Butterfly/Condor (covers call/put flies AND iron
+    flies/condors — the ≥3-leg check must run before the C&P branch, or a
+    4-leg iron fly reads as "Strangle/RR"); C&P + same strike → Straddle;
+    C&P + diff strikes → Strangle/RR; same type + diff strikes → Spread.
+    Multi-expiry: same strike → Calendar; 2 legs + diff strikes → Diagonal."""
     if len(legs) == 1:
         return "Call" if legs[0]["instrument_name"].endswith("-C") else "Put"
     expiries, strikes, types = set(), set(), set()
@@ -196,15 +201,17 @@ def classify_structure(legs: list[dict]) -> str:
         types.add(parts[3])
     if len(expiries) > 1 and len(strikes) == 1:
         return "Calendar"
+    if len(expiries) > 1 and len(legs) == 2:
+        return "Diagonal"
     if len(expiries) == 1:
+        if len(legs) >= 3:
+            return "Butterfly/Condor"
         if types == {"C", "P"} and len(strikes) == 1:
             return "Straddle"
         if types == {"C", "P"} and len(strikes) > 1:
             return "Strangle/RR"
         if len(types) == 1 and len(strikes) > 1:
             return "Spread"
-        if len(legs) >= 3:
-            return "Butterfly/Condor"
     return "Multi-leg"
 
 
@@ -244,16 +251,33 @@ def summarize_blocks(clusters: dict[str, list], top_n: int = 8,
         ivs = [l["iv"] for l in legs if l.get("iv") is not None]
         ts = min(l["timestamp"] for l in legs)
         dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+        # Structure UNIT size for display: the base leg of the package (per-
+        # instrument sums, then min — the ratio-1 leg). A 4×63-lot iron fly is
+        # a 63x structure, not "252x"; leg-sum stays in size_btc for the
+        # min-size floor and IV weighting, where gross traded size is the point.
+        by_inst: dict[str, float] = defaultdict(float)
+        for l in legs:
+            by_inst[l["instrument_name"]] += l.get("amount", 0)
+        unit = min(by_inst.values()) if by_inst else 0
+        # Expiry label: chronological; a multi-expiry structure (calendar,
+        # diagonal, cross-expiry package) names its near AND far tenor. Leg
+        # order is tape order, so a legs[0]-based label was nondeterministic —
+        # identical structures could render under different expiries.
+        exps = sorted({l["instrument_name"].split("-")[1] for l in legs
+                       if len(l["instrument_name"].split("-")) > 1},
+                      key=lambda e: expiry_ms_from_instrument(f"X-{e}-0-C") or 0)
+        expiry = exps[0] if len(exps) == 1 else f"{exps[0]}/{exps[-1]}" if exps else None
         parts = legs[0]["instrument_name"].split("-")
         rows.append({
             "block_trade_id": bid,
             "time_utc": dt.strftime("%H:%M"),
             "structure": classify_structure(legs),
             "size_btc": round(total_btc, 1),
+            "unit_size": round(unit, 1),
             "notional_usd": round(total_btc * index_price),
             "side": dominant_side(legs),
             "avg_iv": round(sum(ivs) / len(ivs), 1) if ivs else None,
-            "expiry": parts[1] if len(parts) > 1 else None,
+            "expiry": expiry,
             "strike": parts[2] if len(parts) > 2 else None,
             "leg_count": len(legs),
         })
@@ -298,6 +322,7 @@ def aggregate_clips(ranked: list[dict], clusters: dict[str, list]) -> list[dict]
             continue
         g["clip_count"] += 1
         g["size_btc"] = round(g["size_btc"] + b["size_btc"], 1)
+        g["unit_size"] = round(g.get("unit_size", 0) + b.get("unit_size", 0), 1)
         g["notional_usd"] += b["notional_usd"]
         g["time_utc"] = min(g["time_utc"], b["time_utc"])
         if b["avg_iv"] is not None:
@@ -412,40 +437,38 @@ def compute_vol_surface(tickers: dict[str, dict], spot: float | None = None,
     front_atm = atms[0] if atms else None
     back_atm = atms[-1] if atms else None
 
+    # Labels are the CONTRACT tokens from references/output-format.md, verbatim —
+    # no explanatory suffixes ("(35.2v)", "non-monotonic", "downside skew"). The
+    # recap template is fixed; embellishments here render as template drift.
     term = None
     if len(atms) >= 2:
         up = all(b - a >= -TERM_TOL for a, b in zip(atms, atms[1:]))
         down = all(b - a <= TERM_TOL for a, b in zip(atms, atms[1:]))
         span = atms[-1] - atms[0]
         if up and not down and span > 1:
-            term = "contango (back > front) — normal upward term structure"
+            term = "contango"
         elif down and not up and span < -1:
-            term = "backwardation (front > back) — near-term stress bid"
+            term = "backwardation"
         elif up or down:
-            term = "flat term structure"
+            term = "flat"
         else:
             peak = max(atm_pts, key=lambda e: e["atm_iv"])
             trough = min(atm_pts, key=lambda e: e["atm_iv"])
             if peak is not atm_pts[0] and peak is not atm_pts[-1]:
-                term = (f"humped — peak at {peak['expiry']} "
-                        f"({peak['atm_iv']}v), non-monotonic")
+                term = f"humped — peak at {peak['expiry']}"
             elif trough is not atm_pts[0] and trough is not atm_pts[-1]:
-                term = (f"dished — trough at {trough['expiry']} "
-                        f"({trough['atm_iv']}v), non-monotonic")
+                term = f"dished — trough at {trough['expiry']}"
             else:
-                term = "mixed, non-monotonic term structure"
+                term = "mixed"
 
     skew = None
     if front and front["rr_25d"] is not None:
         rr = front["rr_25d"]
-        if rr < -0.5:
-            side = "puts bid, downside skew"
-        elif rr > 0.5:
-            side = "calls bid, upside skew"
-        else:
-            side = "skew roughly symmetric"
-        flag = " (extrapolated — wings outside strike range)" if front["wings_extrapolated"] else ""
-        skew = f"front {front['expiry']} 25Δ RR {rr:+}v → {side}{flag}"
+        side = "puts bid" if rr < 0 else "calls bid" if rr > 0 else "flat"
+        # Wing extrapolation is flagged the same way as table cells: a star on
+        # the figure, not prose.
+        star = "*" if front["wings_extrapolated"] else ""
+        skew = f"front 25Δ RR {rr:+}v{star} → {side}"
 
     return {
         "spot": spot,

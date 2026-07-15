@@ -214,6 +214,76 @@ def test_activity_split_collapses_deribit_venues():
     check("no raw 'deribit-usdc' leaks into render", "deribit-usdc" not in md, activity_line)
 
 
+def test_asset_guard_drops_foreign_rows():
+    # Regression: a shared-tmp race once put an ETH Snapshot slice inside a BTC
+    # recap (exit 0, no warning). The CSVs now echo `asset`; rows for a
+    # different asset must be dropped with a loud warning so the field degrades
+    # to null → Deribit fallback instead of rendering the wrong market.
+    recap.WARNINGS.clear()
+    eth_dvol_spot = (
+        "asset,exchange,metric,open,close,high,low\n"
+        "ETH,deribit,dvol,49.4,48.1,49.5,48.0\n"
+        "ETH,deribit,spot,1877,1874,1880,1864\n"
+    )
+    eth_volume = (
+        "asset,exchange,optionType,volume_sum,notional,buy_volume,sell_volume,trade_count\n"
+        "ETH,deribit,call,10000,1,5000,5000,200\n"
+    )
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "dvol_spot.csv", eth_dvol_spot)
+        _write(d, "volume.csv", eth_volume)
+        hot = load_hot(d, "BTC")
+    check("foreign dvol dropped", hot["dvol"] is None, hot["dvol"])
+    check("foreign spot dropped", hot["spot_close"] is None, hot["spot_close"])
+    check("foreign volume dropped", hot["volume_btc"] is None, hot["volume_btc"])
+    check("contamination warned", any("contamination" in w for w in recap.WARNINGS),
+          recap.WARNINGS)
+    # Correct-asset rows with the new column still load normally.
+    recap.WARNINGS.clear()
+    btc_rows = eth_dvol_spot.replace("ETH,", "BTC,")
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "dvol_spot.csv", btc_rows)
+        hot2 = load_hot(d, "BTC")
+    check("own-asset rows kept", hot2["dvol"] == 48.1, hot2["dvol"])
+    # Asset-column-free CSVs (older fixtures) pass through untouched.
+    with tempfile.TemporaryDirectory() as d:
+        hot3 = _full_hot(d)
+    check("legacy CSVs without asset column still load", hot3["dvol"] == 43.34, hot3["dvol"])
+
+
+def test_surface_tickers_asset_guard():
+    recap.WARNINGS.clear()
+    mixed = (
+        "symbol,mark_iv,delta\n"
+        "BTC-3JUL26-60000-C,45.0,0.50\n"
+        "ETH-3JUL26-1900-C,52.0,0.50\n"
+    )
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "surface_now.csv", mixed)
+        t = _load_surface_tickers(d, "surface_now.csv", "BTC")
+    check("own-asset symbol kept", "BTC-3JUL26-60000-C" in t, t)
+    check("foreign symbol dropped", "ETH-3JUL26-1900-C" not in t, t)
+    check("surface contamination warned",
+          any("contamination" in w for w in recap.WARNINGS), recap.WARNINGS)
+    # Without an asset arg (legacy callers) nothing is filtered.
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "surface_now.csv", mixed)
+        t2 = _load_surface_tickers(d, "surface_now.csv")
+    check("no filter without asset arg", len(t2) == 2, t2)
+
+
+def test_strike_label_precision():
+    from recap import _strike_label
+    check("clean thousands abbreviate", _strike_label("68000") == "68K")
+    check("half-thousands keep precision", _strike_label("62500") == "62.5K")
+    # Regression: ETH strikes 1825/1875/1925 all rendered "1K", so an iron
+    # fly read as buying and selling the same strike.
+    check("sub-10K strikes stay raw", _strike_label("1875") == "1875")
+    check("1825 != 1875 != 1925 labels",
+          len({_strike_label(s) for s in ("1825", "1875", "1925")}) == 3)
+    check("non-numeric passes through", _strike_label("X") == "X")
+
+
 def test_venue_label_degrades_for_unknown_venue():
     # A future venue absent from _VENUE_LABELS must degrade to a readable, non-empty
     # label without crashing and without colliding with a mapped label.
@@ -402,7 +472,8 @@ def test_block_flow_from_trades_not_hot():
     bp = bf["biggest_print"]
     check("biggest expiry", bp["expiry"] == "26JUN26", bp)
     check("biggest is Strangle/RR", bp["structure"] == "Strangle/RR", bp)
-    check("biggest size 200", bp["size"] == 200, bp)
+    # Size is the structure UNIT (100 per leg → a 100x RR), not the 200 leg-sum.
+    check("biggest size 100 (unit, not leg-sum)", bp["size"] == 100, bp)
     check("biggest notional 12.0M", bp["notional_m"] == 12.0, bp)
     check("biggest is mixed-direction", bp["side"] == "Mixed", bp)
 
@@ -412,7 +483,7 @@ def test_leg_phrase():
     phrase = _leg_phrase(legs)
     check("leg phrase has put buy", "bought 55KP" in phrase, phrase)
     check("leg phrase has call sell", "sold 65KC" in phrase, phrase)
-    check("leg phrase size", "x200" in phrase, phrase)
+    check("leg phrase unit size (100/leg → x100)", "x100" in phrase, phrase)
     check("no two-way next to bought/sold", "two-way" not in phrase, phrase)
     check("leg phrase avg iv 66.0v", "66.0v" in phrase, phrase)
     # With any leg's direction undisclosed, no side may be asserted: legs render
@@ -489,13 +560,14 @@ def test_block_flow_aggregates_clips_in_rows():
     check("one structure", bf["n_structures"] == 1, bf["n_structures"])
     row = bf["rows"][0]
     check("blocks count on row", row["blocks"] == 5, row)
-    check("summed size in detail", "x150" in row["detail"], row["detail"])
+    # Unit size per clip = the base (ratio-1) leg, 10; summed over 5 clips → x50.
+    check("summed unit size in detail", "x50" in row["detail"], row["detail"])
     check("clip iv range in detail", "36.5–36.9v" in row["detail"], row["detail"])
     check("directional verbs, no two-way tag",
           "bought 60KP" in row["detail"] and "two-way" not in row["detail"],
           row["detail"])
     bp = bf["biggest_print"]
-    check("biggest print is one clip, not the aggregate", bp["size"] == 30, bp)
+    check("biggest print is one clip's unit, not the aggregate", bp["size"] == 10, bp)
     md = render_md({"header": {"asset": "BTC", "window": "1h", "start_utc": "01:00",
                                "end_utc": "02:00"},
                     "snapshot": {}, "biggest_print": bp,
@@ -557,6 +629,62 @@ def test_render_four_sections():
 def test_render_deterministic():
     r = _full_result()
     check("render is deterministic", render_md(r) == render_md(r))
+
+
+def test_render_activity_na_when_missing():
+    # Thin/empty windows must still render the Activity line (as n/a), not drop
+    # it — a live 30m recap omitted the row while Volume/P-C showed n/a.
+    recap.WARNINGS.clear()
+    with tempfile.TemporaryDirectory() as d:
+        hot = load_hot(d, "BTC")  # empty dir → no activity
+    res = build("btc", "30m", 0, 1800_000,
+                {"closes_7d": [], "trades": [], "market": None}, hot)
+    md = render_md(res)
+    activity_lines = [ln for ln in md.splitlines() if ln.strip().startswith("Activity")]
+    check("Activity line present when empty", len(activity_lines) == 1, md[:400])
+    check("Activity reads n/a", "n/a" in activity_lines[0], activity_lines)
+
+
+def test_render_singular_block():
+    # "1 blocks / 1 structure" → both words pluralize independently.
+    trades = [{"instrument_name": "BTC-31JUL26-68000-C", "index_price": 64000,
+               "iv": 27.8, "timestamp": 1780000000000, "direction": "buy",
+               "amount": 100, "block_trade_id": "B1"}]
+    bf = build_block_flow(trades, {}, spot=64000)
+    md = render_md({"header": {"asset": "BTC", "window": "1h", "start_utc": "01:00",
+                               "end_utc": "02:00"},
+                    "snapshot": {}, "biggest_print": bf["biggest_print"],
+                    "block_flow": bf, "vol_surface": None, "flow_horizon": None,
+                    "warnings": []})
+    check("singular: 1 block / 1 structure", "1 block / 1 structure**" in md, md)
+    check("no '1 blocks'", "1 blocks" not in md, md)
+
+
+def test_beyond_24h_prefers_market_ohlc():
+    # The rolling hot file retains ~24h, so for a >24h window its OHLC silently
+    # under-covers (a live 2d recap quoted the 24h low as the 48h low). With a
+    # Deribit market series present, build() must prefer it for DVOL/spot.
+    recap.WARNINGS.clear()
+    end = 100 * 24 * 3600_000
+    mkt = {"dvol": [[0, 40.0, 41.0, 39.0, 40.5], [1, 40.5, 42.0, 38.5, 39.0]],
+           "spot": {"open": [61000.0, 62000.0], "close": [62000.0, 63000.0],
+                    "low": [60500.0, 61500.0]},
+           "spot_now": 63000.0, "tickers": {}}
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot(d)  # hot says spot low 59000, dvol 43.34 — 24h-scoped
+    res = build("btc", "48h", end - 48 * 3600_000, end,
+                {"closes_7d": CLOSES_7D, "trades": [], "market": mkt}, hot)
+    s = res["snapshot"]
+    check("48h spot low from market, not hot", s["spot_low"] == 60500, s["spot_low"])
+    check("48h spot from market", s["spot"] == 63000, s["spot"])
+    check("48h spot_from = full-window open", s["spot_from"] == 61000, s["spot_from"])
+    check("48h dvol from market", s["dvol"] == 39.0, s["dvol"])
+    check("48h dvol_open from market", round(s["dvol_open"], 1) == 40.0, s["dvol_open"])
+    # Within 24h, hot stays authoritative even when a market series exists.
+    res8 = build("btc", "8h", end - 8 * 3600_000, end,
+                 {"closes_7d": CLOSES_7D, "trades": [], "market": mkt}, hot)
+    check("8h keeps hot spot", res8["snapshot"]["spot"] == 60468, res8["snapshot"]["spot"])
+    check("8h keeps hot dvol", res8["snapshot"]["dvol"] == 43.3, res8["snapshot"]["dvol"])
 
 
 def test_render_degraded_banner():

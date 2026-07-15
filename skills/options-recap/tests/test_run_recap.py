@@ -97,13 +97,25 @@ def test_dynamic_window_resolves_correctly():
     # The bug: 3h must resolve to 10800s (not the old 8h/28800 default), PRESET=0.
     check("3h → 10800s, non-preset", plan("btc", "3h") == ("BTC 3h 10800 0", 0))
     check("90m → 5400s, non-preset", plan("btc", "90m") == ("BTC 90m 5400 0", 0))
-    check("2d → 172800s, non-preset", plan("eth", "2d") == ("ETH 2d 172800 0", 0))
     check("6h → 21600s, non-preset", plan("btc", "6h") == ("BTC 6h 21600 0", 0))
 
 
 def test_1d_normalizes_to_preset():
     # 1d → 24h happens before parsing, so it stays on the fast preset path.
     check("1d → 24h, 86400s, preset", plan("btc", "1d") == ("BTC 24h 86400 1", 0))
+
+
+def test_windows_beyond_24h_cap():
+    # Every flow source retains only ~24h, so longer windows clamp to 24h (the
+    # live path also prepends a disclosure banner). 24h itself is NOT capped.
+    check("2d caps to 24h", plan("eth", "2d") == ("ETH 24h 86400 1", 0))
+    check("48h caps to 24h", plan("btc", "48h") == ("BTC 24h 86400 1", 0))
+    check("25h caps to 24h", plan("btc", "25h") == ("BTC 24h 86400 1", 0))
+    check("24h itself not capped", plan("btc", "24h") == ("BTC 24h 86400 1", 0))
+    check("1440m (=24h) not capped", plan("btc", "1440m") == ("BTC 1440m 86400 0", 0))
+    # Regression: the old substring 1d→24h substitution turned 31d into "324h"
+    # (13.5 days); exact-match normalization + the cap now yield a plain 24h.
+    check("31d caps to 24h (not 324h)", plan("btc", "31d") == ("BTC 24h 86400 1", 0))
 
 
 def test_bad_window_exits_2():
