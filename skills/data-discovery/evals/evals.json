@@ -9,7 +9,7 @@
       "assertions": [
         "Response names the S3 buckets (s3://dt-paradigm-data, s3://dt-exchange-venue-data, s3://dt-paradex-data)",
         "Response lists the dataset families: Paradigm trade tape, Paradigm RFQ tape, Paradex DEX trade tape, hot surface",
-        "Response does not invent datasets that are not in references/datasets.md (no raw Deribit/OKX option feeds, no Paradex options, no standalone Greeks/IV)",
+        "Response does not list a raw per-exchange option/future trade feed (e.g. standalone Deribit or OKX option-trade datasets) as queryable — referencing the hot surface's venues or the v_vol_surface pointer is fine, since both are in the catalog",
         "Response is structured as a catalog summary, not a query — it does not attempt to run SQL"
       ]
     },
@@ -37,11 +37,11 @@
     {
       "id": 4,
       "prompt": "what's the latest Deribit option trade data available?",
-      "expected_output": "A direct answer: raw Deribit option trade data is not in this catalog. Points the user at what IS available — Deribit block flow via the Paradigm trade tape (s3://dt-paradigm-data) and current Deribit ATM IV / DVOL via the hot surface (s3://dt-exchange-venue-data/hot/). Does not fabricate a terminal-dime-prod or external/tardis path or claim a coverage range for a dataset that isn't there.",
+      "expected_output": "A helpful answer: the raw per-exchange Deribit option tick/trade feed is no longer in this catalog, but Deribit option data IS available — option block flow in the Paradigm trade tape (product 'BTC OPTION - DBT', s3://dt-paradigm-data) and current Deribit ATM IV / DVOL in the hot surface (s3://dt-exchange-venue-data/hot/). Does not cite a terminal-dime-prod or external/tardis path.",
       "assertions": [
-        "Response states raw Deribit option trade data is not in the catalog",
-        "Response points to the Paradigm tape and/or hot surface instead",
-        "Response does not fabricate an S3 path for Deribit option trades"
+        "Response points to a real catalog source for Deribit option data — the Paradigm trade tape (Deribit option block flow) and/or the hot surface",
+        "Response does not cite a terminal-dime-prod or external/tardis S3 path",
+        "Response does not claim a standalone raw Deribit option-trade tick dataset with its own coverage range"
       ]
     }
   ],
