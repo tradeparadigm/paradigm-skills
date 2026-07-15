@@ -263,10 +263,18 @@ def summarize_blocks(clusters: dict[str, list], top_n: int = 8,
         # diagonal, cross-expiry package) names its near AND far tenor. Leg
         # order is tape order, so a legs[0]-based label was nondeterministic —
         # identical structures could render under different expiries.
+        # "/" only when the pair IS the complete expiry set; with interior
+        # tenors elided (>2 expiries) use "→" so the label reads as a range,
+        # not an enumeration that contradicts the Detail column's legs.
         exps = sorted({l["instrument_name"].split("-")[1] for l in legs
                        if len(l["instrument_name"].split("-")) > 1},
                       key=lambda e: expiry_ms_from_instrument(f"X-{e}-0-C") or 0)
-        expiry = exps[0] if len(exps) == 1 else f"{exps[0]}/{exps[-1]}" if exps else None
+        if not exps:
+            expiry = None
+        elif len(exps) == 1:
+            expiry = exps[0]
+        else:
+            expiry = f"{exps[0]}{'/' if len(exps) == 2 else '→'}{exps[-1]}"
         parts = legs[0]["instrument_name"].split("-")
         rows.append({
             "block_trade_id": bid,

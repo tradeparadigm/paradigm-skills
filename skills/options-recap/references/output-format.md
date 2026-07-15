@@ -45,6 +45,13 @@ Never the leg-sum, which overstates a 4-leg package 4×. The same convention
 applies to the `x[size]` in Block Flow details (there it is the unit size
 summed across the row's clips).
 
+Strike labels abbreviate at 10K and above (`68K`, `62.5K`); below 10K they
+stay raw (`1875`, `2000` — never `2K`), so one table never mixes conventions.
+Multi-expiry structure labels are chronological: `near/far` when those two
+ARE the complete expiry set (calendar, diagonal), `near→far` when interior
+tenors are elided (3+ expiries) — each leg's own expiry always appears in
+the Detail column.
+
 **Block Flow — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)]**
 
 ```yaml

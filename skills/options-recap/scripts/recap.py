@@ -384,18 +384,19 @@ def _load_surface_tickers(csv_dir: str, name: str, asset: str | None = None) -> 
 # ── Block-flow leg detail ───────────────────────────────────────────────────
 
 def _strike_label(raw: str) -> str:
-    """Compact strike text. Clean thousands abbreviate (68000 → 68K, 62500 →
-    62.5K); anything that would lose precision stays raw — ETH strikes like
-    1825/1875/1925 all truncated to "1K" before, so a four-strike iron fly
-    rendered as buying and selling the same strike."""
+    """Compact strike text. Strikes of 10K+ abbreviate (68000 → 68K, 62500 →
+    62.5K, matching how big strikes are spoken); anything below 10K stays raw.
+    The threshold is magnitude, not divisibility: an earlier lossless rule
+    rendered ETH 2000 as "2K" beside raw 1875/2100 in the same table (mixed
+    conventions), and before that 1825/1875/1925 all truncated to "1K"."""
     if not raw.isdigit():
         return raw
     v = int(raw)
+    if v < 10_000:
+        return str(v)
     if v % 1000 == 0:
         return f"{v // 1000}K"
-    if v >= 10_000:
-        return f"{v / 1000:g}K"
-    return str(v)
+    return f"{v / 1000:g}K"
 
 
 def _leg_phrase(legs: list[dict], size: float | None = None,
