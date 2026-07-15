@@ -536,7 +536,10 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     vs_now = hot.get("vs_now") or {}
     vs_open = hot.get("vs_open") or {}
     tickers = vs_now or hot.get("tickers") or (mkt or {}).get("tickers") or {}
-    surf = compute_vol_surface(tickers, surf_spot) if tickers else None
+    # Cap the "now" surface at the display limit so the term-structure label
+    # describes exactly the tenors the table shows (not invisible back months).
+    surf = (compute_vol_surface(tickers, surf_spot, max_expiries=MAX_SURFACE_ROWS)
+            if tickers else None)
     surf_open = compute_vol_surface(vs_open, surf_spot) if vs_open else None
 
     trades = deri.get("trades") or []

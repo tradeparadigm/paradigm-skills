@@ -347,7 +347,8 @@ def _call_delta(inst: str, delta: float) -> float | None:
     return None
 
 
-def compute_vol_surface(tickers: dict[str, dict], spot: float | None = None) -> dict:
+def compute_vol_surface(tickers: dict[str, dict], spot: float | None = None,
+                        max_expiries: int | None = None) -> dict:
     """Derive per-expiry ATM IV, 25-delta risk reversal (skew), 25-delta
     butterfly (wings), and the cross-expiry term-structure read from raw
     per-strike tickers (each carrying `mark_iv` and `delta`).
@@ -355,6 +356,10 @@ def compute_vol_surface(tickers: dict[str, dict], spot: float | None = None) -> 
     Interpolates IV against call-delta: 25Δ call = delta 0.25, 25Δ put =
     delta 0.75 (same strike, put delta −0.25), ATM = 0.50. Metrics whose
     target delta falls outside the strike range are flagged `extrapolated`.
+
+    `max_expiries` truncates the (chronologically sorted) curve before the
+    term read — pass the display cap so the term label describes the tenors
+    the reader actually sees, not invisible back-month ones.
     """
     # Build per-expiry { call_delta: iv } (call & put at a strike share mark_iv).
     by_exp: dict[str, dict[float, float]] = defaultdict(dict)
@@ -390,6 +395,8 @@ def compute_vol_surface(tickers: dict[str, dict], spot: float | None = None) -> 
 
     # Chronological order (unknown expiry_ms sorts last).
     expiries.sort(key=lambda e: (e["expiry_ms"] is None, e["expiry_ms"] or 0))
+    if max_expiries:
+        expiries = expiries[:max_expiries]
 
     front = expiries[0] if expiries else None
 
