@@ -2,12 +2,11 @@
 name: paradigm-data-discovery
 description: >
   Catalog and query-launcher for market data in S3
-  (s3://dt-paradigm-data, s3://dt-exchange-venue-data, s3://terminal-dime-prod) — both historical and near-real-time
+  (s3://dt-paradigm-data, s3://dt-exchange-venue-data, s3://dt-paradex-data) — both historical and near-real-time
   hot surface. ALWAYS load this skill before concluding any dataset is
   out of scope — do not dismiss based on asset class or venue
   assumptions. Covers: Paradigm RFQ block-trade tape, Paradigm RFQ
-  activity tape, Deribit/OKX option trades + combo quotes + future
-  top-of-book quotes, on-chain Paradex perp historical trade tape,
+  activity tape, on-chain Paradex perp historical trade tape,
   and the hot surface (live 1-minute snapshot of
   spot, ATM IV, DVOL, last-minute volume, and block-trade activity,
   plus trailing-window recaps). Fires for any
@@ -21,7 +20,7 @@ compatibility: Read-only data catalog. No authentication required to view the
   references/s3-access.md for the credential bootstrap.
 metadata:
   author: tradeparadigm
-  version: "1.4"
+  version: "1.5"
 ---
 
 ## Hard Rules
@@ -30,7 +29,7 @@ metadata:
    Domain assumptions ("that's not a Paradigm product", "that venue isn't
    supported") are NOT a valid substitute for checking the catalog. The
    dataset families live in S3 — across `s3://dt-paradigm-data`,
-   `s3://dt-exchange-venue-data`, and the deprecated `s3://terminal-dime-prod`
+   `s3://dt-exchange-venue-data`, and `s3://dt-paradex-data`
    — regardless of the instrument's native venue or asset class.
 2. **Default to this skill for any "what data / latest data / do we have X"
    question.** Even if the answer turns out to be "not in catalog," the
@@ -41,9 +40,9 @@ metadata:
 
 Reference catalog **and entry-point** for historical S3-backed datasets the
 agent can query through DuckDB. Scope: the market-data buckets
-`s3://dt-paradigm-data`, `s3://dt-exchange-venue-data`, and the deprecated
-`s3://terminal-dime-prod` — Paradigm RFQ tapes, exchange market data
-(options + futures), and the on-chain Paradex perp trade tape.
+`s3://dt-paradigm-data`, `s3://dt-exchange-venue-data`, and
+`s3://dt-paradex-data` — the Paradigm RFQ tapes, the on-chain Paradex
+perp trade tape, and the near-real-time hot surface.
 
 Two jobs:
 
@@ -60,10 +59,8 @@ Two jobs:
 ## Scope — S3-backed market data (historical + near-real-time hot surface)
 
 In scope: anything in the market-data buckets (`s3://dt-paradigm-data`,
-`s3://dt-exchange-venue-data`, and the deprecated `s3://terminal-dime-prod`) —
-Paradigm block-trade tapes, Deribit/OKX option and combo data,
-Deribit/Bybit/OKX future quotes, the historical Paradex perp trade tape
-(on the deprecated bucket, currently unavailable pending re-home), and the
+`s3://dt-exchange-venue-data`, and `s3://dt-paradex-data`) —
+Paradigm block-trade tapes, the on-chain Paradex perp trade tape, and the
 near-real-time **hot surface** (`s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet`).
 
 Out of scope: anything **live** that isn't in the hot surface — live Paradex
@@ -74,10 +71,10 @@ Rule of thumb:
 
 - If the user's question is anchored to a past date or date range, or
   asks about a tape / snapshot / historical aggregate → historical
-  datasets (1–5).
+  datasets (1–2).
 - If the user asks "what's happening right now" / "current ATM IV" /
   "spot move in the last minute" / "DVOL right now" / "any blocks just
-  printed" → reach for **Dataset 6 (hot surface)** first. One S3 read
+  printed" → reach for **Dataset 3 (hot surface)** first. One S3 read
   replaces several `web_fetch` round-trips.
 - If the user wants live Paradex account state or order placement →
   stand down (route to live-trading skills).
@@ -85,21 +82,17 @@ Rule of thumb:
 ## Trigger
 
 Fire when the user is asking about, or implicitly needs, any of the
-historical S3-backed datasets — Paradigm tapes, option/future market data,
-or the Paradex DEX historical trade tape. Four trigger families:
+historical S3-backed datasets — the Paradigm tapes or the Paradex DEX
+historical trade tape. Three trigger families:
 
 **(A) Catalog questions** — explicit "what data / where / what columns /
 what coverage":
 
 - "What Paradigm / S3 / DuckDB data do we have?"
-- "Where does the <Paradigm tape | option trades | combo quotes | Paradex
-  trade tape> live in S3?"
-- "What columns does the <Paradigm trade tape | RFQ tape | option trades
-  | Paradex trade tape> have?"
-- "What's the date range for <Deribit combo quotes | OKX option trades |
-  Paradex trade tape>?"
-- "Do we have <OKX combos | Bybit options | AVAX options | Paradex perp
-  trades> in S3?"
+- "Where does the <Paradigm tape | Paradex trade tape | hot surface> live in S3?"
+- "What columns does the <Paradigm trade tape | RFQ tape | Paradex trade tape> have?"
+- "What's the date range for <Paradigm tape | Paradex trade tape>?"
+- "Do we have <Paradex perp trades | a given Paradigm product> in S3?"
 - "What's the schema for `paradigm_trade_tape_slim` / `paradex_trade_tape`?"
 
 **(B) Historical Paradigm-flow analysis** — retrospective questions over
@@ -113,15 +106,7 @@ a date range / period that the Paradigm tape can answer:
 - "Top counterparties / largest single trades / unfilled RFQ ratio in <period>"
 - "Compare Paradigm flow across DBT/PRDX/BYB for <period>"
 
-**(C) Exchange market-data analysis** — retrospective questions over option
-trades, combo quotes, or future quotes:
-
-- "Most-traded Deribit options on <date>"
-- "OKX option trade volume in <period>"
-- "Top combo quote activity on <date>"
-- "Bybit/Deribit/OKX future top-of-book on <date>"
-
-**(D) Paradex DEX historical trade tape** — retrospective questions about
+**(C) Paradex DEX historical trade tape** — retrospective questions about
 *on-chain Paradex perp* trades that the historical tape can answer:
 
 - "Biggest Paradex perp trades in <period>"
@@ -130,7 +115,7 @@ trades, combo quotes, or future quotes:
 - "How many trades on Paradex `<MARKET>` last month?"
 - "Paradex taker buy vs sell breakdown for <period>"
 
-For (B), (C), and (D), the response **must** include both the S3 path
+For (B) and (C), the response **must** include both the S3 path
 and a concrete DuckDB query (see Step 5) — don't just describe the
 dataset. Filter `WHERE NOT IS_TRADEBUST` on the Paradex tape.
 
@@ -166,51 +151,38 @@ Pull from `references/datasets.md`. Grouped into:
 1. **Paradigm Block Trade Tape** (`s3://dt-paradigm-data/paradigm_data/`)
    - `paradigm_trade_tape_slim` — executed RFQ block trades
    - `paradigm_rfq_tape_slim` — RFQ activity including unfilled
-2. **Exchange Market Data** (`s3://terminal-dime-prod/external/tardis/v1/`)
-   - Deribit option trades
-   - Deribit option quotes (sparse)
-   - Deribit combo quotes (densest dataset)
-   - OKX option trades
-   - Future quotes (Deribit, Bybit, OKX) — top-of-book for dated +
-     perpetual futures
-3. **Paradex DEX Trade Tape** (`s3://terminal-dime-prod/paradex_data/` —
-   **deprecated bucket; unavailable pending re-home to `dt-exchange-venue-data`**)
+2. **Paradex DEX Trade Tape** (`s3://dt-paradex-data/paradex_data/`)
    - `paradex_trade_tape.csv.gz` — on-chain Paradex perp trades
      (historical only; live Paradex state is out of scope)
-4. **Hot Surface** (`s3://dt-exchange-venue-data/hot/`)
+3. **Hot Surface** (`s3://dt-exchange-venue-data/hot/`)
    - `hot__market_signals_1m.parquet` — single-file LLM-shaped live
-     snapshot (spot / ATM IV / DVOL / 1-min volume / block activity);
+     snapshot (spot / ATM IV / DVOL / funding / 1-min volume / coverage);
      clobbered every 60 s. The catalog's only near-real-time entry.
    - `hot__recap_aggregates_5m_24h.parquet` — a single rolling file of
      5-min aggregate buckets over the trailing 24h (DVOL+spot OHLC, volume
      by venue, per-contract flow, per-block flow); refreshed every ~5 min.
      Apply the window in-query (`WHERE bucket_at >= now - window`). No
      `surface` rows — the vol surface is in `v_vol_surface` on
-     `dt-paradigm-data`. See Dataset 4b for the schema and read pattern.
+     `dt-paradigm-data`. See Dataset 3b for the schema and read pattern.
 
-For each, report: S3 path (with the correct partition pattern —
-`YYYY/MM/DD/` for option/future market data,
-flat file for Paradigm and Paradex tapes), last verified coverage, schema,
+For each, report: S3 path (flat file for the Paradigm and Paradex tapes,
+stable clobbered key for the hot surface), last verified coverage, schema,
 notable filters (e.g. `WHERE PRODUCT LIKE '%OPTION%'` for Paradigm,
 `WHERE NOT IS_TRADEBUST` for Paradex tape).
 
 ## Step 3 — Always Include Verification Hint
 
-When the user asks about a specific date or recent data, include the glob
-date-range probe. Use the regex that matches the dataset's partition
-layout:
-
-**Daily-partitioned (`YYYY/MM/DD/`) — option/future market data:**
+The catalog's coverage dates are point-in-time; the tapes grow forward. When
+the user asks about a specific or recent date, confirm coverage by reading the
+date column directly rather than trusting the last-verified range:
 
 ```sql
-SELECT
-  MIN(regexp_extract(file, '/(\d{4}/\d{2}/\d{2})/', 1)) AS earliest,
-  MAX(regexp_extract(file, '/(\d{4}/\d{2}/\d{2})/', 1)) AS latest,
-  COUNT(*) AS file_count
-FROM glob('<path-with-**>');
+-- Paradigm tape uses DATE; the Paradex tape uses TRADE_AT
+SELECT min(DATE) AS earliest, max(DATE) AS latest, count(*) AS rows
+FROM read_csv_auto('s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz');
 ```
 
-…so they can confirm latest availability before concluding data is missing.
+The hot surface is clobbered every ~60 s, so it's always current — no probe needed.
 
 ## Step 4 — Output Format
 
@@ -243,9 +215,7 @@ ORDER BY NOTIONAL_VOLUME_USD DESC
 LIMIT 25;
 ```
 
-**Paradex DEX historical trade tape — biggest trades by notional in a window**
-(⚠ on the deprecated `terminal-dime-prod` bucket — unavailable pending re-home
-to `dt-exchange-venue-data`; this read will fail until then):
+**Paradex DEX historical trade tape — biggest trades by notional in a window:**
 
 ```sql
 INSTALL httpfs; LOAD httpfs;
@@ -253,7 +223,7 @@ INSTALL httpfs; LOAD httpfs;
 SELECT
   TRADE_AT, MARKET, PRICE, SIZE, TAKER_SIDE,
   PRICE * SIZE AS NOTIONAL_USD
-FROM read_csv_auto('s3://terminal-dime-prod/paradex_data/paradex_trade_tape.csv.gz')
+FROM read_csv_auto('s3://dt-paradex-data/paradex_data/paradex_trade_tape.csv.gz')
 WHERE NOT IS_TRADEBUST
   AND TRADE_AT >= TIMESTAMP '2026-04-01'
   AND TRADE_AT <  TIMESTAMP '2026-05-01'
@@ -268,14 +238,10 @@ Query-template guidelines:
 - For **Paradigm** tape questions, use `paradigm_trade_tape_slim.csv.gz` for
   *executed* block trades; use `paradigm_rfq_tape_slim.csv.gz` if they want
   RFQ-level stats (fill rate, unfilled, lifespan).
-- For **Paradex DEX** tape questions, the tape is `paradex_data/paradex_trade_tape.csv.gz`
-  on the **deprecated `terminal-dime-prod` bucket — currently unavailable
-  pending re-home**, so surface the schema/query for reference but warn that
-  the read will fail until re-homed. When available: **always filter
-  `WHERE NOT IS_TRADEBUST`**; compute notional as `PRICE * SIZE` — there
-  is no precomputed USD notional column.
-- For **option/future market data** questions, use the daily-partitioned path with a glob over
-  the date range; remember timestamps are µs (`to_timestamp(ts / 1e6)`).
+- For **Paradex DEX** tape questions, use
+  `s3://dt-paradex-data/paradex_data/paradex_trade_tape.csv.gz`. **Always
+  filter `WHERE NOT IS_TRADEBUST`**; compute notional as `PRICE * SIZE` —
+  there is no precomputed USD notional column.
 - Filter by `PRODUCT LIKE '%OPTION%'` only if the user specifically asked
   about options; otherwise leave it open so perps/futures are included.
 - Use `NOTIONAL_VOLUME_USD` (Paradigm) or `PRICE * SIZE` (Paradex DEX) for
@@ -295,23 +261,21 @@ questions, give the path + query + a one-line interpretation.
 - **Buckets** (all region `ap-northeast-1`, same IRSA creds):
   `s3://dt-paradigm-data` (Paradigm tapes + `v_vol_surface`, keeps the
   `paradigm_data/` prefix), `s3://dt-exchange-venue-data` (hot surface +
-  recap aggregates, at bucket root), and the **deprecated**
-  `s3://terminal-dime-prod` (`external/` Tardis tree, and the Paradex DEX
-  tape — unavailable pending re-home; do not build new dependencies on it).
+  recap aggregates, at bucket root), and `s3://dt-paradex-data` (the
+  Paradex DEX trade tape, under `paradex_data/`).
 - **Auth:** IRSA (web identity → STS AssumeRoleWithWebIdentity) — see
   `references/s3-access.md`. Tokens expire ~1 hour; refresh on
   HTTP 400 `InvalidToken`.
 - **DuckDB:** `INSTALL httpfs; LOAD httpfs;` every new session.
 - **Unit gotchas to flag when relevant:**
-  - Option/future feed timestamps are microseconds → `to_timestamp(ts / 1e6)`.
-  - Deribit option prices are in BTC/ETH (index currency), not USD.
-  - Deribit amounts are contracts (1 BTC contract = 1 BTC notional).
+  - Hot surface carries units explicitly in the `unit` column — read it.
+  - Paradigm tape: `NOTIONAL_VOLUME_USD` is USD; `QTY` is contracts.
 - **Join keys across Paradigm tapes:** `RFQ_ID`, `BLOCK_TRADE_ID`.
 - **Paradigm exchange suffixes:** `DBT` = Deribit, `PRDX` = Paradex,
   `BYB` = Bybit.
-- **What is NOT here** (call out when asked): Deribit option quotes beyond
-  2026-01-01 are sparse, OKX combo quotes are absent, Greeks/IV are not in
-  the raw option/future feed data, Paradex options excluded (everlasting/perpetual style).
+- **What is NOT here** (call out when asked): raw per-exchange option/future
+  feeds, standalone Greeks/IV (the hot surface carries ATM IV only), and
+  Paradex options (everlasting/perpetual style).
 - This skill is a catalog and query-launcher. For analysis of a single
   pasted trade JSON, hand off to `paradigm-block-analyst`. For execution of
   the SQL queries this skill emits, use whatever DuckDB tool the agent has
