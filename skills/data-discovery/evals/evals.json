@@ -5,23 +5,22 @@
     {
       "id": 1,
       "prompt": "what data do we have available to query?",
-      "expected_output": "An inventory-style response listing the dataset families across the three market-data buckets: the Paradigm executed block trade tape and RFQ activity tape under s3://dt-paradigm-data/paradigm_data/, the hot surface + recap aggregates under s3://dt-exchange-venue-data/hot/, and exchange market data under s3://terminal-dime-prod/external/tardis/v1/ covering Deribit option trades, Deribit option quotes, Deribit combo quotes, and OKX option trades. Mentions the bucket names, region (ap-northeast-1), and that access goes via DuckDB + IRSA-issued STS credentials. Stays concise — does not dump full schemas unless asked.",
+      "expected_output": "An inventory-style response listing the dataset families across the three market-data buckets: the Paradigm executed block trade tape and RFQ activity tape under s3://dt-paradigm-data/paradigm_data/, the on-chain Paradex DEX trade tape under s3://dt-paradex-data/paradex_data/, and the hot surface + recap aggregates under s3://dt-exchange-venue-data/hot/. Mentions the bucket names, region (ap-northeast-1), and that access goes via DuckDB + IRSA-issued STS credentials. Stays concise — does not dump full schemas unless asked.",
       "assertions": [
-        "Response names the S3 buckets (s3://dt-paradigm-data, s3://dt-exchange-venue-data, s3://terminal-dime-prod)",
-        "Response lists at least four dataset families: Paradigm trade tape, Paradigm RFQ tape, Deribit options, OKX options",
-        "Response mentions that combo quotes are also available for Deribit",
-        "Response does not invent datasets that are not in references/datasets.md (no OKX combos, no Paradex options, no Greeks/IV)",
+        "Response names the S3 buckets (s3://dt-paradigm-data, s3://dt-exchange-venue-data, s3://dt-paradex-data)",
+        "Response lists the dataset families: Paradigm trade tape, Paradigm RFQ tape, Paradex DEX trade tape, hot surface",
+        "Response does not list a raw per-exchange option/future trade feed (e.g. standalone Deribit or OKX option-trade datasets) as queryable — referencing the hot surface's venues or the v_vol_surface pointer is fine, since both are in the catalog",
         "Response is structured as a catalog summary, not a query — it does not attempt to run SQL"
       ]
     },
     {
       "id": 2,
       "prompt": "do we have OKX combo quotes?",
-      "expected_output": "A direct answer: no, OKX combo quotes are not in the catalog. Notes that OKX option trades are available (under external/tardis/v1/trades/option/okex-options/) but combo quotes from OKX are absent. Points the user at Deribit combo quotes (external/tardis/v1/quotes/combo/deribit/) as the only combo-quote dataset available.",
+      "expected_output": "A direct answer: no — combo quotes are not in this catalog (nor any raw per-exchange option feed). Points the user at what IS available: Deribit/Paradex block flow via the Paradigm trade tape (s3://dt-paradigm-data), and current ATM IV / DVOL / recent flow via the hot surface (s3://dt-exchange-venue-data/hot/). Does not fabricate an external/tardis or terminal-dime-prod path.",
       "assertions": [
-        "Response clearly states OKX combo quotes are not available",
-        "Response identifies that Deribit combo quotes are available as the alternative",
-        "Response does not fabricate an S3 path for OKX combo quotes"
+        "Response clearly states OKX combo quotes are not in the catalog",
+        "Response points to the Paradigm tape and/or hot surface as what is available",
+        "Response does not fabricate an S3 path (no external/tardis, no terminal-dime-prod)"
       ]
     },
     {
@@ -38,12 +37,11 @@
     {
       "id": 4,
       "prompt": "what's the latest Deribit option trade data available?",
-      "expected_output": "Response gives the path pattern s3://terminal-dime-prod/external/tardis/v1/trades/option/deribit/YYYY/MM/DD/deribit-OPTIONS-YYYY-MM-DD.csv.gz and the last verified coverage (2026-02-01 to 2026-04-30 as of catalog verification). Because the user is asking about latest data, the response also includes the glob date-range probe SQL so they can confirm whether more recent files exist.",
+      "expected_output": "A helpful answer: the raw per-exchange Deribit option tick/trade feed is no longer in this catalog, but Deribit option data IS available — option block flow in the Paradigm trade tape (product 'BTC OPTION - DBT', s3://dt-paradigm-data) and current Deribit ATM IV / DVOL in the hot surface (s3://dt-exchange-venue-data/hot/). Does not cite a terminal-dime-prod or external/tardis path.",
       "assertions": [
-        "Response returns the correct path pattern for Deribit option trades, including the YYYY/MM/DD partition",
-        "Response cites the last verified date range from the catalog (2026-02-01 → 2026-04-30 or equivalent point-in-time note)",
-        "Response includes or recommends running the glob date-range probe to confirm latest availability (mentions glob() with regexp_extract for MIN/MAX dates)",
-        "Response does not claim a hard end-date without flagging that coverage may have advanced"
+        "Response points to a real catalog source for Deribit option data — the Paradigm trade tape (Deribit option block flow) and/or the hot surface",
+        "Response does not cite a terminal-dime-prod or external/tardis S3 path",
+        "Response does not claim a standalone raw Deribit option-trade tick dataset with its own coverage range"
       ]
     }
   ],
