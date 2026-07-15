@@ -15,10 +15,10 @@
     },
     {
       "id": 2,
-      "prompt": "do we have raw Deribit or OKX option trade data?",
-      "expected_output": "A direct answer: no — raw per-exchange option/quote feeds are not in this catalog. Points the user at what IS available: Deribit/Paradex block flow via the Paradigm trade tape (s3://dt-paradigm-data), and current ATM IV / DVOL / recent flow via the hot surface (s3://dt-exchange-venue-data/hot/). Does not fabricate an external/tardis or terminal-dime-prod path.",
+      "prompt": "do we have OKX combo quotes?",
+      "expected_output": "A direct answer: no — combo quotes are not in this catalog (nor any raw per-exchange option feed). Points the user at what IS available: Deribit/Paradex block flow via the Paradigm trade tape (s3://dt-paradigm-data), and current ATM IV / DVOL / recent flow via the hot surface (s3://dt-exchange-venue-data/hot/). Does not fabricate an external/tardis or terminal-dime-prod path.",
       "assertions": [
-        "Response clearly states raw Deribit/OKX option feeds are not in the catalog",
+        "Response clearly states OKX combo quotes are not in the catalog",
         "Response points to the Paradigm tape and/or hot surface as what is available",
         "Response does not fabricate an S3 path (no external/tardis, no terminal-dime-prod)"
       ]
@@ -36,12 +36,12 @@
     },
     {
       "id": 4,
-      "prompt": "biggest Paradex perp trades last month — where's the tape and how do I query it?",
-      "expected_output": "Response gives the path s3://dt-paradex-data/paradex_data/paradex_trade_tape.csv.gz and a ready-to-run DuckDB query using read_csv_auto with WHERE NOT IS_TRADEBUST, a TRADE_AT window, PRICE * SIZE AS NOTIONAL_USD, ORDER BY notional DESC LIMIT 25. Notes there is no precomputed USD notional column so notional is PRICE * SIZE, and filtering by MARKET narrows to a single market.",
+      "prompt": "what's the latest Deribit option trade data available?",
+      "expected_output": "A direct answer: raw Deribit option trade data is not in this catalog. Points the user at what IS available — Deribit block flow via the Paradigm trade tape (s3://dt-paradigm-data) and current Deribit ATM IV / DVOL via the hot surface (s3://dt-exchange-venue-data/hot/). Does not fabricate a terminal-dime-prod or external/tardis path or claim a coverage range for a dataset that isn't there.",
       "assertions": [
-        "Response returns the correct path: s3://dt-paradex-data/paradex_data/paradex_trade_tape.csv.gz",
-        "Response includes a runnable DuckDB query with WHERE NOT IS_TRADEBUST and PRICE * SIZE for notional",
-        "Response does not point at terminal-dime-prod or claim the tape is unavailable"
+        "Response states raw Deribit option trade data is not in the catalog",
+        "Response points to the Paradigm tape and/or hot surface instead",
+        "Response does not fabricate an S3 path for Deribit option trades"
       ]
     }
   ],

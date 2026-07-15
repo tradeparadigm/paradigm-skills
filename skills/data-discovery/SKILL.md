@@ -20,7 +20,7 @@ compatibility: Read-only data catalog. No authentication required to view the
   references/s3-access.md for the credential bootstrap.
 metadata:
   author: tradeparadigm
-  version: "1.5"
+  version: "1.4"
 ---
 
 ## Hard Rules
@@ -41,8 +41,8 @@ metadata:
 Reference catalog **and entry-point** for historical S3-backed datasets the
 agent can query through DuckDB. Scope: the market-data buckets
 `s3://dt-paradigm-data`, `s3://dt-exchange-venue-data`, and
-`s3://dt-paradex-data` — the Paradigm RFQ tapes, the on-chain Paradex
-perp trade tape, and the near-real-time hot surface.
+`s3://dt-paradex-data` — Paradigm RFQ tapes and the on-chain Paradex
+perp trade tape.
 
 Two jobs:
 
@@ -89,10 +89,10 @@ historical trade tape. Three trigger families:
 what coverage":
 
 - "What Paradigm / S3 / DuckDB data do we have?"
-- "Where does the <Paradigm tape | Paradex trade tape | hot surface> live in S3?"
+- "Where does the <Paradigm tape | Paradex trade tape> live in S3?"
 - "What columns does the <Paradigm trade tape | RFQ tape | Paradex trade tape> have?"
-- "What's the date range for <Paradigm tape | Paradex trade tape>?"
-- "Do we have <Paradex perp trades | a given Paradigm product> in S3?"
+- "What's the date range for <Paradex trade tape>?"
+- "Do we have <Paradex perp trades> in S3?"
 - "What's the schema for `paradigm_trade_tape_slim` / `paradex_trade_tape`?"
 
 **(B) Historical Paradigm-flow analysis** — retrospective questions over
@@ -126,7 +126,7 @@ Do **not** fire for:
 - **Live** Paradex questions — current positions, current funding rate,
   live orderbook, order placement, vault state, margin (those are
   Paradex-live skills, not this catalog). The *historical* Paradex trade
-  tape *is* in scope — see family (D) above.
+  tape *is* in scope — see family (C) above.
 - Generic "what can you do" / "what skills do I have" — that's a meta
   question, not a data catalog question.
 - A trade JSON paste asking for analysis of *that single trade* (use
@@ -165,8 +165,8 @@ Pull from `references/datasets.md`. Grouped into:
      `surface` rows — the vol surface is in `v_vol_surface` on
      `dt-paradigm-data`. See Dataset 3b for the schema and read pattern.
 
-For each, report: S3 path (flat file for the Paradigm and Paradex tapes,
-stable clobbered key for the hot surface), last verified coverage, schema,
+For each, report: S3 path (flat file for the Paradigm and Paradex tapes),
+last verified coverage, schema,
 notable filters (e.g. `WHERE PRODUCT LIKE '%OPTION%'` for Paradigm,
 `WHERE NOT IS_TRADEBUST` for Paradex tape).
 
@@ -267,15 +267,11 @@ questions, give the path + query + a one-line interpretation.
   `references/s3-access.md`. Tokens expire ~1 hour; refresh on
   HTTP 400 `InvalidToken`.
 - **DuckDB:** `INSTALL httpfs; LOAD httpfs;` every new session.
-- **Unit gotchas to flag when relevant:**
-  - Hot surface carries units explicitly in the `unit` column — read it.
-  - Paradigm tape: `NOTIONAL_VOLUME_USD` is USD; `QTY` is contracts.
 - **Join keys across Paradigm tapes:** `RFQ_ID`, `BLOCK_TRADE_ID`.
 - **Paradigm exchange suffixes:** `DBT` = Deribit, `PRDX` = Paradex,
   `BYB` = Bybit.
 - **What is NOT here** (call out when asked): raw per-exchange option/future
-  feeds, standalone Greeks/IV (the hot surface carries ATM IV only), and
-  Paradex options (everlasting/perpetual style).
+  feeds, standalone Greeks/IV, and Paradex options (everlasting/perpetual style).
 - This skill is a catalog and query-launcher. For analysis of a single
   pasted trade JSON, hand off to `paradigm-block-analyst`. For execution of
   the SQL queries this skill emits, use whatever DuckDB tool the agent has

@@ -1,8 +1,7 @@
 # Available Market Data — S3 Catalog
 
-Comprehensive map of market data accessible via DuckDB + S3. Covers the
-Paradigm RFQ block-trade flow, the near-real-time hot surface, and the
-on-chain Paradex perp trade tape.
+Comprehensive map of market data accessible via DuckDB + S3. Covers crypto
+options (Paradigm RFQ flow) and the on-chain Paradex perp trade tape.
 
 > **Date ranges below are point-in-time as of last verification: 2026-05-11.**
 > Coverage expands over time — for any "recent date" question, run the glob
