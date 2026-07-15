@@ -262,8 +262,17 @@ def test_summarize_blocks_multi_expiry_label():
                        _leg("BTC-25JUN27-2000-C", "buy", 250, bid="D2")]))
     rows = summarize_blocks(cluster_blocks(a + b), top_n=10, min_btc=5.0)
     labels = {r["expiry"] for r in rows}
-    check("multi-expiry label near/far", labels == {"26MAR27/25JUN27"}, labels)
+    check("2-expiry label near/far with '/'", labels == {"26MAR27/25JUN27"}, labels)
     check("same structure → same label regardless of leg order", len(labels) == 1, labels)
+    # 3+ expiries: "/" would read as a complete enumeration and contradict the
+    # Detail legs (a live 3-expiry package labeled "31JUL26/25SEP26" hid its
+    # 28AUG26 leg) — the label becomes a "→" range instead.
+    tri = [_leg("BTC-31JUL26-66000-C", "sell", 300, bid="T1"),
+           _leg("BTC-28AUG26-66000-C", "buy", 300, bid="T1"),
+           _leg("BTC-25SEP26-65000-C", "sell", 300, bid="T1")]
+    tri_rows = summarize_blocks(cluster_blocks(tri), top_n=10, min_btc=5.0)
+    check("3-expiry label is a '→' range", tri_rows[0]["expiry"] == "31JUL26→25SEP26",
+          tri_rows[0]["expiry"])
 
 
 def test_vrp_reconciles_with_displayed_lines():

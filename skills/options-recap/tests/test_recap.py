@@ -375,13 +375,17 @@ def test_surface_tickers_asset_guard():
 
 def test_strike_label_precision():
     from recap import _strike_label
-    check("clean thousands abbreviate", _strike_label("68000") == "68K")
-    check("half-thousands keep precision", _strike_label("62500") == "62.5K")
+    check("10K+ clean thousands abbreviate", _strike_label("68000") == "68K")
+    check("10K+ half-thousands keep precision", _strike_label("62500") == "62.5K")
     # Regression: ETH strikes 1825/1875/1925 all rendered "1K", so an iron
     # fly read as buying and selling the same strike.
     check("sub-10K strikes stay raw", _strike_label("1875") == "1875")
     check("1825 != 1875 != 1925 labels",
           len({_strike_label(s) for s in ("1825", "1875", "1925")}) == 3)
+    # Regression: 2000 rendered "2K" beside raw 1875/2100 in one ETH table —
+    # the threshold is magnitude (>=10K), not clean divisibility.
+    check("sub-10K clean thousands stay raw too", _strike_label("2000") == "2000")
+    check("boundary: 10000 abbreviates", _strike_label("10000") == "10K")
     check("non-numeric passes through", _strike_label("X") == "X")
 
 
