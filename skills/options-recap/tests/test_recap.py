@@ -26,7 +26,7 @@ from recap import (  # noqa: E402
     parse_window_ms, load_hot, build, build_block_flow, render_md,
     _leg_phrase, pct, pc_descriptor, dvol_label, spot_vol_label, fmt_hhmm,
     run_duckdb, _load_surface_tickers, _delta_fmt, _venue_label,
-    MAX_SURFACE_ROWS,
+    tape_deribit_volume_usd, MAX_SURFACE_ROWS,
 )
 
 _passed = 0
@@ -170,15 +170,18 @@ def test_volume_excludes_aggregate_and_other_venues():
           hot["trades_by_venue"])
 
 
-def test_volume_to_usd_is_sane():
-    # Dollar Volume is always the Deribit-scoped hot rows; the tape is irrelevant.
+def test_volume_to_usd_fallback_is_sane():
+    # FALLBACK path: with an empty tape (trades=[]) the tape $ source is None, so
+    # Volume falls back to the Deribit-scoped hot rollup (volume_btc × spot). The
+    # tape is PRIMARY when present (see test_volume_uses_tape_when_present); this
+    # pins the fallback still produces the sane Deribit-scoped figure.
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot(d)
         res = build("btc", "8h", 0, 8 * 3600_000,
                     {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
     s = res["snapshot"]
-    # Dollar Volume is Deribit-scoped: 7422.5 BTC × $60,468 ≈ $448.9M — NOT the old $9.8T.
-    check("volume_usd_m ~ 449", 440 <= s["volume_usd_m"] <= 460, s["volume_usd_m"])
+    # Fallback Volume is Deribit-scoped: 7422.5 BTC × $60,468 ≈ $448.9M — NOT the old $9.8T.
+    check("volume_usd_m ~ 449 (hot fallback)", 440 <= s["volume_usd_m"] <= 460, s["volume_usd_m"])
     check("volume not trillions", s["volume_usd_m"] < 100_000, s["volume_usd_m"])
     # P/C now trade-count-based across all venues: 11808 puts / 13188 calls = 0.90.
     check("pc ratio 0.90 (by trades, all venues)", s["pc_ratio"] == 0.90, s["pc_ratio"])
@@ -189,6 +192,104 @@ def test_volume_to_usd_is_sane():
     check("activity split ~100%", abs(sum(v["pct"] for v in s["activity_split"]) - 100) <= 2,
           s["activity_split"])
     check("bybit leads activity", s["activity_split"][0]["venue"] == "Bybit", s["activity_split"])
+
+
+# ── Volume: tape-primary (fixes hot-rollup head-lag) ────────────────────────
+
+def test_tape_deribit_volume_usd():
+    # Sums amount × index_price over the window tape.
+    check("sums amount×index", tape_deribit_volume_usd(TRADES) == 200 * 60000,
+          tape_deribit_volume_usd(TRADES))
+    check("empty tape → None", tape_deribit_volume_usd([]) is None,
+          tape_deribit_volume_usd([]))
+    # A trade missing either field contributes 0 — an all-missing tape reads None,
+    # not 0, so build() cleanly falls through to the hot rollup.
+    check("missing index_price → None", tape_deribit_volume_usd(
+        [{"amount": 100}]) is None)
+    check("missing amount → None", tape_deribit_volume_usd(
+        [{"index_price": 60000}]) is None)
+    check("None-valued fields → None", tape_deribit_volume_usd(
+        [{"amount": None, "index_price": None}]) is None)
+    # Mixed: only the fully-priced trade contributes.
+    check("partial tape counts only priced trades", tape_deribit_volume_usd(
+        [{"amount": 100, "index_price": 60000}, {"amount": 50}]) == 6_000_000)
+
+
+def test_volume_uses_tape_when_present():
+    # With BOTH the hot rollup (7422.5 BTC → ~$449M) AND a tape present, Volume takes
+    # the TAPE figure — the hot file head-lags live prints, so the tape is authoritative.
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot(d)
+        res = build("btc", "8h", 0, 8 * 3600_000,
+                    {"closes_7d": CLOSES_7D, "trades": TRADES, "market": None}, hot)
+    s = res["snapshot"]
+    # TRADES = 200 BTC @ index 60000 = $12M; NOT the $449M hot rollup.
+    check("volume from tape ($12M), not hot ($449M)", s["volume_usd_m"] == 12, s["volume_usd_m"])
+
+
+def test_volume_falls_back_to_hot_when_no_tape():
+    # No tape (trades=[]) → hot rollup drives Volume (7422.5 BTC × $60,468 ≈ $449M).
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot(d)
+        res = build("btc", "8h", 0, 8 * 3600_000,
+                    {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
+    check("no tape → hot fallback ~449M", 440 <= res["snapshot"]["volume_usd_m"] <= 460,
+          res["snapshot"]["volume_usd_m"])
+
+
+def test_volume_guard_floors_at_block_total():
+    # Internal-consistency tripwire on the FALLBACK path. Synthetic block whose only
+    # index-bearing leg carries 0 amount and whose sized leg carries no index: the
+    # tape $ sum is 0 (→ None → fallback), yet the block still has notional (block
+    # uses legs[0].index_price × total_btc). This is the only shape that reaches the
+    # guard — with a real tape, tape $ ≥ block by construction and it can't fire.
+    recap.WARNINGS.clear()
+    guard_trades = [
+        # legs[0]: carries the index (block notional multiplier) but 0 amount.
+        {"instrument_name": "BTC-31JUL26-60000-C", "index_price": 64000, "iv": 40.0,
+         "timestamp": 1780000000000, "direction": "buy", "amount": 0, "block_trade_id": "G1"},
+        # legs[1]: carries the amount but no index → contributes 0 to the tape $ sum.
+        {"instrument_name": "BTC-31JUL26-60000-P", "iv": 40.0,
+         "timestamp": 1780000000000, "direction": "buy", "amount": 100, "block_trade_id": "G1"},
+    ]
+    # Tiny hot rollup so the fallback figure sits far below the block total.
+    small_volume = ("exchange,optionType,volume_sum,notional,buy_volume,sell_volume,trade_count\n"
+                    "deribit,call,1.0,1,1,0,1\n")
+    small_dvol_spot = ("exchange,metric,open,close,high,low\n"
+                       "deribit,spot,100,100,100,100\n")
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "volume.csv", small_volume)
+        _write(d, "dvol_spot.csv", small_dvol_spot)
+        hot = load_hot(d, "BTC")
+        res = build("btc", "8h", 0, 8 * 3600_000,
+                    {"closes_7d": CLOSES_7D, "trades": guard_trades, "market": None}, hot)
+    # Block total = 100 BTC × $64,000 = $6.4M; fallback hot vol = 1.0 × $100 = $100.
+    # The floor rounds UP to the next whole million ($7M) so the rendered integer-
+    # million Volume can never sit below the 0.1M-rendered block total ($6.4M).
+    check("block total $6.4M", res["block_flow"]["total_m"] == 6.4, res["block_flow"]["total_m"])
+    check("volume floored above block total ($7M)", res["snapshot"]["volume_usd_m"] == 7,
+          res["snapshot"]["volume_usd_m"])
+    check("rendered floor >= rendered block total",
+          res["snapshot"]["volume_usd_m"] >= res["block_flow"]["total_m"],
+          (res["snapshot"]["volume_usd_m"], res["block_flow"]["total_m"]))
+    check("guard warned about flooring",
+          any("block-flow total" in w for w in recap.WARNINGS), recap.WARNINGS)
+
+
+def test_volume_renders_from_tape_without_hot():
+    # No-S3 behavioral change: with a tape present and NO hot CSVs, Volume now renders
+    # a real figure (was n/a before tape-primary — the old path needed hot volume_btc).
+    recap.WARNINGS.clear()
+    with tempfile.TemporaryDirectory() as d:
+        hot = load_hot(d, "BTC")  # empty dir → no hot volume_btc
+    res = build("btc", "8h", 0, 8 * 3600_000,
+                {"closes_7d": CLOSES_7D, "trades": TRADES, "market": None}, hot)
+    check("volume_usd_m from tape (not None)", res["snapshot"]["volume_usd_m"] == 12,
+          res["snapshot"]["volume_usd_m"])
+    md = render_md(res)
+    vol_line = next(ln for ln in md.splitlines() if ln.strip().startswith("Volume"))
+    check("Volume line shows $12M, not n/a", "$12M" in vol_line and "n/a" not in vol_line,
+          vol_line)
 
 
 def test_activity_split_collapses_deribit_venues():
@@ -642,8 +743,12 @@ def test_render_four_sections():
     for h in ("**Snapshot**", "**Biggest Print**", "**Block Flow", "**Vol Surface**"):
         check(f"render has {h}", h in md, md[:80])
     check("render title", md.startswith("**BTC Options · 8h Recap"), md[:40])
-    check("render volume line (Deribit-scoped)",
-          "Volume" in md and "$449M" in md and "Deribit only" in md, "volume render")
+    # _full_result builds WITH TRADES (200 BTC @ index 60000 = $12M), and the tape is
+    # the PRIMARY Volume source — so the line reads the $12M tape figure, not the
+    # $449M hot rollup. The "Deribit only" label is unchanged.
+    check("render volume line (tape-derived, Deribit-scoped)",
+          "Volume" in md and "$12M" in md and "$449M" not in md and "Deribit only" in md,
+          "volume render")
     check("render multi-venue Activity line", "Activity" in md and "Bybit" in md, "activity render")
     check("render P/C 0.9x", "0.9x" in md)
     check("render biggest Strangle/RR", "26JUN26 Strangle/RR" in md)

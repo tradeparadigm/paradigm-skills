@@ -7,13 +7,13 @@ description: >
   and vol surface. Use when the user types /recap or asks for a market recap,
   options flow summary, "what happened in BTC options", or "last Xh of flow".
   The output format is fixed — always the same four sections in the same order.
-compatibility: Deribit public API (curl) for the tape; Paradigm hot data (DuckDB+S3
-  via IRSA) for DVOL/spot, multi-venue volume/activity, and the vol surface. No
-  authentication required for the public API; the S3 reads require the IRSA
-  bootstrap (see paradigm-data-discovery skill).
+compatibility: Deribit public API (curl) for the tape (7d closes, block flow, and the
+  Volume line's $ figure); Paradigm hot data (DuckDB+S3 via IRSA) for DVOL/spot,
+  multi-venue activity/P-C, and the vol surface. No authentication required for the
+  public API; the S3 reads require the IRSA bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.8"
+  version: "1.9"
 ---
 
 # Options Recap
@@ -29,10 +29,13 @@ metadata:
 | `options` | the literal word `options` | ignored — a no-op keyword (this skill is always options); `run_recap.sh` strips it |
 
 Any `Nm`/`Nh`/`Nd` window up to 24h works and all render identically: DVOL/spot
-and the multi-venue volume/activity come from one rolling hot aggregates file
-sliced to the window at query time, the surface (and its Δ columns) from
-`v_vol_surface`, and block flow from the Deribit tape. A malformed window exits
-with a clear error.
+and the multi-venue activity/P-C come from one rolling hot aggregates file sliced
+to the window at query time, the surface (and its Δ columns) from `v_vol_surface`,
+and the Volume ($) line and block flow both from the Deribit tape — the hot
+aggregates file head-lags the live prints by ~10-15 min, so on a thin window it
+under-reports $ volume (potentially below the block-flow total); the tape carries
+every print with its index price and is authoritative for the Volume figure. A
+malformed window exits with a clear error.
 
 **Windows beyond 24h:** every flow source (the rolling hot aggregates file, the
 Deribit public tape) retains only ~24h, so `run_recap.sh` caps any longer window
