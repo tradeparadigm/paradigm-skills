@@ -51,9 +51,9 @@ from vol_math import (  # noqa: E402
     realized_vs_implied,
     cluster_blocks,
     summarize_blocks,
+    aggregate_clips,
     compute_vol_surface,
     classify_structure,
-    dominant_side,
     RV_LOOKBACK_DAYS,
 )
 
@@ -351,46 +351,71 @@ def _load_surface_tickers(csv_dir: str, name: str) -> dict:
 
 # ── Block-flow leg detail ───────────────────────────────────────────────────
 
-def _leg_phrase(legs: list[dict]) -> str:
+def _leg_phrase(legs: list[dict], size: float | None = None,
+                avg_iv: float | None = None, clips: int = 1) -> str:
     """One-line human detail for a block cluster, e.g.
-    'sold 75C / bought 90C x150 two-way 42.3v'."""
+    'sold 75C / bought 90C x150 42.3v'.
+
+    Directional verbs come from the per-leg taker `direction` field. If any leg
+    lacks one, no direction is asserted: legs render neutrally ('75C vs 90C')
+    tagged "two-way" — the desk term for an undisclosed side, which must never
+    appear next to bought/sold. `size`/`avg_iv`/`clips` override the
+    single-cluster values when the row aggregates several clips."""
+    directional = all(l.get("direction") in ("buy", "sell") for l in legs)
     parts = []
     for leg in sorted(legs, key=lambda l: -l.get("amount", 0))[:4]:
         seg = leg["instrument_name"].split("-")
         if len(seg) < 4:
             continue
-        verb = "bought" if leg.get("direction") == "buy" else "sold"
         strike_k = f"{int(int(seg[2]) / 1000)}K" if seg[2].isdigit() else seg[2]
-        parts.append(f"{verb} {strike_k}{seg[3]}")
-    size = round(sum(l.get("amount", 0) for l in legs), 1)
-    side = dominant_side(legs).lower()
-    ivs = [l["iv"] for l in legs if l.get("iv") is not None]
-    iv = f" {round(sum(ivs)/len(ivs),1)}v" if ivs else ""
-    return f"{' / '.join(parts)} x{size:g} {side}{iv}".strip()
+        if directional:
+            verb = "bought" if leg["direction"] == "buy" else "sold"
+            parts.append(f"{verb} {strike_k}{seg[3]}")
+        else:
+            parts.append(f"{strike_k}{seg[3]}")
+    if size is None:
+        size = round(sum(l.get("amount", 0) for l in legs), 1)
+    if avg_iv is None:
+        ivs = [l["iv"] for l in legs if l.get("iv") is not None]
+        avg_iv = round(sum(ivs) / len(ivs), 1) if ivs else None
+    iv = f" {avg_iv}v" if avg_iv is not None else ""
+    joiner = " / " if directional else " vs "
+    clip_txt = f" ({clips} clips)" if clips > 1 else ""
+    tag = "" if directional else " two-way"
+    return f"{joiner.join(parts)} x{size:g}{clip_txt}{tag}{iv}".strip()
 
 
-def build_block_flow(trades: list[dict], hot: dict, spot: float | None) -> dict:
+def build_block_flow(trades: list[dict], hot: dict, spot: float | None,
+                     top_n: int = 8, min_btc: float = 5.0) -> dict:
     clusters = cluster_blocks(trades)
-    ranked = summarize_blocks(clusters, top_n=8, min_btc=5.0)
+    # One qualified basis (≥min_btc) for the header count/total AND the rows,
+    # so the header always reconciles with the table. Identical clips of one
+    # worked order then collapse into a single ranked row; the header keeps
+    # counting raw blocks, and clip counts on the rows make up the difference.
+    ranked_all = summarize_blocks(clusters, top_n=10**9, min_btc=min_btc)
+    grouped = aggregate_clips(ranked_all, clusters)
     rows = []
-    for i, b in enumerate(ranked, 1):
+    for i, b in enumerate(grouped[:top_n], 1):
         legs = clusters.get(b["block_trade_id"], [])
         exp = b.get("expiry") or ""
         rows.append({
             "rank": i,
             "structure": f"{exp} {b['structure']}".strip(),
             "notl_m": round(b["notional_usd"] / 1e6, 1),
-            "detail": _leg_phrase(legs),
+            "detail": _leg_phrase(legs, size=b["size_btc"], avg_iv=b["avg_iv"],
+                                  clips=b["clip_count"]),
             "side": b["side"], "avg_iv": b["avg_iv"], "time_utc": b["time_utc"],
+            "clip_count": b["clip_count"],
         })
     # Header totals from the same Deribit clustering that produced the rows. The
     # hot block.csv has unit-corrupt rows (one block at $5B) that inflate the sum,
     # so we don't trust it here.
-    total_usd = sum(b["notional_usd"] for b in summarize_blocks(clusters, top_n=10**9, min_btc=0))
-    n_blocks = len(clusters)
+    total_usd = sum(b["notional_usd"] for b in ranked_all)
+    n_blocks = len(ranked_all)
+    omitted = grouped[top_n:]
     biggest = None
-    if ranked:
-        b0 = ranked[0]
+    if ranked_all:
+        b0 = ranked_all[0]  # largest single print, not the clip aggregate
         biggest = {
             "expiry": b0.get("expiry"), "structure": b0["structure"],
             "size": b0["size_btc"], "notional_m": round(b0["notional_usd"] / 1e6, 1),
@@ -399,6 +424,8 @@ def build_block_flow(trades: list[dict], hot: dict, spot: float | None) -> dict:
     return {
         "total_m": round((total_usd or 0) / 1e6, 1), "n_blocks": n_blocks,
         "rows": rows, "biggest_print": biggest,
+        "omitted_blocks": sum(g["clip_count"] for g in omitted),
+        "omitted_m": round(sum(g["notional_usd"] for g in omitted) / 1e6, 1),
     }
 
 
@@ -406,6 +433,22 @@ def build_block_flow(trades: list[dict], hot: dict, spot: float | None) -> dict:
 
 def pct(a, b):
     return round((a / b - 1) * 100, 1) if a and b else None
+
+
+def pc_descriptor(pc: float | None) -> str | None:
+    """Banded P/C label — reciprocal-symmetric (1/1.05 ≈ 0.95, 1/1.25 = 0.80),
+    so a 1.05x ratio reads near-neutral instead of 'puts dominant'."""
+    if pc is None:
+        return None
+    if pc > 1.25:
+        return "puts dominant"
+    if pc > 1.05:
+        return "put-tilt"
+    if pc >= 0.95:
+        return "balanced"
+    if pc >= 0.80:
+        return "call-tilt"
+    return "calls dominant"
 
 
 def fmt_hhmm(ms: int) -> str:
@@ -530,7 +573,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "volume_usd_m": round(vol_usd / 1e6) if vol_usd else None,
         "activity_trades": tt,
         "activity_split": activity_split,
-        "pc_ratio": pc, "pc_dominant": ("puts" if pc and pc > 1 else "calls" if pc else None),
+        "pc_ratio": pc, "pc_descriptor": pc_descriptor(pc),
         "spot_vol_label": spot_vol_label(spot_open, spot_close, dvol_open, dvol_close),
     }
 
@@ -567,7 +610,9 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "snapshot": snapshot,
         "biggest_print": block["biggest_print"],
         "block_flow": {"total_m": block["total_m"], "n_blocks": block["n_blocks"],
-                       "rows": block["rows"]},
+                       "rows": block["rows"],
+                       "omitted_blocks": block["omitted_blocks"],
+                       "omitted_m": block["omitted_m"]},
         "vol_surface": surface_out,
         "flow_horizon": flow_horizon,
         "warnings": WARNINGS,
@@ -665,18 +710,24 @@ def render_md(r: dict) -> str:
                 f"{round(tt / 1e3)}k" if tt >= 1e3 else f"{int(tt)}")
         split = " · ".join(f"{v['venue']} {v['pct']}%"
                            for v in (s.get("activity_split") or [])[:4])
-        L.append(f"{'Activity':<9} {tnum:<11} trades — {split}")
+        L.append(f"{'Activity':<9} {tnum:<11} trades — {split} (by trade count)")
     vol = f"${s['volume_usd_m']}M" if s.get("volume_usd_m") else "n/a"
     L.append(f"{'Volume':<9} {vol:<11} Deribit only (cross-venue $ pending)")
     pc = f"{s['pc_ratio']}x" if s.get("pc_ratio") is not None else "n/a"
-    L.append(f"{'P/C':<9} {pc:<11} {s.get('pc_dominant') or ''} dominant (all venues, by trades)")
+    pc_desc = f"{s['pc_descriptor']} " if s.get("pc_descriptor") else ""
+    L.append(f"{'P/C':<9} {pc:<11} {pc_desc}(all venues, by trades)")
     L += ["```", "", "**Biggest Print**", "", "```yaml"]
 
     if bp:
-        iv = f", {bp['avg_iv']}v avg" if bp.get("avg_iv") is not None else ""
+        # dominant_side's "Mixed" is a structure fact (legs point both ways),
+        # not an aggressor read — don't put it in the side slot.
+        tags = [bp["side"]] if bp.get("side") in ("Buy", "Sell") else []
+        if bp.get("avg_iv") is not None:
+            tags.append(f"{bp['avg_iv']}v avg")
+        tag_txt = f" ({', '.join(tags)})" if tags else ""
         L.append(f"{bp['expiry']} {bp['structure']}   {bp['size']:g}x   "
                  f"${bp['notional_m']}M   {bp['time_utc']} UTC   "
-                 f"via Paradigm/Deribit ({bp['side']}{iv})")
+                 f"via Paradigm/Deribit{tag_txt}")
     else:
         L.append("No data")
     L += ["```", "", f"**Block Flow — ${bf['total_m']}M / {bf['n_blocks']} blocks**",
@@ -685,6 +736,9 @@ def render_md(r: dict) -> str:
     for row in bf["rows"]:
         notl = f"${row['notl_m']}M"
         L.append(f"{str(row['rank']):<3}{row['structure']:<27}{notl:<9}{row['detail']}")
+    if bf.get("omitted_blocks"):
+        more = f"+{bf['omitted_blocks']} more blocks"
+        L.append(f"{'…':<3}{more:<27}${bf['omitted_m']}M")
     L += ["```", "", "**Vol Surface**"]
 
     if vs and vs.get("rows"):

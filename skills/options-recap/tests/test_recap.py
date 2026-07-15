@@ -24,8 +24,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import recap  # noqa: E402
 from recap import (  # noqa: E402
     parse_window_ms, load_hot, build, build_block_flow, render_md,
-    _leg_phrase, pct, dvol_label, spot_vol_label, fmt_hhmm, run_duckdb,
-    _load_surface_tickers, _delta_fmt, _venue_label, MAX_SURFACE_ROWS,
+    _leg_phrase, pct, pc_descriptor, dvol_label, spot_vol_label, fmt_hhmm,
+    run_duckdb, _load_surface_tickers, _delta_fmt, _venue_label,
+    MAX_SURFACE_ROWS,
 )
 
 _passed = 0
@@ -181,7 +182,8 @@ def test_volume_to_usd_is_sane():
     check("volume not trillions", s["volume_usd_m"] < 100_000, s["volume_usd_m"])
     # P/C now trade-count-based across all venues: 11808 puts / 13188 calls = 0.90.
     check("pc ratio 0.90 (by trades, all venues)", s["pc_ratio"] == 0.90, s["pc_ratio"])
-    check("calls dominant", s["pc_dominant"] == "calls", s["pc_dominant"])
+    check("call-tilt (0.90 is a lean, not dominance)", s["pc_descriptor"] == "call-tilt",
+          s["pc_descriptor"])
     # Multi-venue activity present; split sums ~100%, Bybit leads by trade count.
     check("activity_trades 24996", s["activity_trades"] == 24996, s["activity_trades"])
     check("activity split ~100%", abs(sum(v["pct"] for v in s["activity_split"]) - 100) <= 2,
@@ -402,7 +404,7 @@ def test_block_flow_from_trades_not_hot():
     check("biggest is Strangle/RR", bp["structure"] == "Strangle/RR", bp)
     check("biggest size 200", bp["size"] == 200, bp)
     check("biggest notional 12.0M", bp["notional_m"] == 12.0, bp)
-    check("biggest two-way", bp["side"] == "Two-way", bp)
+    check("biggest is mixed-direction", bp["side"] == "Mixed", bp)
 
 
 def test_leg_phrase():
@@ -411,8 +413,91 @@ def test_leg_phrase():
     check("leg phrase has put buy", "bought 55KP" in phrase, phrase)
     check("leg phrase has call sell", "sold 65KC" in phrase, phrase)
     check("leg phrase size", "x200" in phrase, phrase)
-    check("leg phrase two-way", "two-way" in phrase, phrase)
+    check("no two-way next to bought/sold", "two-way" not in phrase, phrase)
     check("leg phrase avg iv 66.0v", "66.0v" in phrase, phrase)
+    # With any leg's direction undisclosed, no side may be asserted: legs render
+    # neutrally and the row is tagged two-way.
+    blind = [dict(t, direction=None) for t in TRADES]
+    nphrase = _leg_phrase(blind)
+    check("neutral legs when side unknown", "55KP vs 65KC" in nphrase, nphrase)
+    check("two-way tag when side unknown", "two-way" in nphrase, nphrase)
+    check("no verbs when side unknown", "bought" not in nphrase and "sold" not in nphrase,
+          nphrase)
+    # Aggregated-clip overrides.
+    cphrase = _leg_phrase(legs, size=412.5, avg_iv=36.6, clips=8)
+    check("clip size override", "x412.5" in cphrase, cphrase)
+    check("clip count rendered", "(8 clips)" in cphrase, cphrase)
+    check("clip iv override", "36.6v" in cphrase, cphrase)
+
+
+def test_pc_descriptor_bands():
+    # Reciprocal-symmetric bands: 1.05x is near-neutral, not "puts dominant".
+    check("1.05 → balanced", pc_descriptor(1.05) == "balanced", pc_descriptor(1.05))
+    check("0.95 → balanced", pc_descriptor(0.95) == "balanced", pc_descriptor(0.95))
+    check("1.15 → put-tilt", pc_descriptor(1.15) == "put-tilt", pc_descriptor(1.15))
+    check("1.30 → puts dominant", pc_descriptor(1.30) == "puts dominant",
+          pc_descriptor(1.30))
+    check("0.90 → call-tilt", pc_descriptor(0.90) == "call-tilt", pc_descriptor(0.90))
+    check("0.57 → calls dominant", pc_descriptor(0.57) == "calls dominant",
+          pc_descriptor(0.57))
+    check("None → None", pc_descriptor(None) is None)
+
+
+def test_block_flow_header_reconciles_with_rows():
+    # 10 distinct straddles (unique strikes → unique signatures, no clip
+    # merging) at descending size. top_n=8 must disclose the 2 omitted blocks,
+    # and header count/total must cover all 10 — same ≥min_btc basis as rows.
+    trades = []
+    for i in range(10):
+        sz = 100 - i * 5
+        trades += [
+            {"instrument_name": f"BTC-26JUN26-{50000 + i * 1000}-C", "index_price": 60000,
+             "iv": 60.0, "timestamp": 1780000000000 + i, "direction": "buy",
+             "amount": sz, "block_trade_id": f"B{i}"},
+            {"instrument_name": f"BTC-26JUN26-{50000 + i * 1000}-P", "index_price": 60000,
+             "iv": 60.0, "timestamp": 1780000000000 + i, "direction": "buy",
+             "amount": sz, "block_trade_id": f"B{i}"},
+        ]
+    bf = build_block_flow(trades, {}, spot=60000)
+    check("8 rows shown", len(bf["rows"]) == 8, len(bf["rows"]))
+    check("header counts all 10", bf["n_blocks"] == 10, bf["n_blocks"])
+    check("2 blocks disclosed as omitted", bf["omitted_blocks"] == 2, bf)
+    shown_m = round(sum(r["notl_m"] for r in bf["rows"]), 1)
+    check("rows + omitted = header total",
+          abs(shown_m + bf["omitted_m"] - bf["total_m"]) < 0.15, bf)
+    md = render_md({"header": {"asset": "BTC", "window": "1h", "start_utc": "01:00",
+                               "end_utc": "02:00"},
+                    "snapshot": {}, "biggest_print": bf["biggest_print"],
+                    "block_flow": bf, "vol_surface": None, "flow_horizon": None,
+                    "warnings": []})
+    check("truncation disclosed in render", "+2 more blocks" in md, md)
+
+
+def test_block_flow_aggregates_clips_in_rows():
+    # 5 clips of one 2:1 spread → one row with a clip count; header still
+    # counts the 5 raw blocks so the table reconciles via the (5 clips) tag.
+    trades = []
+    for i in range(5):
+        trades += [
+            {"instrument_name": "BTC-31JUL26-60000-P", "index_price": 64500,
+             "iv": 36.5 + i * 0.1, "timestamp": 1780000000000 + i * 60000,
+             "direction": "buy", "amount": 20, "block_trade_id": f"K{i}"},
+            {"instrument_name": "BTC-31JUL26-64000-P", "index_price": 64500,
+             "iv": 36.5 + i * 0.1, "timestamp": 1780000000000 + i * 60000,
+             "direction": "sell", "amount": 10, "block_trade_id": f"K{i}"},
+        ]
+    bf = build_block_flow(trades, {}, spot=64500)
+    check("one aggregated row", len(bf["rows"]) == 1, bf["rows"])
+    check("header counts 5 raw blocks", bf["n_blocks"] == 5, bf["n_blocks"])
+    row = bf["rows"][0]
+    check("clip count on row", row["clip_count"] == 5, row)
+    check("(5 clips) in detail", "(5 clips)" in row["detail"], row["detail"])
+    check("summed size in detail", "x150" in row["detail"], row["detail"])
+    check("directional verbs, no two-way tag",
+          "bought 60KP" in row["detail"] and "two-way" not in row["detail"],
+          row["detail"])
+    bp = bf["biggest_print"]
+    check("biggest print is one clip, not the aggregate", bp["size"] == 30, bp)
 
 
 # ── Snapshot helper labels ──────────────────────────────────────────────────

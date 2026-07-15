@@ -20,28 +20,45 @@ Spot      $[X]        [up/down X%] (from $[Y], low $[Z])
 DVOL      [X]v        [flat/rising/falling] ([open] -> [close])
 RV 7d     [X]v        implied [CHEAP/RICH/IN LINE] vs realized
 VRP       [±X]v       vol [underpriced/overpriced] vs delivered
-Activity  [Nk]        trades — [Venue X% · Venue Y% · ...]
+Activity  [Nk]        trades — [Venue X% · Venue Y% · ...] (by trade count)
 Volume    $[X]M       Deribit only (cross-venue $ pending)
-P/C       [X.Xx]      [calls/puts] dominant (all venues, by trades)
+P/C       [X.Xx]      [descriptor] (all venues, by trades)
 ```
 
 **Biggest Print**
 
 ```yaml
-[DDMMMYY] [structure]   [Nx]   $[X]M   [HH:MM] UTC   via [Venue] ([side], [IV]v avg)
+[DDMMMYY] [structure]   [Nx]   $[X]M   [HH:MM] UTC   via [Venue] ([Buy/Sell, ][IV]v avg)
 ```
+
+The side word appears only when the whole block is one-directional (Buy/Sell).
+Mixed-direction structures (any spread) carry no side tag — never write
+"two-way" here; that means "aggressor undisclosed", which this is not.
 
 **Block Flow — $[X]M / [N] blocks**
 
 ```yaml
 #  Structure            Notl     Detail
 -  -------------------  -------  ------------------------------------------
-1  [structure]          $[X]M    [strikes] x[size] - [side] [IV]v [two-way/one-sided]
+1  [structure]          $[X]M    bought [K1][C/P] / sold [K2][C/P] x[size] [(N clips) ][IV]v
 2  …
+…  +[N] more blocks     $[X]M
 ```
 
+Detail rules: per-leg `bought`/`sold` verbs appear only when the tape discloses
+every leg's direction; otherwise legs render neutrally (`[K1]P vs [K2]P`)
+tagged ` two-way`. Repeated prints of one worked order (same legs, directions,
+and size ratio) collapse into a single row with a `(N clips)` count. The header
+count/total covers ALL qualifying blocks; when the table is truncated, the
+final `… +N more blocks $[X]M` line reconciles it.
+
 **Vol Surface**
-Skew: front 25Δ RR [±X]v → [puts bid / calls bid] · Term: [front]v → [back]v → [contango / flat / backwardation]
+Skew: front 25Δ RR [±X]v → [puts bid / calls bid] · Term: [front]v → [back]v → [contango / flat / backwardation / humped — peak at [DDMMMYY] / dished — trough at [DDMMMYY]]
+
+Term reads the whole listed curve, front to last expiry — monotonic (±0.2v
+tolerance) with >1v span is contango/backwardation; non-monotonic curves are
+humped/dished and name the interior peak/trough. `[back]` is the LAST listed
+expiry's ATM, not the second.
 
 ```yaml
 Expiry     ATM      ΔATM     25d RR    ΔRR      Fly     ΔFly

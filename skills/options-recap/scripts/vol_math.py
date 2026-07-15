@@ -209,14 +209,19 @@ def classify_structure(legs: list[dict]) -> str:
 
 
 def dominant_side(legs: list[dict]) -> str:
-    """Buy, Sell, or Two-way for a block cluster (by leg direction count)."""
+    """Buy, Sell, or Mixed for a block cluster (by leg direction count).
+
+    "Mixed" means the structure's legs point both ways (every spread does) —
+    NOT that the aggressor is unknown. Never render it as "two-way": on a
+    block desk that word means the taker side is undisclosed, and the per-leg
+    direction field here is disclosed."""
     buys = sum(1 for l in legs if l["direction"] == "buy")
     sells = len(legs) - buys
     if buys == 0:
         return "Sell"
     if sells == 0:
         return "Buy"
-    return "Two-way"
+    return "Mixed"
 
 
 def summarize_blocks(clusters: dict[str, list], top_n: int = 8,
@@ -254,6 +259,58 @@ def summarize_blocks(clusters: dict[str, list], top_n: int = 8,
         })
     rows.sort(key=lambda r: r["notional_usd"], reverse=True)
     return [r for r in rows if r["size_btc"] >= min_btc][:top_n]
+
+
+def clip_signature(legs: list[dict]) -> tuple:
+    """Structure signature for clip detection: leg instruments, directions,
+    and the leg-size *ratio* (amounts normalized by the smallest leg).
+    Sequential prints of one order being worked differ only in absolute size,
+    so its clips share a signature; distinct structures don't."""
+    amts = [l.get("amount") or 0 for l in legs]
+    base = min((a for a in amts if a), default=1)
+    return tuple(sorted(
+        (l["instrument_name"], l.get("direction"),
+         round((l.get("amount") or 0) / base, 2))
+        for l in legs
+    ))
+
+
+def aggregate_clips(ranked: list[dict], clusters: dict[str, list]) -> list[dict]:
+    """Merge ranked blocks that share a clip signature into one entry.
+
+    Without this, one order worked in clips floods the top-N table with
+    near-duplicate rows and crowds out distinct flow. Each merged entry keeps
+    the largest clip's block_trade_id (ranked arrives notional-desc, so the
+    first seen is the largest), sums size/notional, size-weights the IV, takes
+    the earliest time, and carries `clip_count`. Returns entries sorted by
+    combined notional."""
+    groups: dict[tuple, dict] = {}
+    for b in ranked:
+        legs = clusters.get(b["block_trade_id"]) or []
+        sig = clip_signature(legs) if legs else ("solo", b["block_trade_id"])
+        g = groups.get(sig)
+        if g is None:
+            groups[sig] = dict(
+                b, clip_count=1,
+                _iv_num=(b["avg_iv"] or 0) * b["size_btc"],
+                _iv_den=b["size_btc"] if b["avg_iv"] is not None else 0,
+            )
+            continue
+        g["clip_count"] += 1
+        g["size_btc"] = round(g["size_btc"] + b["size_btc"], 1)
+        g["notional_usd"] += b["notional_usd"]
+        g["time_utc"] = min(g["time_utc"], b["time_utc"])
+        if b["avg_iv"] is not None:
+            g["_iv_num"] += b["avg_iv"] * b["size_btc"]
+            g["_iv_den"] += b["size_btc"]
+    out = []
+    for g in groups.values():
+        den = g.pop("_iv_den")
+        num = g.pop("_iv_num")
+        g["avg_iv"] = round(num / den, 1) if den else None
+        out.append(g)
+    out.sort(key=lambda r: r["notional_usd"], reverse=True)
+    return out
 
 
 # ── Vol surface (#3) ───────────────────────────────────────────────────────
@@ -335,19 +392,39 @@ def compute_vol_surface(tickers: dict[str, dict], spot: float | None = None) -> 
     expiries.sort(key=lambda e: (e["expiry_ms"] is None, e["expiry_ms"] or 0))
 
     front = expiries[0] if expiries else None
-    back = expiries[1] if len(expiries) > 1 else None
-    front_atm = front["atm_iv"] if front else None
-    back_atm = back["atm_iv"] if back else None
+
+    # Term structure reads the WHOLE curve, front to last expiry — a two-point
+    # front-vs-next comparison calls a humped curve (up then down) "contango".
+    # A counter-move ≤ TERM_TOL doesn't break monotonicity (surface noise); the
+    # ±1v span gate keeps genuinely shallow slopes labeled "flat".
+    TERM_TOL = 0.2
+    atm_pts = [e for e in expiries if e["atm_iv"] is not None]
+    atms = [e["atm_iv"] for e in atm_pts]
+    front_atm = atms[0] if atms else None
+    back_atm = atms[-1] if atms else None
 
     term = None
-    if front_atm is not None and back_atm is not None:
-        diff = front_atm - back_atm
-        if diff > 1:
-            term = "backwardation (front > back) — near-term stress bid"
-        elif diff < -1:
+    if len(atms) >= 2:
+        up = all(b - a >= -TERM_TOL for a, b in zip(atms, atms[1:]))
+        down = all(b - a <= TERM_TOL for a, b in zip(atms, atms[1:]))
+        span = atms[-1] - atms[0]
+        if up and not down and span > 1:
             term = "contango (back > front) — normal upward term structure"
-        else:
+        elif down and not up and span < -1:
+            term = "backwardation (front > back) — near-term stress bid"
+        elif up or down:
             term = "flat term structure"
+        else:
+            peak = max(atm_pts, key=lambda e: e["atm_iv"])
+            trough = min(atm_pts, key=lambda e: e["atm_iv"])
+            if peak is not atm_pts[0] and peak is not atm_pts[-1]:
+                term = (f"humped — peak at {peak['expiry']} "
+                        f"({peak['atm_iv']}v), non-monotonic")
+            elif trough is not atm_pts[0] and trough is not atm_pts[-1]:
+                term = (f"dished — trough at {trough['expiry']} "
+                        f"({trough['atm_iv']}v), non-monotonic")
+            else:
+                term = "mixed, non-monotonic term structure"
 
     skew = None
     if front and front["rr_25d"] is not None:

@@ -13,7 +13,7 @@ compatibility: Deribit public API (curl) for the tape; Paradigm hot data (DuckDB
   bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.6"
+  version: "1.7"
 ---
 
 # Options Recap
