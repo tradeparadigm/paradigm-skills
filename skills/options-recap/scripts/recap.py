@@ -352,15 +352,16 @@ def _load_surface_tickers(csv_dir: str, name: str) -> dict:
 # ── Block-flow leg detail ───────────────────────────────────────────────────
 
 def _leg_phrase(legs: list[dict], size: float | None = None,
-                avg_iv: float | None = None, clips: int = 1) -> str:
+                iv_label: str | None = None) -> str:
     """One-line human detail for a block cluster, e.g.
     'sold 75C / bought 90C x150 42.3v'.
 
     Directional verbs come from the per-leg taker `direction` field. If any leg
     lacks one, no direction is asserted: legs render neutrally ('75C vs 90C')
     tagged "two-way" — the desk term for an undisclosed side, which must never
-    appear next to bought/sold. `size`/`avg_iv`/`clips` override the
-    single-cluster values when the row aggregates several clips."""
+    appear next to bought/sold. `size`/`iv_label` override the single-cluster
+    values when the row aggregates several clips of a worked order (iv_label
+    then carries the clip range, e.g. '36.5–37.0')."""
     directional = all(l.get("direction") in ("buy", "sell") for l in legs)
     parts = []
     for leg in sorted(legs, key=lambda l: -l.get("amount", 0))[:4]:
@@ -375,22 +376,35 @@ def _leg_phrase(legs: list[dict], size: float | None = None,
             parts.append(f"{strike_k}{seg[3]}")
     if size is None:
         size = round(sum(l.get("amount", 0) for l in legs), 1)
-    if avg_iv is None:
+    if iv_label is None:
         ivs = [l["iv"] for l in legs if l.get("iv") is not None]
-        avg_iv = round(sum(ivs) / len(ivs), 1) if ivs else None
-    iv = f" {avg_iv}v" if avg_iv is not None else ""
+        iv_label = f"{round(sum(ivs) / len(ivs), 1)}" if ivs else None
+    iv = f" {iv_label}v" if iv_label else ""
     joiner = " / " if directional else " vs "
-    clip_txt = f" ({clips} clips)" if clips > 1 else ""
     tag = "" if directional else " two-way"
-    return f"{joiner.join(parts)} x{size:g}{clip_txt}{tag}{iv}".strip()
+    return f"{joiner.join(parts)} x{size:g}{tag}{iv}".strip()
+
+
+def _iv_label(b: dict) -> str | None:
+    """IV text for a (possibly clip-aggregated) block-flow row: the clip range
+    '36.5–37.0' when a worked order printed at different vols, else one value."""
+    lo, hi = b.get("iv_lo"), b.get("iv_hi")
+    if lo is not None and hi is not None and lo != hi:
+        return f"{lo}–{hi}"
+    if b.get("avg_iv") is not None:
+        return f"{b['avg_iv']}"
+    return None
 
 
 def build_block_flow(trades: list[dict], hot: dict, spot: float | None,
                      top_n: int = 8, min_btc: float = 5.0) -> dict:
     clusters = cluster_blocks(trades)
-    # Identical clips of one worked order collapse into a single ranked row;
-    # the header keeps counting raw blocks, and the rows' clip counts carry
-    # the difference.
+    # Two granularities, both surfaced: tape BLOCKS (block_trade_ids ≥min_btc)
+    # and STRUCTURES (clips of one worked order grouped by leg signature).
+    # Rows are structures; the Blocks column carries each row's print count, so
+    # header and table reconcile by construction. One ≥min_btc basis for
+    # everything — the hot block.csv has unit-corrupt rows (one block at $5B),
+    # so the tape clustering is the only source we trust here.
     ranked_all = summarize_blocks(clusters, top_n=10**9, min_btc=min_btc)
     grouped = aggregate_clips(ranked_all, clusters)
     rows = []
@@ -401,16 +415,11 @@ def build_block_flow(trades: list[dict], hot: dict, spot: float | None,
             "rank": i,
             "structure": f"{exp} {b['structure']}".strip(),
             "notl_m": round(b["notional_usd"] / 1e6, 1),
-            "detail": _leg_phrase(legs, size=b["size_btc"], avg_iv=b["avg_iv"],
-                                  clips=b["clip_count"]),
+            "blocks": b["clip_count"],
+            "detail": _leg_phrase(legs, size=b["size_btc"], iv_label=_iv_label(b)),
             "side": b["side"], "avg_iv": b["avg_iv"], "time_utc": b["time_utc"],
-            "clip_count": b["clip_count"],
         })
-    # Header totals from the same Deribit clustering that produced the rows. The
-    # hot block.csv has unit-corrupt rows (one block at $5B) that inflate the sum,
-    # so we don't trust it here.
-    total_usd = sum(b["notional_usd"] for b in summarize_blocks(clusters, top_n=10**9, min_btc=0))
-    n_blocks = len(clusters)
+    total_usd = sum(b["notional_usd"] for b in ranked_all)
     biggest = None
     if ranked_all:
         b0 = ranked_all[0]  # largest single print, not the clip aggregate
@@ -420,7 +429,8 @@ def build_block_flow(trades: list[dict], hot: dict, spot: float | None,
             "time_utc": b0["time_utc"], "side": b0["side"], "avg_iv": b0["avg_iv"],
         }
     return {
-        "total_m": round((total_usd or 0) / 1e6, 1), "n_blocks": n_blocks,
+        "total_m": round((total_usd or 0) / 1e6, 1),
+        "n_blocks": len(ranked_all), "n_structures": len(grouped),
         "rows": rows, "biggest_print": biggest,
     }
 
@@ -609,7 +619,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "snapshot": snapshot,
         "biggest_print": block["biggest_print"],
         "block_flow": {"total_m": block["total_m"], "n_blocks": block["n_blocks"],
-                       "rows": block["rows"]},
+                       "n_structures": block["n_structures"], "rows": block["rows"]},
         "vol_surface": surface_out,
         "flow_horizon": flow_horizon,
         "warnings": WARNINGS,
@@ -727,12 +737,17 @@ def render_md(r: dict) -> str:
                  f"via Paradigm/Deribit{tag_txt}")
     else:
         L.append("No data")
-    L += ["```", "", f"**Block Flow — ${bf['total_m']}M / {bf['n_blocks']} blocks**",
-          "", "```yaml", f"{'#':<3}{'Structure':<27}{'Notl':<9}Detail",
-          f"{'-':<3}{'-' * 25:<27}{'-' * 7:<9}{'-' * 48}"]
+    n_struct = bf.get("n_structures", len(bf["rows"]))
+    struct_word = "structure" if n_struct == 1 else "structures"
+    trunc = f" (top {len(bf['rows'])} by notional)" if n_struct > len(bf["rows"]) else ""
+    L += ["```", "", f"**Block Flow — ${bf['total_m']}M / {bf['n_blocks']} blocks / "
+          f"{n_struct} {struct_word}{trunc}**",
+          "", "```yaml", f"{'#':<3}{'Structure':<27}{'Notl':<9}{'Blocks':<8}Detail",
+          f"{'-':<3}{'-' * 25:<27}{'-' * 7:<9}{'-' * 6:<8}{'-' * 44}"]
     for row in bf["rows"]:
         notl = f"${row['notl_m']}M"
-        L.append(f"{str(row['rank']):<3}{row['structure']:<27}{notl:<9}{row['detail']}")
+        L.append(f"{str(row['rank']):<3}{row['structure']:<27}{notl:<9}"
+                 f"{str(row.get('blocks', 1)):<8}{row['detail']}")
     L += ["```", "", "**Vol Surface**"]
 
     if vs and vs.get("rows"):

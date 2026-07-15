@@ -291,7 +291,7 @@ def aggregate_clips(ranked: list[dict], clusters: dict[str, list]) -> list[dict]
         g = groups.get(sig)
         if g is None:
             groups[sig] = dict(
-                b, clip_count=1,
+                b, clip_count=1, iv_lo=b["avg_iv"], iv_hi=b["avg_iv"],
                 _iv_num=(b["avg_iv"] or 0) * b["size_btc"],
                 _iv_den=b["size_btc"] if b["avg_iv"] is not None else 0,
             )
@@ -301,6 +301,8 @@ def aggregate_clips(ranked: list[dict], clusters: dict[str, list]) -> list[dict]
         g["notional_usd"] += b["notional_usd"]
         g["time_utc"] = min(g["time_utc"], b["time_utc"])
         if b["avg_iv"] is not None:
+            g["iv_lo"] = b["avg_iv"] if g["iv_lo"] is None else min(g["iv_lo"], b["avg_iv"])
+            g["iv_hi"] = b["avg_iv"] if g["iv_hi"] is None else max(g["iv_hi"], b["avg_iv"])
             g["_iv_num"] += b["avg_iv"] * b["size_btc"]
             g["_iv_den"] += b["size_btc"]
     out = []

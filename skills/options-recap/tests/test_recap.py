@@ -423,11 +423,10 @@ def test_leg_phrase():
     check("two-way tag when side unknown", "two-way" in nphrase, nphrase)
     check("no verbs when side unknown", "bought" not in nphrase and "sold" not in nphrase,
           nphrase)
-    # Aggregated-clip overrides.
-    cphrase = _leg_phrase(legs, size=412.5, avg_iv=36.6, clips=8)
+    # Aggregated-clip overrides: summed size + clip IV range.
+    cphrase = _leg_phrase(legs, size=412.5, iv_label="36.5–37.0")
     check("clip size override", "x412.5" in cphrase, cphrase)
-    check("clip count rendered", "(8 clips)" in cphrase, cphrase)
-    check("clip iv override", "36.6v" in cphrase, cphrase)
+    check("clip iv range rendered", "36.5–37.0v" in cphrase, cphrase)
 
 
 def test_pc_descriptor_bands():
@@ -445,7 +444,8 @@ def test_pc_descriptor_bands():
 
 def test_block_flow_caps_rows_at_top_n():
     # 10 distinct straddles (unique strikes → unique signatures, no clip
-    # merging) at descending size: rows cap at 8, header still counts all 10.
+    # merging) at descending size: rows cap at 8; header counts all 10 blocks
+    # and 10 structures, and the render discloses the truncation.
     trades = []
     for i in range(10):
         sz = 100 - i * 5
@@ -459,12 +459,20 @@ def test_block_flow_caps_rows_at_top_n():
         ]
     bf = build_block_flow(trades, {}, spot=60000)
     check("8 rows shown", len(bf["rows"]) == 8, len(bf["rows"]))
-    check("header counts all 10", bf["n_blocks"] == 10, bf["n_blocks"])
+    check("header counts all 10 blocks", bf["n_blocks"] == 10, bf["n_blocks"])
+    check("10 structures", bf["n_structures"] == 10, bf["n_structures"])
+    md = render_md({"header": {"asset": "BTC", "window": "1h", "start_utc": "01:00",
+                               "end_utc": "02:00"},
+                    "snapshot": {}, "biggest_print": bf["biggest_print"],
+                    "block_flow": bf, "vol_surface": None, "flow_horizon": None,
+                    "warnings": []})
+    check("header shows both granularities", "10 blocks / 10 structures" in md, md)
+    check("truncation disclosed in header", "(top 8 by notional)" in md, md)
 
 
 def test_block_flow_aggregates_clips_in_rows():
-    # 5 clips of one 2:1 spread → one row with a clip count; header still
-    # counts the 5 raw blocks so the table reconciles via the (5 clips) tag.
+    # 5 clips of one 2:1 spread → one structure row whose Blocks count carries
+    # the 5 tape prints; header states both granularities.
     trades = []
     for i in range(5):
         trades += [
@@ -476,17 +484,25 @@ def test_block_flow_aggregates_clips_in_rows():
              "direction": "sell", "amount": 10, "block_trade_id": f"K{i}"},
         ]
     bf = build_block_flow(trades, {}, spot=64500)
-    check("one aggregated row", len(bf["rows"]) == 1, bf["rows"])
+    check("one structure row", len(bf["rows"]) == 1, bf["rows"])
     check("header counts 5 raw blocks", bf["n_blocks"] == 5, bf["n_blocks"])
+    check("one structure", bf["n_structures"] == 1, bf["n_structures"])
     row = bf["rows"][0]
-    check("clip count on row", row["clip_count"] == 5, row)
-    check("(5 clips) in detail", "(5 clips)" in row["detail"], row["detail"])
+    check("blocks count on row", row["blocks"] == 5, row)
     check("summed size in detail", "x150" in row["detail"], row["detail"])
+    check("clip iv range in detail", "36.5–36.9v" in row["detail"], row["detail"])
     check("directional verbs, no two-way tag",
           "bought 60KP" in row["detail"] and "two-way" not in row["detail"],
           row["detail"])
     bp = bf["biggest_print"]
     check("biggest print is one clip, not the aggregate", bp["size"] == 30, bp)
+    md = render_md({"header": {"asset": "BTC", "window": "1h", "start_utc": "01:00",
+                               "end_utc": "02:00"},
+                    "snapshot": {}, "biggest_print": bp,
+                    "block_flow": bf, "vol_surface": None, "flow_horizon": None,
+                    "warnings": []})
+    check("header: 5 blocks / 1 structure", "5 blocks / 1 structure**" in md, md)
+    check("no truncation suffix when all shown", "top 8 by notional" not in md, md)
 
 
 # ── Snapshot helper labels ──────────────────────────────────────────────────

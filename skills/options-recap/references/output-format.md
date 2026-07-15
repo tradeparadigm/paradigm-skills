@@ -35,19 +35,28 @@ The side word appears only when the whole block is one-directional (Buy/Sell).
 Mixed-direction structures (any spread) carry no side tag — never write
 "two-way" here; that means "aggressor undisclosed", which this is not.
 
-**Block Flow — $[X]M / [N] blocks**
+**Block Flow — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)]**
 
 ```yaml
-#  Structure            Notl     Detail
--  -------------------  -------  ------------------------------------------
-1  [structure]          $[X]M    bought [K1][C/P] / sold [K2][C/P] x[size] [(N clips) ][IV]v
+#  Structure            Notl     Blocks  Detail
+-  -------------------  -------  ------  -----------------------------------
+1  [structure]          $[X]M    [n]     bought [K1][C/P] / sold [K2][C/P] x[size] [IV|IV–IV]v
 2  …
 ```
 
+Two granularities, both always stated: tape **blocks** (block_trade_ids, the
+industry term for the individual prints) and **structures** (clips of one
+worked order — same legs, directions, and size ratio — grouped into one row).
+Rows are structures and `#` numbers them; the Blocks column carries each
+row's print count, so the Blocks column sums to the header `[N]` and the row
+count equals `[M]`. When more than 8 structures qualify, the header gains the
+`(top 8 by notional)` suffix — truncation is disclosed in the header and the
+table body never changes shape.
+
 Detail rules: per-leg `bought`/`sold` verbs appear only when the tape discloses
 every leg's direction; otherwise legs render neutrally (`[K1]P vs [K2]P`)
-tagged ` two-way`. Repeated prints of one worked order (same legs, directions,
-and size ratio) collapse into a single row with a `(N clips)` count.
+tagged ` two-way`. Multi-block rows show the clip IV range (`36.5–37.0v`)
+when clips printed at different vols, a single value otherwise.
 
 **Vol Surface**
 Skew: front 25Δ RR [±X]v → [puts bid / calls bid] · Term: [front]v → [back]v → [contango / flat / backwardation / humped — peak at [DDMMMYY] / dished — trough at [DDMMMYY]]
