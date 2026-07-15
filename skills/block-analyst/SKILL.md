@@ -24,7 +24,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.4"
+  version: "1.5"
 ---
 
 # Paradigm Block Trade Analyst
@@ -155,7 +155,7 @@ Extract from the resolved trade-tape record (or the pasted JSON):
 | `quantity` | Number of contracts |
 | `price` | Fill price (in `quote_currency` units) |
 | `mark_price` | Deribit mark at trade time |
-| `displayValues.markOffset` | Fill vs mark: +/- premium |
+| `displayValues.markOffset` | Fill vs mark: +/- premium. **Single-leg** = `PRICE − REF_PRICE`. **Multi-leg** = the *package* net offset (Step 7 "Net package offset"), never a single leg's value |
 | `index_price` | Spot at trade time. **Label this "Spot" in the output, never "Index".** |
 | `strategy_code` | Structure type (see references/strategy-codes.md) |
 | `rfqType` | `grfq` (multi-maker) or `drfq` (directed) |
@@ -451,13 +451,13 @@ line terse and free of commentary). **This exemplar is the manual-path ceiling**
 `analyze.sh` rendered the block, its leaner `[History]`/`[Fair]`/`[Live]` rows are the intended
 live-path output — relay them verbatim; do not re-fetch to pad them up to the richness below:
 
-**BTC Put Calendar 60k · long Jun26 / short Sep26 · ×12.5 | Seller | Recd 0.0451 (~$35.4k) | −22 bps vs mark**
+**BTC Put Calendar 60k · long Jun26 / short Sep26 · ×12.5 | Seller | Recd 0.0451 (~$35.4k) | −22 bps below mark**
 
 Spot 62,728 · 60k −4.3% OTM · long near-Γ / short far-vega · max loss at 60k Jun expiry · grfq/DBT
 
 ```yaml
 [Greeks]   Δ +0.70 BTC (+5.6%) · Vega −$985/v · Γ long (near) · Θ −$423/d
-[Fair]     −22 bps vs mark · Jun60P 46.9v / Sep60P 43.8v · near-far spread 3.0v
+[Fair]     −22 bps below mark · Jun60P 46.9v / Sep60P 43.8v · near-far spread 3.0v
 [History]  6× 60k PCal today — 2×25 BUY → 4×12.5 SELL, two-way @ ~0.0450 · Jun IV 47.3→46.9v, absorbed · OI Jun 5,225 / Sep 3,644
 [Live]     Jun60P 0.0220/0.0230 · Sep60P 0.0660/0.0675 · cal screen ~0.0443 mid · fill +18 bps above
 ```
@@ -467,8 +467,28 @@ Spot 62,728 · 60k −4.3% OTM · long near-Γ / short far-vega · max loss at 6
 - Plain structure name ("Call Ratio", "Straddle", "Risk Reversal") — never the raw code (CS/SD/RR).
 - `Buyer` if the taker paid a net debit, `Seller` if they took in a net credit.
 - Size **per leg in coin** = block qty × each leg ratio (100 lots at 1×1.5 → `100/150 BTC`).
-- Premium: `Paid`/`Recd` <fill price>, then `±bps above/below mark` — use the query's
-  **precomputed `OFFSET_BPS`** verbatim (do not recompute by hand).
+- Premium: `Paid`/`Recd` <net package price>, then `<±N bps> above/below mark` from the
+  **Net package offset** rule below. **Single-leg:** that reduces to the query's precomputed
+  `OFFSET_BPS` = `(PRICE − REF_PRICE) × 10000` — use it verbatim (backward compatible). **Multi-leg:**
+  net the legs first; never paste a single leg's `OFFSET_BPS` into a package header.
+
+**Net package offset (the ONE convention — compute it identically in the header, `[Fair]`, and the
+script):**
+1. Net the taker's **executed** premium across the OPTION legs (exclude any perp/hedge leg):
+   `net_fill = Σ (sign × qty-weight × PRICE)`, `sign` = `+1` BUY / `−1` SELL, qty-weight = leg QTY ÷ the
+   structure's base (smallest) QTY. `net_fill > 0` = net **debit** (Buyer paid); `< 0` = net **credit**
+   (Seller received). Same netting on `REF_PRICE` → `net_mark`.
+2. Display the package price as `|net_fill|` after `Paid` (debit) / `Recd` (credit).
+3. `net_offset_bps = (|net_fill| − |net_mark|) × 10000` — i.e. in the displayed price's own orientation.
+   Positive ⇒ `above mark` (fill richer than mark), negative ⇒ `below mark`. Unit follows the quote
+   currency exactly like single-leg (bps for BTC/ETH, % for USD/USDC). The sign is deterministic — the
+   five near-identical fills of one structure must all print the same sign.
+4. **What it means for the taker (say it; keep the token neutral):** net DEBIT (Buyer) *above* mark =
+   paid more = **against** the taker; net CREDIT (Seller) *below* mark = received less = **against** the
+   taker. Never render an against-the-taker fill as edge.
+5. **Single-leg is unchanged** — one leg IS the package, so this equals `(PRICE − REF_PRICE) × 10000`.
+   Worked multi-leg example — RRPut 25 Sep 26 55000/75000, Seller: Recd **0.0009** net credit vs mark
+   net credit **0.0015** → `(0.0009 − 0.0015) × 10000` = **−6 bps below mark** (received less than mark).
 
 **Line 2 — View, one clause:**
 `<spot + moneyness> · <exposure in greek shorthand> · <key level> · <flow type>`
@@ -480,7 +500,8 @@ Spot 62,728 · 60k −4.3% OTM · long near-Γ / short far-vega · max loss at 6
 - `[Greeks]`  net, scaled to the position: `Δ <coin> (<%>)` · `Vega <±$/v>` · `Γ <val or long/short>` ·
   `Θ <±$/d>` · `Vanna <~val>` (only if non-trivial). Δ uses the triangle. No parentheticals explaining
   what a greek does.
-- `[Fair]`  `<±bps> vs mark` · per-leg vol (`Jun60P 46.9v`) · net spread/edge (`spread 3.0v`).
+- `[Fair]`  `<±bps> above/below mark` (the net package offset — the SAME number as the header) · per-leg
+  vol (`Jun60P 46.9v`) · net spread/edge (`spread 3.0v`).
   If the flow moved the surface, fold it in as one token (`lifted Jun ATM +0.4v`) — never a clause.
 - `[History]`  recurrence verdict · leg-flow with session/24h–7d size (`also on OKX` token ONLY if it
   printed elsewhere) · `OI <val>`. State the verdict (`two-way @ ~0.0450`, `absorbed`) in 1–2 words, no analysis.
@@ -495,8 +516,12 @@ Spot 62,728 · 60k −4.3% OTM · long near-Γ / short far-vega · max loss at 6
 - Drop a bracket row only if its data is genuinely unavailable — never pad, never invent.
 - Δ as the triangle; spell out vega/theta/gamma/vanna; theta & vega are USD ($/v, $/d), only Δ is coin.
 - `Δ %` = `net_delta_coin / block_qty × 100` (≈ `strategy_delta × 100`): ≈0% neutral, ±100% directional.
-- `bps vs mark` comes from the query's precomputed `OFFSET_BPS` (= `(PRICE−REF_PRICE)×10000`);
-  never recompute it mentally. Neutral phrasing, never moralize about crossing the spread.
+- `bps ... mark`: **single-leg** = the query's precomputed `OFFSET_BPS` (= `(PRICE−REF_PRICE)×10000`),
+  used verbatim; **multi-leg** = the Net package offset rule (net the legs, then
+  `(|net_fill|−|net_mark|)×10000` in the Paid/Recd orientation) — never paste a single leg's
+  `OFFSET_BPS` into a package header. Render `<±N bps> above/below mark`; the sign is deterministic.
+  Neutral phrasing, never moralize about crossing the spread, and never show an against-the-taker fill
+  as edge.
 - Resolve Buyer/Seller and long/short from the leg sides + `strategy_delta` (per Step 1) silently —
   state only the verdict, never the convention reasoning.
 - Cite only real `block_trade_id`s; **never invent a `combo_id` — not in the output and not in your
