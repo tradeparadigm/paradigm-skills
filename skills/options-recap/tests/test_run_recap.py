@@ -16,6 +16,7 @@ Run: python3 tests/test_run_recap.py
 import os
 import subprocess
 import sys
+import time
 
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "run_recap.sh")
 
@@ -47,6 +48,16 @@ def plan(*args):
     r = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True,
                        env=env, timeout=20)
     return (r.stdout.strip() or r.stderr.strip()), r.returncode
+
+
+def sources(now_s, *args):
+    """Run with the print-sources hook and a pinned clock; return
+    "ASSET WIN START_MS VS_COLD|-". Exercises the real surface-open source
+    resolution (window-start date math → cold partition path) with no creds."""
+    env = dict(os.environ, RECAP_PRINT_SOURCES="1", RECAP_NOW_S=str(now_s))
+    r = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True,
+                       env=env, timeout=20)
+    return r.stdout.strip()
 
 
 def test_plain_args():
@@ -116,6 +127,49 @@ def test_windows_beyond_24h_cap():
     # Regression: the old substring 1d→24h substitution turned 31d into "324h"
     # (13.5 days); exact-match normalization + the cap now yield a plain 24h.
     check("31d caps to 24h (not 324h)", plan("btc", "31d") == ("BTC 24h 86400 1", 0))
+
+
+# ── Surface-open source resolution (RECAP_PRINT_SOURCES) ────────────────────
+# ΔATM/ΔRR/ΔFly need a window-open surface. Windows ≤1h read it from _hot only
+# (VS_COLD "-"); >1h windows also target the cold hour-partition containing
+# window-start. The bash date math must be UTC and zero-padded on both GNU and
+# BSD date — a wrong partition path silently degrades every Δ column to n/a,
+# which is exactly the bug that shipped when the cold store was empty.
+
+COLD_FMT = ("s3://dt-paradigm-data/paradigm_data/v_vol_surface/"
+            "base={a}/year={t.tm_year:04d}/month={t.tm_mon:02d}/day={t.tm_mday:02d}/"
+            "hour={t.tm_hour:02d}/v_vol_surface.parquet")
+
+
+def expect(asset, win, now_s, secs, cold):
+    start = now_s - secs
+    c = COLD_FMT.format(a=asset, t=time.gmtime(start)) if cold else "-"
+    return f"{asset} {win} {start * 1000} {c}"
+
+
+def test_sources_hot_only_up_to_1h():
+    now = 1_784_536_200  # 2026-07-20 08:30:00 UTC
+    check("30m stays on _hot", sources(now, "btc", "30m") == expect("BTC", "30m", now, 1800, False))
+    check("1h stays on _hot", sources(now, "btc", "1h") == expect("BTC", "1h", now, 3600, False))
+
+
+def test_sources_cold_partition_over_1h():
+    now = 1_784_536_200  # 2026-07-20 08:30:00 UTC
+    out = sources(now, "btc", "8h")
+    check("8h resolves cold partition", out == expect("BTC", "8h", now, 28800, True), out)
+    check("8h cold path zero-padded/UTC",
+          "base=BTC/year=2026/month=07/day=20/hour=00/" in out, out)
+    out = sources(now, "eth", "90m")
+    check("90m (61–120min) also targets cold", out == expect("ETH", "90m", now, 5400, True), out)
+
+
+def test_sources_day_boundary():
+    # Window-start crosses midnight UTC: day/hour must roll back correctly.
+    now = 1_784_514_600  # 2026-07-20 02:30:00 UTC
+    out = sources(now, "btc", "8h")
+    check("8h across midnight → day=19 hour=18",
+          "year=2026/month=07/day=19/hour=18/" in out, out)
+    check("8h across midnight full line", out == expect("BTC", "8h", now, 28800, True), out)
 
 
 def test_bad_window_exits_2():

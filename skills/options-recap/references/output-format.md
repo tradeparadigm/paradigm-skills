@@ -96,7 +96,9 @@ Expiry     ATM      ΔATM     25d RR    ΔRR      Fly     ΔFly
 Formatting rules: ATM/RR/Fly are current (close) values, `X.Xv` precision. The Δ
 columns are the window-over-window change (current − window-open), signed `+X.Xv`;
 `flat` when the change rounds to zero, `n/a` when no window-open surface was
-available. Append `*` to any cell derived from extrapolated wings (e.g. `-4.0v*`).
+available (window-start outside the `v_vol_surface` history — deeper than the
+cold backfill, or in a partition gap). Append `*` to any cell derived from
+extrapolated wings (e.g. `-4.0v*`).
 
 ---
 

@@ -13,7 +13,7 @@ compatibility: Deribit public API (curl) for the tape (7d closes, block flow, an
   public API; the S3 reads require the IRSA bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.8"
+  version: "1.9"
 ---
 
 # Options Recap
@@ -42,6 +42,13 @@ Deribit public tape) retains only ~24h, so `run_recap.sh` caps any longer window
 (e.g. `2d`) at 24h and prepends a one-line `⚠ window capped at 24h — …` banner
 as the first line of its output — **relay it verbatim** (don't drop or reword
 it). The cap lifts once >24h flow is wired to the cold store.
+
+**Vol-surface Δ coverage:** the window-open surface comes from `_hot.parquet`
+(~2h rolling buffer) for short windows, else from the cold `v_vol_surface`
+hour-partition at window-start (published ~15min after each hour closes; the
+`_hot` fallback covers windows whose start hour isn't published yet). Δ columns
+read `n/a` only when window-start is outside the available history — deeper than
+the cold backfill, or in a partition gap.
 
 `/recap` alone = BTC options, last 24h. Still pass just `<ASSET> <WINDOW>` to
 `run_recap.sh` — it drops a stray `options`/`option` token, so `/recap btc
