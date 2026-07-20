@@ -58,6 +58,11 @@ WHERE RFQ_ID LIKE '%<CORE_ID>%' ESCAPE '\'
 -- structure ← DESCRIPTION. Offsets precomputed: OFFSET_BPS (×10000) for COIN-quoted premiums
 -- (BTC/ETH); OFFSET_PCT (% of mark) for USD/USDC-quoted premiums (SOL/alts — dollar prices,
 -- where ×10000 bps is meaningless). Pick by QUOTE_CURRENCY. Never hand-compute the offset.
+-- Per-row OFFSET_BPS/OFFSET_PCT is a SINGLE-LEG value. For a MULTI-ROW (multi-leg) RFQ do NOT
+-- paste a leg's OFFSET_BPS into the package header — net first: net_fill = Σ(±PRICE) over the OPTION
+-- legs (+ for BUY, − for SELL; perp/hedge rows excluded), net_mark = same on REF_PRICE, then package
+-- offset = (|net_fill| − |net_mark|) × 10000 in the displayed Paid/Recd orientation (SKILL Step 7
+-- "Net package offset"). Single-leg reduces to the per-row OFFSET_BPS (unchanged).
 SELECT 'FILL' tag, *,
        ROUND(PRICE - REF_PRICE, 6) AS MARK_OFFSET,
        ROUND((PRICE - REF_PRICE) * 10000, 1) AS OFFSET_BPS,
@@ -125,7 +130,7 @@ JSON. Map by the tape's actual columns:
 | `quantity` | `QTY` (contracts) |
 | `price` (fill) | `PRICE` (execution price, in `QUOTE_CURRENCY`) |
 | `mark_price` | `REF_PRICE` (reference/mark at trade time) |
-| `displayValues.markOffset` | computed: `PRICE − REF_PRICE` |
+| `displayValues.markOffset` | single-leg: `PRICE − REF_PRICE`; multi-leg: the package net offset (SKILL Step 7 "Net package offset"), not a per-leg value |
 | `venue` | from `PRODUCT` suffix — the token after ` - ` (e.g. `DBT` Deribit, `PRDX` Paradex, `BYB` Bybit, `OKX` OKX; **non-exhaustive** — new venues appear over time. Surface an unrecognized suffix verbatim; never fail or guess on one) |
 | `product_codes` / asset + kind | from `PRODUCT` — e.g. `BTC OPTION - DBT`, `ETH PERPETUAL - DBT`, `BTC OPTION - PRDX` |
 | `quote_currency` | `QUOTE_CURRENCY` (`BTC` / `ETH` / `USD` …) |
