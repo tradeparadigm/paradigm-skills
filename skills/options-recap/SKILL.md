@@ -13,7 +13,7 @@ compatibility: Deribit public API (curl) for the tape; Paradigm hot data (DuckDB
   bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.7"
+  version: "1.8"
 ---
 
 # Options Recap
@@ -39,6 +39,13 @@ DVOL / spot / Biggest Print / Block Flow reflect only the ~24h the sources hold
 (the vol-surface Δs do span the full window via cold partitions). `run_recap.sh`
 prepends a one-line `⚠ Volume · Activity · Biggest Print · Block Flow cover …`
 banner in that case — **relay it verbatim** (don't drop or reword it).
+
+**Vol-surface Δ coverage:** the window-open surface comes from `_hot.parquet`
+(~2h rolling buffer) for short windows, else from the cold `v_vol_surface`
+hour-partition at window-start (published ~1h15m after each hour closes; the
+`_hot` fallback covers windows whose start hour isn't published yet). Δ columns
+read `n/a` only when window-start is outside the available history — deeper than
+the cold backfill, or in a partition gap.
 
 `/recap` alone = BTC options, last 24h. Still pass just `<ASSET> <WINDOW>` to
 `run_recap.sh` — it drops a stray `options`/`option` token, so `/recap btc

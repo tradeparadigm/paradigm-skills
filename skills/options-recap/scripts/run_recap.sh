@@ -45,12 +45,34 @@ case "$WIN" in
   5m|10m|20m|1h|4h|8h|24h) PRESET=1;; *) PRESET=0;;
 esac
 
+# Vol-surface deltas (ΔATM/ΔRR/ΔFly) need a window-OPEN surface, which the recap
+# aggregates file doesn't carry (it has no surface rows). Read the consolidated
+# per-strike store v_vol_surface: its rolling _hot.parquet holds ~2h of 1-min
+# snapshots, and older opens come from the cold hour-partition containing
+# window-start (hourly files, published ~1h15m after the hour closes). "Now" is
+# always _hot.parquet's latest snapshot, so open+close share one pipeline.
+# Resolved here, before the STS bootstrap: it's pure date math, which lets the
+# RECAP_PRINT_SOURCES test hook exercise it with no creds. RECAP_NOW_S pins the
+# clock so tests can assert exact partition paths.
+NOW_S=${RECAP_NOW_S:-$(date -u +%s)}; START_S=$((NOW_S - SECS)); START_MS=$((START_S * 1000))
+VS_HOT=s3://dt-paradigm-data/paradigm_data/v_vol_surface/_hot.parquet
+VS_COLD=""
+if [ "$SECS" -gt 3600 ]; then               # window-start may predate _hot's buffer
+  SY=$(date -u -d "@$START_S" +%Y 2>/dev/null || date -u -r "$START_S" +%Y)
+  SM=$(date -u -d "@$START_S" +%m 2>/dev/null || date -u -r "$START_S" +%m)
+  SD=$(date -u -d "@$START_S" +%d 2>/dev/null || date -u -r "$START_S" +%d)
+  SH=$(date -u -d "@$START_S" +%H 2>/dev/null || date -u -r "$START_S" +%H)
+  VS_COLD=s3://dt-paradigm-data/paradigm_data/v_vol_surface/base=${ASSET}/year=${SY}/month=${SM}/day=${SD}/hour=${SH}/v_vol_surface.parquet
+fi
+
 # Testability hooks: echo resolved state and exit before any STS/DuckDB work (no
 # creds/network needed). Used by tests/test_run_recap.py.
 #   RECAP_PRINT_ARGS → "ASSET WIN"          (arg normalization)
 #   RECAP_PRINT_PLAN → "ASSET WIN SECS PRESET"  (window parsing + preset flag)
+#   RECAP_PRINT_SOURCES → "ASSET WIN START_MS VS_COLD|-"  (surface-open resolution)
 [ -n "${RECAP_PRINT_ARGS:-}" ] && { echo "$ASSET $WIN"; exit 0; }
 [ -n "${RECAP_PRINT_PLAN:-}" ] && { echo "$ASSET $WIN $SECS $PRESET"; exit 0; }
+[ -n "${RECAP_PRINT_SOURCES:-}" ] && { echo "$ASSET $WIN $START_MS ${VS_COLD:--}"; exit 0; }
 DIR="$(cd "$(dirname "$0")/.." && pwd)"      # skill dir (scripts/..)
 mkdir -p /tmp/recap
 # Clear stale CSVs from a prior run FIRST. If this run's DuckDB read fails or
@@ -74,25 +96,6 @@ ST=$(printf '%s' "$CREDS" | grep -o '<SessionToken>[^<]*'    | cut -d'>' -f2)
 # tape; the surface from v_vol_surface below).
 REC=s3://dt-exchange-venue-data/hot/hot__recap_aggregates_5m_24h.parquet
 
-# Vol-surface deltas (ΔATM/ΔRR/ΔFly) need a window-OPEN surface, which the recap
-# aggregates file doesn't carry (it has no surface rows). Read the consolidated
-# per-strike store v_vol_surface instead: its rolling _hot.parquet holds ~2h of
-# 1-min snapshots (covers windows ≤1h — both endpoints in one file), and older
-# opens come from the cold hour-partition that contains window-start. "Now" is
-# always _hot.parquet's latest snapshot, so open+close share one pipeline (clean deltas).
-# SECS is already parsed above (works for any window, not just presets).
-NOW_S=$(date -u +%s); START_S=$((NOW_S - SECS)); START_MS=$((START_S * 1000))
-VS_HOT=s3://dt-paradigm-data/paradigm_data/v_vol_surface/_hot.parquet
-if [ "$SECS" -le 3600 ]; then
-  VS_OPEN=$VS_HOT                                   # window-start within _hot's buffer
-else                                                # cold partition at window-start hour
-  SY=$(date -u -d "@$START_S" +%Y 2>/dev/null || date -u -r "$START_S" +%Y)
-  SM=$(date -u -d "@$START_S" +%m 2>/dev/null || date -u -r "$START_S" +%m)
-  SD=$(date -u -d "@$START_S" +%d 2>/dev/null || date -u -r "$START_S" +%d)
-  SH=$(date -u -d "@$START_S" +%H 2>/dev/null || date -u -r "$START_S" +%H)
-  VS_OPEN=s3://dt-paradigm-data/paradigm_data/v_vol_surface/base=${ASSET}/year=${SY}/month=${SM}/day=${SD}/hour=${SH}/v_vol_surface.parquet
-fi
-
 # One DuckDB session → CSVs. One statement per line; `at` is reserved → alias it.
 # dvol_spot + volume come from the rolling recap-aggregates file, windowed at query
 # time by bucket_at (>= START_MS) — one file serves every window, preset or not.
@@ -105,8 +108,24 @@ SET s3_session_token='${ST}';
 COPY (SELECT exchange, metric, arg_min(open, bucket_at) AS open, arg_max(close, bucket_at) AS close, max(high) AS high, min(low) AS low FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot' AND bucket_at >= ${START_MS} GROUP BY exchange, metric) TO '/tmp/recap/dvol_spot.csv' (HEADER, DELIMITER ',');
 COPY (SELECT exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY exchange, optionType) TO '/tmp/recap/volume.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '/tmp/recap/surface_now.csv' (HEADER, DELIMITER ',');
-COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_OPEN}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '/tmp/recap/surface_open.csv' (HEADER, DELIMITER ',');
+COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h WHERE abs("at"-${START_MS})<=900000 ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '/tmp/recap/surface_open.csv' (HEADER, DELIMITER ',');
 SQL
+
+# surface_open: the statement above is a SAFE fallback from _hot (always exists),
+# tolerance-guarded to 15min so a window-start outside _hot's ~2h buffer writes a
+# header-only CSV (→ n/a) instead of a wrong open. For >1h windows the
+# authoritative open is the cold hour-partition — appended as the session's LAST
+# statement so it OVERWRITES the fallback when it succeeds. If the partition
+# object is missing (start hour not yet published — ~1h15m lag — or older than
+# the cold history), read_parquet fails at bind before the COPY sink opens, the
+# fallback file stands, and only this final statement is lost: nothing depends on
+# the DuckDB CLI continuing past the error. This closes the 61–120min gap (cold
+# unpublished, but _hot still covers the start) and keeps clean n/a otherwise.
+if [ -n "$VS_COLD" ]; then
+  cat >> /tmp/recap.sql <<SQL
+COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_COLD}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '/tmp/recap/surface_open.csv' (HEADER, DELIMITER ',');
+SQL
+fi
 
 # recap.py runs this DuckDB session in a thread concurrent with the Deribit fetch.
 cd "$DIR" && exec uv run scripts/recap.py \
