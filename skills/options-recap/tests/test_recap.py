@@ -682,6 +682,33 @@ def test_block_flow_aggregates_clips_in_rows():
     check("no truncation suffix when all shown", "top 8 by notional" not in md, md)
 
 
+def test_block_flow_column_stretches_for_long_labels():
+    # Regression: typed cross-expiry labels ("24JUL26/31JUL26 Call Diagonal",
+    # 29 chars) overflowed the fixed 27-char Structure column, rendering
+    # "...Call Diagonal$42.0M" with no gap. The column now stretches to the
+    # longest label in the window and the header stays aligned with the rows.
+    trades = [
+        {"instrument_name": "BTC-24JUL26-68000-C", "index_price": 60000,
+         "iv": 35.2, "timestamp": 1780000000000, "direction": "buy",
+         "amount": 100, "block_trade_id": "D1"},
+        {"instrument_name": "BTC-31JUL26-71000-C", "index_price": 60000,
+         "iv": 37.1, "timestamp": 1780000000000, "direction": "sell",
+         "amount": 100, "block_trade_id": "D1"},
+    ]
+    bf = build_block_flow(trades, {}, spot=60000)
+    md = render_md({"header": {"asset": "BTC", "window": "1h", "start_utc": "01:00",
+                               "end_utc": "02:00"},
+                    "snapshot": {}, "biggest_print": bf["biggest_print"],
+                    "block_flow": bf, "vol_surface": None, "flow_horizon": None,
+                    "warnings": []})
+    lines = md.splitlines()
+    header = next(l for l in lines if l.startswith("#") and "Structure" in l)
+    row = next(l for l in lines if "Call Diagonal" in l and l.split()[0].isdigit())
+    check("no label/notional collision", "Diagonal$" not in row, row)
+    check("Notl column aligned with row", row.index("$") == header.index("Notl"),
+          (header, row))
+
+
 def test_leg_phrase_calendar_shows_expiry():
     # Same strike, different expiries (a calendar). Without the expiry prefix both
     # legs render identically ('65KC / 65KC') and the detail is unreadable; the

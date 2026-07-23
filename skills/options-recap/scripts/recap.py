@@ -845,13 +845,16 @@ def render_md(r: dict) -> str:
     struct_word = "structure" if n_struct == 1 else "structures"
     block_word = "block" if bf["n_blocks"] == 1 else "blocks"
     trunc = f" (top {len(bf['rows'])} by notional)" if n_struct > len(bf["rows"]) else ""
+    # Structure column stretches to the longest label in this window (typed
+    # labels like "24JUL26/31JUL26 Call Diagonal" overflow a fixed 27).
+    sw = max([27] + [len(row["structure"]) + 2 for row in bf["rows"]])
     L += ["```", "", f"**Block Flow — ${bf['total_m']}M / {bf['n_blocks']} {block_word} / "
           f"{n_struct} {struct_word}{trunc}**",
-          "", "```yaml", f"{'#':<3}{'Structure':<27}{'Notl':<9}{'Blocks':<8}Detail",
-          f"{'-':<3}{'-' * 25:<27}{'-' * 7:<9}{'-' * 6:<8}{'-' * 44}"]
+          "", "```yaml", f"{'#':<3}{'Structure':<{sw}}{'Notl':<9}{'Blocks':<8}Detail",
+          f"{'-':<3}{'-' * (sw - 2):<{sw}}{'-' * 7:<9}{'-' * 6:<8}{'-' * 44}"]
     for row in bf["rows"]:
         notl = f"${row['notl_m']}M"
-        L.append(f"{str(row['rank']):<3}{row['structure']:<27}{notl:<9}"
+        L.append(f"{str(row['rank']):<3}{row['structure']:<{sw}}{notl:<9}"
                  f"{str(row.get('blocks', 1)):<8}{row['detail']}")
     L += ["```", "", "**Vol Surface**"]
 
