@@ -25,6 +25,9 @@ from vol_math import (
     summarize_blocks,
     aggregate_clips,
     clip_signature,
+    parse_tape_description,
+    build_tape_blocks,
+    tape_venue_label,
     HOURS_PER_YEAR,
 )
 
@@ -572,6 +575,112 @@ def test_surface_empty():
     s = compute_vol_surface({}, spot=62000)
     check("empty tickers → no expiries", s["expiries"] == [], s)
     check("empty → term None", s["term_structure"] is None, s)
+
+
+# ── Tape parsing (paradigm_trade_tape_slim DESCRIPTION) ─────────────────────
+
+def test_parse_tape_description_named_and_custom():
+    cases = {
+        "Call 26 Dec 25 104000": ("Call", "26DEC25", 1),
+        "Put 23 Jan 26 95000": ("Put", "23JAN26", 1),
+        "Straddle 19 Nov 25 3050": ("Straddle", "19NOV25", 2),
+        "Strangle 27 Mar 26 90000/95000": ("Strangle", "27MAR26", 2),
+        "CSpd 27 Mar 26 85000/110000": ("Call Spread", "27MAR26", 2),
+        "PSpd 16 Jan 26 95000/93000": ("Put Spread", "16JAN26", 2),
+        "RRCall 30 Jan 26 70000/108000": ("Risk Reversal", "30JAN26", 2),
+        "IFly 26 Jun 26 75000/85000/95000": ("Iron Butterfly", "26JUN26", 4),
+    }
+    for desc, (label, exp, nlegs) in cases.items():
+        p = parse_tape_description(desc)
+        check(f"label {desc!r}", p["label"] == label, p)
+        check(f"expiry {desc!r}", p["expiry"] == exp, p)
+        check(f"legs {desc!r}", len(p["legs"]) == nlegs, p)
+    # Calendar → two expiries joined near/far.
+    cal = parse_tape_description("CCal 27 Feb 26 75000 / 26 Jun 26 75000")
+    check("calendar label", cal["label"] == "Call Calendar", cal)
+    check("calendar joins expiries", cal["expiry"] == "27FEB26/26JUN26", cal)
+    # Custom with explicit signs → per-leg legs extracted.
+    cm = parse_tape_description(
+        "Cstm +1.00 Call 24 Apr 26 78000 -2.00 Call 24 Apr 26 85000")
+    check("custom label", cm["label"] == "Custom", cm)
+    check("custom legs", len(cm["legs"]) == 2, cm)
+    # Unknown head → Custom, doesn't crash.
+    check("unknown head → Custom", parse_tape_description("Frobnicate 1 Jan 26 5")["label"] == "Custom")
+    check("empty → Custom", parse_tape_description("")["label"] == "Custom")
+
+
+def test_tape_venue_label():
+    check("DBT → Deribit", tape_venue_label("BTC OPTION - DBT") == "Deribit")
+    check("PRDX → Paradex", tape_venue_label("ETH OPTION - PRDX") == "Paradex")
+    check("BLSH → Bullish", tape_venue_label("BTC OPTION - BLSH") == "Bullish")
+    check("unknown suffix degrades", tape_venue_label("BTC OPTION - XYZ") == "Xyz")
+    check("no suffix → ?", tape_venue_label("BTC OPTION") == "?")
+
+
+def _trow(desc, side, notl, bid, rfq, prod="BTC OPTION - DBT", qty=100):
+    return {"DATE": "2026-07-23", "TIME": "03:03:53", "PRODUCT": prod,
+            "DESCRIPTION": desc, "QTY": qty, "SIDE": side,
+            "NOTIONAL_VOLUME_USD": notl, "RFQ_ID": rfq,
+            "TRADE_ID": bid + side[:1] + str(notl), "BLOCK_TRADE_ID": bid}
+
+
+def test_build_tape_blocks_notional_is_sum_per_block():
+    # A 4-leg custom block booked as 4 rows repeating the same DESCRIPTION — the
+    # block notional is the Σ of the per-leg NOTIONAL_VOLUME_USD, and the unit size
+    # is the per-row QTY (NOT summed across the repeated legs).
+    desc = ("Cstm -1.00 Put 7 Aug 26 1600 -1.00 Put 7 Aug 26 1700 "
+            "+1.00 Call 7 Aug 26 2000 -1.00 Call 7 Aug 26 2200")
+    rows = [_trow(desc, s, 1_925_970, "bETH", "rETH", prod="ETH OPTION - DBT", qty=1000)
+            for s in ("SELL", "SELL", "SELL", "BUY")]
+    res = build_tape_blocks(rows, min_notional_usd=100_000)
+    check("one block", res["n_blocks"] == 1, res)
+    bp = res["biggest_print"]
+    check("notional = Σ 4 legs = $7.7M", bp["notional_m"] == 7.7, bp)
+    check("unit size = per-row QTY (1000), not 4× = 4000", bp["size"] == 1000, bp)
+    check("custom label", bp["structure"] == "Custom", bp)
+    check("mixed side (buy+sell legs)", bp["side"] == "Mixed", bp)
+
+
+def test_build_tape_blocks_biggest_vs_rfq_rollup():
+    # Biggest print is the single largest BLOCK; Block Flow rows roll up clips by
+    # RFQ_ID. Two Call clips (same RFQ) + one bigger standalone RR block.
+    rows = [
+        _trow("Call 26 Dec 25 104000", "BUY", 1_200_000, "bC1", "rC"),
+        _trow("Call 26 Dec 25 104000", "BUY", 700_000, "bC2", "rC"),
+        _trow("Call 30 Jan 26 108000", "BUY", 900_000, "bRR", "rRR", prod="BTC OPTION - PRDX"),
+        _trow("Put 30 Jan 26 70000", "SELL", 900_000, "bRR", "rRR", prod="BTC OPTION - PRDX"),
+    ]
+    res = build_tape_blocks(rows, min_notional_usd=100_000)
+    check("3 blocks (bC1,bC2,bRR)", res["n_blocks"] == 3, res)
+    check("2 structures (rC rollup + rRR)", res["n_structures"] == 2, res)
+    # Biggest single block: the RR = $1.8M (Σ of its two legs) > the $1.2M Call clip.
+    bp = res["biggest_print"]
+    check("biggest is RR block $1.8M", bp["notional_m"] == 1.8 and bp["structure"] == "Risk Reversal", bp)
+    check("biggest venue Paradex", bp["venue"] == "Paradex", bp)
+    # The Call worked order rolls its two clips into one row (blocks=2).
+    call_row = next(r for r in res["rows"] if "Call" in r["structure"] and r["venue"] == "Deribit")
+    check("Call row rolls 2 clips", call_row["blocks"] == 2, call_row)
+    check("Call row notional Σ clips $1.9M", call_row["notl_m"] == 1.9, call_row)
+
+
+def test_build_tape_blocks_iv_lookup_deribit_only():
+    rows = [
+        _trow("Call 26 Dec 25 104000", "BUY", 1_000_000, "bD", "rD"),          # Deribit
+        _trow("Call 26 Dec 25 104000", "BUY", 1_000_000, "bP", "rP", prod="BTC OPTION - PRDX"),
+    ]
+    iv = lambda cp, k, e: 42.5 if (cp == "C" and k == 104000 and e == "26DEC25") else None
+    res = build_tape_blocks(rows, iv_lookup=iv, min_notional_usd=100_000)
+    by_venue = {r["venue"]: r for r in res["rows"]}
+    check("Deribit block gets IV", by_venue["Deribit"]["avg_iv"] == 42.5, by_venue["Deribit"])
+    check("Paradex block IV n/a (surface is Deribit-only)", by_venue["Paradex"]["avg_iv"] is None,
+          by_venue["Paradex"])
+
+
+def test_build_tape_blocks_empty():
+    res = build_tape_blocks([])
+    check("empty → no biggest print", res["biggest_print"] is None, res)
+    check("empty → zero blocks", res["n_blocks"] == 0, res)
+    check("empty → no rows", res["rows"] == [], res)
 
 
 def main():

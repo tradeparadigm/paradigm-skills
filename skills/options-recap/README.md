@@ -24,23 +24,26 @@ The live path is **one command** the agent runs, then it relays stdout verbatim:
 bash scripts/run_recap.sh <ASSET> <WINDOW>
         │
         ├── STS bootstrap (IRSA → temporary S3 creds)
-        ├── writes /tmp/recap.sql (one DuckDB session, 7 COPY statements → CSVs)
-        └── uv run scripts/recap.py --duckdb-sql /tmp/recap.sql --csv-dir /tmp/recap --render
+        ├── writes $WORK/recap.sql (one DuckDB session, COPY statements → CSVs:
+        │     dvol_spot, volume, surface_now/open, AND blocks from the tape)
+        └── uv run scripts/recap.py --duckdb-sql $WORK/recap.sql --csv-dir $WORK --render
                     │
                     ├── runs DuckDB in a thread  ─┐  (concurrent — both are
-                    ├── fetches Deribit tape      ─┘   network-bound)
-                    │     • 7d hourly closes (realized vol)
-                    │     • window option trades, concurrent time-sliced pagination
-                    ├── ingests the hot CSVs
-                    ├── vol math via scripts/vol_math.py
+                    ├── fetches Deribit 7d closes ─┘   network-bound)
+                    │     • 7d hourly closes (realized vol) — the ONLY exchange-API call
+                    ├── ingests the hot CSVs + blocks.csv (the block tape)
+                    ├── vol math via scripts/vol_math.py (incl. tape block ranking/rollup)
                     └── prints the finished four-section markdown
 ```
 
 - `scripts/run_recap.sh` — the live wrapper (S3 + DuckDB + recap.py).
 - `scripts/recap.py` — orchestrator: fetch, ingest, assemble, compute, render.
 - `scripts/vol_math.py` — pure vol math (realized-vs-implied, Black-76 flow
-  greeks, block clustering/ranking, vol-surface skew/term). No I/O.
-- `scripts/recap.py --no-s3 --render` — offline smoke against live Deribit only.
+  greeks, tape DESCRIPTION parsing + block ranking/rollup, vol-surface skew/term).
+  No I/O.
+- `scripts/recap.py --no-s3 --render` — offline smoke against live Deribit only
+  (7d closes + DVOL/spot); Biggest Print / Block Flow read `No data` (they're
+  S3-only now).
 - `references/output-format.md` — the fixed four-section template + formatting
   rules. The live path doesn't read it (the script emits the shape); it's the
   rendering contract for the injected/simulate modes and the eval harness.
@@ -52,9 +55,10 @@ bash scripts/run_recap.sh <ASSET> <WINDOW>
 volume/`trade_count` rows come from ONE rolling file, `hot__recap_aggregates_5m_24h.parquet`
 (5-min buckets over the trailing 24h), windowed at query time by `WHERE bucket_at
 >= now - window` + aggregation; the vol surface + ΔATM/ΔRR/ΔFly come from
-`v_vol_surface`. The Deribit public API adds only the 7d realized-vol closes,
-the block-leg geometry (Biggest Print / Block Flow), and a live DVOL/spot fallback
-if the S3 read fails.
+`v_vol_surface`; and Biggest Print / Block Flow come from the multi-venue Paradigm
+block tape (`paradigm_trade_tape_slim`), scanned in the same DuckDB session. The
+Deribit public API adds only the 7d realized-vol closes (and a live DVOL/spot
+fallback if the S3 read fails).
 
 Notes / non-obvious bits:
 - **`PRESET` is just a label now.** The canonical windows (`5m 10m 20m 1h 4h 8h
@@ -68,14 +72,14 @@ Notes / non-obvious bits:
 - **The old bug:** a preset `case` mapped unknown windows to a silent 8h default,
   so surface deltas were computed against an 8h-old open. Fixed by parsing the
   window into seconds instead of enumerating presets.
-- **~24h flow horizon.** The flow sections only reach back ~24h: Volume / Activity /
-  P-C come from the rolling recap-aggregates file (trailing 24h) and Biggest Print /
-  Block Flow from the Deribit public tape (also ~24h retention — both `get_last_trades*`
-  endpoints return 0 rows older than ~24h). DVOL/spot (OHLC) and the vol surface
-  (`v_vol_surface`) retain far longer. So for windows >24h, `build()` sets a
-  `flow_horizon` field and `render_md` prepends a one-line banner — the flow sections
-  cover ~24h, the rest spans the full window. The >24h flow data *does* exist in the
-  cold store but isn't wired in yet — the planned follow-up that will retire the banner.
+- **~24h Snapshot horizon.** The *Snapshot* flow sources reach back only ~24h:
+  Volume / Activity / P-C / DVOL / spot come from the rolling recap-aggregates file
+  (trailing 24h). Block Flow + Biggest Print now come from the months-deep Paradigm
+  block tape, and the vol surface (`v_vol_surface`) retains far longer — so those are
+  no longer the constraint. For windows >24h, `build()` sets a `hot_horizon` field and
+  `render_md` prepends a one-line banner scoped to the hot Snapshot sections (Block
+  Flow + surface span the full window). `run_recap.sh` still caps at 24h until the
+  Snapshot sources are wired to the cold store — the follow-up that retires the banner.
 - **Bad windows** (`3x`, `0h`, …) exit `2` with a clear message before any network.
 - The raw per-venue tapes under `external/tardis/` are **not** a source here —
   they don't replicate into the pod's bucket and are stale; Deribit's public API
@@ -89,23 +93,36 @@ script (agent types one short line) and pre-rendering the markdown in `recap.py`
 
 ## Data sources
 
-The recap aggregates file + the `v_vol_surface` store (one DuckDB session) plus
-the Deribit tape. **These are authoritative for DVOL/spot/volume/surface;**
-Deribit supplies only the 7d realized-vol closes and block-leg geometry (the hot
-files carry neither). `recap.py` reads the `dvol_spot` + `volume` rows from the
-recap file, and the surface from `v_vol_surface`. The
-`row_type` map in `hot__recap_aggregates_5m_24h.parquet` (a single rolling file
-of 5-min buckets over the trailing 24h; the window is applied at query time via
+Three S3 sources in one DuckDB session: the recap aggregates file (DVOL/spot,
+volume, activity/P-C), the `v_vol_surface` store (surface + Δ), and the Paradigm
+block tape (Biggest Print + Block Flow). The Deribit public API adds only the 7d
+realized-vol closes. `recap.py` reads the `dvol_spot` + `volume` rows from the
+recap file. The `row_type` map in `hot__recap_aggregates_5m_24h.parquet` (a single
+rolling file of 5-min buckets over the trailing 24h; windowed at query time via
 `WHERE bucket_at >= now - window` + aggregation):
 
 | Section | `row_type` | Key columns |
 |---|---|---|
 | Snapshot DVOL/spot | `dvol_spot` | `metric`, `open`, `close`, `high`, `low` (OHLC: `arg_min(open,bucket_at)` / `arg_max(close,bucket_at)` / `max(high)` / `min(low)`) |
-| Snapshot volume/P-C | `volume` | `exchange`, `optionType`, `volume_sum`, `notional_usd`, `trade_count` |
-| Block Flow | `block` | `block_id`, `notional_usd`, `volume_sum`, `leg_count`, `iv_sum`/`iv_count` |
+| Snapshot volume/P-C/$Volume | `volume` | `exchange`, `optionType`, `volume_sum`, `notional_usd`, `trade_count` |
 
-There is **no `surface` `row_type`** — the vol surface lives in `v_vol_surface`
-(see below). `notional` is now `notional_usd`; IV is `iv_sum`/`iv_count` (no `avg_iv`).
+There is **no `surface` and no `block` `row_type`** — the vol surface lives in
+`v_vol_surface`, and Biggest Print / Block Flow come from the block tape (both
+below). `notional` is `notional_usd`.
+
+**Block tape (Biggest Print + Block Flow).** `s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz`
+— one flat ~1.5MB csv.gz (all dates; a full scan is sub-second, so it's read fresh
+per recap, windowed by the `DATE`+`TIME` filter in `run_recap.sh`). It spans every
+venue Paradigm brokers (`DBT`/`PRDX`/`BLSH`/…) with USD notional **per leg**
+(`NOTIONAL_VOLUME_USD`) and the structure named in `DESCRIPTION`, so `vol_math`
+does no cross-venue $ normalization and no instrument-name inference. `vol_math`
+groups it two ways: by `BLOCK_TRADE_ID` (a block; Σ per-leg notional → the Biggest
+Print is the single largest) and by `RFQ_ID` (a worked order; its blocks roll into
+one Block Flow row with a `Blocks` count). Columns used: `DATE`, `TIME`, `PRODUCT`
+(→ asset + venue), `DESCRIPTION`, `QTY`, `SIDE`, `NOTIONAL_VOLUME_USD`, `RFQ_ID`,
+`BLOCK_TRADE_ID`. The tape carries **no IV** — the top blocks' IV is looked up from
+`v_vol_surface` (Deribit legs only). See the `paradigm-data-discovery` skill for the
+tape schema and the `paradigm-block-analyst` skill for the `DESCRIPTION` grammar.
 
 **Multi-venue representation (truthful + consistent).** The `volume` rows span
 Deribit, OKX, Bybit, Bullish, but their units aren't comparable: `volume_sum` is
@@ -145,22 +162,19 @@ table is capped to the front `MAX_SURFACE_ROWS` expiries.
 
 ## Known hot-data quirk (important)
 
-`hot__recap_aggregates_5m_24h.parquet` `volume`/`block` rows have **inconsistent units**
-and **aggregate/corrupt rows** that, summed naively, produced absurd numbers
-(Volume ~$9.8T, a single $5.1B block) in early versions:
+`hot__recap_aggregates_5m_24h.parquet` `volume` rows have **inconsistent units**
+and **aggregate rows** that, summed naively, produced an absurd Volume (~$9.8T)
+in early versions:
 
 - `volume` carries a per-exchange **aggregate row** (blank `optionType`) whose
   `notional` double-counts, and `volume_sum` units differ by venue
   (Deribit/Bullish in BTC, OKX/Bybit in contracts).
-- `block` occasionally has a **unit-corrupt row** (`notional` = `volume_sum` ×
-  spot on a `volume_sum` that isn't BTC).
 
-`recap.py` defends against both: Volume/P-C are derived from **Deribit only**
-(contracts × spot), dropping the blank-`optionType` aggregate rows; Block Flow
-totals are derived from the **Deribit tape clustering** that produces the
-displayed rows, not from the hot `block` rows. These are pinned by regression
-tests (`test_recap.py`). The upstream producer should ideally emit consistent
-units — until then, recap.py is the guard.
+`recap.py` defends: Volume/P-C are derived from **Deribit only** (contracts ×
+spot), dropping the blank-`optionType` aggregate rows. This is pinned by
+regression tests (`test_recap.py`). (The old hot `block` row_type — which had its
+own unit-corrupt rows — is no longer read at all: Biggest Print + Block Flow now
+come from the Paradigm block tape, where notional is already USD per leg.)
 
 On a hot miss (DuckDB fails / CSVs absent) it degrades: affected sections read
 `No data` and the output is prefixed `⚠ hot surface unavailable`. It never fabricates.
@@ -178,12 +192,16 @@ Stdlib-only, no network/S3. Run in CI on any change under `skills/options-recap/
 via `.github/workflows/options-recap-tests.yml`:
 
 ```bash
-python3 tests/test_vol_math.py    # 54 checks — the math formulas
-python3 tests/test_recap.py       # 107 checks — orchestrator: window parsing,
-                                    #   hot-CSV ingest, the volume/block corruption
-                                    #   guards, assembly, vol-surface deltas,
-                                    #   rendering, run_duckdb
-python3 tests/test_run_recap.py   # 10 checks — run_recap.sh arg normalization
+python3 tests/test_vol_math.py    # 156 checks — the math formulas + tape parsing
+                                    #   (parse_tape_description) and block ranking/
+                                    #   rollup (build_tape_blocks: Σ-per-block
+                                    #   notional, RFQ clip rollup, IV lookup)
+python3 tests/test_recap.py       # 207 checks — orchestrator: window parsing,
+                                    #   hot-CSV ingest, the volume-corruption guard,
+                                    #   block tape → Biggest Print/Block Flow (multi-
+                                    #   venue, venue column, freshness stamp),
+                                    #   assembly, vol-surface deltas, rendering
+python3 tests/test_run_recap.py   # 39 checks — run_recap.sh arg normalization
                                     #   (asset/window resolution, "options" keyword
                                     #   strip) via the RECAP_PRINT_ARGS hook
 ```
@@ -199,5 +217,8 @@ commit. The size of the bump follows the change: a **patch** for fixes/tweaks, a
 **minor** for new content/behaviour. The ΔATM/ΔRR/ΔFly columns + `v_vol_surface`
 open-surface read were the minor bump to `1.4`; relocating the output template to
 `references/output-format.md` is a no-behaviour structural cleanup, so it's the
-**patch** to `1.4.1` (output is byte-identical). (See the repo `CLAUDE.md` for the
-minor/major rules.)
+**patch** to `1.4.1` (output is byte-identical). Repointing Biggest Print + Block
+Flow off the Deribit public API onto the multi-venue Paradigm block tape (S3-only,
+adds a Venue column + `via Paradigm/<venue>` + surface-IV lookup, Volume goes
+hot-only) is the **minor** bump to `1.12` — same four sections and trigger, no
+removed fields. (See the repo `CLAUDE.md` for the minor/major rules.)

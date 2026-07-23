@@ -7,13 +7,14 @@ description: >
   and vol surface. Use when the user types /recap or asks for a market recap,
   options flow summary, "what happened in BTC options", or "last Xh of flow".
   The output format is fixed — always the same four sections in the same order.
-compatibility: Deribit public API (curl) for the tape (7d closes, block flow, and the
-  Volume line's $ figure); Paradigm hot data (DuckDB+S3 via IRSA) for DVOL/spot,
-  multi-venue activity/P-C, and the vol surface. No authentication required for the
-  public API; the S3 reads require the IRSA bootstrap (see paradigm-data-discovery skill).
+compatibility: Deribit public API (curl) for the 7d realized-vol closes only; Paradigm
+  data (DuckDB+S3 via IRSA) for everything else — DVOL/spot, $ Volume, multi-venue
+  activity/P-C, the vol surface, and the Biggest Print + Block Flow (the multi-venue
+  paradigm_trade_tape_slim block tape). No authentication required for the public API;
+  the S3 reads require the IRSA bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.11"
+  version: "1.12"
 ---
 
 # Options Recap
@@ -28,20 +29,24 @@ metadata:
 | `window` | any `Nm`/`Nh`/`Nd` up to 24h — `30m`, `3h`, `8h` (`1d`→`24h`) | `24h` |
 | `options` | the literal word `options` | ignored — a no-op keyword (this skill is always options); `run_recap.sh` strips it |
 
-Any `Nm`/`Nh`/`Nd` window up to 24h works and all render identically: DVOL/spot
-and the multi-venue activity/P-C come from one rolling hot aggregates file sliced
-to the window at query time, the surface (and its Δ columns) from `v_vol_surface`,
-and the Volume ($) line and block flow both from the Deribit tape — the hot
-aggregates file head-lags the live prints by ~10-15 min, so on a thin window it
-under-reports $ volume (potentially below the block-flow total); the tape carries
-every print with its index price and is authoritative for the Volume figure. A
-malformed window exits with a clear error.
+Any `Nm`/`Nh`/`Nd` window up to 24h works and all render identically: DVOL/spot,
+the `$` Volume line, and the multi-venue activity/P-C all come from one rolling hot
+aggregates file sliced to the window at query time; the surface (and its Δ columns)
+from `v_vol_surface`; and **Biggest Print + Block Flow from the multi-venue Paradigm
+block tape** (`paradigm_trade_tape_slim`) — every venue Paradigm brokers
+(Deribit/Paradex/Bullish/…), notional already in USD per leg, so each Block Flow row
+carries a Venue column and Biggest Print reads `via Paradigm/<venue>`. The tape has
+no IV, so the top blocks' IV is looked up from the vol surface (Deribit legs only;
+other venues show IV `n/a`). The tape is S3-sourced (near-real-time, not live), so
+Block Flow discloses a `tape through HH:MM UTC` stamp. A malformed window exits with
+a clear error.
 
-**Windows beyond 24h:** every flow source (the rolling hot aggregates file, the
-Deribit public tape) retains only ~24h, so `run_recap.sh` caps any longer window
-(e.g. `2d`) at 24h and prepends a one-line `⚠ window capped at 24h — …` banner
-as the first line of its output — **relay it verbatim** (don't drop or reword
-it). The cap lifts once >24h flow is wired to the cold store.
+**Windows beyond 24h:** the Snapshot flow sources (the rolling hot aggregates file →
+Volume/Activity/P-C/DVOL/spot) retain only ~24h, so `run_recap.sh` caps any longer
+window (e.g. `2d`) at 24h and prepends a one-line `⚠ window capped at 24h — …` banner
+as the first line of its output — **relay it verbatim** (don't drop or reword it).
+Block Flow itself now comes from the months-deep block tape and isn't the constraint;
+the cap lifts once the Snapshot sources are wired to the cold store.
 
 **Vol-surface Δ coverage:** the window-open surface comes from `_hot.parquet`
 (~2h rolling buffer) for short windows, else from the cold `v_vol_surface`
@@ -63,10 +68,10 @@ command and relay its stdout **verbatim** as your entire reply:
 bash scripts/run_recap.sh BTC 8h      # <ASSET> <WINDOW>; any Nm/Nh/Nd works; 1d→24h
 ```
 
-That script does everything — STS bootstrap, the single DuckDB session over the
-hot surface, the Deribit tape (7d closes + window trades via concurrent,
-time-sliced pagination), the vol math, and final formatting — and prints the
-finished four-section recap. **Do not** add commentary, reformat it, re-fetch
+That script does everything — STS bootstrap, the single DuckDB session (hot
+surface + the Paradigm block tape), the Deribit 7d-closes fetch (the realized-vol
+input), the vol math, and final formatting — and prints the finished four-section
+recap. **Do not** add commentary, reformat it, re-fetch
 anything, or run extra steps. Its output already is the recap. Your reply must
 BEGIN with the script's first output line (the `⚠ …` banner when present, else
 the bold header) — no preamble like "I'll run the recap", no trailing notes or

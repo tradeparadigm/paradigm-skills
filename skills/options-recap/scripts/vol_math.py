@@ -10,6 +10,7 @@ Pure functions, no I/O, no network — unit-tested in test_vol_math.py.
 """
 
 import math
+import re
 from collections import defaultdict
 
 # Crypto trades 24/7, so the calendar annualization factor is √(24×365).
@@ -494,6 +495,380 @@ def aggregate_clips(ranked: list[dict], clusters: dict[str, list]) -> list[dict]
         out.append(g)
     out.sort(key=lambda r: r["notional_usd"], reverse=True)
     return out
+
+
+# ── Tape-sourced blocks (paradigm_trade_tape_slim) ──────────────────────────
+# Biggest Print + Block Flow are built from the Paradigm block-trade tape, NOT
+# the Deribit public API. The tape spans every venue Paradigm brokers
+# (Deribit/Paradex/Bullish/…), already carries USD notional PER LEG
+# (NOTIONAL_VOLUME_USD), and names each structure in DESCRIPTION — so this path
+# does no cross-venue $ normalization and no instrument-name structure inference
+# for the named/custom shapes. DESCRIPTION parsing mirrors the block-analyst
+# skill (analyze_core.parse_description) but is kept independent here so
+# options-recap stays self-contained.
+
+_TAPE_DATE = r"(\d{1,2})\s+([A-Za-z]{3})\s+(\d{2})"          # DD Mon YY
+
+# Head token of DESCRIPTION → display label. Preserves the Call/Put/Iron
+# distinctions the DRFQ StrategyCodeEnum vocabulary encodes; an unrecognised
+# head falls through to Custom (see _tape_label).
+_HEAD_LABEL = {
+    "CALL": "Call", "PUT": "Put",
+    "STRADDLE": "Straddle", "STRANGLE": "Strangle",
+    "RR": "Risk Reversal", "RRCALL": "Risk Reversal", "RRPUT": "Risk Reversal",
+    "CSPD": "Call Spread", "PSPD": "Put Spread",
+    "IFLY": "Iron Butterfly", "CFLY": "Call Butterfly", "PFLY": "Put Butterfly",
+    "FLY": "Butterfly",
+    "ICONDOR": "Iron Condor", "CCONDOR": "Call Condor", "PCONDOR": "Put Condor",
+    "CONDOR": "Condor",
+    "CCAL": "Call Calendar", "PCAL": "Put Calendar", "CAL": "Calendar",
+    "CDIAG": "Call Diagonal", "PDIAG": "Put Diagonal",
+    "COMBO": "Combo", "CSTM": "Custom", "CUSTOM": "Custom",
+}
+
+# venue suffix in PRODUCT ('BTC OPTION - DBT') → short display tag. Unknown/new
+# venues degrade to a title-cased stem rather than crashing (pass-through, no
+# enum) — matches the block-analyst venue handling.
+_TAPE_VENUE = {"DBT": "Deribit", "PRDX": "Paradex", "BLSH": "Bullish",
+               "BYB": "Bybit", "BIT": "Bit.com"}
+
+
+def _compact_exp(d, mon, yy) -> str:
+    return f"{int(d)}{mon.upper()}{yy}"
+
+
+def _uniq_keep(seq):
+    out = []
+    for x in seq:
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def _join_exp(exps) -> str | None:
+    """Chronological near/far join for a multi-expiry label (calendar/diagonal);
+    single expiry passes through, none → None."""
+    exps = _uniq_keep(exps)
+    if not exps:
+        return None
+    if len(exps) == 1:
+        return exps[0]
+    exps = sorted(exps, key=lambda e: expiry_ms_from_instrument(f"X-{e}-0-C") or 0)
+    return f"{exps[0]}/{exps[-1]}" if len(exps) == 2 else f"{exps[0]}→{exps[-1]}"
+
+
+def _tape_label(head_up: str) -> str:
+    if head_up in _HEAD_LABEL:
+        return _HEAD_LABEL[head_up]
+    if head_up.startswith("RR"):
+        return "Risk Reversal"
+    if head_up.endswith("CAL"):
+        return ("Call Calendar" if head_up.startswith("C")
+                else "Put Calendar" if head_up.startswith("P") else "Calendar")
+    return "Custom"
+
+
+def _tape_named_legs(head_up: str, ks: list[int], ec: str) -> list[dict]:
+    """(cp, strike, expiry_c) geometry for a named single-expiry structure — used
+    only for the IV lookup and leg detail (signs/ratios aren't needed here).
+    Unknown shapes return [] so the caller falls back to the raw strike tail."""
+    sk = sorted(ks)
+
+    def L(cp, k):
+        return {"cp": cp, "strike": int(k), "expiry_c": ec}
+
+    if head_up.startswith("STRADDLE") and len(sk) == 1:
+        return [L("C", sk[0]), L("P", sk[0])]
+    if head_up.startswith(("STRANGLE", "RR")) and len(sk) == 2:
+        return [L("P", sk[0]), L("C", sk[1])]
+    if head_up.startswith("CSPD") and len(sk) == 2:
+        return [L("C", sk[0]), L("C", sk[1])]
+    if head_up.startswith("PSPD") and len(sk) == 2:
+        return [L("P", sk[0]), L("P", sk[1])]
+    if head_up.startswith("IFLY") and len(sk) == 3:
+        return [L("P", sk[0]), L("P", sk[1]), L("C", sk[1]), L("C", sk[2])]
+    if head_up.startswith("PFLY") and len(sk) == 3:
+        return [L("P", k) for k in sk]
+    if head_up.startswith(("CFLY", "FLY")) and len(sk) == 3:
+        return [L("C", k) for k in sk]
+    if head_up.startswith("ICONDOR") and len(sk) == 4:
+        return [L("P", sk[0]), L("P", sk[1]), L("C", sk[2]), L("C", sk[3])]
+    if head_up.startswith("PCONDOR") and len(sk) == 4:
+        return [L("P", k) for k in sk]
+    if head_up.startswith(("CCONDOR", "CONDOR")) and len(sk) == 4:
+        return [L("C", k) for k in sk]
+    return []
+
+
+def parse_tape_description(desc: str) -> dict:
+    """Parse a tape DESCRIPTION → {label, expiry, legs, classified}.
+
+    label      display structure name (Straddle, Risk Reversal, Custom, …)
+    expiry     compact expiry; calendars/diagonals join near/far ('10JUL26/31JUL26')
+    legs       [{cp, strike, expiry_c}] where derivable — drives the IV lookup and
+               leg detail; [] when only a name+strikes are given for a shape whose
+               geometry we don't map (caller then shows the raw strike tail).
+    classified False when the shape isn't recognised.
+
+    Mirrors block-analyst analyze_core.parse_description; independent so this
+    skill needs no cross-skill import."""
+    raw = (desc or "").strip()
+    toks = raw.split()
+    if not toks:
+        return {"label": "Custom", "expiry": None, "legs": [], "classified": False}
+    up = toks[0].rstrip(":").upper()
+
+    # Custom: explicit per-leg "[+/-]ratio Type DD Mon YY Strike" (any # of legs).
+    if up.startswith(("CSTM", "CUSTOM")):
+        legs = []
+        for m in re.finditer(
+                r"[+-]?\d*\.?\d+\s+(Call|Put|C|P)\s+" + _TAPE_DATE + r"\s+(\d+)", raw):
+            cp, d, mon, yy, k = m.groups()
+            legs.append({"cp": "C" if cp.upper().startswith("C") else "P",
+                         "strike": int(k), "expiry_c": _compact_exp(d, mon, yy)})
+        return {"label": "Custom", "expiry": _join_exp([l["expiry_c"] for l in legs]),
+                "legs": legs, "classified": bool(legs)}
+
+    # Single outright: "Call 7 May 26 84000".
+    if up in ("CALL", "PUT"):
+        m = re.search(_TAPE_DATE + r"\s+(\d+)", raw)
+        if m:
+            d, mon, yy, k = m.groups()
+            ec = _compact_exp(d, mon, yy)
+            return {"label": _HEAD_LABEL[up], "expiry": ec,
+                    "legs": [{"cp": up[0], "strike": int(k), "expiry_c": ec}],
+                    "classified": True}
+
+    # Calendar / diagonal: two "DD Mon YY Strike" groups.
+    cal = re.findall(_TAPE_DATE + r"\s+(\d+)", raw)
+    if len(cal) >= 2 and (up.endswith("CAL") or up.endswith("DIAG")):
+        cp = "C" if up.startswith("C") else "P" if up.startswith("P") else None
+        legs = [{"cp": cp, "strike": int(k), "expiry_c": _compact_exp(d, mon, yy)}
+                for (d, mon, yy, k) in cal]
+        return {"label": _tape_label(up), "expiry": _join_exp([l["expiry_c"] for l in legs]),
+                "legs": legs, "classified": True}
+
+    # Named single-expiry: "<NAME> DD Mon YY  K[/K...]" (position guard keeps the
+    # date's YY out of the trailing strike group; 2-digit alt strikes are valid).
+    dm = re.search(_TAPE_DATE, raw)
+    km = re.search(r"(\d{2,7}(?:\s*/\s*\d{2,7})*)\s*$", raw)
+    ks = []
+    if km and dm and km.start() >= dm.end():
+        ks = [int(x) for x in re.split(r"\s*/\s*", km.group(1))]
+    if dm and ks:
+        d, mon, yy = dm.groups()
+        ec = _compact_exp(d, mon, yy)
+        return {"label": _tape_label(up), "expiry": ec,
+                "legs": _tape_named_legs(up, ks, ec), "classified": True}
+
+    return {"label": _tape_label(up), "expiry": None, "legs": [], "classified": False}
+
+
+def tape_venue_label(product: str) -> str:
+    _, sep, suf = (product or "").rpartition(" - ")
+    suf = suf.strip().upper() if sep else ""       # no ' - VENUE' suffix → unknown
+    return _TAPE_VENUE.get(suf, suf.title() if suf else "?")
+
+
+def _fnum(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _tape_side(sides: list[str]) -> str:
+    """Buy / Sell / Mixed from the block's per-leg SIDE column. Mixed = legs
+    point both ways (every spread does) — a structure fact, not an unknown
+    aggressor; never rendered as 'two-way'."""
+    s = {(x or "").upper() for x in sides if x}
+    if s == {"BUY"}:
+        return "Buy"
+    if s == {"SELL"}:
+        return "Sell"
+    return "Mixed"
+
+
+def _tape_strike_label(k) -> str:
+    """Compact strike text: 10K+ abbreviates (68000→68K, 62500→62.5K), sub-10K
+    (SOL/alt strikes) stays raw. Mirrors recap._strike_label; kept local so
+    vol_math has no upward dependency on the CLI module."""
+    try:
+        v = int(k)
+    except (TypeError, ValueError):
+        return str(k)
+    if v < 10_000:
+        return str(v)
+    if v % 1000 == 0:
+        return f"{v // 1000}K"
+    return f"{v / 1000:g}K"
+
+
+def _tape_strike_tail(desc: str) -> str:
+    """Trailing 'K1/K2/…' strike group of a DESCRIPTION (after the date) — the
+    detail fallback when we can't map the structure's leg geometry."""
+    dm = re.search(_TAPE_DATE, desc or "")
+    km = re.search(r"(\d{2,7}(?:\s*/\s*\d{2,7})*)\s*$", desc or "")
+    if km and dm and km.start() >= dm.end():
+        return "/".join(_tape_strike_label(x) for x in re.split(r"\s*/\s*", km.group(1)))
+    return ""
+
+
+def _block_from_rows(bid: str, rows: list[dict], iv_lookup=None) -> dict:
+    """Collapse one BLOCK_TRADE_ID's leg-rows into a block summary.
+
+    Notional is Σ NOTIONAL_VOLUME_USD across the rows — robust whether the rows
+    are the block's legs or clips of it (both share the id), and matching the
+    gross-notional convention of the Deribit path. Structure/expiry come from the
+    DESCRIPTION when a row names a multi-leg shape, else from the collected
+    single-leg rows. IV is looked up (Deribit legs only; the tape has none)."""
+    asset = (rows[0].get("PRODUCT") or "").split()[0].upper()
+    venue = tape_venue_label(rows[0].get("PRODUCT"))
+    notional = sum(_fnum(r.get("NOTIONAL_VOLUME_USD")) or 0 for r in rows)
+    side = _tape_side([r.get("SIDE") for r in rows])
+    times = [r.get("TIME") or "" for r in rows if r.get("TIME")]
+    time_utc = (min(times)[:5] if times else "")            # HH:MM, block open
+
+    # A row whose DESCRIPTION names a multi-leg structure carries the whole shape;
+    # otherwise every row is a single leg and the structure is the collection.
+    descs = _uniq_keep([r.get("DESCRIPTION") for r in rows])
+    named = next((parse_tape_description(d) for d in descs
+                  if parse_tape_description(d)["label"] not in ("Call", "Put")
+                  and parse_tape_description(d)["classified"]), None)
+    if named:
+        label, expiry, legs = named["label"], named["expiry"], named["legs"]
+        # Combined-DESCRIPTION block: each row is a leg (its SIDE/price picks which)
+        # but repeats the whole leg list, so the base unit is the per-row QTY, NOT a
+        # sum across rows. QTY encodes the ratio (a 2:1 custom prints 40 / 20), so
+        # the smallest positive QTY is the base-leg count.
+        qtys = [q for q in (_fnum(r.get("QTY")) or 0 for r in rows) if q > 0]
+        unit = min(qtys) if qtys else 0
+    else:
+        # Per-leg rows: one option leg each; classify by the collected geometry.
+        legs = []
+        by_inst = defaultdict(float)
+        for r in rows:
+            p = parse_tape_description(r.get("DESCRIPTION"))
+            q = _fnum(r.get("QTY")) or 0
+            for lg in p["legs"]:
+                legs.append(lg)
+                by_inst[(lg["cp"], lg["strike"], lg["expiry_c"])] += q
+        expiry = _join_exp([lg["expiry_c"] for lg in legs])
+        label = _classify_tape_legs(asset, rows) if legs else "Custom"
+        unit = min(by_inst.values()) if by_inst else (
+            min((_fnum(r.get("QTY")) or 0) for r in rows) or 0)
+
+    # Detail + IV from the parsed legs (IV looked up per Deribit leg).
+    detail, avg_iv = _tape_detail_iv(asset, venue, legs, unit, side,
+                                     rows[0].get("DESCRIPTION"), iv_lookup)
+    return {
+        "block_trade_id": bid, "rfq_id": rows[0].get("RFQ_ID") or bid,
+        "structure": label, "expiry": expiry, "venue": venue,
+        "notional_usd": round(notional), "unit_size": round(unit, 1),
+        "side": side, "avg_iv": avg_iv, "time_utc": time_utc, "detail": detail,
+        "leg_count": len(legs) or len(rows),
+    }
+
+
+def _classify_tape_legs(asset: str, rows: list[dict]) -> str:
+    """Reuse the Deribit-path classifier on synthesized instrument legs (one per
+    per-leg row), with each leg's direction taken straight from its SIDE."""
+    legs = []
+    for r in rows:
+        p = parse_tape_description(r.get("DESCRIPTION"))
+        d = "buy" if (r.get("SIDE") or "").upper() == "BUY" else "sell"
+        for lg in p["legs"]:
+            legs.append({"instrument_name": f"{asset}-{lg['expiry_c']}-{int(lg['strike'])}-{lg['cp']}",
+                         "amount": _fnum(r.get("QTY")) or 0, "direction": d})
+    return classify_structure(legs) if legs else "Custom"
+
+
+def _tape_detail_iv(asset, venue, legs, unit, side, raw_desc, iv_lookup):
+    """One-line leg detail + average IV for a tape block. IV is looked up per
+    Deribit leg (the tape carries none); non-Deribit venues get IV n/a. Detail is
+    'strike+type / … x<size> <iv>v (<Side>)', built from the parsed legs and
+    falling back to the DESCRIPTION strike tail when the geometry isn't mapped.
+    The directional tag is added only for a one-sided block (Buy/Sell) — a Mixed
+    structure's legs point both ways, which the structure name already conveys."""
+    ivs = []
+    if iv_lookup and venue == "Deribit":
+        for lg in legs:
+            iv = iv_lookup(lg["cp"], int(lg["strike"]), lg["expiry_c"])
+            if iv is not None:
+                ivs.append(iv)
+    avg_iv = round(sum(ivs) / len(ivs), 1) if ivs else None
+
+    multi_exp = len({lg["expiry_c"] for lg in legs}) > 1
+    parts = []
+    for lg in legs[:4]:
+        sk = _tape_strike_label(lg["strike"])
+        parts.append(f"{lg['expiry_c']} {sk}{lg['cp']}" if multi_exp else f"{sk}{lg['cp']}")
+    body = " / ".join(parts) or _tape_strike_tail(raw_desc)
+    detail = f"{body} x{unit:g}".strip() if body else f"x{unit:g}"
+    if avg_iv is not None:
+        detail += f" {avg_iv}v"
+    if side in ("Buy", "Sell"):
+        detail += f" ({side})"
+    return detail, avg_iv
+
+
+def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
+                      min_notional_usd: float = 250_000) -> dict:
+    """Group tape leg-rows into blocks and worked-order structures.
+
+    Two levels, matching the recap's block/structure model:
+      • BLOCK_TRADE_ID → one executed block (Σ per-leg notional). The BIGGEST
+        PRINT is the single largest such block.
+      • RFQ_ID         → one worked order; its clips share the id. Block Flow
+        rows are worked orders, `blocks` = distinct BLOCK_TRADE_IDs in the order,
+        notional = Σ across them.
+
+    `iv_lookup(cp, strike, expiry_c) -> mark_iv | None` annotates Deribit blocks.
+    Returns {rows, biggest_print, total_m, n_blocks, n_structures}."""
+    by_block: dict[str, list] = defaultdict(list)
+    for r in rows:
+        bid = r.get("BLOCK_TRADE_ID") or r.get("TRADE_ID")
+        if bid:
+            by_block[bid].append(r)
+
+    blocks = [_block_from_rows(bid, brows, iv_lookup)
+              for bid, brows in by_block.items()]
+    blocks = [b for b in blocks if b["notional_usd"] >= min_notional_usd]
+    blocks.sort(key=lambda b: b["notional_usd"], reverse=True)
+
+    biggest = None
+    if blocks:
+        b0 = blocks[0]
+        biggest = {"expiry": b0["expiry"], "structure": b0["structure"],
+                   "size": b0["unit_size"], "notional_m": round(b0["notional_usd"] / 1e6, 1),
+                   "time_utc": b0["time_utc"], "side": b0["side"],
+                   "avg_iv": b0["avg_iv"], "venue": b0["venue"]}
+
+    # Worked-order rollup: group blocks by RFQ_ID (blocks arrive notional-desc, so
+    # the first seen in a group is its largest — it names the merged row).
+    groups: dict[str, dict] = {}
+    for b in blocks:
+        g = groups.get(b["rfq_id"])
+        if g is None:
+            groups[b["rfq_id"]] = {**b, "blocks": 1}
+        else:
+            g["notional_usd"] += b["notional_usd"]
+            g["blocks"] += 1
+    structures = sorted(groups.values(), key=lambda g: g["notional_usd"], reverse=True)
+
+    out_rows = []
+    for i, g in enumerate(structures[:top_n], 1):
+        out_rows.append({
+            "rank": i, "structure": f"{g['expiry'] or ''} {g['structure']}".strip(),
+            "notl_m": round(g["notional_usd"] / 1e6, 1), "blocks": g["blocks"],
+            "venue": g["venue"], "detail": g["detail"], "side": g["side"],
+            "avg_iv": g["avg_iv"], "time_utc": g["time_utc"],
+        })
+    return {
+        "total_m": round(sum(b["notional_usd"] for b in blocks) / 1e6, 1),
+        "n_blocks": len(blocks), "n_structures": len(structures),
+        "rows": out_rows, "biggest_print": biggest,
+    }
 
 
 # ── Vol surface (#3) ───────────────────────────────────────────────────────

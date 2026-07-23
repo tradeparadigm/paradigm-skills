@@ -39,13 +39,15 @@ esac
 if ! [ "$WN" -gt 0 ] 2>/dev/null || [ "$SECS" -le 0 ]; then
   echo "recap: bad window '$WIN' — use e.g. 30m, 3h, 8h, 24h" >&2; exit 2
 fi
-# Cap at 24h. Every flow source (rolling recap-aggregates file, Deribit public
-# tape) holds only ~24h, so a longer window rendered partially-covered flow
-# under a full-window header. Until >24h flow is wired to the cold store,
-# clamp and DISCLOSE — the banner line below is part of the recap output.
+# Cap at 24h. The Snapshot flow sources (rolling recap-aggregates file →
+# Volume/Activity/P-C/DVOL/spot) hold only ~24h, so a longer window rendered
+# partially-covered Snapshot flow under a full-window header. Block Flow itself
+# now comes from the months-deep Paradigm tape and isn't the constraint, but the
+# Snapshot still is — until those are wired to the cold store, clamp and DISCLOSE
+# (the banner line below is part of the recap output).
 CAP_NOTE=""
 if [ "$SECS" -gt 86400 ]; then
-  CAP_NOTE="⚠ window capped at 24h — $WIN exceeds the ~24h data horizon."
+  CAP_NOTE="⚠ window capped at 24h — $WIN exceeds the ~24h Snapshot-data horizon."
   WIN=24h; SECS=86400
 fi
 # PRESET flags the canonical windows. Since the migration to the single rolling
@@ -108,6 +110,14 @@ ST=$(printf '%s' "$CREDS" | grep -o '<SessionToken>[^<]*'    | cut -d'>' -f2)
 # tape; the surface from v_vol_surface below).
 REC=s3://dt-exchange-venue-data/hot/hot__recap_aggregates_5m_24h.parquet
 
+# Multi-venue Paradigm block tape (paradigm_trade_tape_slim): the source for
+# Biggest Print + Block Flow. One flat csv.gz (~1.5MB, all dates) spanning every
+# venue Paradigm brokers (Deribit/Paradex/Bullish/…), with USD notional PER LEG
+# and the structure named in DESCRIPTION — so recap.py needs no cross-venue $
+# normalization and no instrument-name inference. A full scan is sub-second, so
+# it's read fresh per recap; the window is applied here by the DATE+TIME filter.
+TAPE=s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz
+
 # One DuckDB session → CSVs. One statement per line; `at` is reserved → alias it.
 # dvol_spot + volume come from the rolling recap-aggregates file, windowed at query
 # time by bucket_at (>= START_MS) — one file serves every window, preset or not.
@@ -121,6 +131,7 @@ SET s3_secret_access_key='${SK}';
 SET s3_session_token='${ST}';
 COPY (SELECT asset, exchange, metric, arg_min(open, bucket_at) AS open, arg_max(close, bucket_at) AS close, max(high) AS high, min(low) AS low FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, metric) TO '${WORK}/dvol_spot.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
+COPY (SELECT "DATE", "TIME", PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID FROM read_csv_auto('${TAPE}') WHERE PRODUCT LIKE '${ASSET} OPTION%' AND epoch(CAST(CAST("DATE" AS VARCHAR) || ' ' || CAST("TIME" AS VARCHAR) AS TIMESTAMP)) >= ${START_S}) TO '${WORK}/blocks.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '${WORK}/surface_now.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h WHERE abs("at"-${START_MS})<=900000 ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '${WORK}/surface_open.csv' (HEADER, DELIMITER ',');
 SQL
