@@ -224,19 +224,24 @@ def classify_structure(legs: list[dict]) -> str:
     per instrument into a net signed quantity (+amount buy, −amount sell) so
     ratio patterns survive multiple prints at one strike.
 
+    Labels follow the DRFQ StrategyCodeEnum vocabulary (rfq-trader
+    references/instruments.md): Butterfly family (never "Fly"), typed
+    calendars, and "Custom" (DRFQ code CM) for any package we can't name.
+
     Same expiry, ≥3 legs (runs before the 2-leg C&P branch, else a 4-leg iron
-    fly reads as a Risk Reversal):
+    butterfly reads as a Risk Reversal):
       • one type, 3 strikes → Call/Put Butterfly ONLY when directions are all
         disclosed and the net quantities on ascending strikes form the 1:−2:1
-        fly ratio (broken wings count); ladders/strips/ratios → Multi-leg.
+        fly ratio (broken wings count); ladders/strips/ratios → Custom.
       • one type, 4 strikes → Call/Put Condor ONLY when disclosed and the nets
-        form +q/−q/−q/+q with equal magnitudes; else Multi-leg.
+        form +q/−q/−q/+q with equal magnitudes; else Custom.
       • both types, 4 strikes, 2 calls & 2 puts → Iron Condor.
-      • both types, 3 strikes with a C AND a P on the middle strike → Iron Fly
-        ONLY when the low-strike wing is puts-only, the high-strike wing is
-        calls-only, wing/body sizes are ~equal, and (when disclosed) the body
-        legs share one direction and the wings the opposite; else Multi-leg.
-      • anything else → Multi-leg.
+      • both types, 3 strikes with a C AND a P on the middle strike → Iron
+        Butterfly ONLY when the low-strike wing is puts-only, the high-strike
+        wing is calls-only, wing/body sizes are ~equal, and (when disclosed)
+        the body legs share one direction and the wings the opposite; else
+        Custom.
+      • anything else → Custom.
     Same expiry, 2 legs:
       • C&P same strike → Combo (synthetic forward) when directions are
         disclosed and opposite; Straddle otherwise (disclosed-and-equal, or
@@ -247,10 +252,10 @@ def classify_structure(legs: list[dict]) -> str:
     Multi-expiry:
       • single strike → Call/Put/(mixed→)Calendar; when directions are all
         disclosed it must be long one expiry / short the other (≥1 buy AND ≥1
-        sell) — an all-same-direction time strip → Multi-leg.
+        sell) — an all-same-direction time strip → Custom.
       • 2 legs, diff strikes → Call/Put Diagonal (same long/short requirement;
-        one call + one put is not a diagonal → Multi-leg).
-      • anything else → Multi-leg."""
+        one call + one put is not a diagonal → Custom).
+      • anything else → Custom."""
     if len(legs) == 1:
         return "Call" if legs[0]["instrument_name"].endswith("-C") else "Put"
     expiries, strikes, types = set(), set(), set()
@@ -275,13 +280,13 @@ def classify_structure(legs: list[dict]) -> str:
 
     # Multi-expiry. Calendars/diagonals are a long-one-tenor / short-the-other
     # trade: when every direction is disclosed, require both a buy and a sell;
-    # an all-same-direction package (time strip) is Multi-leg.
+    # an all-same-direction package (time strip) is Custom.
     if len(expiries) > 1:
         if len(strikes) == 1:
             label = ("Call Calendar" if types == {"C"}
                      else "Put Calendar" if types == {"P"} else "Calendar")
             if disclosed and not (has_buy and has_sell):
-                return "Multi-leg"
+                return "Custom"
             return label
         if len(legs) == 2:
             if types == {"C"}:
@@ -289,11 +294,11 @@ def classify_structure(legs: list[dict]) -> str:
             elif types == {"P"}:
                 label = "Put Diagonal"
             else:
-                return "Multi-leg"   # one call + one put across expiries isn't a diagonal
+                return "Custom"   # one call + one put across expiries isn't a diagonal
             if disclosed and not (has_buy and has_sell):
-                return "Multi-leg"
+                return "Custom"
             return label
-        return "Multi-leg"
+        return "Custom"
 
     # Same expiry.
     if len(legs) >= 3:
@@ -303,12 +308,12 @@ def classify_structure(legs: list[dict]) -> str:
             base = "Call" if types == {"C"} else "Put"
             t0 = "C" if types == {"C"} else "P"
             if not disclosed:
-                return "Multi-leg"   # net-ratio patterns need disclosed signs
+                return "Custom"   # net-ratio patterns need disclosed signs
             if n_strikes == 3 and _is_fly([net[(k, t0)] for k in sk]):
                 return f"{base} Butterfly"
             if n_strikes == 4 and _is_condor([net[(k, t0)] for k in sk]):
                 return f"{base} Condor"
-            return "Multi-leg"
+            return "Custom"
         if types == {"C", "P"}:
             n_calls = sum(1 for _, t in pairs if t == "C")
             n_puts = sum(1 for _, t in pairs if t == "P")
@@ -335,8 +340,8 @@ def classify_structure(legs: list[dict]) -> str:
                         len(body_dirs) == 1 and len(wing_dirs) == 1
                         and body_dirs != wing_dirs)
                     if ratio_ok and dir_ok:
-                        return "Iron Fly"
-        return "Multi-leg"
+                        return "Iron Butterfly"
+        return "Custom"
     if types == {"C", "P"} and len(strikes) == 1:
         # C&P at one strike: opposite disclosed directions = synthetic forward
         # (Combo, matching block-analyst); same or undisclosed = Straddle.
@@ -349,7 +354,7 @@ def classify_structure(legs: list[dict]) -> str:
         return "Strangle/RR"
     if len(types) == 1 and len(strikes) > 1:
         return "Call Spread" if types == {"C"} else "Put Spread"
-    return "Multi-leg"
+    return "Custom"
 
 
 def dominant_side(legs: list[dict]) -> str:
