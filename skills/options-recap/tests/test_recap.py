@@ -538,7 +538,8 @@ def test_block_flow_multi_venue_and_notional_floor():
                                "end_utc": "09:00"},
                     "snapshot": {}, "biggest_print": bp, "block_flow": bf,
                     "vol_surface": None, "hot_horizon": None, "warnings": []})
-    check("Venue column rendered", "Venue" in md and "Paradex" in md and "Bullish" in md, md)
+    # No per-row Venue column — the Biggest Print line is where the venue shows.
+    check("no Venue column in table", "Venue" not in md, md)
     check("biggest print names the venue", "via Paradigm/Bullish" in md, md)
 
 
@@ -605,8 +606,7 @@ def test_block_flow_aggregates_clips_by_rfq():
 def test_block_flow_column_stretches_for_long_labels():
     # Regression: typed cross-expiry labels ("24JUL26/31JUL26 Call Diagonal")
     # overflowed a fixed Structure column. The column stretches to the longest
-    # label and the Notl column header stays aligned with the rows — now with a
-    # Venue column between Structure and Notl.
+    # label and the Notl column header stays aligned with the rows.
     rows = [
         _blk("Call 24 Jul 26 68000", "BUY", 21_000_000, bid="D1", rfq="RD", tid="t1"),
         _blk("Call 31 Jul 26 71000", "SELL", 21_000_000, bid="D1", rfq="RD", tid="t2"),

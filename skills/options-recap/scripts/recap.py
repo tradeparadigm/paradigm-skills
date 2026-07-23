@@ -407,25 +407,6 @@ def spot_vol_label(spot_open, spot_close, dvol_open, dvol_close):
     return "vol faded with spot"
 
 
-def _blocks_asof_ms(block_rows: list[dict]) -> int | None:
-    """Newest block-leg timestamp (ms) from blocks.csv DATE+TIME (UTC). Drives the
-    tape-freshness stamp: the Paradigm tape is S3-sourced, so the recap discloses
-    how current the block section is rather than implying it's live to the second."""
-    newest = None
-    for r in block_rows or []:
-        d, t = r.get("DATE"), r.get("TIME")
-        if not d:
-            continue
-        try:
-            dt = datetime.strptime(f"{d} {(t or '00:00:00')[:8]}",
-                                   "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-        ms = int(dt.timestamp() * 1000)
-        newest = ms if newest is None else max(newest, ms)
-    return newest
-
-
 def build(asset: str, window: str, start_ms: int, end_ms: int,
           deri: dict, hot: dict, block_rows: list[dict] | None = None) -> dict:
     asset = asset.upper()
@@ -516,14 +497,9 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         warn(f"blocks.csv: dropped {dropped} non-{asset} rows — cross-asset contamination?")
     block = build_tape_blocks(own_blocks, iv_lookup=iv_lookup)
 
-    # Tape-freshness stamp. The block tape is S3-sourced (near-real-time but not
-    # live-to-the-second), so disclose how current the block section is instead of
-    # implying it matches the window end exactly. Also a >24h flag: Volume/Activity/
-    # P-C/DVOL/spot come from the ~24h hot rollup, so a longer window under-covers
-    # them (run_recap caps at 24h; this defends a direct >24h call).
-    asof_ms = _blocks_asof_ms(own_blocks)
-    blocks_asof = fmt_hhmm(asof_ms) if asof_ms else None
-    blocks_lag_min = round((end_ms - asof_ms) / 60000) if asof_ms else None
+    # >24h flag: Volume/Activity/P-C/DVOL/spot come from the ~24h hot rollup, so a
+    # longer window under-covers them (run_recap caps at 24h; this defends a direct
+    # >24h call).
     hot_horizon = round(window_h) if window_h > 24 else None
 
     snapshot = {
@@ -582,8 +558,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "snapshot": snapshot,
         "biggest_print": block["biggest_print"],
         "block_flow": {"total_m": block["total_m"], "n_blocks": block["n_blocks"],
-                       "n_structures": block["n_structures"], "rows": block["rows"],
-                       "asof_utc": blocks_asof, "lag_min": blocks_lag_min},
+                       "n_structures": block["n_structures"], "rows": block["rows"]},
         "vol_surface": surface_out,
         "hot_horizon": hot_horizon,
         "warnings": WARNINGS,
@@ -687,11 +662,11 @@ def render_md(r: dict) -> str:
     else:
         L.append(f"{'Activity':<9} {'n/a':<11} trades (by trade count)")
     vol = f"${s['volume_usd_m']}M" if s.get("volume_usd_m") else "n/a"
-    L.append(f"{'Volume':<9} {vol:<11} Deribit only (cross-venue $ pending)")
+    L.append(f"{'Volume':<9} {vol:<11} Deribit only")
     pc = f"{s['pc_ratio']}x" if s.get("pc_ratio") is not None else "n/a"
     pc_desc = f"{s['pc_descriptor']} " if s.get("pc_descriptor") else ""
     L.append(f"{'P/C':<9} {pc:<11} {pc_desc}(all venues, by trades)")
-    L += ["```", "", "**Biggest Print — Paradigm block flow**", "", "```yaml"]
+    L += ["```", "", "**Biggest Print**", "", "```yaml"]
 
     if bp:
         # "Mixed" is a structure fact (legs point both ways), not an aggressor
@@ -710,24 +685,20 @@ def render_md(r: dict) -> str:
     struct_word = "structure" if n_struct == 1 else "structures"
     block_word = "block" if bf["n_blocks"] == 1 else "blocks"
     trunc = f" (top {len(bf['rows'])} by notional)" if n_struct > len(bf["rows"]) else ""
-    # S3-tape freshness stamp: disclose how current the block section is (the tape
-    # is near-real-time but not live), and flag a material lag when present.
-    asof = (f" · tape through {bf['asof_utc']} UTC" if bf.get("asof_utc") else "")
-    if bf.get("lag_min") and bf["lag_min"] >= 90:
-        asof += f" ({round(bf['lag_min'] / 60)}h behind)"
     # Structure column stretches to the longest label in this window (typed
-    # labels like "24JUL26/31JUL26 Call Diagonal" overflow a fixed 27).
+    # labels like "24JUL26/31JUL26 Call Diagonal" overflow a fixed 27). Per-row
+    # venue isn't a column — the Biggest Print line names its venue and the
+    # section title carries the Paradigm scope.
     sw = max([27] + [len(row["structure"]) + 2 for row in bf["rows"]])
-    vw = max([8] + [len(row.get("venue") or "") + 2 for row in bf["rows"]])
     L += ["```", "", f"**Block Flow (Paradigm RFQ) — ${bf['total_m']}M / {bf['n_blocks']} {block_word} / "
-          f"{n_struct} {struct_word}{trunc}{asof}**",
+          f"{n_struct} {struct_word}{trunc}**",
           "", "```yaml",
-          f"{'#':<3}{'Structure':<{sw}}{'Venue':<{vw}}{'Notl':<9}{'Blocks':<8}Detail",
-          f"{'-':<3}{'-' * (sw - 2):<{sw}}{'-' * (vw - 2):<{vw}}{'-' * 7:<9}{'-' * 6:<8}{'-' * 40}"]
+          f"{'#':<3}{'Structure':<{sw}}{'Notl':<9}{'Blocks':<8}Detail",
+          f"{'-':<3}{'-' * (sw - 2):<{sw}}{'-' * 7:<9}{'-' * 6:<8}{'-' * 44}"]
     for row in bf["rows"]:
         notl = f"${row['notl_m']}M"
-        L.append(f"{str(row['rank']):<3}{row['structure']:<{sw}}{(row.get('venue') or ''):<{vw}}"
-                 f"{notl:<9}{str(row.get('blocks', 1)):<8}{row['detail']}")
+        L.append(f"{str(row['rank']):<3}{row['structure']:<{sw}}{notl:<9}"
+                 f"{str(row.get('blocks', 1)):<8}{row['detail']}")
     L += ["```", "", "**Vol Surface**"]
 
     if vs and vs.get("rows"):

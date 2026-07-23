@@ -25,11 +25,11 @@ DVOL      [X]v        [flat/rising/falling] ([open] -> [close])
 RV 7d     [X]v        implied [CHEAP/RICH/IN LINE] vs realized
 VRP       [±X]v       vol [underpriced/overpriced/roughly fair] vs delivered
 Activity  [Nk]        trades — [Venue X% · Venue Y% · ...] (by trade count)
-Volume    $[X]M       Deribit only (cross-venue $ pending)
+Volume    $[X]M       Deribit only
 P/C       [X.Xx]      [descriptor] (all venues, by trades)
 ```
 
-**Biggest Print — Paradigm block flow**
+**Biggest Print**
 
 ```yaml
 [DDMMMYY] [structure]   [Nx]   $[X]M   [HH:MM] UTC   via Paradigm/[Venue] ([Buy/Sell, ][IV]v avg)
@@ -38,9 +38,9 @@ P/C       [X.Xx]      [descriptor] (all venues, by trades)
 The single largest **block** (one `BLOCK_TRADE_ID`) in the window, by summed
 per-leg USD notional — from the Paradigm block tape (**Paradigm RFQ/DRFQ flow
 only**, across every venue Paradigm brokers), so `[Venue]` is the venue that
-executed it (Deribit/Paradex/Bullish/…). This is NOT the whole market's biggest
-print — only the biggest Paradigm-brokered one; the `— Paradigm block flow`
-title and the `via Paradigm/…` tag both make that explicit. The side word appears only when
+executed it (Deribit/Paradex/Bullish/…). The `via Paradigm/…` tag is what
+scopes the line — it's the biggest Paradigm-brokered print, not a whole-market
+claim. The side word appears only when
 the whole block is one-directional (Buy/Sell); mixed-direction structures (any
 spread) carry no side tag — never write "two-way" here. The `[IV]v avg` appears
 only for Deribit blocks (IV is looked up from the vol surface, which is
@@ -59,19 +59,20 @@ ARE the complete expiry set (calendar, diagonal), `near→far` when interior
 tenors are elided (3+ expiries) — each leg's own expiry always appears in
 the Detail column.
 
-**Block Flow (Paradigm RFQ) — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)][ · tape through [HH:MM] UTC[ ([n]h behind)]]**
+**Block Flow (Paradigm RFQ) — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)]**
 
 ```yaml
-#  Structure                  Venue    Notl     Blocks  Detail
--  -------------------------  -------  -------  ------  -------------------------------
-1  [structure]                [Venue]  $[X]M    [n]     [K1][C/P] / [K2][C/P] x[size] [IV]v ([Side])
+#  Structure                  Notl     Blocks  Detail
+-  -------------------------  -------  ------  -----------------------------------
+1  [structure]                $[X]M    [n]     [K1][C/P] / [K2][C/P] x[size] [IV]v ([Side])
 2  …
 ```
 
 The Structure column has a 27-char floor but stretches to the longest label in
 the window (a typed cross-expiry label like `24JUL26/31JUL26 Call Diagonal`
-runs past 27); the Venue column likewise stretches — the header and rows stay
-aligned to whatever width the widest values need.
+runs past 27), so the header and rows stay aligned to whatever width the widest
+structure needs. There is no per-row venue column — the `(Paradigm RFQ)` title
+carries the scope and the Biggest Print line names its venue.
 
 Two granularities, both always stated: tape **blocks** (`BLOCK_TRADE_ID`s, the
 industry term for the individual prints) and **structures** (clips of one worked
@@ -79,10 +80,6 @@ order — the blocks sharing an `RFQ_ID` — grouped into one row). Rows are
 structures and `#` numbers them; the Blocks column carries each row's block
 count, so it sums to the header `[N]` and the row count equals `[M]`. When more
 than 8 structures qualify, the header gains the `(top 8 by notional)` suffix.
-
-The tape is S3-sourced (near-real-time, not live-to-the-second), so the header
-carries a `tape through [HH:MM] UTC` freshness stamp, plus `([n]h behind)` when
-the newest block is 90+ min behind the window end.
 
 Detail: strike+type legs (`[K1]C / [K2]P`), the structure unit `x[size]`, the
 average `[IV]v` (Deribit blocks only), and a `([Side])` tag when the block is
