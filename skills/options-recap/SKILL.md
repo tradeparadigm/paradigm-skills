@@ -34,17 +34,14 @@ the `$` Volume line, and the multi-venue activity/P-C all come from one rolling 
 aggregates file sliced to the window at query time; the surface (and its Δ columns)
 from `v_vol_surface`; and **Biggest Print + Block Flow from the multi-venue Paradigm
 block tape** (`paradigm_trade_tape_slim`) — every venue Paradigm brokers
-(Deribit/Paradex/Bullish/…), notional already in USD per leg, so each Block Flow row
-carries a Venue column and Biggest Print reads `via Paradigm/<venue>` — **plus
-venue-tape blocks for venues Paradigm doesn't broker** (OKX today, off the hot
-recap file's `block` rows): these rank in the same pool, render as
-`Block (unclassified)` with an `on <venue> (venue tape)` tag, and add
-`+ venue tape` to the Block Flow title when present. The Paradigm tape has
-no IV, so the top blocks' IV is looked up from the vol surface (Deribit legs only;
-venue-tape blocks carry their venue's per-trade IV where published). The tape is
-S3-sourced (near-real-time, not live), so
-Block Flow discloses a `tape through HH:MM UTC` stamp. A malformed window exits with
-a clear error.
+(Deribit/Paradex/Bullish/…), notional already in USD per leg — **plus venue-tape
+blocks for venues Paradigm doesn't broker** (OKX today, off the hot recap file's
+`block` rows), which rank in the same pool and render as `<Venue> Block` rows
+with a `(venue tape)` detail note. Biggest Print names its venue as
+`via Paradigm/<venue>` (or `via venue tape`). The Paradigm tape has no IV, so the
+top blocks' IV is looked up from the vol surface (Deribit legs only; venue-tape
+blocks carry their venue's per-trade IV where published; other venues show IV
+`n/a`). A malformed window exits with a clear error.
 
 **Windows beyond 24h:** the Snapshot flow sources (the rolling hot aggregates file →
 Volume/Activity/P-C/DVOL/spot) retain only ~24h, so `run_recap.sh` caps any longer

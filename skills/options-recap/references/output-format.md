@@ -29,21 +29,25 @@ Volume    $[X]M       all venues
 P/C       [X.Xx]      [descriptor] (all venues, by trades)
 ```
 
-**Biggest Print — block flow**
+The Volume note reads `all venues` when the cross-venue `turnover_usd` sum
+drove the number; on a pre-upgrade recap file it falls back to the old
+Deribit-scoped calc and the note reads `Deribit only`.
+
+**Biggest Print**
 
 ```yaml
 [DDMMMYY] [structure]   [Nx]   $[X]M   [HH:MM] UTC   via Paradigm/[Venue] ([Buy/Sell, ][IV]v avg)
 ```
 
 The single largest **block** in the window, by summed per-leg USD notional,
-from TWO sources ranked together: the Paradigm block tape (one
+from two sources ranked together: the Paradigm block tape (one
 `BLOCK_TRADE_ID` = one block; every venue Paradigm brokers —
 Deribit/Paradex/Bullish/…) and the exchanges' own venue tapes for venues
 Paradigm does NOT broker (OKX today, via the hot recap file's `block` rows).
-The routing tag names the source: `via Paradigm/[Venue]` for a
-Paradigm-brokered block, `on [Venue] (venue tape)` for a venue-tape one. A
+The `via …` tag names the source and scopes the line: `via Paradigm/[Venue]`
+for a Paradigm-brokered block, `via venue tape` for a venue-tape one. A
 venue-tape winner has no leg geometry, so it renders as
-`Block (unclassified)   [Nx]   $[X]M   ~[HH:MM] UTC   on OKX (venue tape)`
+`OKX Block   [Nx]   $[X]M   ~[HH:MM] UTC   via venue tape`
 (`~` = 5-min bucket resolution; `[Nx]` is its total coin size). Deribit and
 Bullish blocks NOT brokered via Paradigm are still absent (no id bridge
 between the tapes). The side word appears only when
@@ -66,25 +70,27 @@ ARE the complete expiry set (calendar, diagonal), `near→far` when interior
 tenors are elided (3+ expiries) — each leg's own expiry always appears in
 the Detail column.
 
-**Block Flow (Paradigm RFQ[ + venue tape]) — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)][ · tape through [HH:MM] UTC[ ([n]h behind)]]**
+**Block Flow — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)]**
 
 ```yaml
-#  Structure                  Venue    Notl     Blocks  Detail
--  -------------------------  -------  -------  ------  -------------------------------
-1  [structure]                [Venue]  $[X]M    [n]     [K1][C/P] / [K2][C/P] x[size] [IV]v ([Side])
-2  Block (unclassified)       OKX      $[X]M    1       x[size] [IV]v — [n] legs, venue tape (no leg geometry)
+#  Structure                  Notl     Blocks  Detail
+-  -------------------------  -------  ------  -----------------------------------
+1  [structure]                $[X]M    [n]     [K1][C/P] / [K2][C/P] x[size] [IV]v ([Side])
+2  OKX Block                  $[X]M    1       x[size] [IV]v — [n] legs (venue tape)
 …
 ```
 
-The title's `+ venue tape` appears only when venue-tape blocks (non-Paradigm
-venues — OKX today) actually contributed to the window; totals then span both
-sources. Venue-tape rows are always structure-unclassified (their tape has no
-leg geometry) and count as one block each.
+Venue-tape rows (non-Paradigm venues — OKX today) rank in the same pool and
+count toward the header totals. Their tape has no leg geometry, so the
+structure label is `[Venue] Block`, the detail carries a `(venue tape)` note,
+and they count as one block each.
 
 The Structure column has a 27-char floor but stretches to the longest label in
 the window (a typed cross-expiry label like `24JUL26/31JUL26 Call Diagonal`
-runs past 27); the Venue column likewise stretches — the header and rows stay
-aligned to whatever width the widest values need.
+runs past 27), so the header and rows stay aligned to whatever width the widest
+structure needs. There is no per-row venue column — the Biggest Print line's
+`via Paradigm/<venue>` tag is where the venue shows, and a venue-tape row
+carries its venue in the structure label (`OKX Block`).
 
 Two granularities, both always stated: tape **blocks** (`BLOCK_TRADE_ID`s, the
 industry term for the individual prints) and **structures** (clips of one worked
@@ -92,10 +98,6 @@ order — the blocks sharing an `RFQ_ID` — grouped into one row). Rows are
 structures and `#` numbers them; the Blocks column carries each row's block
 count, so it sums to the header `[N]` and the row count equals `[M]`. When more
 than 8 structures qualify, the header gains the `(top 8 by notional)` suffix.
-
-The tape is S3-sourced (near-real-time, not live-to-the-second), so the header
-carries a `tape through [HH:MM] UTC` freshness stamp, plus `([n]h behind)` when
-the newest block is 90+ min behind the window end.
 
 Detail: strike+type legs (`[K1]C / [K2]P`), the structure unit `x[size]`, the
 average `[IV]v` (Deribit blocks only), and a `([Side])` tag when the block is

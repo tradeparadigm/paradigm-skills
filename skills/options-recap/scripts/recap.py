@@ -391,11 +391,13 @@ def load_venue_blocks(csv_dir: str, asset: str) -> list[dict]:
 def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
     """Shape venue-tape block rows into the block dicts build_tape_blocks
     merges (source="venue"). The venue tape carries totals per block — no leg
-    geometry (expiry/strike/type/side) — so the structure is honest-unclassified
-    and the detail says where the row came from. notional_usd = volume_coin ×
-    spot: underlying-USD, the same basis as the Paradigm tape's
-    NOTIONAL_VOLUME_USD (valued at recap-time spot, not trade-time — a
-    disclosed approximation). No spot → skip with a warning, never guess."""
+    geometry (expiry/strike/type/side) — so the structure label is the venue +
+    "Block" (there is no per-row venue column; the label is where the venue
+    shows) and the detail carries a compact "(venue tape)" provenance note.
+    notional_usd = volume_coin × spot: underlying-USD, the same basis as the
+    Paradigm tape's NOTIONAL_VOLUME_USD (valued at recap-time spot, not
+    trade-time — a disclosed approximation). No spot → skip with a warning,
+    never guess."""
     if rows and not spot:
         warn("venue-tape blocks skipped — no spot to price coin volume")
         return []
@@ -408,15 +410,16 @@ def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
         avg_iv = round(iv_sum / iv_count, 1) if iv_sum is not None and iv_count else None
         legs = int(_num(r, "leg_count") or 0)
         bucket_ms = _num(r, "bucket_at")
+        venue = _venue_label(r.get("exchange"))
         detail = f"x{vol:g}"
         if avg_iv is not None:
             detail += f" {avg_iv}v"
-        detail += f" — {legs or '?'} legs, venue tape (no leg geometry)"
+        detail += f" — {legs or '?'} legs (venue tape)"
         out.append({
             "block_trade_id": r.get("block_id"),
             "rfq_id": r.get("block_id"),  # its own worked order
-            "structure": "Block (unclassified)", "expiry": "",
-            "venue": _venue_label(r.get("exchange")),
+            "structure": f"{venue} Block", "expiry": "",
+            "venue": venue,
             "notional_usd": round(vol * spot),
             "unit_size": round(vol, 1),  # total coin size — legs unknown
             "side": "", "avg_iv": avg_iv,
@@ -481,25 +484,6 @@ def spot_vol_label(spot_open, spot_close, dvol_open, dvol_close):
     if su and vu:
         return "vol bought through rally"
     return "vol faded with spot"
-
-
-def _blocks_asof_ms(block_rows: list[dict]) -> int | None:
-    """Newest block-leg timestamp (ms) from blocks.csv DATE+TIME (UTC). Drives the
-    tape-freshness stamp: the Paradigm tape is S3-sourced, so the recap discloses
-    how current the block section is rather than implying it's live to the second."""
-    newest = None
-    for r in block_rows or []:
-        d, t = r.get("DATE"), r.get("TIME")
-        if not d:
-            continue
-        try:
-            dt = datetime.strptime(f"{d} {(t or '00:00:00')[:8]}",
-                                   "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-        ms = int(dt.timestamp() * 1000)
-        newest = ms if newest is None else max(newest, ms)
-    return newest
 
 
 def build(asset: str, window: str, start_ms: int, end_ms: int,
@@ -606,14 +590,9 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     block = build_tape_blocks(own_blocks, iv_lookup=iv_lookup,
                               extra_blocks=venue_blocks)
 
-    # Tape-freshness stamp. The block tape is S3-sourced (near-real-time but not
-    # live-to-the-second), so disclose how current the block section is instead of
-    # implying it matches the window end exactly. Also a >24h flag: Volume/Activity/
-    # P-C/DVOL/spot come from the ~24h hot rollup, so a longer window under-covers
-    # them (run_recap caps at 24h; this defends a direct >24h call).
-    asof_ms = _blocks_asof_ms(own_blocks)
-    blocks_asof = fmt_hhmm(asof_ms) if asof_ms else None
-    blocks_lag_min = round((end_ms - asof_ms) / 60000) if asof_ms else None
+    # >24h flag: Volume/Activity/P-C/DVOL/spot come from the ~24h hot rollup, so a
+    # longer window under-covers them (run_recap caps at 24h; this defends a direct
+    # >24h call).
     hot_horizon = round(window_h) if window_h > 24 else None
 
     snapshot = {
@@ -674,8 +653,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "biggest_print": block["biggest_print"],
         "block_flow": {"total_m": block["total_m"], "n_blocks": block["n_blocks"],
                        "n_structures": block["n_structures"], "rows": block["rows"],
-                       "n_venue_blocks": block.get("n_venue_blocks", 0),
-                       "asof_utc": blocks_asof, "lag_min": blocks_lag_min},
+                       "n_venue_blocks": block.get("n_venue_blocks", 0)},
         "vol_surface": surface_out,
         "hot_horizon": hot_horizon,
         "warnings": WARNINGS,
@@ -781,26 +759,25 @@ def render_md(r: dict) -> str:
     vol = f"${s['volume_usd_m']}M" if s.get("volume_usd_m") else "n/a"
     # "all venues" when the cross-venue turnover_usd sum drove the number;
     # the Deribit-scoped label survives only on the pre-upgrade fallback.
-    vol_note = ("all venues" if s.get("volume_scope") == "all"
-                else "Deribit only (cross-venue $ pending)")
+    vol_note = "all venues" if s.get("volume_scope") == "all" else "Deribit only"
     L.append(f"{'Volume':<9} {vol:<11} {vol_note}")
     pc = f"{s['pc_ratio']}x" if s.get("pc_ratio") is not None else "n/a"
     pc_desc = f"{s['pc_descriptor']} " if s.get("pc_descriptor") else ""
     L.append(f"{'P/C':<9} {pc:<11} {pc_desc}(all venues, by trades)")
-    L += ["```", "", "**Biggest Print — block flow**", "", "```yaml"]
+    L += ["```", "", "**Biggest Print**", "", "```yaml"]
 
     if bp:
         # "Mixed" is a structure fact (legs point both ways), not an aggressor
         # read — don't put it in the side slot. Venue names the executing venue.
         # Source-aware routing tag: a Paradigm-brokered block reads
-        # "via Paradigm/<venue>"; a venue-tape block (e.g. OKX, which Paradigm
-        # doesn't broker) reads "on <venue> (venue tape)".
+        # "via Paradigm/<venue>"; a venue-tape block reads "via venue tape" —
+        # its venue is already the structure label ("OKX Block"), and the tag
+        # explains the unclassified structure + the ~approximate time.
         tags = [bp["side"]] if bp.get("side") in ("Buy", "Sell") else []
         if bp.get("avg_iv") is not None:
             tags.append(f"{bp['avg_iv']}v avg")
         tag_txt = f" ({', '.join(tags)})" if tags else ""
-        via = (f"on {bp.get('venue') or '?'} (venue tape)"
-               if bp.get("source") == "venue"
+        via = ("via venue tape" if bp.get("source") == "venue"
                else f"via Paradigm/{bp.get('venue') or '?'}")
         label = f"{bp['expiry']} {bp['structure']}".strip()  # venue blocks have no expiry
         L.append(f"{label}   {bp['size']:g}x   "
@@ -812,29 +789,20 @@ def render_md(r: dict) -> str:
     struct_word = "structure" if n_struct == 1 else "structures"
     block_word = "block" if bf["n_blocks"] == 1 else "blocks"
     trunc = f" (top {len(bf['rows'])} by notional)" if n_struct > len(bf["rows"]) else ""
-    # S3-tape freshness stamp: disclose how current the block section is (the tape
-    # is near-real-time but not live), and flag a material lag when present.
-    asof = (f" · tape through {bf['asof_utc']} UTC" if bf.get("asof_utc") else "")
-    if bf.get("lag_min") and bf["lag_min"] >= 90:
-        asof += f" ({round(bf['lag_min'] / 60)}h behind)"
     # Structure column stretches to the longest label in this window (typed
-    # labels like "24JUL26/31JUL26 Call Diagonal" overflow a fixed 27).
+    # labels like "24JUL26/31JUL26 Call Diagonal" overflow a fixed 27). Per-row
+    # venue isn't a column — the Biggest Print line's via Paradigm/<venue> tag
+    # is where the venue shows.
     sw = max([27] + [len(row["structure"]) + 2 for row in bf["rows"]])
-    vw = max([8] + [len(row.get("venue") or "") + 2 for row in bf["rows"]])
-    # Sources disclosed in the title: "+ venue tape" appears only when venue-tape
-    # blocks (exchanges Paradigm doesn't broker, e.g. OKX) actually contributed
-    # to this window's pool — totals and rows then span both sources.
-    src = ("Paradigm RFQ + venue tape" if bf.get("n_venue_blocks")
-           else "Paradigm RFQ")
-    L += ["```", "", f"**Block Flow ({src}) — ${bf['total_m']}M / {bf['n_blocks']} {block_word} / "
-          f"{n_struct} {struct_word}{trunc}{asof}**",
+    L += ["```", "", f"**Block Flow — ${bf['total_m']}M / {bf['n_blocks']} {block_word} / "
+          f"{n_struct} {struct_word}{trunc}**",
           "", "```yaml",
-          f"{'#':<3}{'Structure':<{sw}}{'Venue':<{vw}}{'Notl':<9}{'Blocks':<8}Detail",
-          f"{'-':<3}{'-' * (sw - 2):<{sw}}{'-' * (vw - 2):<{vw}}{'-' * 7:<9}{'-' * 6:<8}{'-' * 40}"]
+          f"{'#':<3}{'Structure':<{sw}}{'Notl':<9}{'Blocks':<8}Detail",
+          f"{'-':<3}{'-' * (sw - 2):<{sw}}{'-' * 7:<9}{'-' * 6:<8}{'-' * 44}"]
     for row in bf["rows"]:
         notl = f"${row['notl_m']}M"
-        L.append(f"{str(row['rank']):<3}{row['structure']:<{sw}}{(row.get('venue') or ''):<{vw}}"
-                 f"{notl:<9}{str(row.get('blocks', 1)):<8}{row['detail']}")
+        L.append(f"{str(row['rank']):<3}{row['structure']:<{sw}}{notl:<9}"
+                 f"{str(row.get('blocks', 1)):<8}{row['detail']}")
     L += ["```", "", "**Vol Surface**"]
 
     if vs and vs.get("rows"):

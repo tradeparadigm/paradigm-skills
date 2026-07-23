@@ -149,10 +149,11 @@ notional**: it's ~50–100× below the underlying-USD basis the block sections u
   warning, never guessed.
 - Merges them into the same pool: min-notional filter, Biggest Print candidacy and
   top-N ranking on equal terms. The venue tape carries **no leg geometry**, so they
-  render as `Block (unclassified)` with a `venue tape` detail note and `~HH:MM`
-  times (5-min bucket resolution); the section title gains `+ venue tape` whenever
-  they contribute. Bybit can never appear here — its feed has an is-block flag but
-  no group id, so its blocks are unreconstructable and ride the volume/flow rows.
+  render as `<Venue> Block` rows (the venue lives in the structure label — there is
+  no per-row venue column) with a `(venue tape)` detail note and `~HH:MM` times
+  (5-min bucket resolution); a venue-tape Biggest Print reads `via venue tape`.
+  Bybit can never appear here — its feed has an is-block flag but no group id, so
+  its blocks are unreconstructable and ride the volume/flow rows.
 
 **Multi-venue representation (truthful + consistent).** The `volume` rows span
 Deribit, OKX, Bybit, Bullish. The dollar **Volume** line sums **`turnover_usd`**
@@ -254,6 +255,6 @@ open-surface read were the minor bump to `1.4`; relocating the output template t
 `references/output-format.md` is a no-behaviour structural cleanup, so it's the
 **patch** to `1.4.1` (output is byte-identical). Repointing Biggest Print + Block
 Flow off the Deribit public API onto the multi-venue Paradigm block tape (S3-only,
-adds a Venue column + `via Paradigm/<venue>` + surface-IV lookup, Volume goes
+adds `via Paradigm/<venue>` + surface-IV lookup, Volume goes
 hot-only) is the **minor** bump to `1.12` — same four sections and trigger, no
 removed fields. (See the repo `CLAUDE.md` for the minor/major rules.)
