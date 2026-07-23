@@ -93,7 +93,7 @@ SURFACE_OPEN_CSV = (
     "BTC-3JUL26-65000-C,49.0,0.25\n"
     "BTC-3JUL26-55000-P,52.0,-0.25\n"
 )
-# A 2-leg block: put buy + call sell (Strangle/RR), 100 BTC per leg @ $60k.
+# A 2-leg block: put buy + call sell (Risk Reversal), 100 BTC per leg @ $60k.
 TRADES = [
     {"instrument_name": "BTC-26JUN26-55000-P", "index_price": 60000, "iv": 72.0,
      "timestamp": 1780000000000, "direction": "buy", "amount": 100, "block_trade_id": "B1"},
@@ -576,7 +576,7 @@ def test_block_flow_from_trades_not_hot():
     check("total not billions", bf["total_m"] < 1000, bf["total_m"])
     bp = bf["biggest_print"]
     check("biggest expiry", bp["expiry"] == "26JUN26", bp)
-    check("biggest is Strangle/RR", bp["structure"] == "Strangle/RR", bp)
+    check("biggest is Risk Reversal", bp["structure"] == "Risk Reversal", bp)
     # Size is the structure UNIT (100 per leg → a 100x RR), not the 200 leg-sum.
     check("biggest size 100 (unit, not leg-sum)", bp["size"] == 100, bp)
     check("biggest notional 12.0M", bp["notional_m"] == 12.0, bp)
@@ -682,6 +682,33 @@ def test_block_flow_aggregates_clips_in_rows():
     check("no truncation suffix when all shown", "top 8 by notional" not in md, md)
 
 
+def test_block_flow_column_stretches_for_long_labels():
+    # Regression: typed cross-expiry labels ("24JUL26/31JUL26 Call Diagonal",
+    # 29 chars) overflowed the fixed 27-char Structure column, rendering
+    # "...Call Diagonal$42.0M" with no gap. The column now stretches to the
+    # longest label in the window and the header stays aligned with the rows.
+    trades = [
+        {"instrument_name": "BTC-24JUL26-68000-C", "index_price": 60000,
+         "iv": 35.2, "timestamp": 1780000000000, "direction": "buy",
+         "amount": 100, "block_trade_id": "D1"},
+        {"instrument_name": "BTC-31JUL26-71000-C", "index_price": 60000,
+         "iv": 37.1, "timestamp": 1780000000000, "direction": "sell",
+         "amount": 100, "block_trade_id": "D1"},
+    ]
+    bf = build_block_flow(trades, {}, spot=60000)
+    md = render_md({"header": {"asset": "BTC", "window": "1h", "start_utc": "01:00",
+                               "end_utc": "02:00"},
+                    "snapshot": {}, "biggest_print": bf["biggest_print"],
+                    "block_flow": bf, "vol_surface": None, "flow_horizon": None,
+                    "warnings": []})
+    lines = md.splitlines()
+    header = next(l for l in lines if l.startswith("#") and "Structure" in l)
+    row = next(l for l in lines if "Call Diagonal" in l and l.split()[0].isdigit())
+    check("no label/notional collision", "Diagonal$" not in row, row)
+    check("Notl column aligned with row", row.index("$") == header.index("Notl"),
+          (header, row))
+
+
 def test_leg_phrase_calendar_shows_expiry():
     # Same strike, different expiries (a calendar). Without the expiry prefix both
     # legs render identically ('65KC / 65KC') and the detail is unreadable; the
@@ -755,7 +782,7 @@ def test_render_four_sections():
           "volume render")
     check("render multi-venue Activity line", "Activity" in md and "Bybit" in md, "activity render")
     check("render P/C 0.9x", "0.9x" in md)
-    check("render biggest Strangle/RR", "26JUN26 Strangle/RR" in md)
+    check("render biggest Risk Reversal", "26JUN26 Risk Reversal" in md)
     # Vol-surface delta columns are always present in the header; with no
     # window-open surface (this fixture has none) the delta cells read n/a.
     check("delta columns present", "ΔATM" in md and "ΔRR" in md and "ΔFly" in md, md)
@@ -764,6 +791,34 @@ def test_render_four_sections():
     check("no Themes", "Themes" not in md)
     check("no Dealer positioning", "Dealer positioning" not in md)
     check("four yaml fences", md.count("```yaml") == 4, md.count("```yaml"))
+
+
+def test_render_vrp_deadband_matches_rv_line():
+    # A small positive VRP (0.5v) is inside the ±1v dead-band: the RV line must
+    # read "IN LINE" and the VRP line "roughly fair" — never "IN LINE" beside
+    # "overpriced" on adjacent lines (the contradiction this fix removes).
+    md = render_md({"header": {"asset": "BTC", "window": "1h", "start_utc": "01:00",
+                               "end_utc": "02:00"},
+                    "snapshot": {"vrp": 0.5, "rv_7d": 45.0, "dvol": 45.5},
+                    "biggest_print": None,
+                    "block_flow": {"rows": [], "n_blocks": 0, "n_structures": 0,
+                                   "total_m": 0, "truncated": False},
+                    "vol_surface": None, "flow_horizon": None, "warnings": []})
+    rv_line = next(l for l in md.splitlines() if l.startswith("RV 7d"))
+    vrp_line = next(l for l in md.splitlines() if l.startswith("VRP"))
+    check("small +VRP → RV line IN LINE", "IN LINE" in rv_line, rv_line)
+    check("small +VRP → VRP line roughly fair", "roughly fair" in vrp_line, vrp_line)
+    check("small +VRP not called overpriced", "overpriced" not in vrp_line, vrp_line)
+    # Outside the band the words still flip.
+    md2 = render_md({"header": {"asset": "BTC", "window": "1h", "start_utc": "01:00",
+                                "end_utc": "02:00"},
+                     "snapshot": {"vrp": 3.0, "rv_7d": 42.0, "dvol": 45.0},
+                     "biggest_print": None,
+                     "block_flow": {"rows": [], "n_blocks": 0, "n_structures": 0,
+                                    "total_m": 0, "truncated": False},
+                     "vol_surface": None, "flow_horizon": None, "warnings": []})
+    vrp_line2 = next(l for l in md2.splitlines() if l.startswith("VRP"))
+    check("VRP > 1 → overpriced", "overpriced" in vrp_line2, vrp_line2)
 
 
 def test_render_deterministic():
