@@ -14,7 +14,7 @@ compatibility: Deribit public API (curl) for the 7d realized-vol closes only; Pa
   the S3 reads require the IRSA bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.12"
+  version: "1.13"
 ---
 
 # Options Recap

@@ -153,6 +153,18 @@ COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_COL
 SQL
 fi
 
+# volume.csv upgrade: OVERWRITE the legacy shape above with one that adds
+# turnover_usd — the pipeline's per-trade USD premium, summable across ALL
+# venues (drives the cross-venue $ Volume line). Same fallback-then-overwrite
+# pattern as VS_COLD: on a recap file that predates the column this bind fails,
+# the legacy volume.csv (Activity/P-C intact) stands, and recap.py labels the
+# Volume line Deribit-scoped. Appended LAST so a routine VS_COLD miss can't
+# shadow it and its own (transitional) failure loses nothing after it. Once the
+# upstream column is everywhere, fold turnover_usd into the main COPY.
+cat >> "$WORK/recap.sql" <<SQL
+COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(turnover_usd) AS turnover_usd, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
+SQL
+
 # recap.py runs this DuckDB session in a thread concurrent with the Deribit fetch.
 # No exec — the EXIT trap must fire to clean up $WORK.
 [ -n "$CAP_NOTE" ] && { echo "$CAP_NOTE"; echo; }

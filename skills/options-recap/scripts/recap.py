@@ -233,6 +233,7 @@ def load_hot(csv_dir: str, asset: str) -> dict:
     out = {"dvol": None, "dvol_open": None, "dvol_low": None, "dvol_high": None,
            "spot_close": None, "spot_open": None, "spot_low": None,
            "volume_btc": None, "put_vol": None, "call_vol": None,
+           "turnover_usd": None,
            "trades_by_venue": {}, "trades_total": None,
            "put_trades": None, "call_trades": None,
            "tickers": {}, "vs_now": {}, "vs_open": {}}
@@ -253,17 +254,24 @@ def load_hot(csv_dir: str, asset: str) -> dict:
     if not ds:
         warn("hot dvol_spot.csv missing — DVOL/spot from snapshot or fallback")
 
-    # Volume / P/C. Two reads, each on a basis that's honest for its scope:
-    #   • Dollar volume — ONLY Deribit is priced in USD reliably (1 contract = 1 BTC,
-    #     confirmed from the venue instrument feed). `volume_sum` units differ by
-    #     venue and `notional_usd` isn't yet cross-venue-normalized, so we do NOT
-    #     sum $ across venues; the Volume line is explicitly Deribit-scoped.
+    # Volume / P/C. Three reads, each on a basis that's honest for its scope:
+    #   • Dollar volume — `turnover_usd` is the upstream per-trade USD premium
+    #     (priced at each trade's own index, contract multipliers applied at
+    #     ingestion from the venue instrument spec), so it sums truthfully across
+    #     ALL venues. Null/absent cells contribute nothing; if NO row carries it
+    #     (pre-upgrade recap file), build() falls back to the Deribit-scoped
+    #     volume_sum × spot calc below and labels the line accordingly.
+    #   • Deribit coin volume — the fallback basis: ONLY Deribit is priced in USD
+    #     reliably without turnover_usd (1 contract = 1 BTC); `volume_sum` units
+    #     differ by venue, so this sum never crosses venues.
     #   • Activity + P/C — `trade_count` is unit-free (a trade is a trade), so it
     #     aggregates across ALL venues truthfully, with no contract multiplier.
     # Blank-optionType rows are per-exchange aggregates that double-count — drop them.
     vol = [r for r in _own_asset_rows(_read_csv(csv_dir, "volume.csv"), asset, "volume.csv")
            if (r.get("optionType") or "").strip()]
     if vol:
+        tus = [t for t in (_num(r, "turnover_usd") for r in vol) if t is not None]
+        out["turnover_usd"] = sum(tus) or None
         # Exact "deribit" only — NOT startswith: the sibling venue deribit-usdc is
         # USDC-linear (a different contract unit), so folding it into this
         # BTC-inverse dollar-volume sum would contaminate the Volume line.
@@ -457,14 +465,22 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
 
     rv = realized_vs_implied(deri.get("closes_7d") or [], dvol_close)
 
-    # Volume ($) is Deribit-scoped, from the hot rollup: call+put BTC volume × spot.
-    # (Only Deribit is reliably priced 1 contract = 1 BTC; volume_sum units differ by
-    # venue and notional_usd isn't yet cross-venue-normalized, so the line stays
-    # Deribit-scoped.) The rollup head-lags the live tape ~10-15 min, so a very thin
-    # window may under-count the newest prints — an accepted trade-off now that Block
-    # Flow is the multi-venue Paradigm tape, a different universe from this line.
+    # Volume ($): the upstream turnover_usd sum is a true cross-venue USD total
+    # (per-trade, priced at trade time). On a recap file that predates the column
+    # the line falls back to the old Deribit-scoped volume_sum × spot calc —
+    # labeled as such in render_md via volume_scope, so nothing is overstated
+    # either way. The rollup head-lags the live tape ~10-15 min, so a very thin
+    # window may under-count the newest prints — an accepted trade-off now that
+    # Block Flow is the multi-venue Paradigm tape, a different universe from this
+    # line.
+    turnover_usd = hot.get("turnover_usd")
     vol_btc = hot.get("volume_btc")
-    vol_usd = vol_btc * spot if (vol_btc and spot) else None
+    if turnover_usd:
+        vol_usd = turnover_usd
+        volume_scope = "all"
+    else:
+        vol_usd = vol_btc * spot if (vol_btc and spot) else None
+        volume_scope = "deribit"
     # Activity + P/C use trade_count — unit-free, so they span ALL venues truthfully.
     pt, ct = hot.get("put_trades"), hot.get("call_trades")
     pc = round(pt / ct, 2) if pt and ct else None
@@ -543,6 +559,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "dvol_label": dvol_label(dvol_open, dvol_close),
         "rv_7d": rv.get("value"), "vrp": rv.get("vrp"), "vrp_label": rv.get("vrp_label"),
         "volume_usd_m": round(vol_usd / 1e6) if vol_usd else None,
+        "volume_scope": volume_scope,
         "activity_trades": tt,
         "activity_split": activity_split,
         "pc_ratio": pc, "pc_descriptor": pc_descriptor(pc),
@@ -687,7 +704,11 @@ def render_md(r: dict) -> str:
     else:
         L.append(f"{'Activity':<9} {'n/a':<11} trades (by trade count)")
     vol = f"${s['volume_usd_m']}M" if s.get("volume_usd_m") else "n/a"
-    L.append(f"{'Volume':<9} {vol:<11} Deribit only (cross-venue $ pending)")
+    # "all venues" when the cross-venue turnover_usd sum drove the number;
+    # the Deribit-scoped label survives only on the pre-upgrade fallback.
+    vol_note = ("all venues" if s.get("volume_scope") == "all"
+                else "Deribit only (cross-venue $ pending)")
+    L.append(f"{'Volume':<9} {vol:<11} {vol_note}")
     pc = f"{s['pc_ratio']}x" if s.get("pc_ratio") is not None else "n/a"
     pc_desc = f"{s['pc_descriptor']} " if s.get("pc_descriptor") else ""
     L.append(f"{'P/C':<9} {pc:<11} {pc_desc}(all venues, by trades)")

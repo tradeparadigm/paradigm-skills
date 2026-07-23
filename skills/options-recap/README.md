@@ -65,10 +65,12 @@ Notes / non-obvious bits:
   24h`) set `PRESET=1`, but since every window reads the same rolling file this no
   longer gates the data path — it's retained for the plan/test hook and as an
   observability signal (canonical vs ad-hoc window).
-- **Dollar Volume is Deribit-scoped; Activity/P-C span all venues.** See "Data
-  sources" below — `volume_sum` units differ per venue so the `$` Volume line uses
-  only the exact-`deribit` rows (1 contract = 1 BTC), while the unit-free
-  `trade_count` drives the multi-venue Activity line and the P/C ratio.
+- **Dollar Volume and Activity/P-C span all venues.** See "Data sources" below —
+  the `$` Volume line sums the upstream `turnover_usd` column (per-trade USD
+  premium, normalized at ingestion), while the unit-free `trade_count` drives the
+  multi-venue Activity line and the P/C ratio. On a pre-upgrade recap file (no
+  `turnover_usd`) the Volume line falls back to the old Deribit-scoped
+  `volume_sum × spot` calc and says so in its label.
 - **The old bug:** a preset `case` mapped unknown windows to a silent 8h default,
   so surface deltas were computed against an 8h-old open. Fixed by parsing the
   window into seconds instead of enumerating presets.
@@ -104,7 +106,7 @@ rolling file of 5-min buckets over the trailing 24h; windowed at query time via
 | Section | `row_type` | Key columns |
 |---|---|---|
 | Snapshot DVOL/spot | `dvol_spot` | `metric`, `open`, `close`, `high`, `low` (OHLC: `arg_min(open,bucket_at)` / `arg_max(close,bucket_at)` / `max(high)` / `min(low)`) |
-| Snapshot volume/P-C/$Volume | `volume` | `exchange`, `optionType`, `volume_sum`, `notional_usd`, `trade_count` |
+| Snapshot volume/P-C/$Volume | `volume` | `exchange`, `optionType`, `volume_sum`, `turnover_usd`, `notional_usd`, `trade_count` |
 
 There is **no `surface` and no `block` `row_type`** — the vol surface lives in
 `v_vol_surface`, and Biggest Print / Block Flow come from the block tape (both
@@ -125,16 +127,19 @@ one Block Flow row with a `Blocks` count). Columns used: `DATE`, `TIME`, `PRODUC
 tape schema and the `paradigm-block-analyst` skill for the `DESCRIPTION` grammar.
 
 **Multi-venue representation (truthful + consistent).** The `volume` rows span
-Deribit, OKX, Bybit, Bullish, but their units aren't comparable: `volume_sum` is
-each venue's native contract unit and `notional_usd` isn't yet cross-venue
-normalized. So the recap only aggregates across venues on a **unit-free** basis —
-**`trade_count`** — which drives the multi-venue **Activity** line (total trades +
-per-venue share) and the **P/C** ratio (put vs call trades, all venues). The
-dollar **Volume** line stays **Deribit-scoped** (the one venue we can price in USD
-reliably: 1 contract = 1 BTC) and is labeled as such — we never sum `volume_sum`
-or `notional_usd` across venues. When the pipeline later emits a normalized
-cross-venue USD field, the Volume line upgrades to a true market total; until then
-nothing is overstated. **No venue contract multipliers are hardcoded anywhere.**
+Deribit, OKX, Bybit, Bullish. The dollar **Volume** line sums **`turnover_usd`**
+across all of them — the pipeline's per-trade USD premium, computed at ingestion
+from each venue's own instrument spec (contract multipliers + trade-time index),
+so the sum is a true market total with no per-venue logic here. **Activity** and
+**P/C** aggregate on the unit-free **`trade_count`** basis as before. `volume_sum`
+(venue-native contract units) and `notional_usd` are still never summed across
+venues. Rollout caveats: on a recap file that predates `turnover_usd` the upgraded
+volume.csv COPY fails at bind, the legacy shape stands, and the Volume line falls
+back to the Deribit-scoped `volume_sum × spot` calc with the "Deribit only" label;
+and for ~24h after the upstream deploy, buckets built before the column carry null
+turnover, so the all-venue total under-counts until the retained series turns over
+(or is backfilled upstream). **No venue contract multipliers are hardcoded
+anywhere.**
 
 The "now" values (latest DVOL/spot close, current surface) come from the newest
 `bucket_at` in the recap file and the latest `v_vol_surface/_hot` snapshot.
@@ -170,11 +175,13 @@ in early versions:
   `notional` double-counts, and `volume_sum` units differ by venue
   (Deribit/Bullish in BTC, OKX/Bybit in contracts).
 
-`recap.py` defends: Volume/P-C are derived from **Deribit only** (contracts ×
-spot), dropping the blank-`optionType` aggregate rows. This is pinned by
-regression tests (`test_recap.py`). (The old hot `block` row_type — which had its
-own unit-corrupt rows — is no longer read at all: Biggest Print + Block Flow now
-come from the Paradigm block tape, where notional is already USD per leg.)
+`recap.py` defends: dollar Volume sums only the normalized `turnover_usd` column
+(never raw `notional`), dropping the blank-`optionType` aggregate rows, and falls
+back to a **Deribit-only** contracts × spot calc when the column is absent. This
+is pinned by regression tests (`test_recap.py`). (The old hot `block` row_type —
+which had its own unit-corrupt rows — is no longer read at all: Biggest Print +
+Block Flow now come from the Paradigm block tape, where notional is already USD
+per leg.)
 
 On a hot miss (DuckDB fails / CSVs absent) it degrades: affected sections read
 `No data` and the output is prefixed `⚠ hot surface unavailable`. It never fabricates.

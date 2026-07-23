@@ -25,7 +25,7 @@ DVOL      [X]v        [flat/rising/falling] ([open] -> [close])
 RV 7d     [X]v        implied [CHEAP/RICH/IN LINE] vs realized
 VRP       [±X]v       vol [underpriced/overpriced/roughly fair] vs delivered
 Activity  [Nk]        trades — [Venue X% · Venue Y% · ...] (by trade count)
-Volume    $[X]M       Deribit only (cross-venue $ pending)
+Volume    $[X]M       all venues
 P/C       [X.Xx]      [descriptor] (all venues, by trades)
 ```
 

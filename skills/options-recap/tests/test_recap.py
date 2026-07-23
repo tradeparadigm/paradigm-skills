@@ -66,6 +66,32 @@ CORRUPT_VOLUME_CSV = (
     "deribit-usdc,call,15.3,14740.6,11.61,3.69,83\n"
     "deribit-usdc,put,51.0,25581.55,8.01,42.99,50\n"
 )
+# Post-upgrade shape: the recap file's volume rows carry turnover_usd — the
+# upstream per-trade USD premium (contract multipliers + trade-time index applied
+# at ingestion), summable across ALL venues with no per-venue logic. Same trade
+# rows as CORRUPT_VOLUME_CSV plus the asset echo + the new column; the
+# blank-optionType aggregate row still gets dropped before any sum. Round numbers
+# so the expected total is auditable by eye: $279.54M across the five venues.
+# okex rows deliberately carry turnover ≪ notional×anything — the 0.01 contract
+# multiplier is upstream's job; this file just sums the column.
+UPGRADED_VOLUME_CSV = (
+    "asset,exchange,optionType,volume_sum,notional,turnover_usd,buy_volume,sell_volume,trade_count\n"
+    "BTC,deribit,call,4719.6,78.27,150000000.0,2231.6,2488.0,2652\n"
+    "BTC,deribit,put,2702.9,88.36,90000000.0,1001.8,1701.1,1844\n"
+    "BTC,bybit-options,put,4035.26,2094282.15,2100000.0,2565.5,1469.76,7135\n"
+    "BTC,bybit-options,call,3044.33,1413683.95,1400000.0,1670.2,1374.13,8315\n"
+    "BTC,okex-options,put,246718.0,3966.56,24000000.0,110024.0,136694.0,2779\n"
+    "BTC,okex-options,call,188346.0,1841.07,12000000.0,97495.0,90851.0,2138\n"
+    "BTC,deribit-usdc,call,15.3,14740.6,14700.0,11.61,3.69,83\n"
+    "BTC,deribit-usdc,put,51.0,25581.55,25500.0,8.01,42.99,50\n"
+    # bullish: turnover blank (e.g. null upstream) — contributes nothing,
+    # must not zero or crash the sum.
+    "BTC,bullish,call,10.0,650000.0,,5.0,5.0,20\n"
+    "BTC,deribit,,163448320.0,9803096239210.0,999999999999.0,81069170.0,82379150.0,47759\n"
+)
+# Σ turnover of the kept (non-blank-optionType) rows above.
+UPGRADED_TURNOVER_TOTAL = (150_000_000 + 90_000_000 + 2_100_000 + 1_400_000
+                           + 24_000_000 + 12_000_000 + 14_700 + 25_500)
 DVOL_SPOT_CSV = (
     "exchange,metric,open,close,high,low\n"
     "deribit,dvol,45.41,43.34,45.5,43.0\n"
@@ -225,6 +251,60 @@ def test_volume_na_without_hot():
     md = render_md(res)
     vol_line = next(ln for ln in md.splitlines() if ln.strip().startswith("Volume"))
     check("Volume line reads n/a", "n/a" in vol_line, vol_line)
+
+
+# ── load_hot/build: cross-venue turnover_usd ($ Volume) ──────────────────────
+
+def test_turnover_sums_across_all_venues():
+    recap.WARNINGS.clear()
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "volume.csv", UPGRADED_VOLUME_CSV)
+        _write(d, "dvol_spot.csv", DVOL_SPOT_CSV)
+        hot = load_hot(d, "BTC")
+    # All venues' turnover summed — incl. deribit-usdc and OKX (whose contract
+    # multiplier was applied upstream); the blank-optionType aggregate row
+    # (999999999999) dropped; bullish's blank cell contributes nothing.
+    check("turnover_usd = Σ all venues", hot["turnover_usd"] == UPGRADED_TURNOVER_TOTAL,
+          hot["turnover_usd"])
+    check("aggregate row's absurd turnover excluded",
+          hot["turnover_usd"] < 1e9, hot["turnover_usd"])
+    # The Deribit coin-volume basis still parses (it's the fallback).
+    check("volume_btc still deribit-scoped", abs(hot["volume_btc"] - 7422.5) < 1e-6,
+          hot["volume_btc"])
+
+
+def test_turnover_drives_volume_line_and_label():
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "volume.csv", UPGRADED_VOLUME_CSV)
+        _write(d, "dvol_spot.csv", DVOL_SPOT_CSV)
+        hot = load_hot(d, "BTC")
+        res = build("btc", "8h", 0, 8 * 3600_000,
+                    {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+    s = res["snapshot"]
+    check("volume_usd_m from turnover (280)",
+          s["volume_usd_m"] == round(UPGRADED_TURNOVER_TOTAL / 1e6), s["volume_usd_m"])
+    check("volume_scope all", s["volume_scope"] == "all", s["volume_scope"])
+    check("volume unaffected by block tape", s["volume_usd_m"] != 12, s["volume_usd_m"])
+    md = render_md(res)
+    vol_line = next(ln for ln in md.splitlines() if ln.strip().startswith("Volume"))
+    check("volume line says all venues", "all venues" in vol_line, vol_line)
+    check("Deribit-only label gone", "Deribit only" not in vol_line, vol_line)
+
+
+def test_missing_turnover_falls_back_to_deribit_scope():
+    # Pre-upgrade recap file (no turnover_usd column): the Volume line must keep
+    # the old Deribit-scoped calc AND its honest label — never n/a, never a
+    # cross-venue sum of unit-mixed columns.
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot(d)  # CORRUPT_VOLUME_CSV carries no turnover_usd
+        res = build("btc", "8h", 0, 8 * 3600_000,
+                    {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+    s = res["snapshot"]
+    check("no turnover parsed", hot["turnover_usd"] is None, hot["turnover_usd"])
+    check("fallback scope deribit", s["volume_scope"] == "deribit", s["volume_scope"])
+    check("fallback volume ~449", 440 <= s["volume_usd_m"] <= 460, s["volume_usd_m"])
+    md = render_md(res)
+    check("fallback label kept", "Deribit only (cross-venue $ pending)" in md, "label")
 
 
 def test_activity_split_collapses_deribit_venues():
