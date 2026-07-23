@@ -73,7 +73,7 @@
       {
         "block_trade_id": "BLOCK-276921",
         "time_utc": "06:40",
-        "structure": "Spread",
+        "structure": "Put Spread",
         "size_btc": 84.6,
         "notional_usd": 5226775,
         "side": "Two-way",
@@ -85,7 +85,7 @@
       {
         "block_trade_id": "BLOCK-276918",
         "time_utc": "06:32",
-        "structure": "Spread",
+        "structure": "Put Spread",
         "size_btc": 60.0,
         "notional_usd": 3712546,
         "side": "Two-way",
@@ -97,7 +97,7 @@
       {
         "block_trade_id": "BLOCK-276916",
         "time_utc": "06:27",
-        "structure": "Spread",
+        "structure": "Put Spread",
         "size_btc": 50.0,
         "notional_usd": 3072046,
         "side": "Two-way",
@@ -109,7 +109,7 @@
       {
         "block_trade_id": "BLOCK-276915",
         "time_utc": "06:26",
-        "structure": "Spread",
+        "structure": "Put Spread",
         "size_btc": 50.0,
         "notional_usd": 3071349,
         "side": "Two-way",

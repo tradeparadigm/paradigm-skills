@@ -199,8 +199,13 @@ def test_classify_structure():
           classify_structure(straddle))
     spread = [_leg("BTC-26JUN26-60000-P", "buy", 10),
               _leg("BTC-26JUN26-55000-P", "sell", 10)]
-    check("same type diff strikes → Spread", classify_structure(spread) == "Spread",
-          classify_structure(spread))
+    check("both puts diff strikes → Put Spread",
+          classify_structure(spread) == "Put Spread", classify_structure(spread))
+    call_spread = [_leg("BTC-26JUN26-60000-C", "buy", 10),
+                   _leg("BTC-26JUN26-65000-C", "sell", 10)]
+    check("both calls diff strikes → Call Spread",
+          classify_structure(call_spread) == "Call Spread",
+          classify_structure(call_spread))
     cal = [_leg("BTC-26JUN26-60000-C", "buy", 10),
            _leg("BTC-3JUL26-60000-C", "sell", 10)]
     check("diff expiries same strike → Calendar", classify_structure(cal) == "Calendar",
@@ -400,7 +405,7 @@ def test_aggregate_clips_merges_worked_order():
     ranked = summarize_blocks(clusters, top_n=10**9, min_btc=5.0)
     grouped = aggregate_clips(ranked, clusters)
     check("4 blocks → 2 grouped rows", len(grouped) == 2, grouped)
-    spread = next(g for g in grouped if g["structure"] == "Spread")
+    spread = next(g for g in grouped if g["structure"] == "Put Spread")
     check("clip_count 3", spread["clip_count"] == 3, spread)
     check("sizes summed (150+30+30)", spread["size_btc"] == 210.0, spread)
     check("unit sizes summed (50+10+10)", spread["unit_size"] == 70.0, spread)

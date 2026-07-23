@@ -189,7 +189,8 @@ def classify_structure(legs: list[dict]) -> str:
     Same expiry: ≥3 legs → Butterfly/Condor (covers call/put flies AND iron
     flies/condors — the ≥3-leg check must run before the C&P branch, or a
     4-leg iron fly reads as "Strangle/RR"); C&P + same strike → Straddle;
-    C&P + diff strikes → Strangle/RR; same type + diff strikes → Spread.
+    C&P + diff strikes → Strangle/RR; same type + diff strikes → Call Spread
+    (both calls) or Put Spread (both puts).
     Multi-expiry: same strike → Calendar; 2 legs + diff strikes → Diagonal."""
     if len(legs) == 1:
         return "Call" if legs[0]["instrument_name"].endswith("-C") else "Put"
@@ -211,7 +212,7 @@ def classify_structure(legs: list[dict]) -> str:
         if types == {"C", "P"} and len(strikes) > 1:
             return "Strangle/RR"
         if len(types) == 1 and len(strikes) > 1:
-            return "Spread"
+            return "Call Spread" if types == {"C"} else "Put Spread"
     return "Multi-leg"
 
 
