@@ -127,22 +127,28 @@ one Block Flow row with a `Blocks` count). Columns used: `DATE`, `TIME`, `PRODUC
 `v_vol_surface` (Deribit legs only). See the `paradigm-data-discovery` skill for the
 tape schema and the `paradigm-block-analyst` skill for the `DESCRIPTION` grammar.
 
-**Venue-tape blocks (`venue_blocks.csv`) — coverage for venues the Paradigm tape
-doesn't broker.** The recap file's `block` rows carry every block/OTC print off the
-exchanges' own feeds (Deribit `block_trade_id`, OKX `blockTdId`, Bullish
-`otcTradeId`); `run_recap.sh` groups them per `(exchange, block_id)` into
-`venue_blocks.csv` with **unit-explicit columns**: `volume_coin` (Σ leg amounts,
-coin) and `premium_usd` (Σ premium — kept for debuggability, **never displayed as
-notional**: it's ~50–100× below the underlying-USD basis the block sections use).
-`recap.py` then:
+**Venue-tape blocks (`venue_blocks.csv`) — full-market block coverage.** The
+recap file's `block` rows carry every block/OTC print off the exchanges' own
+feeds (Deribit `block_trade_id`, OKX `blockTdId`, Bullish `otcTradeId`);
+`run_recap.sh` groups the **option-kind** rows per `(exchange, block_id)` into
+`venue_blocks.csv` (`instrument_kind='option'` in the COPY — a perp/spot OTC
+block must never compete in an options recap) with **unit-explicit columns**:
+`volume_coin` (Σ leg amounts, coin) and `premium_usd` (Σ premium — kept for
+debuggability, **never displayed as notional**: it's ~50–100× below the
+underlying-USD basis the block sections use). `recap.py` then:
 
-- **Includes only venues the Paradigm tape does NOT cover** (`_TAPE_BROKERED_VENUES`
-  excludes deribit / deribit-usdc / paradex / bullish) — so **OKX** today. A
-  Paradigm-brokered block appears on *both* tapes with **unjoinable ids** (tape
-  `BLOCK_TRADE_ID` = Paradigm's `DRFQv2-bt_…`; venue `block_id` = venue-native,
-  e.g. Deribit `BLOCK-280624` — verified against real files 2026-07-23), so
-  including tape-covered venues would double-count. Deribit/Bullish blocks not
-  brokered via Paradigm remain out of scope until an id bridge exists.
+- **Dedupes by the venue's own block id, then merges EVERY venue** — no
+  per-venue bias in either direction. The slim tape exports
+  `VENUE_BLOCK_TRADE_ID` (tradeparadigm/data#697): the venue's own id recorded
+  at execution (Deribit `BLOCK-…`, Bullish `otc_trade_id`) — identical to the
+  venue tape's `block_id`, so a Paradigm-brokered block is dropped from the
+  venue-tape side by exact id match, and non-Paradigm Deribit/Bullish blocks
+  merge alongside OKX's. Conservative fallback (`_dedupe_venue_blocks`): a tape
+  row *without* a venue id (pre-upgrade tape file; DRFQ v1/GRFQ rows carry none)
+  can't be deduped against, so that row's venue is excluded from the merge for
+  the window rather than risk double-counting. A venue with no tape rows merges
+  freely — which also keeps Block Flow alive off the venue tapes when the
+  Paradigm tape read fails entirely.
 - **Prices them as `volume_coin × spot`** — underlying-USD, the same basis as the
   tape's `NOTIONAL_VOLUME_USD`, valued at recap-time spot (a disclosed
   approximation vs the tape's trade-time figures). No spot → skipped with a
@@ -162,13 +168,17 @@ from each venue's own instrument spec (contract multipliers + trade-time index),
 so the sum is a true market total with no per-venue logic here. **Activity** and
 **P/C** aggregate on the unit-free **`trade_count`** basis as before. `volume_sum`
 (venue-native contract units) and `notional_usd` are still never summed across
-venues. Rollout caveats: on a recap file that predates `turnover_usd` the upgraded
-volume.csv COPY fails at bind, the legacy shape stands, and the Volume line falls
-back to the Deribit-scoped `volume_sum × spot` calc with the "Deribit only" label;
-and for ~24h after the upstream deploy, buckets built before the column carry null
-turnover, so the all-venue total under-counts until the retained series turns over
-(or is backfilled upstream). **No venue contract multipliers are hardcoded
-anywhere.**
+venues. The "all venues" label is **gated on per-venue completeness**: if any
+venue that traded carries only null turnover cells (a partial upstream rollout),
+the line falls back to the Deribit-scoped `volume_sum × spot` calc with the
+"Deribit only" label rather than present a partial sum as a market total. Same
+fallback on a recap file that predates `turnover_usd` entirely (the upgraded
+volume.csv COPY fails at bind and the legacy shape stands). Remaining caveat the
+gate can't see: for ~24h after the upstream deploy, a venue's EARLY buckets carry
+null turnover while its later ones don't, so a technically-complete sum still
+under-counts until the retained series turns over — upstream cannot backfill
+those values (they only exist from ingestion onward). **No venue contract
+multipliers are hardcoded anywhere.**
 
 The "now" values (latest DVOL/spot close, current surface) come from the newest
 `bucket_at` in the recap file and the latest `v_vol_surface/_hot` snapshot.

@@ -131,11 +131,24 @@ SET s3_secret_access_key='${SK}';
 SET s3_session_token='${ST}';
 COPY (SELECT asset, exchange, metric, arg_min(open, bucket_at) AS open, arg_max(close, bucket_at) AS close, max(high) AS high, min(low) AS low FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, metric) TO '${WORK}/dvol_spot.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
-COPY (SELECT "DATE", "TIME", PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID FROM read_csv_auto('${TAPE}') WHERE PRODUCT LIKE '${ASSET} OPTION%' AND epoch(CAST(CAST("DATE" AS VARCHAR) || ' ' || CAST("TIME" AS VARCHAR) AS TIMESTAMP)) >= ${START_S}) TO '${WORK}/blocks.csv' (HEADER, DELIMITER ',');
-COPY (SELECT asset, exchange, block_id, instrument_kind, min(bucket_at) AS bucket_at, sum(volume_sum) AS volume_coin, sum(notional_usd) AS premium_usd, sum(leg_count) AS leg_count, sum(iv_sum) AS iv_sum, sum(iv_count) AS iv_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='block' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, block_id, instrument_kind) TO '${WORK}/venue_blocks.csv' (HEADER, DELIMITER ',');
+COPY (SELECT * FROM read_csv_auto('${TAPE}') WHERE PRODUCT LIKE '${ASSET} OPTION%' AND epoch(CAST(CAST("DATE" AS VARCHAR) || ' ' || CAST("TIME" AS VARCHAR) AS TIMESTAMP)) >= ${START_S}) TO '${WORK}/blocks.csv' (HEADER, DELIMITER ',');
+COPY (SELECT asset, exchange, block_id, min(bucket_at) AS bucket_at, sum(volume_sum) AS volume_coin, sum(notional_usd) AS premium_usd, sum(leg_count) AS leg_count, sum(iv_sum) AS iv_sum, sum(iv_count) AS iv_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='block' AND instrument_kind='option' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, block_id) TO '${WORK}/venue_blocks.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '${WORK}/surface_now.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h WHERE abs("at"-${START_MS})<=900000 ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '${WORK}/surface_open.csv' (HEADER, DELIMITER ',');
+COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(turnover_usd) AS turnover_usd, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
 SQL
+
+# volume.csv upgrade (the statement just above): OVERWRITES the legacy shape
+# with one that adds turnover_usd — the pipeline's per-trade USD premium,
+# summable across ALL venues (drives the cross-venue $ Volume line). Same
+# fallback-then-overwrite pattern as the VS_COLD surface read: on a recap file
+# that predates the column this bind fails, the legacy volume.csv
+# (Activity/P-C intact) stands, and recap.py labels the Volume line
+# Deribit-scoped. Placed BEFORE the VS_COLD append so neither may-fail
+# statement can shadow the other's output even if the DuckDB CLI ever bails on
+# error (its -bail default is off — statements continue past a failure — but
+# nothing here depends on that). Once the upstream column is everywhere, fold
+# turnover_usd into the main volume COPY.
 
 # surface_open: the statement above is a SAFE fallback from _hot (always exists),
 # tolerance-guarded to 15min so a window-start outside _hot's ~2h buffer writes a
@@ -153,18 +166,6 @@ if [ -n "$VS_COLD" ]; then
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_COLD}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '${WORK}/surface_open.csv' (HEADER, DELIMITER ',');
 SQL
 fi
-
-# volume.csv upgrade: OVERWRITE the legacy shape above with one that adds
-# turnover_usd — the pipeline's per-trade USD premium, summable across ALL
-# venues (drives the cross-venue $ Volume line). Same fallback-then-overwrite
-# pattern as VS_COLD: on a recap file that predates the column this bind fails,
-# the legacy volume.csv (Activity/P-C intact) stands, and recap.py labels the
-# Volume line Deribit-scoped. Appended LAST so a routine VS_COLD miss can't
-# shadow it and its own (transitional) failure loses nothing after it. Once the
-# upstream column is everywhere, fold turnover_usd into the main COPY.
-cat >> "$WORK/recap.sql" <<SQL
-COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(turnover_usd) AS turnover_usd, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
-SQL
 
 # recap.py runs this DuckDB session in a thread concurrent with the Deribit fetch.
 # No exec — the EXIT trap must fire to clean up $WORK.

@@ -56,6 +56,7 @@ from vol_math import (  # noqa: E402
     realized_vs_implied,
     build_tape_blocks,
     compute_vol_surface,
+    tape_venue_label,
     RV_LOOKBACK_DAYS,
 )
 
@@ -233,7 +234,7 @@ def load_hot(csv_dir: str, asset: str) -> dict:
     out = {"dvol": None, "dvol_open": None, "dvol_low": None, "dvol_high": None,
            "spot_close": None, "spot_open": None, "spot_low": None,
            "volume_btc": None, "put_vol": None, "call_vol": None,
-           "turnover_usd": None,
+           "turnover_usd": None, "turnover_complete": False,
            "trades_by_venue": {}, "trades_total": None,
            "put_trades": None, "call_trades": None,
            "tickers": {}, "vs_now": {}, "vs_open": {}}
@@ -271,7 +272,16 @@ def load_hot(csv_dir: str, asset: str) -> dict:
            if (r.get("optionType") or "").strip()]
     if vol:
         tus = [t for t in (_num(r, "turnover_usd") for r in vol) if t is not None]
-        out["turnover_usd"] = sum(tus) or None
+        out["turnover_usd"] = sum(tus) if tus else None
+        # "all venues" must mean ALL: during a partial upstream rollout some
+        # venues' cells are null and contribute $0 — presenting that sum as
+        # an all-venue total under-reports while claiming completeness. The
+        # label upgrade is gated on every venue that traded carrying at
+        # least one non-null turnover cell.
+        venues_traded = {(r.get("exchange") or "").lower() for r in vol}
+        venues_with_tu = {(r.get("exchange") or "").lower() for r in vol
+                          if _num(r, "turnover_usd") is not None}
+        out["turnover_complete"] = bool(tus) and venues_traded == venues_with_tu
         # Exact "deribit" only — NOT startswith: the sibling venue deribit-usdc is
         # USDC-linear (a different contract unit), so folding it into this
         # BTC-inverse dollar-volume sum would contaminate the Volume line.
@@ -361,21 +371,12 @@ def load_blocks(csv_dir: str) -> list[dict]:
     return rows
 
 
-# Venues whose blocks the Paradigm tape already covers (Paradigm brokers them:
-# DBT / PRDX / BLSH). Their venue-tape block rows are EXCLUDED from the merge —
-# a Paradigm-brokered block appears on both tapes with UNJOINABLE ids (the
-# Paradigm tape's BLOCK_TRADE_ID is Paradigm's own `DRFQv2-bt_…`, the venue
-# tape's block_id is venue-native, e.g. Deribit `BLOCK-280624` — verified
-# against real files 2026-07-23), so including them would double-count.
-# Venues NOT in this set (OKX today) have zero tape overlap by construction.
-_TAPE_BROKERED_VENUES = {"deribit", "deribit-usdc", "paradex", "bullish"}
-
-
 def load_venue_blocks(csv_dir: str, asset: str) -> list[dict]:
-    """Read venue_blocks.csv — block/OTC prints off the EXCHANGES' own tapes
-    (the hot recap file's `block` rows, grouped per block id in DuckDB), for
-    venues the Paradigm tape does NOT cover. Missing file → [] (the Paradigm
-    tape still renders alone; pre-column files simply lack blocks here).
+    """Read venue_blocks.csv — OPTION block/OTC prints off the EXCHANGES' own
+    tapes (the hot recap file's `block` rows, grouped per block id in DuckDB,
+    `instrument_kind='option'` — a perp/spot OTC block must never compete in
+    an options recap). Missing file → [] (the Paradigm tape still renders
+    alone). Dedup against the Paradigm tape happens in _dedupe_venue_blocks.
 
     Columns are unit-explicit: `volume_coin` (Σ leg amounts, coin units) and
     `premium_usd` (Σ premium — carried for debuggability, NEVER displayed as
@@ -384,8 +385,50 @@ def load_venue_blocks(csv_dir: str, asset: str) -> list[dict]:
     """
     rows = _own_asset_rows(_read_csv(csv_dir, "venue_blocks.csv"), asset,
                            "venue_blocks.csv")
+    # Belt to the SQL's WHERE: a row that still carries a non-option kind
+    # (older CSV shape) is dropped here too.
     return [r for r in rows
-            if (r.get("exchange") or "").lower() not in _TAPE_BROKERED_VENUES]
+            if (r.get("instrument_kind") or "option") == "option"]
+
+
+def _dedupe_venue_blocks(venue_rows: list[dict], tape_rows: list[dict]) -> list[dict]:
+    """Drop venue-tape blocks already represented on the Paradigm tape.
+
+    Exact-id first: the tape's `VENUE_BLOCK_TRADE_ID` is the venue's OWN
+    block id, recorded at execution and exported by the slim tape
+    (tradeparadigm/data#697) — Deribit `BLOCK-…`, Bullish `otc_trade_id` —
+    the same string the venue tape's `block_id` carries, so set membership
+    is an exact dedupe. Every venue then merges, including non-Paradigm
+    Deribit/Bullish blocks (there is no per-venue bias either way).
+
+    Conservative per-venue fallback: a tape row WITHOUT a venue id (a tape
+    file predating the column, or DRFQ v1/GRFQ rows, which carry none)
+    cannot be deduped against — so ALL venue-tape blocks for that row's
+    venue are dropped rather than risk double-counting. A venue with no
+    tape rows at all merges freely: nothing to double-count (this also
+    keeps Block Flow alive off the venue tapes when the Paradigm tape read
+    fails entirely).
+    """
+    tape_ids: set[str] = set()
+    unidentified: set[str] = set()  # venue labels with >=1 id-less tape row
+    for r in tape_rows or []:
+        vid = (r.get("VENUE_BLOCK_TRADE_ID") or "").strip()
+        if vid:
+            tape_ids.add(vid)
+        else:
+            unidentified.add(tape_venue_label(r.get("PRODUCT")))
+    kept, conservative = [], 0
+    for r in venue_rows:
+        if (r.get("block_id") or "") in tape_ids:
+            continue  # exact duplicate of a Paradigm-brokered block
+        if _venue_label(r.get("exchange")) in unidentified:
+            conservative += 1
+            continue
+        kept.append(r)
+    if conservative:
+        warn(f"venue-tape blocks: dropped {conservative} for venues whose tape "
+             "rows carry no venue id (can't dedupe — pre-upgrade tape?)")
+    return kept
 
 
 def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
@@ -528,10 +571,13 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     # line.
     turnover_usd = hot.get("turnover_usd")
     vol_btc = hot.get("volume_btc")
-    if turnover_usd:
+    if turnover_usd and hot.get("turnover_complete"):
         vol_usd = turnover_usd
         volume_scope = "all"
     else:
+        # No turnover, or PARTIAL turnover (a venue traded with only null
+        # cells — mid-rollout): a partial sum must not present as an
+        # all-venue total, so fall back to the Deribit-scoped calc.
         vol_usd = vol_btc * spot if (vol_btc and spot) else None
         volume_scope = "deribit"
     # Activity + P/C use trade_count — unit-free, so they span ALL venues truthfully.
@@ -583,10 +629,13 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     dropped = len(block_rows or []) - len(own_blocks)
     if dropped:
         warn(f"blocks.csv: dropped {dropped} non-{asset} rows — cross-asset contamination?")
-    # Venue-tape blocks (OKX today — venues the Paradigm tape doesn't broker,
-    # see _TAPE_BROKERED_VENUES) join the same pool: min-notional filter,
-    # Biggest Print candidacy, and top-N ranking on equal underlying-USD terms.
-    venue_blocks = _venue_tape_blocks(venue_block_rows or [], spot)
+    # Venue-tape blocks join the same pool — ALL venues, deduped against the
+    # Paradigm tape by the venue's own block id (_dedupe_venue_blocks), so
+    # non-Paradigm Deribit/Bullish blocks appear alongside OKX's with no
+    # double count: min-notional filter, Biggest Print candidacy, and top-N
+    # ranking on equal underlying-USD terms.
+    venue_blocks = _venue_tape_blocks(
+        _dedupe_venue_blocks(venue_block_rows or [], own_blocks), spot)
     block = build_tape_blocks(own_blocks, iv_lookup=iv_lookup,
                               extra_blocks=venue_blocks)
 

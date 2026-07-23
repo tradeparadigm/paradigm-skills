@@ -674,6 +674,12 @@ def test_build_tape_blocks_merges_extra_blocks():
     # No extra_blocks → identical behavior to before (n_venue_blocks 0).
     res2 = build_tape_blocks(tape, min_notional_usd=250_000)
     check("no extras → n_venue_blocks 0", res2["n_venue_blocks"] == 0, res2)
+    # Venue-blocks-ONLY pool (zero Paradigm rows — a quiet RFQ day with live
+    # exchange prints): the merge must not be conditional on tape rows.
+    res3 = build_tape_blocks([], min_notional_usd=250_000, extra_blocks=[extra[0]])
+    check("venue-only pool ranks", res3["n_blocks"] == 1, res3)
+    check("venue-only biggest print", res3["biggest_print"]["notional_m"] == 18.0, res3)
+    check("venue-only rows render", len(res3["rows"]) == 1, res3)
 
 
 def test_build_tape_blocks_biggest_vs_rfq_rollup():

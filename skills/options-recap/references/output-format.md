@@ -42,15 +42,14 @@ Deribit-scoped calc and the note reads `Deribit only`.
 The single largest **block** in the window, by summed per-leg USD notional,
 from two sources ranked together: the Paradigm block tape (one
 `BLOCK_TRADE_ID` = one block; every venue Paradigm brokers —
-Deribit/Paradex/Bullish/…) and the exchanges' own venue tapes for venues
-Paradigm does NOT broker (OKX today, via the hot recap file's `block` rows).
+Deribit/Paradex/Bullish/…) and the exchanges' own venue tapes (any venue, via
+the hot recap file's option `block` rows, deduped against the Paradigm tape by
+the venue's own block id — `VENUE_BLOCK_TRADE_ID` — so nothing double-counts).
 The `via …` tag names the source and scopes the line: `via Paradigm/[Venue]`
 for a Paradigm-brokered block, `via venue tape` for a venue-tape one. A
 venue-tape winner has no leg geometry, so it renders as
-`OKX Block   [Nx]   $[X]M   ~[HH:MM] UTC   via venue tape`
-(`~` = 5-min bucket resolution; `[Nx]` is its total coin size). Deribit and
-Bullish blocks NOT brokered via Paradigm are still absent (no id bridge
-between the tapes). The side word appears only when
+`[Venue] Block   [Nx]   $[X]M   ~[HH:MM] UTC   via venue tape`
+(`~` = 5-min bucket resolution; `[Nx]` is its total coin size). The side word appears only when
 the whole block is one-directional (Buy/Sell); mixed-direction structures (any
 spread) carry no side tag — never write "two-way" here. The `[IV]v avg` appears
 only for Deribit blocks (IV is looked up from the vol surface, which is
@@ -80,10 +79,10 @@ the Detail column.
 …
 ```
 
-Venue-tape rows (non-Paradigm venues — OKX today) rank in the same pool and
-count toward the header totals. Their tape has no leg geometry, so the
-structure label is `[Venue] Block`, the detail carries a `(venue tape)` note,
-and they count as one block each.
+Venue-tape rows (blocks not brokered via Paradigm, any venue) rank in the same
+pool and count toward the header totals. Their tape has no leg geometry, so
+the structure label is `[Venue] Block`, the detail carries a `(venue tape)`
+note, and they count as one block each.
 
 The Structure column has a 27-char floor but stretches to the longest label in
 the window (a typed cross-expiry label like `24JUL26/31JUL26 Call Diagonal`

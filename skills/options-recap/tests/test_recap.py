@@ -73,7 +73,9 @@ CORRUPT_VOLUME_CSV = (
 # blank-optionType aggregate row still gets dropped before any sum. Round numbers
 # so the expected total is auditable by eye: $279.54M across the five venues.
 # okex rows deliberately carry turnover ≪ notional×anything — the 0.01 contract
-# multiplier is upstream's job; this file just sums the column.
+# multiplier is upstream's job; this file just sums the column. bullish carries
+# one blank cell alongside a populated one — a blank contributes nothing, and
+# the venue still counts as turnover-complete (it has ≥1 non-null cell).
 UPGRADED_VOLUME_CSV = (
     "asset,exchange,optionType,volume_sum,notional,turnover_usd,buy_volume,sell_volume,trade_count\n"
     "BTC,deribit,call,4719.6,78.27,150000000.0,2231.6,2488.0,2652\n"
@@ -84,14 +86,13 @@ UPGRADED_VOLUME_CSV = (
     "BTC,okex-options,call,188346.0,1841.07,12000000.0,97495.0,90851.0,2138\n"
     "BTC,deribit-usdc,call,15.3,14740.6,14700.0,11.61,3.69,83\n"
     "BTC,deribit-usdc,put,51.0,25581.55,25500.0,8.01,42.99,50\n"
-    # bullish: turnover blank (e.g. null upstream) — contributes nothing,
-    # must not zero or crash the sum.
-    "BTC,bullish,call,10.0,650000.0,,5.0,5.0,20\n"
+    "BTC,bullish,call,10.0,650000.0,640000.0,5.0,5.0,20\n"
+    "BTC,bullish,put,2.0,130000.0,,1.0,1.0,4\n"
     "BTC,deribit,,163448320.0,9803096239210.0,999999999999.0,81069170.0,82379150.0,47759\n"
 )
 # Σ turnover of the kept (non-blank-optionType) rows above.
 UPGRADED_TURNOVER_TOTAL = (150_000_000 + 90_000_000 + 2_100_000 + 1_400_000
-                           + 24_000_000 + 12_000_000 + 14_700 + 25_500)
+                           + 24_000_000 + 12_000_000 + 14_700 + 25_500 + 640_000)
 DVOL_SPOT_CSV = (
     "exchange,metric,open,close,high,low\n"
     "deribit,dvol,45.41,43.34,45.5,43.0\n"
@@ -133,12 +134,18 @@ CLOSES_7D = [60000 + (i % 5) * 50 for i in range(60)]  # gentle, non-flat
 # sell) on Deribit, one BLOCK_TRADE_ID, $6M/leg → $12M block, Mixed side.
 
 
-def _blk(desc, side, notl, bid="B1", rfq="R1", prod="BTC OPTION - DBT",
-         qty=100, date="2026-06-01", time="12:00:00", tid=None):
+def _blk(desc, side, notl, bid="DRFQv2-bt_3TESTRR000000000000000000001", rfq="R1",
+         prod="BTC OPTION - DBT", qty=100, date="2026-06-01", time="12:00:00",
+         tid=None, venue_id="BLOCK-RR1"):
+    # Realistic id shapes: BLOCK_TRADE_ID is Paradigm's own DRFQv2-bt_… id;
+    # VENUE_BLOCK_TRADE_ID is the venue's own id (Deribit BLOCK-…), the join
+    # key against venue_blocks.csv. venue_id="" models a tape row that carries
+    # none (pre-upgrade tape, DRFQ v1/GRFQ) — the conservative-fallback case.
     return {"DATE": date, "TIME": time, "PRODUCT": prod, "DESCRIPTION": desc,
             "QTY": qty, "PRICE": 0.01, "REF_PRICE": 0.01, "SIDE": side,
             "QUOTE_CURRENCY": "BTC", "NOTIONAL_VOLUME_USD": notl, "RFQ_ID": rfq,
-            "TRADE_ID": tid or (bid + side[:1]), "BLOCK_TRADE_ID": bid}
+            "TRADE_ID": tid or (bid + side[:1]), "BLOCK_TRADE_ID": bid,
+            "VENUE_BLOCK_TRADE_ID": venue_id}
 
 
 BLOCKS_RR = [
@@ -146,20 +153,25 @@ BLOCKS_RR = [
     _blk("Call 26 Jun 26 65000", "SELL", 6_000_000, tid="t2"),
 ]
 
-# Venue-tape blocks (venue_blocks.csv) — the hot recap file's `block` rows,
-# grouped per block id. Unit-explicit columns: volume_coin (Σ leg amounts, coin)
-# and premium_usd (Σ premium — NEVER a display notional; underlying notional is
-# volume_coin × spot). OKX-BLK-1: 300 BTC × $60,468 spot = $18.14M — bigger than
-# the $12M Paradigm RR, so it should win Biggest Print. OKX-BLK-2: 2 BTC ≈ $121k,
-# under the $250k floor → filtered. The deribit/bullish rows are tape-brokered
-# venues → EXCLUDED by the coverage rule (no id bridge; would double-count).
+# Venue-tape blocks (venue_blocks.csv) — the hot recap file's OPTION `block`
+# rows, grouped per block id. Unit-explicit columns: volume_coin (Σ leg
+# amounts, coin) and premium_usd (Σ premium — NEVER a display notional;
+# underlying notional is volume_coin × spot).
+#   OKX-BLK-1  300 BTC × $60,468 ≈ $18.14M — should win Biggest Print.
+#   OKX-BLK-2  2 BTC ≈ $121k — under the $250k floor, filtered.
+#   BLOCK-RR1  the SAME venue id BLOCKS_RR carries — an exact duplicate of the
+#              Paradigm-brokered RR, dropped by id-dedupe.
+#   BLOCK-280624  a NON-Paradigm Deribit block (no tape row carries this id) —
+#              merges: 150 BTC ≈ $9.07M.
+#   OTC-9      a non-Paradigm Bullish OTC options block — merges: 50 BTC ≈ $3.02M.
 VENUE_BLOCKS_CSV = (
-    "asset,exchange,block_id,instrument_kind,bucket_at,volume_coin,premium_usd,"
+    "asset,exchange,block_id,bucket_at,volume_coin,premium_usd,"
     "leg_count,iv_sum,iv_count\n"
-    "BTC,okex-options,OKX-BLK-1,option,1780000200000,300,90000,3,187.5,3\n"
-    "BTC,okex-options,OKX-BLK-2,option,1780000500000,2,600,1,,\n"
-    "BTC,deribit,BLOCK-280624,option,1780000200000,150,45000,2,120,2\n"
-    "BTC,bullish,OTC-9,perp,1780000200000,50,3000000,1,,\n"
+    "BTC,okex-options,OKX-BLK-1,1780000200000,300,90000,3,187.5,3\n"
+    "BTC,okex-options,OKX-BLK-2,1780000500000,2,600,1,,\n"
+    "BTC,deribit,BLOCK-RR1,1780000200000,200,120000,2,132,2\n"
+    "BTC,deribit,BLOCK-280624,1780000200000,150,45000,2,120,2\n"
+    "BTC,bullish,OTC-9,1780000200000,50,3000000,1,,\n"
 )
 
 
@@ -271,19 +283,66 @@ def test_volume_na_without_hot():
 
 # ── Venue-tape blocks (venue_blocks.csv → Block Flow merge) ──────────────────
 
-def test_load_venue_blocks_coverage_rule():
-    # Only venues the Paradigm tape does NOT broker survive the load — a
-    # tape-brokered venue's blocks appear on both tapes with unjoinable ids,
-    # so including them would double-count.
+def test_load_venue_blocks_kind_belt_and_missing_file():
+    # All venues load now (dedupe happens later, by id); the loader's only
+    # filter is the options belt — a row still carrying a non-option kind
+    # (older CSV shape) must not compete in an options recap.
     recap.WARNINGS.clear()
     with tempfile.TemporaryDirectory() as d:
         _write(d, "venue_blocks.csv", VENUE_BLOCKS_CSV)
         rows = load_venue_blocks(d, "BTC")
-    check("only okex rows kept", {r["exchange"] for r in rows} == {"okex-options"}, rows)
-    check("deribit/bullish excluded", len(rows) == 2, len(rows))
+    check("all venues load", {r["exchange"] for r in rows}
+          == {"okex-options", "deribit", "bullish"}, rows)
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "venue_blocks.csv",
+               "asset,exchange,block_id,instrument_kind,bucket_at,volume_coin,"
+               "premium_usd,leg_count,iv_sum,iv_count\n"
+               "BTC,okex-options,OKX-PERP-1,perp,1780000200000,500,100,1,,\n"
+               "BTC,okex-options,OKX-OPT-1,option,1780000200000,10,100,1,,\n")
+        rows = load_venue_blocks(d, "BTC")
+    check("non-option kind dropped by belt", [r["block_id"] for r in rows] == ["OKX-OPT-1"],
+          rows)
     # Missing file → [] and no crash (Paradigm tape renders alone).
     with tempfile.TemporaryDirectory() as d2:
         check("missing file → empty", load_venue_blocks(d2, "BTC") == [])
+
+
+def test_dedupe_drops_exact_id_matches_and_merges_the_rest():
+    recap.WARNINGS.clear()
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "venue_blocks.csv", VENUE_BLOCKS_CSV)
+        rows = load_venue_blocks(d, "BTC")
+    kept = recap._dedupe_venue_blocks(rows, BLOCKS_RR)
+    ids = {r["block_id"] for r in kept}
+    # BLOCK-RR1 is the venue id BLOCKS_RR carries → exact dupe, dropped.
+    check("Paradigm-brokered dupe dropped", "BLOCK-RR1" not in ids, ids)
+    # Non-Paradigm Deribit + Bullish blocks now MERGE (no venue bias).
+    check("non-Paradigm deribit kept", "BLOCK-280624" in ids, ids)
+    check("non-Paradigm bullish kept", "OTC-9" in ids, ids)
+    check("okx kept", {"OKX-BLK-1", "OKX-BLK-2"} <= ids, ids)
+
+
+def test_dedupe_conservative_fallback_on_idless_tape_rows():
+    # A tape row WITHOUT a venue id (pre-upgrade tape / DRFQ v1) can't be
+    # deduped against → that venue's tape blocks are all dropped rather than
+    # risk double-counting; other venues are unaffected. Case must not
+    # matter for the venue match.
+    recap.WARNINGS.clear()
+    idless_tape = [_blk("Put 26 Jun 26 55000", "BUY", 6_000_000, venue_id="")]
+    rows = [
+        {"exchange": "Deribit", "block_id": "BLOCK-280624", "volume_coin": "150"},
+        {"exchange": "okex-options", "block_id": "OKX-BLK-1", "volume_coin": "300"},
+    ]
+    kept = recap._dedupe_venue_blocks(rows, idless_tape)
+    check("deribit dropped conservatively (case-insensitive)",
+          [r["block_id"] for r in kept] == ["OKX-BLK-1"], kept)
+    check("conservative drop warned", any("can't dedupe" in w for w in recap.WARNINGS),
+          recap.WARNINGS)
+    # No tape rows at all (e.g. tape read failed) → everything merges;
+    # there is nothing on the Paradigm side to double-count against.
+    recap.WARNINGS.clear()
+    kept = recap._dedupe_venue_blocks(rows, [])
+    check("tape outage → venue blocks keep Block Flow alive", len(kept) == 2, kept)
 
 
 def test_venue_tape_blocks_priced_by_coin_volume_not_premium():
@@ -318,20 +377,28 @@ def test_venue_blocks_merge_into_block_flow():
         res = build("btc", "8h", 0, 8 * 3600_000,
                     {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR, venue_rows)
     bf, bp = res["block_flow"], res["biggest_print"]
-    # Pool = $12M Paradigm RR + $18.1M OKX block (the $121k one is under the
-    # $250k floor). Totals span both sources.
-    check("two blocks in pool", bf["n_blocks"] == 2, bf["n_blocks"])
-    check("total spans both sources (~$30.1M)", 30.0 <= bf["total_m"] <= 30.3, bf["total_m"])
-    check("venue block counted", bf.get("n_venue_blocks") == 1, bf.get("n_venue_blocks"))
+    # Pool after id-dedupe + $250k floor: Paradigm RR $12M + OKX $18.14M +
+    # non-Paradigm Deribit $9.07M + Bullish $3.02M (BLOCK-RR1 deduped,
+    # OKX-BLK-2 under the floor). Totals span every source, no double count.
+    check("four blocks in pool", bf["n_blocks"] == 4, bf["n_blocks"])
+    check("total spans all sources (~$42.2M)", 42.0 <= bf["total_m"] <= 42.5, bf["total_m"])
+    check("venue blocks counted", bf.get("n_venue_blocks") == 3, bf.get("n_venue_blocks"))
     venues = [r.get("venue") for r in bf["rows"]]
-    check("OKX row present", "OKX" in venues, venues)
+    check("OKX + Deribit + Bullish venue rows present",
+          {"OKX", "Deribit", "Bullish"} <= set(venues), venues)
     check("OKX outranks the RR", bf["rows"][0]["venue"] == "OKX", bf["rows"][0])
+    # The deduped RR appears exactly once (as the Paradigm structure row) —
+    # its venue-tape twin must not add a second $12M-ish deribit row.
+    deribit_rows = [r for r in bf["rows"] if r.get("venue") == "Deribit"]
+    check("one Paradigm + one venue-tape deribit row, no dupe",
+          sorted(r["notl_m"] for r in deribit_rows) == [9.1, 12.0], deribit_rows)
     # Biggest Print is the OKX venue-tape block, source-tagged.
     check("biggest is the OKX block", bp["notional_m"] == 18.1, bp)
     check("biggest source venue", bp.get("source") == "venue", bp)
     md = render_md(res)
     check("biggest line names venue in label", "OKX Block" in md, "render")
     check("biggest line says via venue tape", "via venue tape" in md, "render")
+    check("non-Paradigm deribit block rendered", "Deribit Block" in md, "render")
     check("title stays plain (no source scope tag)", "**Block Flow — $" in md, "render")
     check("~time rendered (5m resolution)", "~" in md, "render")
 
@@ -399,6 +466,59 @@ def test_missing_turnover_falls_back_to_deribit_scope():
     check("fallback volume ~449", 440 <= s["volume_usd_m"] <= 460, s["volume_usd_m"])
     md = render_md(res)
     check("fallback label kept", "Deribit only" in md, "label")
+
+
+def test_all_null_turnover_column_falls_back():
+    # Column present but every cell blank (upstream deployed, no data yet):
+    # must read as "not derivable" → fallback, never a $0 all-venues line.
+    all_null = UPGRADED_VOLUME_CSV.replace("150000000.0", "").replace("90000000.0", "") \
+        .replace("2100000.0", "").replace("1400000.0", "") \
+        .replace("24000000.0", "").replace("12000000.0", "") \
+        .replace("14700.0", "").replace("25500.0", "").replace("640000.0", "") \
+        .replace("999999999999.0", "")
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "volume.csv", all_null)
+        _write(d, "dvol_spot.csv", DVOL_SPOT_CSV)
+        hot = load_hot(d, "BTC")
+        res = build("btc", "8h", 0, 8 * 3600_000,
+                    {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+    check("all-null → no turnover", hot["turnover_usd"] is None, hot["turnover_usd"])
+    check("all-null → fallback scope", res["snapshot"]["volume_scope"] == "deribit",
+          res["snapshot"]["volume_scope"])
+
+
+def test_partial_turnover_does_not_claim_all_venues():
+    # Mid-rollout state: one venue trades but carries ONLY null turnover
+    # cells — its dollars would contribute $0 to a line labeled "all
+    # venues". The label upgrade must be gated on per-venue completeness.
+    partial = UPGRADED_VOLUME_CSV.replace(
+        "BTC,bybit-options,put,4035.26,2094282.15,2100000.0",
+        "BTC,bybit-options,put,4035.26,2094282.15,",
+    ).replace(
+        "BTC,bybit-options,call,3044.33,1413683.95,1400000.0",
+        "BTC,bybit-options,call,3044.33,1413683.95,",
+    )
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "volume.csv", partial)
+        _write(d, "dvol_spot.csv", DVOL_SPOT_CSV)
+        hot = load_hot(d, "BTC")
+        res = build("btc", "8h", 0, 8 * 3600_000,
+                    {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+    s = res["snapshot"]
+    check("partial turnover detected", hot["turnover_complete"] is False,
+          hot["turnover_complete"])
+    check("partial → fallback scope, not 'all venues'", s["volume_scope"] == "deribit",
+          s["volume_scope"])
+    md = render_md(res)
+    check("partial → Deribit-scoped label", "Deribit only" in md, "label")
+    # Control: the full fixture is complete (bullish's single blank cell
+    # doesn't trip the gate — the venue has another non-null cell).
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "volume.csv", UPGRADED_VOLUME_CSV)
+        _write(d, "dvol_spot.csv", DVOL_SPOT_CSV)
+        hot2 = load_hot(d, "BTC")
+    check("complete fixture passes the gate", hot2["turnover_complete"] is True,
+          hot2["turnover_complete"])
 
 
 def test_activity_split_collapses_deribit_venues():

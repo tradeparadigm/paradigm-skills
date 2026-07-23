@@ -35,13 +35,14 @@ aggregates file sliced to the window at query time; the surface (and its Δ colu
 from `v_vol_surface`; and **Biggest Print + Block Flow from the multi-venue Paradigm
 block tape** (`paradigm_trade_tape_slim`) — every venue Paradigm brokers
 (Deribit/Paradex/Bullish/…), notional already in USD per leg — **plus venue-tape
-blocks for venues Paradigm doesn't broker** (OKX today, off the hot recap file's
-`block` rows), which rank in the same pool and render as `<Venue> Block` rows
-with a `(venue tape)` detail note. Biggest Print names its venue as
-`via Paradigm/<venue>` (or `via venue tape`). The Paradigm tape has no IV, so the
-top blocks' IV is looked up from the vol surface (Deribit legs only; venue-tape
-blocks carry their venue's per-trade IV where published; other venues show IV
-`n/a`). A malformed window exits with a clear error.
+blocks from the exchanges' own feeds** (any venue, off the hot recap file's
+option `block` rows, deduped against the Paradigm tape by the venue's own block
+id so nothing double-counts), which rank in the same pool and render as
+`<Venue> Block` rows with a `(venue tape)` detail note. Biggest Print names its
+venue as `via Paradigm/<venue>` (or `via venue tape`). The Paradigm tape has no
+IV, so the top blocks' IV is looked up from the vol surface (Deribit legs only;
+venue-tape blocks carry their venue's per-trade IV where published; other venues
+show IV `n/a`). A malformed window exits with a clear error.
 
 **Windows beyond 24h:** the Snapshot flow sources (the rolling hot aggregates file →
 Volume/Activity/P-C/DVOL/spot) retain only ~24h, so `run_recap.sh` caps any longer
