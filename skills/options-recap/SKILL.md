@@ -13,7 +13,7 @@ compatibility: Deribit public API (curl) for the tape (7d closes, block flow, an
   public API; the S3 reads require the IRSA bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "2.0"
+  version: "1.11"
 ---
 
 # Options Recap
