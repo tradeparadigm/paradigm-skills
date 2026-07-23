@@ -1,0 +1,33 @@
+name: skill version check
+
+# Enforces the version-bump policy (see AGENTS.md) on pull requests: when a
+# skill's metadata.version changes it must move forward by exactly one in a
+# single component (major, minor, or patch). A jump of two or more, a
+# multi-component change, or a decrease fails the check. Leaving the version
+# unchanged is allowed (draft / WIP edits).
+on:
+  pull_request:
+    paths:
+      - 'skills/*/SKILL.md'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need the base branch history to diff against the merge base.
+          fetch-depth: 0
+
+      - name: Install PyYAML
+        run: pip install --quiet pyyaml
+
+      - name: Check skill version increments
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/check_version_increment.py
