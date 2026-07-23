@@ -59,7 +59,7 @@ ARE the complete expiry set (calendar, diagonal), `near→far` when interior
 tenors are elided (3+ expiries) — each leg's own expiry always appears in
 the Detail column.
 
-**Block Flow (Paradigm RFQ) — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)]**
+**Block Flow — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)]**
 
 ```yaml
 #  Structure                  Notl     Blocks  Detail
@@ -71,8 +71,8 @@ the Detail column.
 The Structure column has a 27-char floor but stretches to the longest label in
 the window (a typed cross-expiry label like `24JUL26/31JUL26 Call Diagonal`
 runs past 27), so the header and rows stay aligned to whatever width the widest
-structure needs. There is no per-row venue column — the `(Paradigm RFQ)` title
-carries the scope and the Biggest Print line names its venue.
+structure needs. There is no per-row venue column — the Biggest Print line's
+`via Paradigm/<venue>` tag is where the venue shows.
 
 Two granularities, both always stated: tape **blocks** (`BLOCK_TRADE_ID`s, the
 industry term for the individual prints) and **structures** (clips of one worked

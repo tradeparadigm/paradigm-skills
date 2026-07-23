@@ -35,10 +35,9 @@ aggregates file sliced to the window at query time; the surface (and its Δ colu
 from `v_vol_surface`; and **Biggest Print + Block Flow from the multi-venue Paradigm
 block tape** (`paradigm_trade_tape_slim`) — every venue Paradigm brokers
 (Deribit/Paradex/Bullish/…), notional already in USD per leg. Biggest Print names
-its venue as `via Paradigm/<venue>`; the Block Flow title carries the
-`(Paradigm RFQ)` scope. The tape has no IV, so the top blocks' IV is looked up
-from the vol surface (Deribit legs only; other venues show IV `n/a`). A malformed
-window exits with a clear error.
+its venue as `via Paradigm/<venue>`. The tape has no IV, so the top blocks' IV is
+looked up from the vol surface (Deribit legs only; other venues show IV `n/a`).
+A malformed window exits with a clear error.
 
 **Windows beyond 24h:** the Snapshot flow sources (the rolling hot aggregates file →
 Volume/Activity/P-C/DVOL/spot) retain only ~24h, so `run_recap.sh` caps any longer
