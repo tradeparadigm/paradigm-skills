@@ -687,10 +687,10 @@ def render_md(r: dict) -> str:
     trunc = f" (top {len(bf['rows'])} by notional)" if n_struct > len(bf["rows"]) else ""
     # Structure column stretches to the longest label in this window (typed
     # labels like "24JUL26/31JUL26 Call Diagonal" overflow a fixed 27). Per-row
-    # venue isn't a column — the Biggest Print line names its venue and the
-    # section title carries the Paradigm scope.
+    # venue isn't a column — the Biggest Print line's via Paradigm/<venue> tag
+    # is where the venue shows.
     sw = max([27] + [len(row["structure"]) + 2 for row in bf["rows"]])
-    L += ["```", "", f"**Block Flow (Paradigm RFQ) — ${bf['total_m']}M / {bf['n_blocks']} {block_word} / "
+    L += ["```", "", f"**Block Flow — ${bf['total_m']}M / {bf['n_blocks']} {block_word} / "
           f"{n_struct} {struct_word}{trunc}**",
           "", "```yaml",
           f"{'#':<3}{'Structure':<{sw}}{'Notl':<9}{'Blocks':<8}Detail",
