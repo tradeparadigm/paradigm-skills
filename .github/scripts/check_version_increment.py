@@ -28,18 +28,16 @@ Exit code 0 = all good, 1 = at least one violation, 2 = the tool itself failed.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
-try:
-    import yaml
-except ImportError:  # pragma: no cover - CI installs pyyaml
-    print("error: PyYAML is required (pip install pyyaml)", file=sys.stderr)
-    sys.exit(2)
-
-
 SKILL_GLOB = "skills/*/SKILL.md"
+
+# Matches a `version:` line nested under the `metadata:` block, capturing the
+# value with optional surrounding quotes stripped, e.g.  `  version: "1.5"`.
+_VERSION_RE = re.compile(r'^\s+version\s*:\s*["\']?([^"\'\s#]+)', re.MULTILINE)
 
 
 def run(*args: str) -> str:
@@ -65,19 +63,28 @@ def git_show(rev: str, path: str) -> str | None:
 
 
 def parse_version(content: str | None) -> str | None:
-    """Extract metadata.version from a SKILL.md's YAML frontmatter."""
+    """Extract metadata.version from a SKILL.md's YAML frontmatter.
+
+    Deliberately stdlib-only (no PyYAML): the frontmatter is the block between
+    the first two ``---`` delimiters, and we scan it for the indented
+    ``version:`` line under ``metadata:``. Skills in this repo put ``version``
+    only under ``metadata``, so a scoped scan from the ``metadata:`` key is
+    both correct and fast.
+    """
     if not content:
         return None
     parts = content.split("---", 2)
     if len(parts) < 3:
         return None
-    try:
-        fm = yaml.safe_load(parts[1]) or {}
-    except yaml.YAMLError:
-        return None
-    metadata = fm.get("metadata") or {}
-    version = metadata.get("version")
-    return None if version is None else str(version).strip()
+    frontmatter = parts[1]
+
+    # Restrict the search to the metadata block so an unrelated top-level
+    # `version:` (should one ever appear) can't be picked up by mistake.
+    meta = re.search(r'^metadata\s*:\s*$', frontmatter, re.MULTILINE)
+    scope = frontmatter[meta.end():] if meta else frontmatter
+
+    match = _VERSION_RE.search(scope)
+    return match.group(1).strip() if match else None
 
 
 def normalize(version: str) -> tuple[int, int, int]:

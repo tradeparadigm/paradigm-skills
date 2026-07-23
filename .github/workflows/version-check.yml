@@ -23,9 +23,8 @@ jobs:
           # Need the base branch history to diff against the merge base.
           fetch-depth: 0
 
-      - name: Install PyYAML
-        run: pip install --quiet pyyaml
-
+      # No dependency install: the checker is pure Python stdlib, so the job is
+      # just checkout + one python3 invocation.
       - name: Check skill version increments
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
