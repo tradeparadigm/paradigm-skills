@@ -219,6 +219,6 @@ open-surface read were the minor bump to `1.4`; relocating the output template t
 `references/output-format.md` is a no-behaviour structural cleanup, so it's the
 **patch** to `1.4.1` (output is byte-identical). Repointing Biggest Print + Block
 Flow off the Deribit public API onto the multi-venue Paradigm block tape (S3-only,
-adds a Venue column + `via Paradigm/<venue>` + surface-IV lookup, Volume goes
+adds `via Paradigm/<venue>` + surface-IV lookup, Volume goes
 hot-only) is the **minor** bump to `1.12` — same four sections and trigger, no
 removed fields. (See the repo `CLAUDE.md` for the minor/major rules.)
