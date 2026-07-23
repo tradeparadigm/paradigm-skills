@@ -29,22 +29,29 @@ Volume    $[X]M       all venues
 P/C       [X.Xx]      [descriptor] (all venues, by trades)
 ```
 
-**Biggest Print — Paradigm block flow**
+**Biggest Print — block flow**
 
 ```yaml
 [DDMMMYY] [structure]   [Nx]   $[X]M   [HH:MM] UTC   via Paradigm/[Venue] ([Buy/Sell, ][IV]v avg)
 ```
 
-The single largest **block** (one `BLOCK_TRADE_ID`) in the window, by summed
-per-leg USD notional — from the Paradigm block tape (**Paradigm RFQ/DRFQ flow
-only**, across every venue Paradigm brokers), so `[Venue]` is the venue that
-executed it (Deribit/Paradex/Bullish/…). This is NOT the whole market's biggest
-print — only the biggest Paradigm-brokered one; the `— Paradigm block flow`
-title and the `via Paradigm/…` tag both make that explicit. The side word appears only when
+The single largest **block** in the window, by summed per-leg USD notional,
+from TWO sources ranked together: the Paradigm block tape (one
+`BLOCK_TRADE_ID` = one block; every venue Paradigm brokers —
+Deribit/Paradex/Bullish/…) and the exchanges' own venue tapes for venues
+Paradigm does NOT broker (OKX today, via the hot recap file's `block` rows).
+The routing tag names the source: `via Paradigm/[Venue]` for a
+Paradigm-brokered block, `on [Venue] (venue tape)` for a venue-tape one. A
+venue-tape winner has no leg geometry, so it renders as
+`Block (unclassified)   [Nx]   $[X]M   ~[HH:MM] UTC   on OKX (venue tape)`
+(`~` = 5-min bucket resolution; `[Nx]` is its total coin size). Deribit and
+Bullish blocks NOT brokered via Paradigm are still absent (no id bridge
+between the tapes). The side word appears only when
 the whole block is one-directional (Buy/Sell); mixed-direction structures (any
 spread) carry no side tag — never write "two-way" here. The `[IV]v avg` appears
 only for Deribit blocks (IV is looked up from the vol surface, which is
-Deribit-scoped); other venues carry no IV tag.
+Deribit-scoped); venue-tape blocks carry per-trade IV where their venue
+publishes it (OKX does); other venues show no IV tag.
 
 `[Nx]` is the structure UNIT size — the base (ratio-1) leg count of the
 package, e.g. a 4×63-lot iron fly is `63x`, a 600-per-leg calendar is `600x`.
@@ -59,14 +66,20 @@ ARE the complete expiry set (calendar, diagonal), `near→far` when interior
 tenors are elided (3+ expiries) — each leg's own expiry always appears in
 the Detail column.
 
-**Block Flow (Paradigm RFQ) — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)][ · tape through [HH:MM] UTC[ ([n]h behind)]]**
+**Block Flow (Paradigm RFQ[ + venue tape]) — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)][ · tape through [HH:MM] UTC[ ([n]h behind)]]**
 
 ```yaml
 #  Structure                  Venue    Notl     Blocks  Detail
 -  -------------------------  -------  -------  ------  -------------------------------
 1  [structure]                [Venue]  $[X]M    [n]     [K1][C/P] / [K2][C/P] x[size] [IV]v ([Side])
-2  …
+2  Block (unclassified)       OKX      $[X]M    1       x[size] [IV]v — [n] legs, venue tape (no leg geometry)
+…
 ```
+
+The title's `+ venue tape` appears only when venue-tape blocks (non-Paradigm
+venues — OKX today) actually contributed to the window; totals then span both
+sources. Venue-tape rows are always structure-unclassified (their tape has no
+leg geometry) and count as one block each.
 
 The Structure column has a 27-char floor but stretches to the longest label in
 the window (a typed cross-expiry label like `24JUL26/31JUL26 Call Diagonal`

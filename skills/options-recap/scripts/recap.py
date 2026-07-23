@@ -361,6 +361,74 @@ def load_blocks(csv_dir: str) -> list[dict]:
     return rows
 
 
+# Venues whose blocks the Paradigm tape already covers (Paradigm brokers them:
+# DBT / PRDX / BLSH). Their venue-tape block rows are EXCLUDED from the merge —
+# a Paradigm-brokered block appears on both tapes with UNJOINABLE ids (the
+# Paradigm tape's BLOCK_TRADE_ID is Paradigm's own `DRFQv2-bt_…`, the venue
+# tape's block_id is venue-native, e.g. Deribit `BLOCK-280624` — verified
+# against real files 2026-07-23), so including them would double-count.
+# Venues NOT in this set (OKX today) have zero tape overlap by construction.
+_TAPE_BROKERED_VENUES = {"deribit", "deribit-usdc", "paradex", "bullish"}
+
+
+def load_venue_blocks(csv_dir: str, asset: str) -> list[dict]:
+    """Read venue_blocks.csv — block/OTC prints off the EXCHANGES' own tapes
+    (the hot recap file's `block` rows, grouped per block id in DuckDB), for
+    venues the Paradigm tape does NOT cover. Missing file → [] (the Paradigm
+    tape still renders alone; pre-column files simply lack blocks here).
+
+    Columns are unit-explicit: `volume_coin` (Σ leg amounts, coin units) and
+    `premium_usd` (Σ premium — carried for debuggability, NEVER displayed as
+    notional: it is ~50-100x smaller than the underlying-USD basis the block
+    sections use). Underlying notional is derived later as volume_coin × spot.
+    """
+    rows = _own_asset_rows(_read_csv(csv_dir, "venue_blocks.csv"), asset,
+                           "venue_blocks.csv")
+    return [r for r in rows
+            if (r.get("exchange") or "").lower() not in _TAPE_BROKERED_VENUES]
+
+
+def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
+    """Shape venue-tape block rows into the block dicts build_tape_blocks
+    merges (source="venue"). The venue tape carries totals per block — no leg
+    geometry (expiry/strike/type/side) — so the structure is honest-unclassified
+    and the detail says where the row came from. notional_usd = volume_coin ×
+    spot: underlying-USD, the same basis as the Paradigm tape's
+    NOTIONAL_VOLUME_USD (valued at recap-time spot, not trade-time — a
+    disclosed approximation). No spot → skip with a warning, never guess."""
+    if rows and not spot:
+        warn("venue-tape blocks skipped — no spot to price coin volume")
+        return []
+    out = []
+    for r in rows:
+        vol = _num(r, "volume_coin")
+        if not vol or not r.get("block_id"):
+            continue
+        iv_sum, iv_count = _num(r, "iv_sum"), _num(r, "iv_count")
+        avg_iv = round(iv_sum / iv_count, 1) if iv_sum is not None and iv_count else None
+        legs = int(_num(r, "leg_count") or 0)
+        bucket_ms = _num(r, "bucket_at")
+        detail = f"x{vol:g}"
+        if avg_iv is not None:
+            detail += f" {avg_iv}v"
+        detail += f" — {legs or '?'} legs, venue tape (no leg geometry)"
+        out.append({
+            "block_trade_id": r.get("block_id"),
+            "rfq_id": r.get("block_id"),  # its own worked order
+            "structure": "Block (unclassified)", "expiry": "",
+            "venue": _venue_label(r.get("exchange")),
+            "notional_usd": round(vol * spot),
+            "unit_size": round(vol, 1),  # total coin size — legs unknown
+            "side": "", "avg_iv": avg_iv,
+            # bucket_at is the block's first 5m bucket — ~5-min resolution,
+            # hence the "~" prefix (the Paradigm tape has exact times).
+            "time_utc": f"~{fmt_hhmm(int(bucket_ms))}" if bucket_ms else "",
+            "detail": detail, "leg_count": legs,
+            "source": "venue",
+        })
+    return out
+
+
 # ── Assembly ────────────────────────────────────────────────────────────────
 
 def pct(a, b):
@@ -435,7 +503,8 @@ def _blocks_asof_ms(block_rows: list[dict]) -> int | None:
 
 
 def build(asset: str, window: str, start_ms: int, end_ms: int,
-          deri: dict, hot: dict, block_rows: list[dict] | None = None) -> dict:
+          deri: dict, hot: dict, block_rows: list[dict] | None = None,
+          venue_block_rows: list[dict] | None = None) -> dict:
     asset = asset.upper()
     mkt = deri.get("market")
     window_h = (end_ms - start_ms) / 3600_000
@@ -530,7 +599,12 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     dropped = len(block_rows or []) - len(own_blocks)
     if dropped:
         warn(f"blocks.csv: dropped {dropped} non-{asset} rows — cross-asset contamination?")
-    block = build_tape_blocks(own_blocks, iv_lookup=iv_lookup)
+    # Venue-tape blocks (OKX today — venues the Paradigm tape doesn't broker,
+    # see _TAPE_BROKERED_VENUES) join the same pool: min-notional filter,
+    # Biggest Print candidacy, and top-N ranking on equal underlying-USD terms.
+    venue_blocks = _venue_tape_blocks(venue_block_rows or [], spot)
+    block = build_tape_blocks(own_blocks, iv_lookup=iv_lookup,
+                              extra_blocks=venue_blocks)
 
     # Tape-freshness stamp. The block tape is S3-sourced (near-real-time but not
     # live-to-the-second), so disclose how current the block section is instead of
@@ -600,6 +674,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "biggest_print": block["biggest_print"],
         "block_flow": {"total_m": block["total_m"], "n_blocks": block["n_blocks"],
                        "n_structures": block["n_structures"], "rows": block["rows"],
+                       "n_venue_blocks": block.get("n_venue_blocks", 0),
                        "asof_utc": blocks_asof, "lag_min": blocks_lag_min},
         "vol_surface": surface_out,
         "hot_horizon": hot_horizon,
@@ -712,19 +787,25 @@ def render_md(r: dict) -> str:
     pc = f"{s['pc_ratio']}x" if s.get("pc_ratio") is not None else "n/a"
     pc_desc = f"{s['pc_descriptor']} " if s.get("pc_descriptor") else ""
     L.append(f"{'P/C':<9} {pc:<11} {pc_desc}(all venues, by trades)")
-    L += ["```", "", "**Biggest Print — Paradigm block flow**", "", "```yaml"]
+    L += ["```", "", "**Biggest Print — block flow**", "", "```yaml"]
 
     if bp:
         # "Mixed" is a structure fact (legs point both ways), not an aggressor
-        # read — don't put it in the side slot. Venue names the executing venue
-        # for this Paradigm-brokered block (Deribit/Paradex/Bullish/…).
+        # read — don't put it in the side slot. Venue names the executing venue.
+        # Source-aware routing tag: a Paradigm-brokered block reads
+        # "via Paradigm/<venue>"; a venue-tape block (e.g. OKX, which Paradigm
+        # doesn't broker) reads "on <venue> (venue tape)".
         tags = [bp["side"]] if bp.get("side") in ("Buy", "Sell") else []
         if bp.get("avg_iv") is not None:
             tags.append(f"{bp['avg_iv']}v avg")
         tag_txt = f" ({', '.join(tags)})" if tags else ""
-        L.append(f"{bp['expiry']} {bp['structure']}   {bp['size']:g}x   "
+        via = (f"on {bp.get('venue') or '?'} (venue tape)"
+               if bp.get("source") == "venue"
+               else f"via Paradigm/{bp.get('venue') or '?'}")
+        label = f"{bp['expiry']} {bp['structure']}".strip()  # venue blocks have no expiry
+        L.append(f"{label}   {bp['size']:g}x   "
                  f"${bp['notional_m']}M   {bp['time_utc']} UTC   "
-                 f"via Paradigm/{bp.get('venue') or '?'}{tag_txt}")
+                 f"{via}{tag_txt}")
     else:
         L.append("No data")
     n_struct = bf.get("n_structures", len(bf["rows"]))
@@ -740,7 +821,12 @@ def render_md(r: dict) -> str:
     # labels like "24JUL26/31JUL26 Call Diagonal" overflow a fixed 27).
     sw = max([27] + [len(row["structure"]) + 2 for row in bf["rows"]])
     vw = max([8] + [len(row.get("venue") or "") + 2 for row in bf["rows"]])
-    L += ["```", "", f"**Block Flow (Paradigm RFQ) — ${bf['total_m']}M / {bf['n_blocks']} {block_word} / "
+    # Sources disclosed in the title: "+ venue tape" appears only when venue-tape
+    # blocks (exchanges Paradigm doesn't broker, e.g. OKX) actually contributed
+    # to this window's pool — totals and rows then span both sources.
+    src = ("Paradigm RFQ + venue tape" if bf.get("n_venue_blocks")
+           else "Paradigm RFQ")
+    L += ["```", "", f"**Block Flow ({src}) — ${bf['total_m']}M / {bf['n_blocks']} {block_word} / "
           f"{n_struct} {struct_word}{trunc}{asof}**",
           "", "```yaml",
           f"{'#':<3}{'Structure':<{sw}}{'Venue':<{vw}}{'Notl':<9}{'Blocks':<8}Detail",
@@ -795,6 +881,7 @@ def main() -> None:
     start_ms = now_ms - parse_window_ms(args.window)
 
     block_rows: list[dict] = []
+    venue_block_rows: list[dict] = []
     if args.no_s3:
         # Offline/local: no hot CSVs or block tape; Deribit supplies DVOL/spot/
         # surface. Block flow is empty (No data) since it's S3-only now.
@@ -811,6 +898,7 @@ def main() -> None:
             deri = deri_fut.result()
         hot = load_hot(args.csv_dir, ASSET)
         block_rows = load_blocks(args.csv_dir)
+        venue_block_rows = load_venue_blocks(args.csv_dir, ASSET)
         # No hot dvol_spot row: the DuckDB read of the rolling recap-aggregates file
         # failed or returned nothing for this window. Either way DVOL/spot must come
         # from Deribit. Also fetch for any >24h window — the rolling file only
@@ -827,7 +915,8 @@ def main() -> None:
             except Exception as e:  # noqa: BLE001
                 warn(f"deribit market fallback failed: {e}")
 
-    result = build(asset, args.window, start_ms, now_ms, deri, hot, block_rows)
+    result = build(asset, args.window, start_ms, now_ms, deri, hot, block_rows,
+                   venue_block_rows)
     if args.render:
         print(render_md(result))
     else:

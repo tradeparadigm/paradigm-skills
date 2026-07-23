@@ -23,10 +23,10 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 import recap  # noqa: E402
 from recap import (  # noqa: E402
-    parse_window_ms, load_hot, load_blocks, build, render_md,
+    parse_window_ms, load_hot, load_blocks, load_venue_blocks, build, render_md,
     pct, pc_descriptor, dvol_label, spot_vol_label, fmt_hhmm,
     run_duckdb, _load_surface_tickers, _delta_fmt, _venue_label,
-    MAX_SURFACE_ROWS,
+    _venue_tape_blocks, MAX_SURFACE_ROWS,
 )
 
 _passed = 0
@@ -146,6 +146,22 @@ BLOCKS_RR = [
     _blk("Call 26 Jun 26 65000", "SELL", 6_000_000, tid="t2"),
 ]
 
+# Venue-tape blocks (venue_blocks.csv) — the hot recap file's `block` rows,
+# grouped per block id. Unit-explicit columns: volume_coin (Σ leg amounts, coin)
+# and premium_usd (Σ premium — NEVER a display notional; underlying notional is
+# volume_coin × spot). OKX-BLK-1: 300 BTC × $60,468 spot = $18.14M — bigger than
+# the $12M Paradigm RR, so it should win Biggest Print. OKX-BLK-2: 2 BTC ≈ $121k,
+# under the $250k floor → filtered. The deribit/bullish rows are tape-brokered
+# venues → EXCLUDED by the coverage rule (no id bridge; would double-count).
+VENUE_BLOCKS_CSV = (
+    "asset,exchange,block_id,instrument_kind,bucket_at,volume_coin,premium_usd,"
+    "leg_count,iv_sum,iv_count\n"
+    "BTC,okex-options,OKX-BLK-1,option,1780000200000,300,90000,3,187.5,3\n"
+    "BTC,okex-options,OKX-BLK-2,option,1780000500000,2,600,1,,\n"
+    "BTC,deribit,BLOCK-280624,option,1780000200000,150,45000,2,120,2\n"
+    "BTC,bullish,OTC-9,perp,1780000200000,50,3000000,1,,\n"
+)
+
 
 def _full_hot(d):
     _write(d, "volume.csv", CORRUPT_VOLUME_CSV)
@@ -251,6 +267,82 @@ def test_volume_na_without_hot():
     md = render_md(res)
     vol_line = next(ln for ln in md.splitlines() if ln.strip().startswith("Volume"))
     check("Volume line reads n/a", "n/a" in vol_line, vol_line)
+
+
+# ── Venue-tape blocks (venue_blocks.csv → Block Flow merge) ──────────────────
+
+def test_load_venue_blocks_coverage_rule():
+    # Only venues the Paradigm tape does NOT broker survive the load — a
+    # tape-brokered venue's blocks appear on both tapes with unjoinable ids,
+    # so including them would double-count.
+    recap.WARNINGS.clear()
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "venue_blocks.csv", VENUE_BLOCKS_CSV)
+        rows = load_venue_blocks(d, "BTC")
+    check("only okex rows kept", {r["exchange"] for r in rows} == {"okex-options"}, rows)
+    check("deribit/bullish excluded", len(rows) == 2, len(rows))
+    # Missing file → [] and no crash (Paradigm tape renders alone).
+    with tempfile.TemporaryDirectory() as d2:
+        check("missing file → empty", load_venue_blocks(d2, "BTC") == [])
+
+
+def test_venue_tape_blocks_priced_by_coin_volume_not_premium():
+    recap.WARNINGS.clear()
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "venue_blocks.csv", VENUE_BLOCKS_CSV)
+        rows = load_venue_blocks(d, "BTC")
+    blocks = _venue_tape_blocks(rows, spot=60468)
+    big = next(b for b in blocks if b["block_trade_id"] == "OKX-BLK-1")
+    # Underlying-USD basis: 300 × 60468 = $18,140,400 — NOT the $90k premium.
+    check("notional = volume_coin × spot", big["notional_usd"] == 300 * 60468,
+          big["notional_usd"])
+    check("premium never the notional", big["notional_usd"] != 90000, big["notional_usd"])
+    check("avg_iv from components (62.5)", big["avg_iv"] == 62.5, big["avg_iv"])
+    check("source tagged venue", big["source"] == "venue", big)
+    check("time approximate (~HH:MM)", big["time_utc"].startswith("~"), big["time_utc"])
+    check("structure unclassified", big["structure"] == "Block (unclassified)", big)
+    # No spot → skipped with a warning, never guessed.
+    recap.WARNINGS.clear()
+    check("no spot → no blocks", _venue_tape_blocks(rows, spot=None) == [])
+    check("no spot warned", any("venue-tape blocks skipped" in w for w in recap.WARNINGS),
+          recap.WARNINGS)
+
+
+def test_venue_blocks_merge_into_block_flow():
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot(d)  # spot 60468
+        _write(d, "venue_blocks.csv", VENUE_BLOCKS_CSV)
+        venue_rows = load_venue_blocks(d, "BTC")
+        res = build("btc", "8h", 0, 8 * 3600_000,
+                    {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR, venue_rows)
+    bf, bp = res["block_flow"], res["biggest_print"]
+    # Pool = $12M Paradigm RR + $18.1M OKX block (the $121k one is under the
+    # $250k floor). Totals span both sources.
+    check("two blocks in pool", bf["n_blocks"] == 2, bf["n_blocks"])
+    check("total spans both sources (~$30.1M)", 30.0 <= bf["total_m"] <= 30.3, bf["total_m"])
+    check("venue block counted", bf.get("n_venue_blocks") == 1, bf.get("n_venue_blocks"))
+    venues = [r.get("venue") for r in bf["rows"]]
+    check("OKX row present", "OKX" in venues, venues)
+    check("OKX outranks the RR", bf["rows"][0]["venue"] == "OKX", bf["rows"][0])
+    # Biggest Print is the OKX venue-tape block, source-tagged.
+    check("biggest is the OKX block", bp["notional_m"] == 18.1, bp)
+    check("biggest source venue", bp.get("source") == "venue", bp)
+    md = render_md(res)
+    check("biggest line says on OKX (venue tape)", "on OKX (venue tape)" in md, "render")
+    check("title discloses venue tape", "Block Flow (Paradigm RFQ + venue tape)" in md,
+          "render")
+    check("unclassified row rendered", "Block (unclassified)" in md, "render")
+
+
+def test_block_flow_title_stays_paradigm_only_without_venue_blocks():
+    with tempfile.TemporaryDirectory() as d:
+        hot = _full_hot(d)
+        res = build("btc", "8h", 0, 8 * 3600_000,
+                    {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+    md = render_md(res)
+    check("no venue blocks → plain title", "Block Flow (Paradigm RFQ)" in md, "render")
+    check("no venue-tape tag", "venue tape" not in md, "render")
+    check("biggest still via Paradigm", "via Paradigm/Deribit" in md, "render")
 
 
 # ── load_hot/build: cross-venue turnover_usd ($ Volume) ──────────────────────

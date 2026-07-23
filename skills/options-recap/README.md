@@ -107,10 +107,11 @@ rolling file of 5-min buckets over the trailing 24h; windowed at query time via
 |---|---|---|
 | Snapshot DVOL/spot | `dvol_spot` | `metric`, `open`, `close`, `high`, `low` (OHLC: `arg_min(open,bucket_at)` / `arg_max(close,bucket_at)` / `max(high)` / `min(low)`) |
 | Snapshot volume/P-C/$Volume | `volume` | `exchange`, `optionType`, `volume_sum`, `turnover_usd`, `notional_usd`, `trade_count` |
+| Block Flow (non-Paradigm venues) | `block` | `exchange`, `block_id`, `volume_sum`, `notional_usd` (**premium**, not underlying — see below), `leg_count`, `iv_sum`/`iv_count` |
 
-There is **no `surface` and no `block` `row_type`** — the vol surface lives in
-`v_vol_surface`, and Biggest Print / Block Flow come from the block tape (both
-below). `notional` is `notional_usd`.
+There is **no `surface` `row_type`** — the vol surface lives in `v_vol_surface`.
+Biggest Print / Block Flow are primarily the block tape (below), plus the
+`block` rows for venues the tape doesn't broker. `notional` is `notional_usd`.
 
 **Block tape (Biggest Print + Block Flow).** `s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz`
 — one flat ~1.5MB csv.gz (all dates; a full scan is sub-second, so it's read fresh
@@ -125,6 +126,33 @@ one Block Flow row with a `Blocks` count). Columns used: `DATE`, `TIME`, `PRODUC
 `BLOCK_TRADE_ID`. The tape carries **no IV** — the top blocks' IV is looked up from
 `v_vol_surface` (Deribit legs only). See the `paradigm-data-discovery` skill for the
 tape schema and the `paradigm-block-analyst` skill for the `DESCRIPTION` grammar.
+
+**Venue-tape blocks (`venue_blocks.csv`) — coverage for venues the Paradigm tape
+doesn't broker.** The recap file's `block` rows carry every block/OTC print off the
+exchanges' own feeds (Deribit `block_trade_id`, OKX `blockTdId`, Bullish
+`otcTradeId`); `run_recap.sh` groups them per `(exchange, block_id)` into
+`venue_blocks.csv` with **unit-explicit columns**: `volume_coin` (Σ leg amounts,
+coin) and `premium_usd` (Σ premium — kept for debuggability, **never displayed as
+notional**: it's ~50–100× below the underlying-USD basis the block sections use).
+`recap.py` then:
+
+- **Includes only venues the Paradigm tape does NOT cover** (`_TAPE_BROKERED_VENUES`
+  excludes deribit / deribit-usdc / paradex / bullish) — so **OKX** today. A
+  Paradigm-brokered block appears on *both* tapes with **unjoinable ids** (tape
+  `BLOCK_TRADE_ID` = Paradigm's `DRFQv2-bt_…`; venue `block_id` = venue-native,
+  e.g. Deribit `BLOCK-280624` — verified against real files 2026-07-23), so
+  including tape-covered venues would double-count. Deribit/Bullish blocks not
+  brokered via Paradigm remain out of scope until an id bridge exists.
+- **Prices them as `volume_coin × spot`** — underlying-USD, the same basis as the
+  tape's `NOTIONAL_VOLUME_USD`, valued at recap-time spot (a disclosed
+  approximation vs the tape's trade-time figures). No spot → skipped with a
+  warning, never guessed.
+- Merges them into the same pool: min-notional filter, Biggest Print candidacy and
+  top-N ranking on equal terms. The venue tape carries **no leg geometry**, so they
+  render as `Block (unclassified)` with a `venue tape` detail note and `~HH:MM`
+  times (5-min bucket resolution); the section title gains `+ venue tape` whenever
+  they contribute. Bybit can never appear here — its feed has an is-block flag but
+  no group id, so its blocks are unreconstructable and ride the volume/flow rows.
 
 **Multi-venue representation (truthful + consistent).** The `volume` rows span
 Deribit, OKX, Bybit, Bullish. The dollar **Volume** line sums **`turnover_usd`**
