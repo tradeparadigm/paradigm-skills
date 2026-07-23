@@ -276,6 +276,91 @@ def test_classify_structure():
           classify_structure(cross) == "Multi-leg", classify_structure(cross))
 
 
+def test_classify_structure_ratio_aware():
+    # ── Butterflies: ratio + disclosed direction, not just "3 strikes" ──
+    # Genuine 1:−2:1 call fly (buy wings, sell 2× middle).
+    fly = [_leg("BTC-26JUN26-60000-C", "buy", 10),
+           _leg("BTC-26JUN26-65000-C", "sell", 20),
+           _leg("BTC-26JUN26-70000-C", "buy", 10)]
+    check("genuine 1:-2:1 call fly → Call Butterfly",
+          classify_structure(fly) == "Call Butterfly", classify_structure(fly))
+    # Broken-wing fly: uneven strike spacing (60/65/78) but same 1:−2:1 ratio.
+    bwfly = [_leg("BTC-26JUN26-60000-C", "buy", 10),
+             _leg("BTC-26JUN26-65000-C", "sell", 20),
+             _leg("BTC-26JUN26-78000-C", "buy", 10)]
+    check("broken-wing fly (uneven spacing) → Call Butterfly",
+          classify_structure(bwfly) == "Call Butterfly", classify_structure(bwfly))
+    # Call ladder +1/−1/−1 (3 strikes, one type) is NOT a fly.
+    ladder = [_leg("BTC-26JUN26-60000-C", "buy", 10),
+              _leg("BTC-26JUN26-65000-C", "sell", 10),
+              _leg("BTC-26JUN26-70000-C", "sell", 10)]
+    check("call ladder +1/-1/-1 → Multi-leg",
+          classify_structure(ladder) == "Multi-leg", classify_structure(ladder))
+    # 3-strike strip: all bought, same type → not a fly.
+    strip3 = [_leg("BTC-26JUN26-60000-C", "buy", 10),
+              _leg("BTC-26JUN26-65000-C", "buy", 10),
+              _leg("BTC-26JUN26-70000-C", "buy", 10)]
+    check("3-strike all-buy strip → Multi-leg",
+          classify_structure(strip3) == "Multi-leg", classify_structure(strip3))
+    # ── Condors ──
+    condor = [_leg("BTC-26JUN26-50000-C", "buy", 10),
+              _leg("BTC-26JUN26-55000-C", "sell", 10),
+              _leg("BTC-26JUN26-60000-C", "sell", 10),
+              _leg("BTC-26JUN26-65000-C", "buy", 10)]
+    check("genuine +/-/-/+ call condor → Call Condor",
+          classify_structure(condor) == "Call Condor", classify_structure(condor))
+    # 4-strike same-type strip (all buys) → not a condor.
+    strip4 = [_leg("BTC-26JUN26-50000-C", "buy", 10),
+              _leg("BTC-26JUN26-55000-C", "buy", 10),
+              _leg("BTC-26JUN26-60000-C", "buy", 10),
+              _leg("BTC-26JUN26-65000-C", "buy", 10)]
+    check("4-strike all-buy strip → Multi-leg",
+          classify_structure(strip4) == "Multi-leg", classify_structure(strip4))
+    # ── Iron Fly wing placement ──
+    ironfly = [_leg("ETH-16JUL26-1875-C", "sell", 63),
+               _leg("ETH-16JUL26-1875-P", "sell", 63),
+               _leg("ETH-16JUL26-1925-C", "buy", 63),
+               _leg("ETH-16JUL26-1825-P", "buy", 63)]
+    check("P-low / C-high wings + short body → Iron Fly",
+          classify_structure(ironfly) == "Iron Fly", classify_structure(ironfly))
+    # A CALL wing below the body (low strike is a call, not a put) → Multi-leg.
+    bad_ironfly = [_leg("ETH-16JUL26-1875-C", "sell", 63),
+                   _leg("ETH-16JUL26-1875-P", "sell", 63),
+                   _leg("ETH-16JUL26-1925-C", "buy", 63),
+                   _leg("ETH-16JUL26-1825-C", "buy", 63)]
+    check("call wing below body → Multi-leg",
+          classify_structure(bad_ironfly) == "Multi-leg", classify_structure(bad_ironfly))
+    # ── Straddle vs synthetic (Combo) ──
+    same = [_leg("BTC-26JUN26-60000-C", "buy", 10),
+            _leg("BTC-26JUN26-60000-P", "buy", 10)]
+    check("same-strike C&P same direction → Straddle",
+          classify_structure(same) == "Straddle", classify_structure(same))
+    combo = [_leg("BTC-26JUN26-60000-C", "buy", 10),
+             _leg("BTC-26JUN26-60000-P", "sell", 10)]
+    check("same-strike C&P opposite direction → Combo (synthetic)",
+          classify_structure(combo) == "Combo", classify_structure(combo))
+    # ── Calendar direction (long one expiry / short the other) ──
+    strip_cal = [_leg("BTC-26JUN26-60000-C", "buy", 10),
+                 _leg("BTC-3JUL26-60000-C", "buy", 10)]
+    check("same-direction two-expiry calls (time strip) → Multi-leg",
+          classify_structure(strip_cal) == "Multi-leg", classify_structure(strip_cal))
+    opp_cal = [_leg("BTC-26JUN26-60000-C", "buy", 10),
+               _leg("BTC-3JUL26-60000-C", "sell", 10)]
+    check("opposing-direction two-expiry calls → Call Calendar",
+          classify_structure(opp_cal) == "Call Calendar", classify_structure(opp_cal))
+
+
+def test_summarize_blocks_size_weights_avg_iv():
+    # Two legs, very different sizes and IVs: avg_iv must weight by amount, not
+    # take the plain leg mean. 90 BTC @ 40v + 10 BTC @ 80v → (40*90+80*10)/100
+    # = 44.0, NOT the unweighted 60.0.
+    trades = [_leg("BTC-26JUN26-60000-C", "buy", 90, iv=40.0, bid="W1"),
+              _leg("BTC-26JUN26-65000-C", "sell", 10, iv=80.0, bid="W1")]
+    blocks = summarize_blocks(cluster_blocks(trades), min_btc=5.0)
+    check("avg_iv size-weighted (44.0, not 60.0)", blocks[0]["avg_iv"] == 44.0,
+          blocks[0]["avg_iv"])
+
+
 def test_dominant_side():
     buys = [_leg("BTC-26JUN26-60000-P", "buy", 10),
             _leg("BTC-26JUN26-55000-P", "buy", 10)]

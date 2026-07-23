@@ -23,7 +23,7 @@ would read as a zero-length window. Intraday windows stay HH:MM-only.
 Spot      $[X]        [up/down X%] (from $[Y], low $[Z])
 DVOL      [X]v        [flat/rising/falling] ([open] -> [close])
 RV 7d     [X]v        implied [CHEAP/RICH/IN LINE] vs realized
-VRP       [±X]v       vol [underpriced/overpriced] vs delivered
+VRP       [±X]v       vol [underpriced/overpriced/roughly fair] vs delivered
 Activity  [Nk]        trades — [Venue X% · Venue Y% · ...] (by trade count)
 Volume    $[X]M       Deribit only (cross-venue $ pending)
 P/C       [X.Xx]      [descriptor] (all venues, by trades)
@@ -55,11 +55,16 @@ the Detail column.
 **Block Flow — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)]**
 
 ```yaml
-#  Structure            Notl     Blocks  Detail
--  -------------------  -------  ------  -----------------------------------
-1  [structure]          $[X]M    [n]     bought [K1][C/P] / sold [K2][C/P] x[size] [IV|IV–IV]v
+#  Structure                  Notl     Blocks  Detail
+-  -------------------------  -------  ------  -----------------------------------
+1  [structure]                $[X]M    [n]     bought [K1][C/P] / sold [K2][C/P] x[size] [IV|IV–IV]v
 2  …
 ```
+
+The Structure column has a 27-char floor but stretches to the longest label in
+the window (a typed cross-expiry label like `24JUL26/31JUL26 Call Diagonal`
+runs past 27), so the header and rows stay aligned to whatever width the widest
+structure needs.
 
 Two granularities, both always stated: tape **blocks** (block_trade_ids, the
 industry term for the individual prints) and **structures** (clips of one
@@ -76,11 +81,12 @@ tagged ` two-way`. Multi-block rows show the clip IV range (`36.5–37.0v`)
 when clips printed at different vols, a single value otherwise.
 
 **Vol Surface**
-Skew: front 25Δ RR [±X]v → [puts bid / calls bid / flat] · Term: [front]v → [back]v → [contango / flat / backwardation / humped — peak at [DDMMMYY] / dished — trough at [DDMMMYY]]
+Skew: front 25Δ RR [±X]v → [puts bid / calls bid / flat] · Term: [front]v → [back]v → [contango / flat / backwardation / humped — peak at [DDMMMYY] / dished — trough at [DDMMMYY] / mixed]
 
 Term reads the whole listed curve, front to last expiry — monotonic (±0.2v
 tolerance) with >1v span is contango/backwardation; non-monotonic curves are
-humped/dished and name the interior peak/trough. `[back]` is the LAST listed
+humped/dished and name the interior peak/trough, or `mixed` when the shape is
+neither cleanly humped nor dished. `[back]` is the LAST listed
 expiry's ATM, not the second. The skew side word is the RR's sign (negative →
 puts bid, positive → calls bid, zero → flat); extrapolated wings put a `*` on
 the RR figure (`+1.3v*`), never prose. These slots take exactly these tokens —

@@ -793,6 +793,34 @@ def test_render_four_sections():
     check("four yaml fences", md.count("```yaml") == 4, md.count("```yaml"))
 
 
+def test_render_vrp_deadband_matches_rv_line():
+    # A small positive VRP (0.5v) is inside the ±1v dead-band: the RV line must
+    # read "IN LINE" and the VRP line "roughly fair" — never "IN LINE" beside
+    # "overpriced" on adjacent lines (the contradiction this fix removes).
+    md = render_md({"header": {"asset": "BTC", "window": "1h", "start_utc": "01:00",
+                               "end_utc": "02:00"},
+                    "snapshot": {"vrp": 0.5, "rv_7d": 45.0, "dvol": 45.5},
+                    "biggest_print": None,
+                    "block_flow": {"rows": [], "n_blocks": 0, "n_structures": 0,
+                                   "total_m": 0, "truncated": False},
+                    "vol_surface": None, "flow_horizon": None, "warnings": []})
+    rv_line = next(l for l in md.splitlines() if l.startswith("RV 7d"))
+    vrp_line = next(l for l in md.splitlines() if l.startswith("VRP"))
+    check("small +VRP → RV line IN LINE", "IN LINE" in rv_line, rv_line)
+    check("small +VRP → VRP line roughly fair", "roughly fair" in vrp_line, vrp_line)
+    check("small +VRP not called overpriced", "overpriced" not in vrp_line, vrp_line)
+    # Outside the band the words still flip.
+    md2 = render_md({"header": {"asset": "BTC", "window": "1h", "start_utc": "01:00",
+                                "end_utc": "02:00"},
+                     "snapshot": {"vrp": 3.0, "rv_7d": 42.0, "dvol": 45.0},
+                     "biggest_print": None,
+                     "block_flow": {"rows": [], "n_blocks": 0, "n_structures": 0,
+                                    "total_m": 0, "truncated": False},
+                     "vol_surface": None, "flow_horizon": None, "warnings": []})
+    vrp_line2 = next(l for l in md2.splitlines() if l.startswith("VRP"))
+    check("VRP > 1 → overpriced", "overpriced" in vrp_line2, vrp_line2)
+
+
 def test_render_deterministic():
     r = _full_result()
     check("render is deterministic", render_md(r) == render_md(r))

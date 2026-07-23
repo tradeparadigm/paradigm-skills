@@ -807,8 +807,10 @@ def render_md(r: dict) -> str:
     L.append(f"{'RV 7d':<9} {rv:<11} implied {rich} vs realized")
 
     vrp_txt = f"{vrp:+}v" if vrp is not None else "n/a"
-    upo = ("underpriced" if vrp is not None and vrp < 0 else
-           "overpriced" if vrp is not None and vrp > 0 else "fair")
+    # Same ±1v dead-band as the RV line above — otherwise a VRP in (0,1] prints
+    # "IN LINE" and "overpriced" on adjacent lines.
+    upo = ("underpriced" if vrp is not None and vrp < -1 else
+           "overpriced" if vrp is not None and vrp > 1 else "roughly fair")
     L.append(f"{'VRP':<9} {vrp_txt:<11} vol {upo} vs delivered")
 
     # Activity always renders — an empty window reads n/a like Volume/P-C do;

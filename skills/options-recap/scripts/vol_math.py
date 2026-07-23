@@ -183,59 +183,130 @@ def cluster_blocks(trades: list[dict]) -> dict[str, list]:
 
 # ── Block structures (#2b) ─────────────────────────────────────────────────
 
-def classify_structure(legs: list[dict]) -> str:
-    """Name a block cluster's structure from its leg instruments (and, where
-    it disambiguates, the disclosed per-leg directions).
+_FLY_RTOL = 0.05      # relative tolerance for ratio comparisons on float amounts
 
-    Same expiry, ≥3 legs (this check runs before the 2-leg C&P branch, or a
-    4-leg iron fly would read as a Risk Reversal): shape is verified from the
-    distinct strikes and types — one type + 3 strikes → Call/Put Butterfly
-    (broken wings count), + 4 strikes → Call/Put Condor; both types + 4 strikes
-    with 2 calls & 2 puts → Iron Condor, + 3 strikes with a call AND a put on
-    the middle strike → Iron Fly; anything else → Multi-leg.
-    Same expiry, 2 legs: C&P same strike → Straddle; C&P diff strikes →
-    Strangle when every leg's direction is disclosed and all match, Risk
-    Reversal when they differ, else Strangle/RR; one type + diff strikes →
-    Call Spread (both calls) or Put Spread (both puts).
-    Multi-expiry: single strike → Call/Put/(mixed→)Calendar; 2 legs + diff
-    strikes → Call/Put Diagonal (one call + one put is not a diagonal →
-    Multi-leg)."""
+
+def _same_sign(a: float, b: float) -> bool:
+    """True when both are strictly nonzero and share a sign."""
+    return a != 0 and b != 0 and (a > 0) == (b > 0)
+
+
+def _is_fly(q: list[float]) -> bool:
+    """Net signed quantities on 3 ascending strikes form a 1:−2:1 fly (either
+    polarity): wings same sign and ~equal, middle opposite with |mid| ≈ sum of
+    wings. Broken-wing (uneven strike spacing) shares this ratio, so no spacing
+    check — the ratio alone is the test."""
+    q1, q2, q3 = q
+    if q1 == 0 or q2 == 0 or q3 == 0:
+        return False
+    if not _same_sign(q1, q3) or _same_sign(q1, q2):
+        return False
+    return (math.isclose(abs(q1), abs(q3), rel_tol=_FLY_RTOL)
+            and math.isclose(abs(q2), abs(q1) + abs(q3), rel_tol=_FLY_RTOL))
+
+
+def _is_condor(q: list[float]) -> bool:
+    """Net signed quantities on 4 ascending strikes form +q/−q/−q/+q (either
+    polarity): outer pair same sign, inner pair the opposite sign, all ~equal
+    magnitude."""
+    q1, q2, q3, q4 = q
+    if any(x == 0 for x in q):
+        return False
+    if not (_same_sign(q1, q4) and _same_sign(q2, q3)) or _same_sign(q1, q2):
+        return False
+    m0 = abs(q1)
+    return all(math.isclose(abs(x), m0, rel_tol=_FLY_RTOL) for x in q)
+
+
+def classify_structure(legs: list[dict]) -> str:
+    """Name a block cluster's structure from its leg instruments and, where it
+    disambiguates, the disclosed per-leg directions. Legs are first consolidated
+    per instrument into a net signed quantity (+amount buy, −amount sell) so
+    ratio patterns survive multiple prints at one strike.
+
+    Same expiry, ≥3 legs (runs before the 2-leg C&P branch, else a 4-leg iron
+    fly reads as a Risk Reversal):
+      • one type, 3 strikes → Call/Put Butterfly ONLY when directions are all
+        disclosed and the net quantities on ascending strikes form the 1:−2:1
+        fly ratio (broken wings count); ladders/strips/ratios → Multi-leg.
+      • one type, 4 strikes → Call/Put Condor ONLY when disclosed and the nets
+        form +q/−q/−q/+q with equal magnitudes; else Multi-leg.
+      • both types, 4 strikes, 2 calls & 2 puts → Iron Condor.
+      • both types, 3 strikes with a C AND a P on the middle strike → Iron Fly
+        ONLY when the low-strike wing is puts-only, the high-strike wing is
+        calls-only, wing/body sizes are ~equal, and (when disclosed) the body
+        legs share one direction and the wings the opposite; else Multi-leg.
+      • anything else → Multi-leg.
+    Same expiry, 2 legs:
+      • C&P same strike → Combo (synthetic forward) when directions are
+        disclosed and opposite; Straddle otherwise (disclosed-and-equal, or
+        undisclosed — the common case).
+      • C&P diff strikes → Strangle (disclosed, all same direction), Risk
+        Reversal (disclosed, differ), else Strangle/RR.
+      • one type, diff strikes → Call/Put Spread.
+    Multi-expiry:
+      • single strike → Call/Put/(mixed→)Calendar; when directions are all
+        disclosed it must be long one expiry / short the other (≥1 buy AND ≥1
+        sell) — an all-same-direction time strip → Multi-leg.
+      • 2 legs, diff strikes → Call/Put Diagonal (same long/short requirement;
+        one call + one put is not a diagonal → Multi-leg).
+      • anything else → Multi-leg."""
     if len(legs) == 1:
         return "Call" if legs[0]["instrument_name"].endswith("-C") else "Put"
     expiries, strikes, types = set(), set(), set()
     pairs = []                    # (strike, type) per leg
+    net: dict[tuple, float] = defaultdict(float)   # signed qty per (strike,type)
+    amt: dict[tuple, float] = defaultdict(float)   # unsigned qty per (strike,type)
     for leg in legs:
         parts = leg["instrument_name"].split("-")
+        k, t = int(parts[2]), parts[3]
         expiries.add(parts[1])
-        strikes.add(int(parts[2]))
-        types.add(parts[3])
-        pairs.append((int(parts[2]), parts[3]))
+        strikes.add(k)
+        types.add(t)
+        pairs.append((k, t))
+        a = leg.get("amount") or 0
+        d = leg.get("direction")
+        net[(k, t)] += a if d == "buy" else -a if d == "sell" else 0
+        amt[(k, t)] += a
     dirs = [leg.get("direction") for leg in legs]
+    disclosed = all(d in ("buy", "sell") for d in dirs)
+    has_buy = any(d == "buy" for d in dirs)
+    has_sell = any(d == "sell" for d in dirs)
 
-    # Multi-expiry.
+    # Multi-expiry. Calendars/diagonals are a long-one-tenor / short-the-other
+    # trade: when every direction is disclosed, require both a buy and a sell;
+    # an all-same-direction package (time strip) is Multi-leg.
     if len(expiries) > 1:
         if len(strikes) == 1:
-            if types == {"C"}:
-                return "Call Calendar"
-            if types == {"P"}:
-                return "Put Calendar"
-            return "Calendar"
+            label = ("Call Calendar" if types == {"C"}
+                     else "Put Calendar" if types == {"P"} else "Calendar")
+            if disclosed and not (has_buy and has_sell):
+                return "Multi-leg"
+            return label
         if len(legs) == 2:
             if types == {"C"}:
-                return "Call Diagonal"
-            if types == {"P"}:
-                return "Put Diagonal"
-            return "Multi-leg"    # one call + one put across expiries isn't a diagonal
+                label = "Call Diagonal"
+            elif types == {"P"}:
+                label = "Put Diagonal"
+            else:
+                return "Multi-leg"   # one call + one put across expiries isn't a diagonal
+            if disclosed and not (has_buy and has_sell):
+                return "Multi-leg"
+            return label
         return "Multi-leg"
 
     # Same expiry.
     if len(legs) >= 3:
         n_strikes = len(strikes)
+        sk = sorted(strikes)
         if len(types) == 1:
             base = "Call" if types == {"C"} else "Put"
-            if n_strikes == 3:
+            t0 = "C" if types == {"C"} else "P"
+            if not disclosed:
+                return "Multi-leg"   # net-ratio patterns need disclosed signs
+            if n_strikes == 3 and _is_fly([net[(k, t0)] for k in sk]):
                 return f"{base} Butterfly"
-            if n_strikes == 4:
+            if n_strikes == 4 and _is_condor([net[(k, t0)] for k in sk]):
                 return f"{base} Condor"
             return "Multi-leg"
         if types == {"C", "P"}:
@@ -243,14 +314,37 @@ def classify_structure(legs: list[dict]) -> str:
             n_puts = sum(1 for _, t in pairs if t == "P")
             if n_strikes == 4 and n_calls == 2 and n_puts == 2:
                 return "Iron Condor"
-            mid = sorted(strikes)[1] if n_strikes == 3 else None
-            if mid is not None and (mid, "C") in pairs and (mid, "P") in pairs:
-                return "Iron Fly"
+            if n_strikes == 3:
+                low, mid, high = sk[0], sk[1], sk[2]
+                low_types = {t for (k, t) in pairs if k == low}
+                high_types = {t for (k, t) in pairs if k == high}
+                body_dirs = {leg.get("direction") for leg in legs
+                             if int(leg["instrument_name"].split("-")[2]) == mid}
+                wing_dirs = {leg.get("direction") for leg in legs
+                             if int(leg["instrument_name"].split("-")[2]) in (low, high)}
+                is_ironfly = (
+                    (mid, "C") in pairs and (mid, "P") in pairs
+                    and low_types == {"P"} and high_types == {"C"}
+                )
+                if is_ironfly:
+                    sizes = [amt[(low, "P")], amt[(mid, "C")],
+                             amt[(mid, "P")], amt[(high, "C")]]
+                    ratio_ok = all(math.isclose(s, sizes[0], rel_tol=_FLY_RTOL)
+                                   for s in sizes)
+                    dir_ok = (not disclosed) or (
+                        len(body_dirs) == 1 and len(wing_dirs) == 1
+                        and body_dirs != wing_dirs)
+                    if ratio_ok and dir_ok:
+                        return "Iron Fly"
         return "Multi-leg"
     if types == {"C", "P"} and len(strikes) == 1:
+        # C&P at one strike: opposite disclosed directions = synthetic forward
+        # (Combo, matching block-analyst); same or undisclosed = Straddle.
+        if disclosed and len(set(dirs)) > 1:
+            return "Combo"
         return "Straddle"
     if types == {"C", "P"} and len(strikes) > 1:
-        if all(d in ("buy", "sell") for d in dirs):
+        if disclosed:
             return "Strangle" if len(set(dirs)) == 1 else "Risk Reversal"
         return "Strangle/RR"
     if len(types) == 1 and len(strikes) > 1:
@@ -291,7 +385,13 @@ def summarize_blocks(clusters: dict[str, list], top_n: int = 8,
             continue
         total_btc = sum(l.get("amount", 0) for l in legs)
         index_price = legs[0].get("index_price") or 0
-        ivs = [l["iv"] for l in legs if l.get("iv") is not None]
+        # Size-weight avg_iv by leg amount (matching aggregate_clips), so a
+        # small far-OTM leg can't drag the package IV around; unweighted leg
+        # means over-counted the tiny legs.
+        iv_num = sum(l["iv"] * (l.get("amount") or 0)
+                     for l in legs if l.get("iv") is not None)
+        iv_den = sum((l.get("amount") or 0)
+                     for l in legs if l.get("iv") is not None)
         ts = min(l["timestamp"] for l in legs)
         dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
         # Structure UNIT size for display: the base leg of the package (per-
@@ -327,7 +427,7 @@ def summarize_blocks(clusters: dict[str, list], top_n: int = 8,
             "unit_size": round(unit, 1),
             "notional_usd": round(total_btc * index_price),
             "side": dominant_side(legs),
-            "avg_iv": round(sum(ivs) / len(ivs), 1) if ivs else None,
+            "avg_iv": round(iv_num / iv_den, 1) if iv_den else None,
             "expiry": expiry,
             "strike": parts[2] if len(parts) > 2 else None,
             "leg_count": len(legs),
