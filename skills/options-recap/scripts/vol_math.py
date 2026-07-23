@@ -184,35 +184,77 @@ def cluster_blocks(trades: list[dict]) -> dict[str, list]:
 # ── Block structures (#2b) ─────────────────────────────────────────────────
 
 def classify_structure(legs: list[dict]) -> str:
-    """Name a block cluster's structure from its leg instruments.
+    """Name a block cluster's structure from its leg instruments (and, where
+    it disambiguates, the disclosed per-leg directions).
 
-    Same expiry: ≥3 legs → Butterfly/Condor (covers call/put flies AND iron
-    flies/condors — the ≥3-leg check must run before the C&P branch, or a
-    4-leg iron fly reads as "Strangle/RR"); C&P + same strike → Straddle;
-    C&P + diff strikes → Strangle/RR; same type + diff strikes → Call Spread
-    (both calls) or Put Spread (both puts).
-    Multi-expiry: same strike → Calendar; 2 legs + diff strikes → Diagonal."""
+    Same expiry, ≥3 legs (this check runs before the 2-leg C&P branch, or a
+    4-leg iron fly would read as a Risk Reversal): shape is verified from the
+    distinct strikes and types — one type + 3 strikes → Call/Put Butterfly
+    (broken wings count), + 4 strikes → Call/Put Condor; both types + 4 strikes
+    with 2 calls & 2 puts → Iron Condor, + 3 strikes with a call AND a put on
+    the middle strike → Iron Fly; anything else → Multi-leg.
+    Same expiry, 2 legs: C&P same strike → Straddle; C&P diff strikes →
+    Strangle when every leg's direction is disclosed and all match, Risk
+    Reversal when they differ, else Strangle/RR; one type + diff strikes →
+    Call Spread (both calls) or Put Spread (both puts).
+    Multi-expiry: single strike → Call/Put/(mixed→)Calendar; 2 legs + diff
+    strikes → Call/Put Diagonal (one call + one put is not a diagonal →
+    Multi-leg)."""
     if len(legs) == 1:
         return "Call" if legs[0]["instrument_name"].endswith("-C") else "Put"
     expiries, strikes, types = set(), set(), set()
+    pairs = []                    # (strike, type) per leg
     for leg in legs:
         parts = leg["instrument_name"].split("-")
         expiries.add(parts[1])
         strikes.add(int(parts[2]))
         types.add(parts[3])
-    if len(expiries) > 1 and len(strikes) == 1:
-        return "Calendar"
-    if len(expiries) > 1 and len(legs) == 2:
-        return "Diagonal"
-    if len(expiries) == 1:
-        if len(legs) >= 3:
-            return "Butterfly/Condor"
-        if types == {"C", "P"} and len(strikes) == 1:
-            return "Straddle"
-        if types == {"C", "P"} and len(strikes) > 1:
-            return "Strangle/RR"
-        if len(types) == 1 and len(strikes) > 1:
-            return "Call Spread" if types == {"C"} else "Put Spread"
+        pairs.append((int(parts[2]), parts[3]))
+    dirs = [leg.get("direction") for leg in legs]
+
+    # Multi-expiry.
+    if len(expiries) > 1:
+        if len(strikes) == 1:
+            if types == {"C"}:
+                return "Call Calendar"
+            if types == {"P"}:
+                return "Put Calendar"
+            return "Calendar"
+        if len(legs) == 2:
+            if types == {"C"}:
+                return "Call Diagonal"
+            if types == {"P"}:
+                return "Put Diagonal"
+            return "Multi-leg"    # one call + one put across expiries isn't a diagonal
+        return "Multi-leg"
+
+    # Same expiry.
+    if len(legs) >= 3:
+        n_strikes = len(strikes)
+        if len(types) == 1:
+            base = "Call" if types == {"C"} else "Put"
+            if n_strikes == 3:
+                return f"{base} Butterfly"
+            if n_strikes == 4:
+                return f"{base} Condor"
+            return "Multi-leg"
+        if types == {"C", "P"}:
+            n_calls = sum(1 for _, t in pairs if t == "C")
+            n_puts = sum(1 for _, t in pairs if t == "P")
+            if n_strikes == 4 and n_calls == 2 and n_puts == 2:
+                return "Iron Condor"
+            mid = sorted(strikes)[1] if n_strikes == 3 else None
+            if mid is not None and (mid, "C") in pairs and (mid, "P") in pairs:
+                return "Iron Fly"
+        return "Multi-leg"
+    if types == {"C", "P"} and len(strikes) == 1:
+        return "Straddle"
+    if types == {"C", "P"} and len(strikes) > 1:
+        if all(d in ("buy", "sell") for d in dirs):
+            return "Strangle" if len(set(dirs)) == 1 else "Risk Reversal"
+        return "Strangle/RR"
+    if len(types) == 1 and len(strikes) > 1:
+        return "Call Spread" if types == {"C"} else "Put Spread"
     return "Multi-leg"
 
 

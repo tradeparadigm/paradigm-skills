@@ -25,7 +25,7 @@
       {
         "block_trade_id": "BLOCK-276917",
         "time_utc": "06:28",
-        "structure": "Strangle/RR",
+        "structure": "Risk Reversal",
         "size_btc": 200.0,
         "notional_usd": 12334650,
         "side": "Two-way",

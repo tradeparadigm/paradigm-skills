@@ -93,7 +93,7 @@ SURFACE_OPEN_CSV = (
     "BTC-3JUL26-65000-C,49.0,0.25\n"
     "BTC-3JUL26-55000-P,52.0,-0.25\n"
 )
-# A 2-leg block: put buy + call sell (Strangle/RR), 100 BTC per leg @ $60k.
+# A 2-leg block: put buy + call sell (Risk Reversal), 100 BTC per leg @ $60k.
 TRADES = [
     {"instrument_name": "BTC-26JUN26-55000-P", "index_price": 60000, "iv": 72.0,
      "timestamp": 1780000000000, "direction": "buy", "amount": 100, "block_trade_id": "B1"},
@@ -576,7 +576,7 @@ def test_block_flow_from_trades_not_hot():
     check("total not billions", bf["total_m"] < 1000, bf["total_m"])
     bp = bf["biggest_print"]
     check("biggest expiry", bp["expiry"] == "26JUN26", bp)
-    check("biggest is Strangle/RR", bp["structure"] == "Strangle/RR", bp)
+    check("biggest is Risk Reversal", bp["structure"] == "Risk Reversal", bp)
     # Size is the structure UNIT (100 per leg → a 100x RR), not the 200 leg-sum.
     check("biggest size 100 (unit, not leg-sum)", bp["size"] == 100, bp)
     check("biggest notional 12.0M", bp["notional_m"] == 12.0, bp)
@@ -755,7 +755,7 @@ def test_render_four_sections():
           "volume render")
     check("render multi-venue Activity line", "Activity" in md and "Bybit" in md, "activity render")
     check("render P/C 0.9x", "0.9x" in md)
-    check("render biggest Strangle/RR", "26JUN26 Strangle/RR" in md)
+    check("render biggest Risk Reversal", "26JUN26 Risk Reversal" in md)
     # Vol-surface delta columns are always present in the header; with no
     # window-open surface (this fixture has none) the delta cells read n/a.
     check("delta columns present", "ΔATM" in md and "ΔRR" in md and "ΔFly" in md, md)

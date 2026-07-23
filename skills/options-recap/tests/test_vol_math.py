@@ -189,10 +189,21 @@ def test_cluster_blocks_filters_screen():
 def test_classify_structure():
     put = [_leg("BTC-26JUN26-60000-P", "buy", 10)]
     check("single put → Put", classify_structure(put) == "Put", classify_structure(put))
+    # C&P diff strikes: all directions disclosed & they DIFFER → Risk Reversal.
     rr = [_leg("BTC-26JUN26-55000-P", "buy", 100),
           _leg("BTC-26JUN26-68000-C", "sell", 100)]
-    check("P+C diff strikes → Strangle/RR", classify_structure(rr) == "Strangle/RR",
-          classify_structure(rr))
+    check("P buy + C sell diff strikes → Risk Reversal",
+          classify_structure(rr) == "Risk Reversal", classify_structure(rr))
+    # Same C&P diff strikes but both bought (same direction) → Strangle.
+    strangle = [_leg("BTC-26JUN26-55000-P", "buy", 100),
+                _leg("BTC-26JUN26-68000-C", "buy", 100)]
+    check("P buy + C buy diff strikes → Strangle",
+          classify_structure(strangle) == "Strangle", classify_structure(strangle))
+    # Direction undisclosed on any leg → keep the ambiguous Strangle/RR.
+    undisclosed = [_leg("BTC-26JUN26-55000-P", None, 100),
+                   _leg("BTC-26JUN26-68000-C", "sell", 100)]
+    check("undisclosed direction → Strangle/RR",
+          classify_structure(undisclosed) == "Strangle/RR", classify_structure(undisclosed))
     straddle = [_leg("BTC-26JUN26-60000-P", "buy", 10),
                 _leg("BTC-26JUN26-60000-C", "buy", 10)]
     check("P+C same strike → Straddle", classify_structure(straddle) == "Straddle",
@@ -206,22 +217,63 @@ def test_classify_structure():
     check("both calls diff strikes → Call Spread",
           classify_structure(call_spread) == "Call Spread",
           classify_structure(call_spread))
-    cal = [_leg("BTC-26JUN26-60000-C", "buy", 10),
-           _leg("BTC-3JUL26-60000-C", "sell", 10)]
-    check("diff expiries same strike → Calendar", classify_structure(cal) == "Calendar",
-          classify_structure(cal))
-    # Short straddle + long wings = iron fly. The ≥3-leg check must beat the
-    # C&P branch — this printed as "Strangle/RR" in a live ETH recap.
+    # ── ≥3-leg shape verification ──
+    # 3 distinct strikes, all calls → Call Butterfly (broken wings still count).
+    call_fly = [_leg("BTC-26JUN26-60000-C", "buy", 10),
+                _leg("BTC-26JUN26-65000-C", "sell", 20),
+                _leg("BTC-26JUN26-72000-C", "buy", 10)]
+    check("3 strikes all calls → Call Butterfly",
+          classify_structure(call_fly) == "Call Butterfly", classify_structure(call_fly))
+    # 4 distinct strikes, all puts → Put Condor.
+    put_condor = [_leg("BTC-26JUN26-50000-P", "buy", 10),
+                  _leg("BTC-26JUN26-55000-P", "sell", 10),
+                  _leg("BTC-26JUN26-60000-P", "sell", 10),
+                  _leg("BTC-26JUN26-65000-P", "buy", 10)]
+    check("4 strikes all puts → Put Condor",
+          classify_structure(put_condor) == "Put Condor", classify_structure(put_condor))
+    # Short straddle body + long wings = Iron Fly. The ≥3-leg check must beat
+    # the 2-leg C&P branch — this printed as "Strangle/RR" in a live ETH recap.
     ironfly = [_leg("ETH-16JUL26-1875-C", "sell", 63),
                _leg("ETH-16JUL26-1875-P", "sell", 63),
                _leg("ETH-16JUL26-1925-C", "buy", 63),
                _leg("ETH-16JUL26-1825-P", "buy", 63)]
-    check("4-leg iron fly → Butterfly/Condor",
-          classify_structure(ironfly) == "Butterfly/Condor", classify_structure(ironfly))
-    diag = [_leg("ETH-24JUL26-1900-C", "buy", 6400),
-            _leg("ETH-28AUG26-2100-C", "sell", 6400)]
-    check("2 legs diff expiry+strike → Diagonal", classify_structure(diag) == "Diagonal",
-          classify_structure(diag))
+    check("4-leg, 3-strike, C&P mid → Iron Fly",
+          classify_structure(ironfly) == "Iron Fly", classify_structure(ironfly))
+    # 4 strikes, 2 calls + 2 puts → Iron Condor.
+    ironcondor = [_leg("BTC-26JUN26-55000-P", "buy", 10),
+                  _leg("BTC-26JUN26-60000-P", "sell", 10),
+                  _leg("BTC-26JUN26-70000-C", "sell", 10),
+                  _leg("BTC-26JUN26-75000-C", "buy", 10)]
+    check("4-leg, 4-strike, 2C+2P → Iron Condor",
+          classify_structure(ironcondor) == "Iron Condor", classify_structure(ironcondor))
+    # 3-leg, only 2 distinct strikes, mixed types → not a fly → Multi-leg.
+    not_a_fly = [_leg("BTC-26JUN26-80000-C", "sell", 10),
+                 _leg("BTC-26JUN26-62000-P", "buy", 10),
+                 _leg("BTC-26JUN26-62000-C", "buy", 10)]
+    check("3-leg 2-strike package → Multi-leg",
+          classify_structure(not_a_fly) == "Multi-leg", classify_structure(not_a_fly))
+    # ── Calendars / diagonals ──
+    call_cal = [_leg("BTC-26JUN26-60000-C", "buy", 10),
+                _leg("BTC-3JUL26-60000-C", "sell", 10)]
+    check("diff expiry same strike all calls → Call Calendar",
+          classify_structure(call_cal) == "Call Calendar", classify_structure(call_cal))
+    put_cal = [_leg("BTC-26JUN26-60000-P", "buy", 10),
+               _leg("BTC-3JUL26-60000-P", "sell", 10)]
+    check("diff expiry same strike all puts → Put Calendar",
+          classify_structure(put_cal) == "Put Calendar", classify_structure(put_cal))
+    call_diag = [_leg("ETH-24JUL26-1900-C", "buy", 6400),
+                 _leg("ETH-28AUG26-2100-C", "sell", 6400)]
+    check("2 legs diff expiry+strike, calls → Call Diagonal",
+          classify_structure(call_diag) == "Call Diagonal", classify_structure(call_diag))
+    put_diag = [_leg("ETH-24JUL26-1900-P", "buy", 6400),
+                _leg("ETH-28AUG26-1700-P", "sell", 6400)]
+    check("2 legs diff expiry+strike, puts → Put Diagonal",
+          classify_structure(put_diag) == "Put Diagonal", classify_structure(put_diag))
+    # Cross-expiry, diff strikes, ONE call + ONE put → not a diagonal → Multi-leg.
+    cross = [_leg("ETH-24JUL26-1900-C", "buy", 100),
+             _leg("ETH-28AUG26-1700-P", "sell", 100)]
+    check("cross-expiry C+P diff strikes → Multi-leg",
+          classify_structure(cross) == "Multi-leg", classify_structure(cross))
 
 
 def test_dominant_side():
@@ -251,7 +303,7 @@ def test_summarize_blocks_ranks_and_describes():
     check("largest by notional first (the RR)", top["block_trade_id"] == "RR", top)
     check("largest size is 200 BTC", top["size_btc"] == 200.0, top)
     check("unit size is 100 (per-leg, not leg-sum)", top["unit_size"] == 100.0, top)
-    check("largest classified Strangle/RR", top["structure"] == "Strangle/RR", top)
+    check("largest classified Risk Reversal", top["structure"] == "Risk Reversal", top)
     check("largest is mixed-direction", top["side"] == "Mixed", top)
     check("largest expiry 26JUN26", top["expiry"] == "26JUN26", top)
     check("notional ranks RR above outright", top["notional_usd"] > blocks[1]["notional_usd"], blocks)
