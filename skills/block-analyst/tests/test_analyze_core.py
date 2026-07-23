@@ -11,6 +11,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 import analyze_core as ac  # noqa: E402
+import analyze as az  # noqa: E402 — stdlib-only; imported for _struct_name (display names)
 
 _p = _f = 0
 
@@ -232,6 +233,40 @@ ok(_rroff["val"] == -6.0 and _rroff["sign"] == -1, "RRPut package offset = -6 bp
 # net_cash sign: BUY positive, SELL negative, ×qty
 ok(ac.net_cash([{"SIDE": "BUY", "PRICE": 2.9, "QTY": 10}]) == 29.0, "net_cash BUY debit")
 ok(ac.net_cash([{"SIDE": "SELL", "PRICE": 2.9, "QTY": 10}]) == -29.0, "net_cash SELL credit")
+
+# ── display names — DRFQ vocabulary (Butterfly family, typed calendars) ────────
+# Names must match the DRFQ StrategyCodeEnum table (rfq-trader references/
+# instruments.md): "Call/Put/Iron Butterfly" (never "Fly"), calendars typed C/P.
+ok(az._struct_name("BF", ac.parse_description("CFly 3 Jul 26 58000/60000/62000")["legs"])
+   == "Call Butterfly", "CFly → Call Butterfly (not Call Fly)")
+ok(az._struct_name("BF", ac.parse_description("PFly 27 Mar 26 40000/50000/60000")["legs"])
+   == "Put Butterfly", "PFly → Put Butterfly (not Put Fly)")
+ok(az._struct_name("BF", ac.parse_description("IFly 3 Jul 26 58000/60000/62000")["legs"])
+   == "Iron Butterfly", "IFly (2P+2C legs) → Iron Butterfly (not Iron Fly)")
+ok(az._struct_name("CA", ac.parse_description("CCal 10 Jul 26 63000 / 31 Jul 26 63000")["legs"])
+   == "Call Calendar", "CCal → typed Call Calendar (not bare Calendar)")
+ok(az._struct_name("CA", ac.parse_description("PCal 26 Dec 25 86000 / 27 Mar 26 86000")["legs"])
+   == "Put Calendar", "PCal → typed Put Calendar")
+# cross-expiry pair with DIFFERENT strikes is a diagonal, not a calendar
+ok(az._struct_name("CA", ac.parse_description("PCal 26 Dec 25 86000 / 27 Mar 26 85000")["legs"])
+   == "Put Diagonal", "PCal with two strikes → Put Diagonal")
+ok(az._struct_name("CM", []) == "Custom", "CM → Custom (the unnamed-package bucket)")
+# per-leg-rows ("combo") path — signs from row SIDE, names match options-recap:
+# same-strike C&P traded opposite ways is a synthetic forward → "Combo", not RR
+syn = ac.legs_from_rows([
+    {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Call 31 Jul 26 60000", "SIDE": "BUY", "PRICE": 0.05, "QTY": 100},
+    {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 31 Jul 26 60000", "SIDE": "SELL", "PRICE": 0.04, "QTY": 100}])
+ok(az._struct_name("combo", syn) == "Combo", "per-leg same-strike C&P opposite ways → Combo (synthetic)")
+# C&P at different strikes traded opposite ways stays a Risk Reversal
+rrl = ac.legs_from_rows([
+    {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 31 Jul 26 50000", "SIDE": "BUY", "PRICE": 0.0091, "QTY": 200},
+    {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Call 31 Jul 26 70000", "SIDE": "SELL", "PRICE": 0.0037, "QTY": 200}])
+ok(az._struct_name("combo", rrl) == "Risk Reversal", "per-leg C&P diff strikes opposite ways → Risk Reversal")
+# a calendar stored as per-leg rows gets its typed name, not the Combo bucket
+cal = ac.legs_from_rows([
+    {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Call 10 Jul 26 63000", "SIDE": "SELL", "PRICE": 0.0065, "QTY": 200},
+    {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Call 31 Jul 26 63000", "SIDE": "BUY", "PRICE": 0.0251, "QTY": 200}])
+ok(az._struct_name("combo", cal) == "Call Calendar", "per-leg cross-expiry same-strike calls → Call Calendar")
 
 # ── fallbacks for unmapped structures ──────────────────────────────────────────
 # a description that lists explicit legs (even under an unknown name) → extractable

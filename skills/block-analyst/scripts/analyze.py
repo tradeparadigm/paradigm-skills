@@ -274,8 +274,11 @@ def _leg_lbl(l, multi_exp):
 
 
 def _struct_name(code, legs):
-    """Human structure name; condor/fly reflect leg composition (a 4-call block is a
-    Call Condor, not an Iron Condor). Perp/future leg noted."""
+    """Human structure name in the DRFQ StrategyCodeEnum vocabulary (rfq-trader
+    references/instruments.md): Butterfly family (never "Fly"), typed calendars.
+    Condor/butterfly reflect leg composition (a 4-call block is a Call Condor, not
+    an Iron Condor); a cross-expiry pair with different strikes is a Diagonal.
+    Perp/future leg noted."""
     opt = [l for l in legs if l["cp"] != "FUT"]
     perp = " + perp" if any(l["cp"] == "FUT" for l in legs) else ""
     allc = bool(opt) and all(l["cp"] == "C" for l in opt)
@@ -283,14 +286,33 @@ def _struct_name(code, legs):
     if code == "CO":
         base = "Call Condor" if allc else "Put Condor" if allp else "Iron Condor"
     elif code == "BF":
-        base = "Call Fly" if allc else "Put Fly" if allp else "Iron Fly"
+        base = "Call Butterfly" if allc else "Put Butterfly" if allp else "Iron Butterfly"
+    elif code == "CA":
+        kind = "Calendar" if len({l["strike"] for l in opt}) <= 1 else "Diagonal"
+        base = f"Call {kind}" if allc else f"Put {kind}" if allp else kind
     elif code == "combo":
-        base = ("Risk Reversal" if (any(l["cp"] == "C" for l in opt) and any(l["cp"] == "P" for l in opt)
-                                    and len(opt) == 2) else "Combo")
+        # per-leg-rows package: signs are exact (row SIDE), so name 2-leg shapes
+        # with the same vocabulary options-recap uses (same-strike C&P traded
+        # opposite ways = synthetic forward = "Combo").
+        base = "Combo"
+        if len(opt) == 2:
+            a, b = sorted(opt, key=lambda l: l["strike"])
+            cps = {a["cp"], b["cp"]}
+            same_k = a["strike"] == b["strike"]
+            same_e = a.get("expiry_c") == b.get("expiry_c")
+            opp = (a["sign"] or 0) * (b["sign"] or 0) < 0
+            if cps == {"C", "P"} and same_e:
+                base = (("Combo" if opp else "Straddle") if same_k
+                        else ("Risk Reversal" if opp else "Strangle"))
+            elif len(cps) == 1 and not same_e:
+                kind = "Calendar" if same_k else "Diagonal"
+                base = f"{'Call' if cps == {'C'} else 'Put'} {kind}"
+            elif len(cps) == 1 and not same_k:
+                base = f"{'Call' if cps == {'C'} else 'Put'} Spread"
     else:
         base = {"CL": "Call", "PL": "Put", "ST": "Straddle", "SN": "Strangle",
                 "CS": "Call Spread", "PS": "Put Spread",
-                "RR": "Risk Reversal", "CA": "Calendar", "CM": "Custom"}.get(code, code)
+                "RR": "Risk Reversal", "CM": "Custom"}.get(code, code)
     return base + perp
 
 

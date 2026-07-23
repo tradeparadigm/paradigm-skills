@@ -79,8 +79,8 @@ Paradigm across Deribit, Paradex, and Bybit.
 - Call Spread: `CSpd 27 Mar 26 85000/110000`
 - Put Spread: `PSpd 16 Jan 26 95000/93000`
 - Risk Reversal: `RRCall 30 Jan 26 70000/108000`
-- Iron Fly: `IFly 26 Jun 26 75000/85000/95000`
-- Put Fly: `PFly 27 Mar 26 60000/50000/40000`
+- Iron Butterfly: `IFly 26 Jun 26 75000/85000/95000`
+- Put Butterfly: `PFly 27 Mar 26 60000/50000/40000`
 - Call Calendar: `CCal 27 Feb 26 75000 / 26 Jun 26 75000`
 - Put Calendar: `PCal 26 Dec 25 86000 / 27 Mar 26 85000`
 - Custom multi-leg: `Cstm +1.00 Call 24 Apr 26 78000 -2.00 Call 24 Apr 26 85000`

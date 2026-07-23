@@ -8,13 +8,13 @@ Maps `strategy_code` field values from the Paradigm block trade JSON to structur
 | `PL` | Outright Put | Single put option leg |
 | `SN` | Strangle | OTM call + OTM put, same expiry, different strikes |
 | `ST` | Straddle | ATM call + ATM put, same expiry, same strike |
-| `BF` | Butterfly | Three-strike spread (long wings, short body or vice versa) |
+| `BF` | Butterfly | Three-strike spread (long wings, short body or vice versa); displayed as Call/Put/Iron Butterfly per leg composition |
 | `CO` | Condor | Four-strike spread; wider wings than butterfly |
 | `CA` | Calendar | Same strike, different expiries (long back / short front or reverse) |
 | `CCal` | Call Calendar | Calendar built from calls (tape `DESCRIPTION` prefix `CCal`) |
 | `PCal` | Put Calendar | Calendar built from puts (tape `DESCRIPTION` prefix `PCal`) |
 | `RR` | Risk Reversal | Long OTM call + short OTM put (or reverse), same expiry |
-| `CM` | Custom Multi-leg | Arbitrary combination not covered by named structures |
+| `CM` | Custom | Arbitrary multi-leg combination not covered by named structures (DRFQ code `CM`) |
 
 **Calendar direction (tape `DESCRIPTION` lists near expiry first, far second):**
 - `SIDE=BUY` → **long calendar**: long far / short near, pays debit, long vega, short near-gamma.
