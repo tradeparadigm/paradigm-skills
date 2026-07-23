@@ -5,11 +5,11 @@
     {
       "id": 1,
       "prompt": "/recap btc options 8h",
-      "expected_output": "A BTC options recap for the last 8 hours in the fixed 4-section format: (1) Snapshot yaml block — Spot, DVOL open→close, RV 7d, VRP, Volume, P/C; (2) Biggest Print — single largest block one-liner; (3) Block Flow table — numbered rows with Structure, Notl, Detail columns; (4) Vol Surface — skew/term line + expiry table (ATM, 25d RR, Fly). Data labeled as estimated when live tools unavailable.",
+      "expected_output": "A BTC options recap for the last 8 hours in the fixed 4-section format: (1) Snapshot yaml block — Spot, DVOL open→close, RV 7d, VRP, Volume, P/C; (2) Biggest Print — single largest block one-liner (venue named as via Paradigm/<venue>); (3) Block Flow table — numbered rows with Structure, Venue, Notl, Blocks, Detail columns; (4) Vol Surface — skew/term line + expiry table (ATM, 25d RR, Fly). Data labeled as estimated when live tools unavailable.",
       "assertions": [
         "Response includes a Snapshot section as a code block with Spot, DVOL, RV 7d, VRP, Volume, and P/C fields",
         "Response includes a Biggest Print section with a single largest block identified",
-        "Response includes a Block Flow section with a numbered table (Structure, Notl, Detail columns)",
+        "Response includes a Block Flow section with a numbered table (Structure, Venue, Notl, Blocks, Detail columns)",
         "Response includes a Vol Surface section with a skew/term summary line and a table showing ATM, 25d RR, and Fly per expiry",
         "Response does NOT include a Themes section, a dealer positioning line, or a Bottom Line section — those have been removed from the format",
         "Response clearly labels any data as estimated or simulated when live tools are unavailable — does not present fabricated numbers as confirmed live data"

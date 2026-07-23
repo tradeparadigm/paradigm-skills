@@ -6,25 +6,28 @@
 """
 recap.py — single-call orchestrator for the options recap.
 
-ONE invocation does the entire recap: it fetches the Deribit tape (7d closes +
-window option trades with concurrent, time-sliced pagination — no serial
-backfill), ingests the hot-surface CSVs the DuckDB step wrote, runs the vol
-math (realized-vs-implied, block clustering/ranking, vol-surface skew/term),
-and prints ONE JSON object whose fields map 1:1 to the four output sections.
+ONE invocation does the entire recap: it fetches the Deribit 7d closes (the
+realized-vol input), ingests the DuckDB-written CSVs (hot surface + the
+multi-venue block tape), runs the vol math (realized-vs-implied, block
+ranking/rollup, vol-surface skew/term), and prints ONE JSON object whose fields
+map 1:1 to the four output sections.
 
 The agent runs this once and renders the four sections from the JSON. It must
 not paginate, merge, cluster, or hand-assemble a snapshot — all of that is here.
 
 Pipeline (concurrent where independent):
-  • Deribit 7d hourly closes        → realized vol
-  • Deribit window option trades    → $ Volume, biggest print + block flow legs
-  • hot CSVs in --csv-dir (DuckDB)  → DVOL/spot OHLC, activity+P/C trade counts,
-                                      vol surface (markIV/delta per strike)
+  • Deribit 7d hourly closes        → realized vol (no non-Deribit source)
+  • blocks.csv (DuckDB, tape)       → Biggest Print + Block Flow, across ALL
+                                      venues Paradigm brokers (Deribit/Paradex/
+                                      Bullish/…), notional already in USD per leg
+  • hot CSVs in --csv-dir (DuckDB)  → DVOL/spot OHLC, $ Volume, activity+P/C
+                                      trade counts, vol surface (markIV/delta)
 
-Hot CSVs are authoritative for DVOL/spot/activity/P-C/surface. The Volume $
-figure is tape-PRIMARY (the hot rollup head-lags the tape ~10-15 min and only
-serves as fallback); Deribit also supplies the 7d realized-vol input and block
-leg detail (hot never carries those).
+Hot CSVs are authoritative for DVOL/spot/$Volume/activity/P-C/surface. Biggest
+Print + Block Flow come from the Paradigm block tape (paradigm_trade_tape_slim)
+— multi-venue, S3-sourced, no live exchange API. The tape carries no IV, so the
+top blocks' IV is looked up from the vol surface (Deribit legs only). Deribit
+still supplies the 7d realized-vol closes; nothing else hits an exchange API.
 
 Usage:
     uv run scripts/recap.py --asset btc --window 8h --csv-dir /tmp/recap
@@ -39,24 +42,20 @@ On any single-source failure the affected fields are null and a line is added to
 import argparse
 import csv
 import json
-import math
 import os
 import subprocess
 import sys
 import urllib.request
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
 sys.path.insert(0, os.path.dirname(__file__))
 from vol_math import (  # noqa: E402
     realized_vs_implied,
-    cluster_blocks,
-    summarize_blocks,
-    aggregate_clips,
+    build_tape_blocks,
     compute_vol_surface,
-    classify_structure,
     RV_LOOKBACK_DAYS,
 )
 
@@ -103,55 +102,16 @@ def fetch_7d_closes(asset: str, end_ms: int) -> list[float]:
     return res.get("close") or []
 
 
-def _fetch_trade_slice(asset: str, start_ms: int, end_ms: int, depth: int = 0) -> list[dict]:
-    """Fetch every option trade in [start_ms, end_ms]. Deribit caps a response
-    at 1000 trades; when a slice overflows (`has_more`) we bisect it and fetch
-    the halves concurrently. Time-slicing removes the serial cursor dependency
-    that made the old runbook backfill page-by-page."""
-    res = _get("get_last_trades_by_currency", {
-        "currency": asset, "kind": "option", "count": 1000,
-        "start_timestamp": start_ms, "end_timestamp": end_ms, "sorting": "desc",
-    })
-    trades = res.get("trades") or []
-    if res.get("has_more") and depth < 8 and end_ms - start_ms > 60_000:
-        mid = (start_ms + end_ms) // 2
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            halves = list(ex.map(
-                lambda se: _fetch_trade_slice(asset, se[0], se[1], depth + 1),
-                [(start_ms, mid), (mid + 1, end_ms)],
-            ))
-        for h in halves:
-            trades.extend(h)
-    return trades
-
-
-def fetch_window_trades(asset: str, start_ms: int, end_ms: int) -> list[dict]:
-    """Concurrent, time-sliced fetch of the whole window, deduped by trade_id."""
-    span_h = (end_ms - start_ms) / 3600_000
-    n_slices = 1 if span_h <= 2 else min(24, max(2, round(span_h)))
-    edges = [start_ms + round(i * (end_ms - start_ms) / n_slices) for i in range(n_slices + 1)]
-    slices = [(edges[i] + (1 if i else 0), edges[i + 1]) for i in range(n_slices)]
-    out: list[dict] = []
-    with ThreadPoolExecutor(max_workers=min(8, len(slices))) as ex:
-        futs = [ex.submit(_fetch_trade_slice, asset, s, e) for s, e in slices]
-        for f in as_completed(futs):
-            out.extend(f.result())
-    dedup = {t["trade_id"]: t for t in out}
-    return list(dedup.values())
-
-
 def fetch_deribit(asset: str, start_ms: int, end_ms: int, want_market: bool) -> dict:
-    """Always: 7d closes + window trades. If want_market (no S3), also DVOL,
-    spot OHLC and a vol-surface ticker set so the pipeline runs end-to-end."""
-    res: dict = {"closes_7d": [], "trades": [], "market": None}
+    """Always: 7d closes (the realized-vol input; no non-Deribit source). If
+    want_market (no S3), also DVOL, spot OHLC and a vol-surface ticker set so the
+    pipeline runs end-to-end. Block flow no longer comes from here — it's the
+    multi-venue Paradigm tape (blocks.csv), so no window-trade fetch."""
+    res: dict = {"closes_7d": [], "market": None}
     try:
         res["closes_7d"] = fetch_7d_closes(asset, end_ms)
     except Exception as e:
         warn(f"deribit 7d closes failed: {e}")
-    try:
-        res["trades"] = fetch_window_trades(asset, start_ms, end_ms)
-    except Exception as e:
-        warn(f"deribit trades failed: {e}")
     if want_market:
         try:
             res["market"] = _fetch_market_fallback(asset, start_ms, end_ms)
@@ -381,120 +341,16 @@ def _load_surface_tickers(csv_dir: str, name: str, asset: str | None = None) -> 
     return out
 
 
-# ── Block-flow leg detail ───────────────────────────────────────────────────
+# ── Block tape (paradigm_trade_tape_slim) ───────────────────────────────
 
-def _strike_label(raw: str) -> str:
-    """Compact strike text. Strikes of 10K+ abbreviate (68000 → 68K, 62500 →
-    62.5K, matching how big strikes are spoken); anything below 10K stays raw.
-    The threshold is magnitude, not divisibility: an earlier lossless rule
-    rendered ETH 2000 as "2K" beside raw 1875/2100 in the same table (mixed
-    conventions), and before that 1825/1875/1925 all truncated to "1K"."""
-    if not raw.isdigit():
-        return raw
-    v = int(raw)
-    if v < 10_000:
-        return str(v)
-    if v % 1000 == 0:
-        return f"{v // 1000}K"
-    return f"{v / 1000:g}K"
-
-
-def _leg_phrase(legs: list[dict], size: float | None = None,
-                iv_label: str | None = None) -> str:
-    """One-line human detail for a block cluster, e.g.
-    'sold 75KC / bought 90KC x150 42.3v', or, for a multi-expiry block,
-    'sold 27JUN26 65KC / bought 25JUL26 65KC x30'.
-
-    Directional verbs come from the per-leg taker `direction` field. If any leg
-    lacks one, no direction is asserted: legs render neutrally ('75KC vs 90KC')
-    tagged "two-way" — the desk term for an undisclosed side, which must never
-    appear next to bought/sold. `size`/`iv_label` override the single-cluster
-    values when the row aggregates several clips of a worked order (iv_label
-    then carries the clip range, e.g. '36.5–37.0')."""
-    directional = all(l.get("direction") in ("buy", "sell") for l in legs)
-    # When the block spans more than one expiry (calendar/diagonal), strike+type
-    # alone collapses distinct legs to the same label ('65KC / 65KC') — the expiry
-    # IS the differentiator, so prefix each leg with it. Same-expiry structures
-    # (straddle/strangle/spread/fly) don't need it: strike+type is unambiguous and
-    # the expiry would just be repeated noise.
-    multi_exp = len({leg["instrument_name"].split("-")[1] for leg in legs
-                     if len(leg["instrument_name"].split("-")) >= 2}) > 1
-    parts = []
-    for leg in sorted(legs, key=lambda l: -l.get("amount", 0))[:4]:
-        seg = leg["instrument_name"].split("-")
-        if len(seg) < 4:
-            continue
-        strike_k = _strike_label(seg[2])
-        label = f"{seg[1]} {strike_k}{seg[3]}" if multi_exp else f"{strike_k}{seg[3]}"
-        if directional:
-            verb = "bought" if leg["direction"] == "buy" else "sold"
-            parts.append(f"{verb} {label}")
-        else:
-            parts.append(label)
-    if size is None:
-        # Structure UNIT size (base-leg count), matching summarize_blocks'
-        # unit_size — never the leg-sum, which overstates a 4-leg fly 4×.
-        by_inst: dict[str, float] = defaultdict(float)
-        for l in legs:
-            by_inst[l["instrument_name"]] += l.get("amount", 0)
-        size = round(min(by_inst.values()), 1) if by_inst else 0
-    if iv_label is None:
-        ivs = [l["iv"] for l in legs if l.get("iv") is not None]
-        iv_label = f"{round(sum(ivs) / len(ivs), 1)}" if ivs else None
-    iv = f" {iv_label}v" if iv_label else ""
-    joiner = " / " if directional else " vs "
-    tag = "" if directional else " two-way"
-    return f"{joiner.join(parts)} x{size:g}{tag}{iv}".strip()
-
-
-def _iv_label(b: dict) -> str | None:
-    """IV text for a (possibly clip-aggregated) block-flow row: the clip range
-    '36.5–37.0' when a worked order printed at different vols, else one value."""
-    lo, hi = b.get("iv_lo"), b.get("iv_hi")
-    if lo is not None and hi is not None and lo != hi:
-        return f"{lo}–{hi}"
-    if b.get("avg_iv") is not None:
-        return f"{b['avg_iv']}"
-    return None
-
-
-def build_block_flow(trades: list[dict], hot: dict, spot: float | None,
-                     top_n: int = 8, min_btc: float = 5.0) -> dict:
-    clusters = cluster_blocks(trades)
-    # Two granularities, both surfaced: tape BLOCKS (block_trade_ids ≥min_btc)
-    # and STRUCTURES (clips of one worked order grouped by leg signature).
-    # Rows are structures; the Blocks column carries each row's print count, so
-    # header and table reconcile by construction. One ≥min_btc basis for
-    # everything — the hot block.csv has unit-corrupt rows (one block at $5B),
-    # so the tape clustering is the only source we trust here.
-    ranked_all = summarize_blocks(clusters, top_n=10**9, min_btc=min_btc)
-    grouped = aggregate_clips(ranked_all, clusters)
-    rows = []
-    for i, b in enumerate(grouped[:top_n], 1):
-        legs = clusters.get(b["block_trade_id"], [])
-        exp = b.get("expiry") or ""
-        rows.append({
-            "rank": i,
-            "structure": f"{exp} {b['structure']}".strip(),
-            "notl_m": round(b["notional_usd"] / 1e6, 1),
-            "blocks": b["clip_count"],
-            "detail": _leg_phrase(legs, size=b["unit_size"], iv_label=_iv_label(b)),
-            "side": b["side"], "avg_iv": b["avg_iv"], "time_utc": b["time_utc"],
-        })
-    total_usd = sum(b["notional_usd"] for b in ranked_all)
-    biggest = None
-    if ranked_all:
-        b0 = ranked_all[0]  # largest single print, not the clip aggregate
-        biggest = {
-            "expiry": b0.get("expiry"), "structure": b0["structure"],
-            "size": b0["unit_size"], "notional_m": round(b0["notional_usd"] / 1e6, 1),
-            "time_utc": b0["time_utc"], "side": b0["side"], "avg_iv": b0["avg_iv"],
-        }
-    return {
-        "total_m": round((total_usd or 0) / 1e6, 1),
-        "n_blocks": len(ranked_all), "n_structures": len(grouped),
-        "rows": rows, "biggest_print": biggest,
-    }
+def load_blocks(csv_dir: str) -> list[dict]:
+    """Read blocks.csv — the window\'s option block legs from the Paradigm tape
+    (paradigm_trade_tape_slim), one row per leg, across every venue. Missing file
+    → [] (Biggest Print / Block Flow then read No data), never a crash."""
+    rows = _read_csv(csv_dir, "blocks.csv")
+    if not rows:
+        warn("blocks.csv missing/empty — Biggest Print / Block Flow unavailable")
+    return rows
 
 
 # ── Assembly ────────────────────────────────────────────────────────────────
@@ -551,19 +407,27 @@ def spot_vol_label(spot_open, spot_close, dvol_open, dvol_close):
     return "vol faded with spot"
 
 
-def tape_deribit_volume_usd(trades):
-    """Deribit $ volume straight from the window tape — every trade carries amount +
-    index_price. The hot aggregates file head-lags the tape by ~10-15 min (measured
-    2026-07-15), so on a thin window it misses the newest prints and Volume could fall
-    BELOW the same reply's block-flow total. The tape is already fetched for Block Flow,
-    is Deribit-scoped (same universe as the line's "Deribit only" label), and prices each
-    trade at its prevailing index instead of one end-of-window spot."""
-    total = sum((t.get("amount") or 0) * (t.get("index_price") or 0) for t in trades)
-    return total or None
+def _blocks_asof_ms(block_rows: list[dict]) -> int | None:
+    """Newest block-leg timestamp (ms) from blocks.csv DATE+TIME (UTC). Drives the
+    tape-freshness stamp: the Paradigm tape is S3-sourced, so the recap discloses
+    how current the block section is rather than implying it's live to the second."""
+    newest = None
+    for r in block_rows or []:
+        d, t = r.get("DATE"), r.get("TIME")
+        if not d:
+            continue
+        try:
+            dt = datetime.strptime(f"{d} {(t or '00:00:00')[:8]}",
+                                   "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        ms = int(dt.timestamp() * 1000)
+        newest = ms if newest is None else max(newest, ms)
+    return newest
 
 
 def build(asset: str, window: str, start_ms: int, end_ms: int,
-          deri: dict, hot: dict) -> dict:
+          deri: dict, hot: dict, block_rows: list[dict] | None = None) -> dict:
     asset = asset.upper()
     mkt = deri.get("market")
     window_h = (end_ms - start_ms) / 3600_000
@@ -593,16 +457,14 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
 
     rv = realized_vs_implied(deri.get("closes_7d") or [], dvol_close)
 
-    # Volume ($) is Deribit-scoped. The window tape is PRIMARY — every trade carries
-    # amount + index_price, so it prices each print at its prevailing index and never
-    # head-lags the live prints the way the hot rollup does (~10-15 min measured). The
-    # hot BTC×spot figure is the fallback when the tape is empty. hot volume.csv is
-    # still authoritative for Activity + P/C below (trade_count), so it's read either way.
-    trades = deri.get("trades") or []
-    vol_usd = tape_deribit_volume_usd(trades)
-    if vol_usd is None:
-        vol_btc = hot.get("volume_btc")
-        vol_usd = vol_btc * spot if (vol_btc and spot) else None
+    # Volume ($) is Deribit-scoped, from the hot rollup: call+put BTC volume × spot.
+    # (Only Deribit is reliably priced 1 contract = 1 BTC; volume_sum units differ by
+    # venue and notional_usd isn't yet cross-venue-normalized, so the line stays
+    # Deribit-scoped.) The rollup head-lags the live tape ~10-15 min, so a very thin
+    # window may under-count the newest prints — an accepted trade-off now that Block
+    # Flow is the multi-venue Paradigm tape, a different universe from this line.
+    vol_btc = hot.get("volume_btc")
+    vol_usd = vol_btc * spot if (vol_btc and spot) else None
     # Activity + P/C use trade_count — unit-free, so they span ALL venues truthfully.
     pt, ct = hot.get("put_trades"), hot.get("call_trades")
     pc = round(pt / ct, 2) if pt and ct else None
@@ -635,33 +497,34 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
             if tickers else None)
     surf_open = compute_vol_surface(vs_open, surf_spot) if vs_open else None
 
-    block = build_block_flow(trades, hot, spot)
+    # Biggest Print + Block Flow: the multi-venue Paradigm block tape (blocks.csv),
+    # ranked/rolled-up in vol_math. Notional is USD per leg on the tape, so this path
+    # does no cross-venue normalization. IV isn't on the tape, so annotate the top
+    # blocks from the vol surface — Deribit legs only (the surface is Deribit-scoped);
+    # non-Deribit venues show IV n/a.
+    def iv_lookup(cp: str, strike: int, expiry_c: str):
+        t = (vs_now or {}).get(f"{asset}-{expiry_c}-{int(strike)}-{cp}")
+        return t.get("mark_iv") if t else None
 
-    # Internal-consistency tripwire: blocks are a subset of tape volume, so Volume can
-    # never legitimately read below the same reply's block-flow total. UNREACHABLE with
-    # a real tape — block flow is built from the SAME `trades`, and an empty tape zeroes
-    # both sides — so this defends only a future regression (e.g. someone re-inverting
-    # the source priority). Floor to the next whole million so the invariant survives
-    # Volume's integer-million rounding vs Block Flow's 0.1M rendering.
-    if vol_usd is not None and block["total_m"] * 1e6 > vol_usd:
-        warn(f"volume ${vol_usd / 1e6:.1f}M below block-flow total ${block['total_m']}M "
-             "— flooring Volume at block total (stale hot rollup?)")
-        vol_usd = math.ceil(block["total_m"]) * 1e6
+    # Defense in depth: the DuckDB query already scopes blocks.csv to this asset,
+    # but drop any stray other-asset row (PRODUCT '<ASSET> OPTION - …') before
+    # ranking — a leaked ETH row must never win a BTC recap's Biggest Print.
+    own_blocks = [r for r in (block_rows or [])
+                  if (r.get("PRODUCT") or "").upper().startswith(f"{asset} ")]
+    dropped = len(block_rows or []) - len(own_blocks)
+    if dropped:
+        warn(f"blocks.csv: dropped {dropped} non-{asset} rows — cross-asset contamination?")
+    block = build_tape_blocks(own_blocks, iv_lookup=iv_lookup)
 
-    # Flow-horizon check. The flow sections only reach back ~24h: Volume / Activity /
-    # P/C come from the rolling recap-aggregates file (trailing 24h) and Biggest
-    # Print / Block Flow from the Deribit public tape (also ~24h retention); DVOL/spot
-    # (OHLC) and the vol surface (v_vol_surface) retain much longer. So for a window
-    # past that horizon the flow sections silently cover less than the header claims.
-    # The tape's oldest trade is the tightest available proxy for the covered span
-    # (both flow sources cap near 24h). Surface a banner (render_md). Cleared
-    # automatically once >24h flow is sourced from the cold store.
-    flow_horizon = None
-    if window_h > 24 and trades:
-        oldest = min(t.get("timestamp") or end_ms for t in trades)
-        covered_h = (end_ms - oldest) / 3600_000
-        if window_h - covered_h > 2:
-            flow_horizon = {"covered_h": round(covered_h), "window_h": round(window_h)}
+    # Tape-freshness stamp. The block tape is S3-sourced (near-real-time but not
+    # live-to-the-second), so disclose how current the block section is instead of
+    # implying it matches the window end exactly. Also a >24h flag: Volume/Activity/
+    # P-C/DVOL/spot come from the ~24h hot rollup, so a longer window under-covers
+    # them (run_recap caps at 24h; this defends a direct >24h call).
+    asof_ms = _blocks_asof_ms(own_blocks)
+    blocks_asof = fmt_hhmm(asof_ms) if asof_ms else None
+    blocks_lag_min = round((end_ms - asof_ms) / 60000) if asof_ms else None
+    hot_horizon = round(window_h) if window_h > 24 else None
 
     snapshot = {
         "spot": round(spot) if spot else None,
@@ -719,9 +582,10 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "snapshot": snapshot,
         "biggest_print": block["biggest_print"],
         "block_flow": {"total_m": block["total_m"], "n_blocks": block["n_blocks"],
-                       "n_structures": block["n_structures"], "rows": block["rows"]},
+                       "n_structures": block["n_structures"], "rows": block["rows"],
+                       "asof_utc": blocks_asof, "lag_min": blocks_lag_min},
         "vol_surface": surface_out,
-        "flow_horizon": flow_horizon,
+        "hot_horizon": hot_horizon,
         "warnings": WARNINGS,
     }
 
@@ -769,15 +633,13 @@ def render_md(r: dict) -> str:
         L.append("⚠ hot surface unavailable — affected sections read No data")
         L.append("")
 
-    # >24h window: the flow sections only reach back ~24h (rolling recap-aggregates
-    # file + Deribit tape both cap near 24h), while DVOL/spot/surface span the full
-    # window. Flag it so the header isn't read as covering the whole window for flow.
-    # Goes away once >24h flow comes from the cold store.
-    fh = r.get("flow_horizon")
-    if fh:
-        L.append(f"⚠ Volume · Activity · Biggest Print · Block Flow cover "
-                 f"~{fh['covered_h']}h (~24h flow-data horizon); DVOL/spot/surface "
-                 f"span the full {fh['window_h']}h.")
+    # >24h window: Volume/Activity/P-C/DVOL/spot come from the ~24h hot rollup, so
+    # they under-cover a longer window while Block Flow (Paradigm tape) and the
+    # surface span it fully. run_recap caps at 24h; this defends a direct >24h call.
+    hh = r.get("hot_horizon")
+    if hh:
+        L.append(f"⚠ Volume · Activity · P/C · DVOL/spot cover ~24h (hot-rollup "
+                 f"horizon); Block Flow and surface span the full {hh}h.")
         L.append("")
 
     L.append(f"**{h['asset']} Options · {h['window']} Recap · "
@@ -829,35 +691,43 @@ def render_md(r: dict) -> str:
     pc = f"{s['pc_ratio']}x" if s.get("pc_ratio") is not None else "n/a"
     pc_desc = f"{s['pc_descriptor']} " if s.get("pc_descriptor") else ""
     L.append(f"{'P/C':<9} {pc:<11} {pc_desc}(all venues, by trades)")
-    L += ["```", "", "**Biggest Print**", "", "```yaml"]
+    L += ["```", "", "**Biggest Print — Paradigm block flow**", "", "```yaml"]
 
     if bp:
-        # dominant_side's "Mixed" is a structure fact (legs point both ways),
-        # not an aggressor read — don't put it in the side slot.
+        # "Mixed" is a structure fact (legs point both ways), not an aggressor
+        # read — don't put it in the side slot. Venue names the executing venue
+        # for this Paradigm-brokered block (Deribit/Paradex/Bullish/…).
         tags = [bp["side"]] if bp.get("side") in ("Buy", "Sell") else []
         if bp.get("avg_iv") is not None:
             tags.append(f"{bp['avg_iv']}v avg")
         tag_txt = f" ({', '.join(tags)})" if tags else ""
         L.append(f"{bp['expiry']} {bp['structure']}   {bp['size']:g}x   "
                  f"${bp['notional_m']}M   {bp['time_utc']} UTC   "
-                 f"via Paradigm/Deribit{tag_txt}")
+                 f"via Paradigm/{bp.get('venue') or '?'}{tag_txt}")
     else:
         L.append("No data")
     n_struct = bf.get("n_structures", len(bf["rows"]))
     struct_word = "structure" if n_struct == 1 else "structures"
     block_word = "block" if bf["n_blocks"] == 1 else "blocks"
     trunc = f" (top {len(bf['rows'])} by notional)" if n_struct > len(bf["rows"]) else ""
+    # S3-tape freshness stamp: disclose how current the block section is (the tape
+    # is near-real-time but not live), and flag a material lag when present.
+    asof = (f" · tape through {bf['asof_utc']} UTC" if bf.get("asof_utc") else "")
+    if bf.get("lag_min") and bf["lag_min"] >= 90:
+        asof += f" ({round(bf['lag_min'] / 60)}h behind)"
     # Structure column stretches to the longest label in this window (typed
     # labels like "24JUL26/31JUL26 Call Diagonal" overflow a fixed 27).
     sw = max([27] + [len(row["structure"]) + 2 for row in bf["rows"]])
-    L += ["```", "", f"**Block Flow — ${bf['total_m']}M / {bf['n_blocks']} {block_word} / "
-          f"{n_struct} {struct_word}{trunc}**",
-          "", "```yaml", f"{'#':<3}{'Structure':<{sw}}{'Notl':<9}{'Blocks':<8}Detail",
-          f"{'-':<3}{'-' * (sw - 2):<{sw}}{'-' * 7:<9}{'-' * 6:<8}{'-' * 44}"]
+    vw = max([8] + [len(row.get("venue") or "") + 2 for row in bf["rows"]])
+    L += ["```", "", f"**Block Flow (Paradigm RFQ) — ${bf['total_m']}M / {bf['n_blocks']} {block_word} / "
+          f"{n_struct} {struct_word}{trunc}{asof}**",
+          "", "```yaml",
+          f"{'#':<3}{'Structure':<{sw}}{'Venue':<{vw}}{'Notl':<9}{'Blocks':<8}Detail",
+          f"{'-':<3}{'-' * (sw - 2):<{sw}}{'-' * (vw - 2):<{vw}}{'-' * 7:<9}{'-' * 6:<8}{'-' * 40}"]
     for row in bf["rows"]:
         notl = f"${row['notl_m']}M"
-        L.append(f"{str(row['rank']):<3}{row['structure']:<{sw}}{notl:<9}"
-                 f"{str(row.get('blocks', 1)):<8}{row['detail']}")
+        L.append(f"{str(row['rank']):<3}{row['structure']:<{sw}}{(row.get('venue') or ''):<{vw}}"
+                 f"{notl:<9}{str(row.get('blocks', 1)):<8}{row['detail']}")
     L += ["```", "", "**Vol Surface**"]
 
     if vs and vs.get("rows"):
@@ -903,13 +773,15 @@ def main() -> None:
     now_ms = args.now_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = now_ms - parse_window_ms(args.window)
 
+    block_rows: list[dict] = []
     if args.no_s3:
-        # Offline/local: no hot CSVs; Deribit supplies DVOL/spot/surface too.
+        # Offline/local: no hot CSVs or block tape; Deribit supplies DVOL/spot/
+        # surface. Block flow is empty (No data) since it's S3-only now.
         hot = {"tickers": {}}
         deri = fetch_deribit(ASSET, start_ms, now_ms, want_market=True)
     else:
-        # Parallelize the DuckDB read (hot CSVs) with the always-needed Deribit
-        # core fetch (7d closes + window trades) — both are network-bound.
+        # Parallelize the DuckDB read (hot CSVs + block tape) with the Deribit 7d
+        # closes fetch (the realized-vol input) — both are network-bound.
         with ThreadPoolExecutor(max_workers=2) as ex:
             duck_fut = ex.submit(run_duckdb, args.duckdb_sql) if args.duckdb_sql else None
             deri_fut = ex.submit(fetch_deribit, ASSET, start_ms, now_ms, False)
@@ -917,6 +789,7 @@ def main() -> None:
                 duck_fut.result()
             deri = deri_fut.result()
         hot = load_hot(args.csv_dir, ASSET)
+        block_rows = load_blocks(args.csv_dir)
         # No hot dvol_spot row: the DuckDB read of the rolling recap-aggregates file
         # failed or returned nothing for this window. Either way DVOL/spot must come
         # from Deribit. Also fetch for any >24h window — the rolling file only
@@ -933,7 +806,7 @@ def main() -> None:
             except Exception as e:  # noqa: BLE001
                 warn(f"deribit market fallback failed: {e}")
 
-    result = build(asset, args.window, start_ms, now_ms, deri, hot)
+    result = build(asset, args.window, start_ms, now_ms, deri, hot, block_rows)
     if args.render:
         print(render_md(result))
     else:

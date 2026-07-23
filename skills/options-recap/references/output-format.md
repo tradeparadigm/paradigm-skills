@@ -29,15 +29,22 @@ Volume    $[X]M       Deribit only (cross-venue $ pending)
 P/C       [X.Xx]      [descriptor] (all venues, by trades)
 ```
 
-**Biggest Print**
+**Biggest Print — Paradigm block flow**
 
 ```yaml
-[DDMMMYY] [structure]   [Nx]   $[X]M   [HH:MM] UTC   via [Venue] ([Buy/Sell, ][IV]v avg)
+[DDMMMYY] [structure]   [Nx]   $[X]M   [HH:MM] UTC   via Paradigm/[Venue] ([Buy/Sell, ][IV]v avg)
 ```
 
-The side word appears only when the whole block is one-directional (Buy/Sell).
-Mixed-direction structures (any spread) carry no side tag — never write
-"two-way" here; that means "aggressor undisclosed", which this is not.
+The single largest **block** (one `BLOCK_TRADE_ID`) in the window, by summed
+per-leg USD notional — from the Paradigm block tape (**Paradigm RFQ/DRFQ flow
+only**, across every venue Paradigm brokers), so `[Venue]` is the venue that
+executed it (Deribit/Paradex/Bullish/…). This is NOT the whole market's biggest
+print — only the biggest Paradigm-brokered one; the `— Paradigm block flow`
+title and the `via Paradigm/…` tag both make that explicit. The side word appears only when
+the whole block is one-directional (Buy/Sell); mixed-direction structures (any
+spread) carry no side tag — never write "two-way" here. The `[IV]v avg` appears
+only for Deribit blocks (IV is looked up from the vol surface, which is
+Deribit-scoped); other venues carry no IV tag.
 
 `[Nx]` is the structure UNIT size — the base (ratio-1) leg count of the
 package, e.g. a 4×63-lot iron fly is `63x`, a 600-per-leg calendar is `600x`.
@@ -52,33 +59,35 @@ ARE the complete expiry set (calendar, diagonal), `near→far` when interior
 tenors are elided (3+ expiries) — each leg's own expiry always appears in
 the Detail column.
 
-**Block Flow — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)]**
+**Block Flow (Paradigm RFQ) — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)][ · tape through [HH:MM] UTC[ ([n]h behind)]]**
 
 ```yaml
-#  Structure                  Notl     Blocks  Detail
--  -------------------------  -------  ------  -----------------------------------
-1  [structure]                $[X]M    [n]     bought [K1][C/P] / sold [K2][C/P] x[size] [IV|IV–IV]v
+#  Structure                  Venue    Notl     Blocks  Detail
+-  -------------------------  -------  -------  ------  -------------------------------
+1  [structure]                [Venue]  $[X]M    [n]     [K1][C/P] / [K2][C/P] x[size] [IV]v ([Side])
 2  …
 ```
 
 The Structure column has a 27-char floor but stretches to the longest label in
 the window (a typed cross-expiry label like `24JUL26/31JUL26 Call Diagonal`
-runs past 27), so the header and rows stay aligned to whatever width the widest
-structure needs.
+runs past 27); the Venue column likewise stretches — the header and rows stay
+aligned to whatever width the widest values need.
 
-Two granularities, both always stated: tape **blocks** (block_trade_ids, the
-industry term for the individual prints) and **structures** (clips of one
-worked order — same legs, directions, and size ratio — grouped into one row).
-Rows are structures and `#` numbers them; the Blocks column carries each
-row's print count, so the Blocks column sums to the header `[N]` and the row
-count equals `[M]`. When more than 8 structures qualify, the header gains the
-`(top 8 by notional)` suffix — truncation is disclosed in the header and the
-table body never changes shape.
+Two granularities, both always stated: tape **blocks** (`BLOCK_TRADE_ID`s, the
+industry term for the individual prints) and **structures** (clips of one worked
+order — the blocks sharing an `RFQ_ID` — grouped into one row). Rows are
+structures and `#` numbers them; the Blocks column carries each row's block
+count, so it sums to the header `[N]` and the row count equals `[M]`. When more
+than 8 structures qualify, the header gains the `(top 8 by notional)` suffix.
 
-Detail rules: per-leg `bought`/`sold` verbs appear only when the tape discloses
-every leg's direction; otherwise legs render neutrally (`[K1]P vs [K2]P`)
-tagged ` two-way`. Multi-block rows show the clip IV range (`36.5–37.0v`)
-when clips printed at different vols, a single value otherwise.
+The tape is S3-sourced (near-real-time, not live-to-the-second), so the header
+carries a `tape through [HH:MM] UTC` freshness stamp, plus `([n]h behind)` when
+the newest block is 90+ min behind the window end.
+
+Detail: strike+type legs (`[K1]C / [K2]P`), the structure unit `x[size]`, the
+average `[IV]v` (Deribit blocks only), and a `([Side])` tag when the block is
+one-directional (Buy/Sell) — omitted for mixed-direction structures. Multi-expiry
+structures prefix each leg with its own expiry.
 
 **Vol Surface**
 Skew: front 25Δ RR [±X]v → [puts bid / calls bid / flat] · Term: [front]v → [back]v → [contango / flat / backwardation / humped — peak at [DDMMMYY] / dished — trough at [DDMMMYY] / mixed]
