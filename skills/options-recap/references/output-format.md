@@ -42,9 +42,11 @@ Deribit-scoped calc and the note reads `Deribit only`.
 The single largest **block** in the window, by summed per-leg USD notional,
 from two sources ranked together: the Paradigm block tape (one
 `BLOCK_TRADE_ID` = one block; every venue Paradigm brokers —
-Deribit/Paradex/Bullish/…) and the exchanges' own venue tapes (any venue, via
-the hot recap file's option `block` rows, deduped against the Paradigm tape by
-the venue's own block id — `VENUE_BLOCK_TRADE_ID` — so nothing double-counts).
+Deribit/Paradex/Bullish/…) and the exchanges' own venue tapes for venues
+Paradigm does NOT broker (OKX today, via the hot recap file's option `block`
+rows) — the only venues with zero Paradigm-tape overlap, so nothing
+double-counts. (Widening to every venue via exact id-dedupe is deferred to the
+Snowflake-off migration; see the maintainer README.)
 The `via …` tag names the source and scopes the line: `via Paradigm/[Venue]`
 for a Paradigm-brokered block, `via venue tape` for a venue-tape one. A
 venue-tape winner has no leg geometry, so it renders as
@@ -79,7 +81,7 @@ the Detail column.
 …
 ```
 
-Venue-tape rows (blocks not brokered via Paradigm, any venue) rank in the same
+Venue-tape rows (venues Paradigm never brokers — OKX today) rank in the same
 pool and count toward the header totals. Their tape has no leg geometry, so
 the structure label is `[Venue] Block`, the detail carries a `(venue tape)`
 note, and they count as one block each.

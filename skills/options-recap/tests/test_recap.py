@@ -134,18 +134,12 @@ CLOSES_7D = [60000 + (i % 5) * 50 for i in range(60)]  # gentle, non-flat
 # sell) on Deribit, one BLOCK_TRADE_ID, $6M/leg → $12M block, Mixed side.
 
 
-def _blk(desc, side, notl, bid="DRFQv2-bt_3TESTRR000000000000000000001", rfq="R1",
-         prod="BTC OPTION - DBT", qty=100, date="2026-06-01", time="12:00:00",
-         tid=None, venue_id="BLOCK-RR1"):
-    # Realistic id shapes: BLOCK_TRADE_ID is Paradigm's own DRFQv2-bt_… id;
-    # VENUE_BLOCK_TRADE_ID is the venue's own id (Deribit BLOCK-…), the join
-    # key against venue_blocks.csv. venue_id="" models a tape row that carries
-    # none (pre-upgrade tape, DRFQ v1/GRFQ) — the conservative-fallback case.
+def _blk(desc, side, notl, bid="B1", rfq="R1", prod="BTC OPTION - DBT",
+         qty=100, date="2026-06-01", time="12:00:00", tid=None):
     return {"DATE": date, "TIME": time, "PRODUCT": prod, "DESCRIPTION": desc,
             "QTY": qty, "PRICE": 0.01, "REF_PRICE": 0.01, "SIDE": side,
             "QUOTE_CURRENCY": "BTC", "NOTIONAL_VOLUME_USD": notl, "RFQ_ID": rfq,
-            "TRADE_ID": tid or (bid + side[:1]), "BLOCK_TRADE_ID": bid,
-            "VENUE_BLOCK_TRADE_ID": venue_id}
+            "TRADE_ID": tid or (bid + side[:1]), "BLOCK_TRADE_ID": bid}
 
 
 BLOCKS_RR = [
@@ -156,20 +150,19 @@ BLOCKS_RR = [
 # Venue-tape blocks (venue_blocks.csv) — the hot recap file's OPTION `block`
 # rows, grouped per block id. Unit-explicit columns: volume_coin (Σ leg
 # amounts, coin) and premium_usd (Σ premium — NEVER a display notional;
-# underlying notional is volume_coin × spot).
+# underlying notional is volume_coin × spot). Dedupe is STRUCTURAL today
+# (see _dedupe_venue_blocks / _TAPE_BROKERED_VENUES): OKX merges (Paradigm
+# never brokers it); Deribit/Bullish are excluded because a block there could
+# be the Paradigm-brokered copy and the slim tape has no venue id to dedupe on
+# yet (deferred to taskwarrior #119).
 #   OKX-BLK-1  300 BTC × $60,468 ≈ $18.14M — should win Biggest Print.
 #   OKX-BLK-2  2 BTC ≈ $121k — under the $250k floor, filtered.
-#   BLOCK-RR1  the SAME venue id BLOCKS_RR carries — an exact duplicate of the
-#              Paradigm-brokered RR, dropped by id-dedupe.
-#   BLOCK-280624  a NON-Paradigm Deribit block (no tape row carries this id) —
-#              merges: 150 BTC ≈ $9.07M.
-#   OTC-9      a non-Paradigm Bullish OTC options block — merges: 50 BTC ≈ $3.02M.
+#   BLOCK-280624 (deribit) / OTC-9 (bullish) — brokered venues, excluded today.
 VENUE_BLOCKS_CSV = (
     "asset,exchange,block_id,bucket_at,volume_coin,premium_usd,"
     "leg_count,iv_sum,iv_count\n"
     "BTC,okex-options,OKX-BLK-1,1780000200000,300,90000,3,187.5,3\n"
     "BTC,okex-options,OKX-BLK-2,1780000500000,2,600,1,,\n"
-    "BTC,deribit,BLOCK-RR1,1780000200000,200,120000,2,132,2\n"
     "BTC,deribit,BLOCK-280624,1780000200000,150,45000,2,120,2\n"
     "BTC,bullish,OTC-9,1780000200000,50,3000000,1,,\n"
 )
@@ -307,42 +300,23 @@ def test_load_venue_blocks_kind_belt_and_missing_file():
         check("missing file → empty", load_venue_blocks(d2, "BTC") == [])
 
 
-def test_dedupe_drops_exact_id_matches_and_merges_the_rest():
-    recap.WARNINGS.clear()
+def test_dedupe_excludes_paradigm_brokered_venues():
+    # Structural, window-independent dedupe: venues Paradigm brokers
+    # (deribit/deribit-usdc/paradex/bullish) are excluded — a block there
+    # could be the Paradigm-brokered copy and the slim tape carries no venue
+    # id to dedupe on yet (#119). Venues Paradigm never brokers (OKX) merge.
     with tempfile.TemporaryDirectory() as d:
         _write(d, "venue_blocks.csv", VENUE_BLOCKS_CSV)
         rows = load_venue_blocks(d, "BTC")
-    kept = recap._dedupe_venue_blocks(rows, BLOCKS_RR)
-    ids = {r["block_id"] for r in kept}
-    # BLOCK-RR1 is the venue id BLOCKS_RR carries → exact dupe, dropped.
-    check("Paradigm-brokered dupe dropped", "BLOCK-RR1" not in ids, ids)
-    # Non-Paradigm Deribit + Bullish blocks now MERGE (no venue bias).
-    check("non-Paradigm deribit kept", "BLOCK-280624" in ids, ids)
-    check("non-Paradigm bullish kept", "OTC-9" in ids, ids)
-    check("okx kept", {"OKX-BLK-1", "OKX-BLK-2"} <= ids, ids)
-
-
-def test_dedupe_conservative_fallback_on_idless_tape_rows():
-    # A tape row WITHOUT a venue id (pre-upgrade tape / DRFQ v1) can't be
-    # deduped against → that venue's tape blocks are all dropped rather than
-    # risk double-counting; other venues are unaffected. Case must not
-    # matter for the venue match.
-    recap.WARNINGS.clear()
-    idless_tape = [_blk("Put 26 Jun 26 55000", "BUY", 6_000_000, venue_id="")]
-    rows = [
-        {"exchange": "Deribit", "block_id": "BLOCK-280624", "volume_coin": "150"},
-        {"exchange": "okex-options", "block_id": "OKX-BLK-1", "volume_coin": "300"},
-    ]
-    kept = recap._dedupe_venue_blocks(rows, idless_tape)
-    check("deribit dropped conservatively (case-insensitive)",
-          [r["block_id"] for r in kept] == ["OKX-BLK-1"], kept)
-    check("conservative drop warned", any("can't dedupe" in w for w in recap.WARNINGS),
-          recap.WARNINGS)
-    # No tape rows at all (e.g. tape read failed) → everything merges;
-    # there is nothing on the Paradigm side to double-count against.
-    recap.WARNINGS.clear()
-    kept = recap._dedupe_venue_blocks(rows, [])
-    check("tape outage → venue blocks keep Block Flow alive", len(kept) == 2, kept)
+    kept = {r["block_id"] for r in recap._dedupe_venue_blocks(rows)}
+    check("okx merges (never brokered)", {"OKX-BLK-1", "OKX-BLK-2"} <= kept, kept)
+    check("deribit excluded (could be brokered)", "BLOCK-280624" not in kept, kept)
+    check("bullish excluded (could be brokered)", "OTC-9" not in kept, kept)
+    # Case-insensitive on the exchange id.
+    mixed = [{"exchange": "Deribit", "block_id": "X"},
+             {"exchange": "OKEX-OPTIONS", "block_id": "Y"}]
+    kept2 = {r["block_id"] for r in recap._dedupe_venue_blocks(mixed)}
+    check("case-insensitive venue match", kept2 == {"Y"}, kept2)
 
 
 def test_venue_tape_blocks_priced_by_coin_volume_not_premium():
@@ -377,28 +351,23 @@ def test_venue_blocks_merge_into_block_flow():
         res = build("btc", "8h", 0, 8 * 3600_000,
                     {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR, venue_rows)
     bf, bp = res["block_flow"], res["biggest_print"]
-    # Pool after id-dedupe + $250k floor: Paradigm RR $12M + OKX $18.14M +
-    # non-Paradigm Deribit $9.07M + Bullish $3.02M (BLOCK-RR1 deduped,
-    # OKX-BLK-2 under the floor). Totals span every source, no double count.
-    check("four blocks in pool", bf["n_blocks"] == 4, bf["n_blocks"])
-    check("total spans all sources (~$42.2M)", 42.0 <= bf["total_m"] <= 42.5, bf["total_m"])
-    check("venue blocks counted", bf.get("n_venue_blocks") == 3, bf.get("n_venue_blocks"))
+    # Pool after structural dedupe + $250k floor: Paradigm RR $12M + OKX
+    # $18.14M. Deribit/Bullish venue-tape blocks are excluded (brokered venues,
+    # no tape venue id yet — #119); OKX-BLK-2 is under the floor.
+    check("two blocks in pool", bf["n_blocks"] == 2, bf["n_blocks"])
+    check("total = RR + OKX (~$30.1M)", 30.0 <= bf["total_m"] <= 30.3, bf["total_m"])
+    check("one venue block counted (OKX)", bf.get("n_venue_blocks") == 1,
+          bf.get("n_venue_blocks"))
     venues = [r.get("venue") for r in bf["rows"]]
-    check("OKX + Deribit + Bullish venue rows present",
-          {"OKX", "Deribit", "Bullish"} <= set(venues), venues)
+    check("OKX venue row present", "OKX" in venues, venues)
+    check("no brokered-venue tape rows leaked", "Bullish" not in venues, venues)
     check("OKX outranks the RR", bf["rows"][0]["venue"] == "OKX", bf["rows"][0])
-    # The deduped RR appears exactly once (as the Paradigm structure row) —
-    # its venue-tape twin must not add a second $12M-ish deribit row.
-    deribit_rows = [r for r in bf["rows"] if r.get("venue") == "Deribit"]
-    check("one Paradigm + one venue-tape deribit row, no dupe",
-          sorted(r["notl_m"] for r in deribit_rows) == [9.1, 12.0], deribit_rows)
     # Biggest Print is the OKX venue-tape block, source-tagged.
     check("biggest is the OKX block", bp["notional_m"] == 18.1, bp)
     check("biggest source venue", bp.get("source") == "venue", bp)
     md = render_md(res)
     check("biggest line names venue in label", "OKX Block" in md, "render")
     check("biggest line says via venue tape", "via venue tape" in md, "render")
-    check("non-Paradigm deribit block rendered", "Deribit Block" in md, "render")
     check("title stays plain (no source scope tag)", "**Block Flow — $" in md, "render")
     check("~time rendered (5m resolution)", "~" in md, "render")
 

@@ -56,7 +56,6 @@ from vol_math import (  # noqa: E402
     realized_vs_implied,
     build_tape_blocks,
     compute_vol_surface,
-    tape_venue_label,
     RV_LOOKBACK_DAYS,
 )
 
@@ -391,44 +390,30 @@ def load_venue_blocks(csv_dir: str, asset: str) -> list[dict]:
             if (r.get("instrument_kind") or "option") == "option"]
 
 
-def _dedupe_venue_blocks(venue_rows: list[dict], tape_rows: list[dict]) -> list[dict]:
-    """Drop venue-tape blocks already represented on the Paradigm tape.
+# Venues Paradigm brokers — a block on any of these CAN appear on BOTH the
+# Paradigm tape and the exchange's own tape, so merging its venue-tape copy
+# would double-count the brokered flow. Venues NOT in this set are never
+# brokered by Paradigm, so their venue-tape blocks have zero overlap with the
+# Paradigm tape and merge freely — OKX today (Bybit has no group id, so it
+# never reaches `block` rows at all). This structural exclusion is the whole
+# dedupe today.
+#
+# Exact per-block dedupe by the venue's OWN block id — which would let a
+# brokered venue merge its genuinely non-Paradigm blocks too, keyed on a
+# shared id — needs that id on the slim tape. It is deferred to the
+# Snowflake-off migration (taskwarrior #119), where it lands from S3 with
+# proper CDC dedup rather than as a schema change to the live analytics.trade
+# dbt model. Until then this set is the boundary and only OKX merges.
+_TAPE_BROKERED_VENUES = {"deribit", "deribit-usdc", "paradex", "bullish"}
 
-    Exact-id first: the tape's `VENUE_BLOCK_TRADE_ID` is the venue's OWN
-    block id, recorded at execution and exported by the slim tape
-    (tradeparadigm/data#697) — Deribit `BLOCK-…`, Bullish `otc_trade_id` —
-    the same string the venue tape's `block_id` carries, so set membership
-    is an exact dedupe. Every venue then merges, including non-Paradigm
-    Deribit/Bullish blocks (there is no per-venue bias either way).
 
-    Conservative per-venue fallback: a tape row WITHOUT a venue id (a tape
-    file predating the column, or DRFQ v1/GRFQ rows, which carry none)
-    cannot be deduped against — so ALL venue-tape blocks for that row's
-    venue are dropped rather than risk double-counting. A venue with no
-    tape rows at all merges freely: nothing to double-count (this also
-    keeps Block Flow alive off the venue tapes when the Paradigm tape read
-    fails entirely).
-    """
-    tape_ids: set[str] = set()
-    unidentified: set[str] = set()  # venue labels with >=1 id-less tape row
-    for r in tape_rows or []:
-        vid = (r.get("VENUE_BLOCK_TRADE_ID") or "").strip()
-        if vid:
-            tape_ids.add(vid)
-        else:
-            unidentified.add(tape_venue_label(r.get("PRODUCT")))
-    kept, conservative = [], 0
-    for r in venue_rows:
-        if (r.get("block_id") or "") in tape_ids:
-            continue  # exact duplicate of a Paradigm-brokered block
-        if _venue_label(r.get("exchange")) in unidentified:
-            conservative += 1
-            continue
-        kept.append(r)
-    if conservative:
-        warn(f"venue-tape blocks: dropped {conservative} for venues whose tape "
-             "rows carry no venue id (can't dedupe — pre-upgrade tape?)")
-    return kept
+def _dedupe_venue_blocks(venue_rows: list[dict]) -> list[dict]:
+    """Keep only venue-tape blocks that can't be a Paradigm-brokered
+    duplicate — those on venues Paradigm never brokers (`_TAPE_BROKERED_VENUES`
+    excluded). Window-independent and dependent on no tape column. See the
+    note above for the id-based dedupe deferred to taskwarrior #119."""
+    return [r for r in venue_rows
+            if (r.get("exchange") or "").lower() not in _TAPE_BROKERED_VENUES]
 
 
 def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
@@ -629,13 +614,13 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     dropped = len(block_rows or []) - len(own_blocks)
     if dropped:
         warn(f"blocks.csv: dropped {dropped} non-{asset} rows — cross-asset contamination?")
-    # Venue-tape blocks join the same pool — ALL venues, deduped against the
-    # Paradigm tape by the venue's own block id (_dedupe_venue_blocks), so
-    # non-Paradigm Deribit/Bullish blocks appear alongside OKX's with no
-    # double count: min-notional filter, Biggest Print candidacy, and top-N
-    # ranking on equal underlying-USD terms.
+    # Venue-tape blocks join the same pool (min-notional filter, Biggest Print
+    # candidacy, top-N ranking on equal underlying-USD terms), after
+    # _dedupe_venue_blocks removes anything that could be a Paradigm-brokered
+    # duplicate — today that leaves venues Paradigm never brokers (OKX);
+    # taskwarrior #119 widens it to every venue via exact id dedupe.
     venue_blocks = _venue_tape_blocks(
-        _dedupe_venue_blocks(venue_block_rows or [], own_blocks), spot)
+        _dedupe_venue_blocks(venue_block_rows or []), spot)
     block = build_tape_blocks(own_blocks, iv_lookup=iv_lookup,
                               extra_blocks=venue_blocks)
 

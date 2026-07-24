@@ -137,18 +137,19 @@ block must never compete in an options recap) with **unit-explicit columns**:
 debuggability, **never displayed as notional**: it's ~50–100× below the
 underlying-USD basis the block sections use). `recap.py` then:
 
-- **Dedupes by the venue's own block id, then merges EVERY venue** — no
-  per-venue bias in either direction. The slim tape exports
-  `VENUE_BLOCK_TRADE_ID` (tradeparadigm/data#697): the venue's own id recorded
-  at execution (Deribit `BLOCK-…`, Bullish `otc_trade_id`) — identical to the
-  venue tape's `block_id`, so a Paradigm-brokered block is dropped from the
-  venue-tape side by exact id match, and non-Paradigm Deribit/Bullish blocks
-  merge alongside OKX's. Conservative fallback (`_dedupe_venue_blocks`): a tape
-  row *without* a venue id (pre-upgrade tape file; DRFQ v1/GRFQ rows carry none)
-  can't be deduped against, so that row's venue is excluded from the merge for
-  the window rather than risk double-counting. A venue with no tape rows merges
-  freely — which also keeps Block Flow alive off the venue tapes when the
-  Paradigm tape read fails entirely.
+- **Merges only venues Paradigm never brokers** (`_dedupe_venue_blocks` /
+  `_TAPE_BROKERED_VENUES`). A block on a venue Paradigm brokers
+  (Deribit/Bullish/Paradex) can appear on *both* the Paradigm tape and the
+  exchange's own tape, and the slim tape carries no shared id to dedupe on, so
+  those venues are excluded — leaving the venues with zero Paradigm overlap.
+  **OKX today** (Bybit has no group id, so it never reaches `block` rows at
+  all). This structural exclusion is window-independent and depends on no tape
+  column. **Deferred to the Snowflake-off migration (taskwarrior #119):**
+  exporting the venue's own block id (`VENUE_BLOCK_TRADE_ID` — Deribit
+  `BLOCK-…`, Bullish `otc_trade_id`) onto the slim tape, which then lets *every*
+  venue merge by exact id-dedupe with no double-count. That export was
+  deliberately **not** bolted onto the live `analytics.trade` dbt model (too
+  much blast radius); it lands from S3 with proper CDC dedup under #119.
 - **Prices them as `volume_coin × spot`** — underlying-USD, the same basis as the
   tape's `NOTIONAL_VOLUME_USD`, valued at recap-time spot (a disclosed
   approximation vs the tape's trade-time figures). No spot → skipped with a
