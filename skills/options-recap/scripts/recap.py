@@ -233,6 +233,7 @@ def load_hot(csv_dir: str, asset: str) -> dict:
     out = {"dvol": None, "dvol_open": None, "dvol_low": None, "dvol_high": None,
            "spot_close": None, "spot_open": None, "spot_low": None,
            "volume_btc": None, "put_vol": None, "call_vol": None,
+           "turnover_usd": None, "turnover_complete": False,
            "trades_by_venue": {}, "trades_total": None,
            "put_trades": None, "call_trades": None,
            "tickers": {}, "vs_now": {}, "vs_open": {}}
@@ -253,17 +254,33 @@ def load_hot(csv_dir: str, asset: str) -> dict:
     if not ds:
         warn("hot dvol_spot.csv missing — DVOL/spot from snapshot or fallback")
 
-    # Volume / P/C. Two reads, each on a basis that's honest for its scope:
-    #   • Dollar volume — ONLY Deribit is priced in USD reliably (1 contract = 1 BTC,
-    #     confirmed from the venue instrument feed). `volume_sum` units differ by
-    #     venue and `notional_usd` isn't yet cross-venue-normalized, so we do NOT
-    #     sum $ across venues; the Volume line is explicitly Deribit-scoped.
+    # Volume / P/C. Three reads, each on a basis that's honest for its scope:
+    #   • Dollar volume — `turnover_usd` is the upstream per-trade USD premium
+    #     (priced at each trade's own index, contract multipliers applied at
+    #     ingestion from the venue instrument spec), so it sums truthfully across
+    #     ALL venues. Null/absent cells contribute nothing; if NO row carries it
+    #     (pre-upgrade recap file), build() falls back to the Deribit-scoped
+    #     volume_sum × spot calc below and labels the line accordingly.
+    #   • Deribit coin volume — the fallback basis: ONLY Deribit is priced in USD
+    #     reliably without turnover_usd (1 contract = 1 BTC); `volume_sum` units
+    #     differ by venue, so this sum never crosses venues.
     #   • Activity + P/C — `trade_count` is unit-free (a trade is a trade), so it
     #     aggregates across ALL venues truthfully, with no contract multiplier.
     # Blank-optionType rows are per-exchange aggregates that double-count — drop them.
     vol = [r for r in _own_asset_rows(_read_csv(csv_dir, "volume.csv"), asset, "volume.csv")
            if (r.get("optionType") or "").strip()]
     if vol:
+        tus = [t for t in (_num(r, "turnover_usd") for r in vol) if t is not None]
+        out["turnover_usd"] = sum(tus) if tus else None
+        # "all venues" must mean ALL: during a partial upstream rollout some
+        # venues' cells are null and contribute $0 — presenting that sum as
+        # an all-venue total under-reports while claiming completeness. The
+        # label upgrade is gated on every venue that traded carrying at
+        # least one non-null turnover cell.
+        venues_traded = {(r.get("exchange") or "").lower() for r in vol}
+        venues_with_tu = {(r.get("exchange") or "").lower() for r in vol
+                          if _num(r, "turnover_usd") is not None}
+        out["turnover_complete"] = bool(tus) and venues_traded == venues_with_tu
         # Exact "deribit" only — NOT startswith: the sibling venue deribit-usdc is
         # USDC-linear (a different contract unit), so folding it into this
         # BTC-inverse dollar-volume sum would contaminate the Volume line.
@@ -353,6 +370,96 @@ def load_blocks(csv_dir: str) -> list[dict]:
     return rows
 
 
+def load_venue_blocks(csv_dir: str, asset: str) -> list[dict]:
+    """Read venue_blocks.csv — OPTION block/OTC prints off the EXCHANGES' own
+    tapes (the hot recap file's `block` rows, grouped per block id in DuckDB,
+    `instrument_kind='option'` — a perp/spot OTC block must never compete in
+    an options recap). Missing file → [] (the Paradigm tape still renders
+    alone). Dedup against the Paradigm tape happens in _dedupe_venue_blocks.
+
+    Columns are unit-explicit: `volume_coin` (Σ leg amounts, coin units) and
+    `premium_usd` (Σ premium — carried for debuggability, NEVER displayed as
+    notional: it is ~50-100x smaller than the underlying-USD basis the block
+    sections use). Underlying notional is derived later as volume_coin × spot.
+    """
+    rows = _own_asset_rows(_read_csv(csv_dir, "venue_blocks.csv"), asset,
+                           "venue_blocks.csv")
+    # Belt to the SQL's WHERE: a row that still carries a non-option kind
+    # (older CSV shape) is dropped here too.
+    return [r for r in rows
+            if (r.get("instrument_kind") or "option") == "option"]
+
+
+# Venues Paradigm brokers — a block on any of these CAN appear on BOTH the
+# Paradigm tape and the exchange's own tape, so merging its venue-tape copy
+# would double-count the brokered flow. Venues NOT in this set are never
+# brokered by Paradigm, so their venue-tape blocks have zero overlap with the
+# Paradigm tape and merge freely — OKX today (Bybit has no group id, so it
+# never reaches `block` rows at all). This structural exclusion is the whole
+# dedupe today.
+#
+# Exact per-block dedupe by the venue's OWN block id — which would let a
+# brokered venue merge its genuinely non-Paradigm blocks too, keyed on a
+# shared id — needs that id on the slim tape. It is deferred to the
+# Snowflake-off migration (taskwarrior #119), where it lands from S3 with
+# proper CDC dedup rather than as a schema change to the live analytics.trade
+# dbt model. Until then this set is the boundary and only OKX merges.
+_TAPE_BROKERED_VENUES = {"deribit", "deribit-usdc", "paradex", "bullish"}
+
+
+def _dedupe_venue_blocks(venue_rows: list[dict]) -> list[dict]:
+    """Keep only venue-tape blocks that can't be a Paradigm-brokered
+    duplicate — those on venues Paradigm never brokers (`_TAPE_BROKERED_VENUES`
+    excluded). Window-independent and dependent on no tape column. See the
+    note above for the id-based dedupe deferred to taskwarrior #119."""
+    return [r for r in venue_rows
+            if (r.get("exchange") or "").lower() not in _TAPE_BROKERED_VENUES]
+
+
+def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
+    """Shape venue-tape block rows into the block dicts build_tape_blocks
+    merges (source="venue"). The venue tape carries totals per block — no leg
+    geometry (expiry/strike/type/side) — so the structure label is the venue +
+    "Block" (there is no per-row venue column; the label is where the venue
+    shows) and the detail carries a compact "(venue tape)" provenance note.
+    notional_usd = volume_coin × spot: underlying-USD, the same basis as the
+    Paradigm tape's NOTIONAL_VOLUME_USD (valued at recap-time spot, not
+    trade-time — a disclosed approximation). No spot → skip with a warning,
+    never guess."""
+    if rows and not spot:
+        warn("venue-tape blocks skipped — no spot to price coin volume")
+        return []
+    out = []
+    for r in rows:
+        vol = _num(r, "volume_coin")
+        if not vol or not r.get("block_id"):
+            continue
+        iv_sum, iv_count = _num(r, "iv_sum"), _num(r, "iv_count")
+        avg_iv = round(iv_sum / iv_count, 1) if iv_sum is not None and iv_count else None
+        legs = int(_num(r, "leg_count") or 0)
+        bucket_ms = _num(r, "bucket_at")
+        venue = _venue_label(r.get("exchange"))
+        detail = f"x{vol:g}"
+        if avg_iv is not None:
+            detail += f" {avg_iv}v"
+        detail += f" — {legs or '?'} legs (venue tape)"
+        out.append({
+            "block_trade_id": r.get("block_id"),
+            "rfq_id": r.get("block_id"),  # its own worked order
+            "structure": f"{venue} Block", "expiry": "",
+            "venue": venue,
+            "notional_usd": round(vol * spot),
+            "unit_size": round(vol, 1),  # total coin size — legs unknown
+            "side": "", "avg_iv": avg_iv,
+            # bucket_at is the block's first 5m bucket — ~5-min resolution,
+            # hence the "~" prefix (the Paradigm tape has exact times).
+            "time_utc": f"~{fmt_hhmm(int(bucket_ms))}" if bucket_ms else "",
+            "detail": detail, "leg_count": legs,
+            "source": "venue",
+        })
+    return out
+
+
 # ── Assembly ────────────────────────────────────────────────────────────────
 
 def pct(a, b):
@@ -408,7 +515,8 @@ def spot_vol_label(spot_open, spot_close, dvol_open, dvol_close):
 
 
 def build(asset: str, window: str, start_ms: int, end_ms: int,
-          deri: dict, hot: dict, block_rows: list[dict] | None = None) -> dict:
+          deri: dict, hot: dict, block_rows: list[dict] | None = None,
+          venue_block_rows: list[dict] | None = None) -> dict:
     asset = asset.upper()
     mkt = deri.get("market")
     window_h = (end_ms - start_ms) / 3600_000
@@ -438,14 +546,25 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
 
     rv = realized_vs_implied(deri.get("closes_7d") or [], dvol_close)
 
-    # Volume ($) is Deribit-scoped, from the hot rollup: call+put BTC volume × spot.
-    # (Only Deribit is reliably priced 1 contract = 1 BTC; volume_sum units differ by
-    # venue and notional_usd isn't yet cross-venue-normalized, so the line stays
-    # Deribit-scoped.) The rollup head-lags the live tape ~10-15 min, so a very thin
-    # window may under-count the newest prints — an accepted trade-off now that Block
-    # Flow is the multi-venue Paradigm tape, a different universe from this line.
+    # Volume ($): the upstream turnover_usd sum is a true cross-venue USD total
+    # (per-trade, priced at trade time). On a recap file that predates the column
+    # the line falls back to the old Deribit-scoped volume_sum × spot calc —
+    # labeled as such in render_md via volume_scope, so nothing is overstated
+    # either way. The rollup head-lags the live tape ~10-15 min, so a very thin
+    # window may under-count the newest prints — an accepted trade-off now that
+    # Block Flow is the multi-venue Paradigm tape, a different universe from this
+    # line.
+    turnover_usd = hot.get("turnover_usd")
     vol_btc = hot.get("volume_btc")
-    vol_usd = vol_btc * spot if (vol_btc and spot) else None
+    if turnover_usd and hot.get("turnover_complete"):
+        vol_usd = turnover_usd
+        volume_scope = "all"
+    else:
+        # No turnover, or PARTIAL turnover (a venue traded with only null
+        # cells — mid-rollout): a partial sum must not present as an
+        # all-venue total, so fall back to the Deribit-scoped calc.
+        vol_usd = vol_btc * spot if (vol_btc and spot) else None
+        volume_scope = "deribit"
     # Activity + P/C use trade_count — unit-free, so they span ALL venues truthfully.
     pt, ct = hot.get("put_trades"), hot.get("call_trades")
     pc = round(pt / ct, 2) if pt and ct else None
@@ -495,7 +614,15 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     dropped = len(block_rows or []) - len(own_blocks)
     if dropped:
         warn(f"blocks.csv: dropped {dropped} non-{asset} rows — cross-asset contamination?")
-    block = build_tape_blocks(own_blocks, iv_lookup=iv_lookup)
+    # Venue-tape blocks join the same pool (min-notional filter, Biggest Print
+    # candidacy, top-N ranking on equal underlying-USD terms), after
+    # _dedupe_venue_blocks removes anything that could be a Paradigm-brokered
+    # duplicate — today that leaves venues Paradigm never brokers (OKX);
+    # taskwarrior #119 widens it to every venue via exact id dedupe.
+    venue_blocks = _venue_tape_blocks(
+        _dedupe_venue_blocks(venue_block_rows or []), spot)
+    block = build_tape_blocks(own_blocks, iv_lookup=iv_lookup,
+                              extra_blocks=venue_blocks)
 
     # >24h flag: Volume/Activity/P-C/DVOL/spot come from the ~24h hot rollup, so a
     # longer window under-covers them (run_recap caps at 24h; this defends a direct
@@ -519,6 +646,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "dvol_label": dvol_label(dvol_open, dvol_close),
         "rv_7d": rv.get("value"), "vrp": rv.get("vrp"), "vrp_label": rv.get("vrp_label"),
         "volume_usd_m": round(vol_usd / 1e6) if vol_usd else None,
+        "volume_scope": volume_scope,
         "activity_trades": tt,
         "activity_split": activity_split,
         "pc_ratio": pc, "pc_descriptor": pc_descriptor(pc),
@@ -558,7 +686,8 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "snapshot": snapshot,
         "biggest_print": block["biggest_print"],
         "block_flow": {"total_m": block["total_m"], "n_blocks": block["n_blocks"],
-                       "n_structures": block["n_structures"], "rows": block["rows"]},
+                       "n_structures": block["n_structures"], "rows": block["rows"],
+                       "n_venue_blocks": block.get("n_venue_blocks", 0)},
         "vol_surface": surface_out,
         "hot_horizon": hot_horizon,
         "warnings": WARNINGS,
@@ -662,7 +791,10 @@ def render_md(r: dict) -> str:
     else:
         L.append(f"{'Activity':<9} {'n/a':<11} trades (by trade count)")
     vol = f"${s['volume_usd_m']}M" if s.get("volume_usd_m") else "n/a"
-    L.append(f"{'Volume':<9} {vol:<11} Deribit only")
+    # "all venues" when the cross-venue turnover_usd sum drove the number;
+    # the Deribit-scoped label survives only on the pre-upgrade fallback.
+    vol_note = "all venues" if s.get("volume_scope") == "all" else "Deribit only"
+    L.append(f"{'Volume':<9} {vol:<11} {vol_note}")
     pc = f"{s['pc_ratio']}x" if s.get("pc_ratio") is not None else "n/a"
     pc_desc = f"{s['pc_descriptor']} " if s.get("pc_descriptor") else ""
     L.append(f"{'P/C':<9} {pc:<11} {pc_desc}(all venues, by trades)")
@@ -670,15 +802,21 @@ def render_md(r: dict) -> str:
 
     if bp:
         # "Mixed" is a structure fact (legs point both ways), not an aggressor
-        # read — don't put it in the side slot. Venue names the executing venue
-        # for this Paradigm-brokered block (Deribit/Paradex/Bullish/…).
+        # read — don't put it in the side slot. Venue names the executing venue.
+        # Source-aware routing tag: a Paradigm-brokered block reads
+        # "via Paradigm/<venue>"; a venue-tape block reads "via venue tape" —
+        # its venue is already the structure label ("OKX Block"), and the tag
+        # explains the unclassified structure + the ~approximate time.
         tags = [bp["side"]] if bp.get("side") in ("Buy", "Sell") else []
         if bp.get("avg_iv") is not None:
             tags.append(f"{bp['avg_iv']}v avg")
         tag_txt = f" ({', '.join(tags)})" if tags else ""
-        L.append(f"{bp['expiry']} {bp['structure']}   {bp['size']:g}x   "
+        via = ("via venue tape" if bp.get("source") == "venue"
+               else f"via Paradigm/{bp.get('venue') or '?'}")
+        label = f"{bp['expiry']} {bp['structure']}".strip()  # venue blocks have no expiry
+        L.append(f"{label}   {bp['size']:g}x   "
                  f"${bp['notional_m']}M   {bp['time_utc']} UTC   "
-                 f"via Paradigm/{bp.get('venue') or '?'}{tag_txt}")
+                 f"{via}{tag_txt}")
     else:
         L.append("No data")
     n_struct = bf.get("n_structures", len(bf["rows"]))
@@ -745,6 +883,7 @@ def main() -> None:
     start_ms = now_ms - parse_window_ms(args.window)
 
     block_rows: list[dict] = []
+    venue_block_rows: list[dict] = []
     if args.no_s3:
         # Offline/local: no hot CSVs or block tape; Deribit supplies DVOL/spot/
         # surface. Block flow is empty (No data) since it's S3-only now.
@@ -761,6 +900,7 @@ def main() -> None:
             deri = deri_fut.result()
         hot = load_hot(args.csv_dir, ASSET)
         block_rows = load_blocks(args.csv_dir)
+        venue_block_rows = load_venue_blocks(args.csv_dir, ASSET)
         # No hot dvol_spot row: the DuckDB read of the rolling recap-aggregates file
         # failed or returned nothing for this window. Either way DVOL/spot must come
         # from Deribit. Also fetch for any >24h window — the rolling file only
@@ -777,7 +917,8 @@ def main() -> None:
             except Exception as e:  # noqa: BLE001
                 warn(f"deribit market fallback failed: {e}")
 
-    result = build(asset, args.window, start_ms, now_ms, deri, hot, block_rows)
+    result = build(asset, args.window, start_ms, now_ms, deri, hot, block_rows,
+                   venue_block_rows)
     if args.render:
         print(render_md(result))
     else:

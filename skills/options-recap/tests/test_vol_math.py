@@ -641,6 +641,47 @@ def test_build_tape_blocks_notional_is_sum_per_block():
     check("mixed side (buy+sell legs)", bp["side"] == "Mixed", bp)
 
 
+def test_build_tape_blocks_merges_extra_blocks():
+    # Pre-shaped venue-tape blocks (source="venue") enter the pool BEFORE the
+    # min-notional filter and compete for Biggest Print / top-N on equal
+    # underlying-USD terms; each is its own worked order (blocks=1).
+    tape = [_trow("Put 26 Jun 26 55000", "BUY", 6_000_000, "bT", "rT")]
+    extra = [
+        {"block_trade_id": "OKX-1", "rfq_id": "OKX-1",
+         "structure": "Block (unclassified)", "expiry": "", "venue": "OKX",
+         "notional_usd": 18_000_000, "unit_size": 300.0, "side": "",
+         "avg_iv": 62.5, "time_utc": "~12:05",
+         "detail": "x300 62.5v — 3 legs, venue tape (no leg geometry)",
+         "leg_count": 3, "source": "venue"},
+        {"block_trade_id": "OKX-2", "rfq_id": "OKX-2",
+         "structure": "Block (unclassified)", "expiry": "", "venue": "OKX",
+         "notional_usd": 120_000, "unit_size": 2.0, "side": "",
+         "avg_iv": None, "time_utc": "~12:10", "detail": "x2 — 1 legs, venue tape",
+         "leg_count": 1, "source": "venue"},
+    ]
+    res = build_tape_blocks(tape, min_notional_usd=250_000, extra_blocks=extra)
+    check("small venue block filtered by floor", res["n_blocks"] == 2, res["n_blocks"])
+    check("n_venue_blocks counts survivors only", res["n_venue_blocks"] == 1,
+          res["n_venue_blocks"])
+    check("venue block wins biggest print", res["biggest_print"]["notional_m"] == 18.0,
+          res["biggest_print"])
+    check("biggest source = venue", res["biggest_print"]["source"] == "venue",
+          res["biggest_print"])
+    check("each venue block its own worked order",
+          [r["blocks"] for r in res["rows"]] == [1, 1], res["rows"])
+    check("tape row keeps paradigm source", any(r["source"] == "paradigm"
+          for r in res["rows"]), res["rows"])
+    # No extra_blocks → identical behavior to before (n_venue_blocks 0).
+    res2 = build_tape_blocks(tape, min_notional_usd=250_000)
+    check("no extras → n_venue_blocks 0", res2["n_venue_blocks"] == 0, res2)
+    # Venue-blocks-ONLY pool (zero Paradigm rows — a quiet RFQ day with live
+    # exchange prints): the merge must not be conditional on tape rows.
+    res3 = build_tape_blocks([], min_notional_usd=250_000, extra_blocks=[extra[0]])
+    check("venue-only pool ranks", res3["n_blocks"] == 1, res3)
+    check("venue-only biggest print", res3["biggest_print"]["notional_m"] == 18.0, res3)
+    check("venue-only rows render", len(res3["rows"]) == 1, res3)
+
+
 def test_build_tape_blocks_biggest_vs_rfq_rollup():
     # Biggest print is the single largest BLOCK; Block Flow rows roll up clips by
     # RFQ_ID. Two Call clips (same RFQ) + one bigger standalone RR block.
