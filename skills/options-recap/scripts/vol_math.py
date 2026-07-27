@@ -767,6 +767,7 @@ def _block_from_rows(bid: str, rows: list[dict], iv_lookup=None) -> dict:
         "notional_usd": round(notional), "unit_size": round(unit, 1),
         "side": side, "avg_iv": avg_iv, "time_utc": time_utc, "detail": detail,
         "leg_count": len(legs) or len(rows),
+        "source": "paradigm",  # vs "venue" for exchange-tape extra_blocks
     }
 
 
@@ -813,7 +814,8 @@ def _tape_detail_iv(asset, venue, legs, unit, side, raw_desc, iv_lookup):
 
 
 def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
-                      min_notional_usd: float = 250_000) -> dict:
+                      min_notional_usd: float = 250_000,
+                      extra_blocks: list[dict] | None = None) -> dict:
     """Group tape leg-rows into blocks and worked-order structures.
 
     Two levels, matching the recap's block/structure model:
@@ -823,8 +825,16 @@ def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
         rows are worked orders, `blocks` = distinct BLOCK_TRADE_IDs in the order,
         notional = Σ across them.
 
+    `extra_blocks` are PRE-SHAPED block dicts (same keys _block_from_rows emits,
+    with source="venue") from exchange tapes the Paradigm tape doesn't cover —
+    e.g. OKX blocks off the hot recap file. They enter the pool before the
+    min-notional filter and compete for Biggest Print / top-N on equal terms;
+    each is its own worked order (rfq_id = its block id). Their notional_usd
+    MUST already be underlying-USD, the same basis as NOTIONAL_VOLUME_USD.
+
     `iv_lookup(cp, strike, expiry_c) -> mark_iv | None` annotates Deribit blocks.
-    Returns {rows, biggest_print, total_m, n_blocks, n_structures}."""
+    Returns {rows, biggest_print, total_m, n_blocks, n_structures,
+    n_venue_blocks}."""
     by_block: dict[str, list] = defaultdict(list)
     for r in rows:
         bid = r.get("BLOCK_TRADE_ID") or r.get("TRADE_ID")
@@ -833,8 +843,10 @@ def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
 
     blocks = [_block_from_rows(bid, brows, iv_lookup)
               for bid, brows in by_block.items()]
+    blocks += [dict(b) for b in (extra_blocks or [])]
     blocks = [b for b in blocks if b["notional_usd"] >= min_notional_usd]
     blocks.sort(key=lambda b: b["notional_usd"], reverse=True)
+    n_venue = sum(1 for b in blocks if b.get("source") == "venue")
 
     biggest = None
     if blocks:
@@ -842,7 +854,8 @@ def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
         biggest = {"expiry": b0["expiry"], "structure": b0["structure"],
                    "size": b0["unit_size"], "notional_m": round(b0["notional_usd"] / 1e6, 1),
                    "time_utc": b0["time_utc"], "side": b0["side"],
-                   "avg_iv": b0["avg_iv"], "venue": b0["venue"]}
+                   "avg_iv": b0["avg_iv"], "venue": b0["venue"],
+                   "source": b0.get("source") or "paradigm"}
 
     # Worked-order rollup: group blocks by RFQ_ID (blocks arrive notional-desc, so
     # the first seen in a group is its largest — it names the merged row).
@@ -863,10 +876,12 @@ def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
             "notl_m": round(g["notional_usd"] / 1e6, 1), "blocks": g["blocks"],
             "venue": g["venue"], "detail": g["detail"], "side": g["side"],
             "avg_iv": g["avg_iv"], "time_utc": g["time_utc"],
+            "source": g.get("source") or "paradigm",
         })
     return {
         "total_m": round(sum(b["notional_usd"] for b in blocks) / 1e6, 1),
         "n_blocks": len(blocks), "n_structures": len(structures),
+        "n_venue_blocks": n_venue,
         "rows": out_rows, "biggest_print": biggest,
     }
 
