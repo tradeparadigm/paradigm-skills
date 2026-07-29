@@ -45,13 +45,13 @@ if [ -z "$AK" ] || [ -z "$SK" ] || [ -z "$ST" ]; then
   echo "STS bootstrap failed: $(printf '%s' "$CREDS" | head -c 200)"; exit 1
 fi
 
-# Snowflake-free Paradigm tape: hot__recap_30d.parquet (row_type=
+# Snowflake-free Paradigm tape: hot__paradigm_trade_tape_30d.parquet (row_type=
 # 'paradigm_trade', leg grain, trailing 30 days — exactly the HIST horizon),
 # built by the exchange-venue-data paradigm-trade CronJob from the
 # Airbyte→S3 UM landing. Replaces the Snowflake-egressed
 # paradigm_trade_tape_slim.csv.gz; the temp table below aliases its columns
 # to the old tape names so fill/hist stay shape-identical downstream.
-TAPE=s3://dt-exchange-venue-data/hot/hot__recap_30d.parquet
+TAPE=s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet
 # `_` is a LIKE wildcard and ids are r_…-style — escape it so the match is literal.
 CORE_SQL=${CORE//_/\\_}
 
@@ -68,8 +68,9 @@ CREATE TEMP TABLE tape AS
 SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS DATE,
        strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS TIME,
        auction AS AUCTION, product AS PRODUCT, description AS DESCRIPTION,
-       qty AS QTY, price AS PRICE, ref_price AS REF_PRICE, side AS SIDE,
-       currency AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
+       quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE,
+       taker_side AS SIDE,
+       asset AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
        rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID,
        UPPER(REPLACE(description,' ','')) AS DESC_N
 FROM read_parquet('${TAPE}')

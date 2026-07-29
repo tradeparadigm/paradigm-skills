@@ -54,11 +54,12 @@ CREATE TEMP TABLE tape AS
 SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS DATE,
        strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS TIME,
        auction AS AUCTION, product AS PRODUCT, description AS DESCRIPTION,
-       qty AS QTY, price AS PRICE, ref_price AS REF_PRICE, side AS SIDE,
-       currency AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
+       quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE,
+       taker_side AS SIDE,
+       asset AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
        rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID,
        UPPER(REPLACE(description,' ','')) AS DESC_N
-FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__recap_30d.parquet')
+FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet')
 WHERE row_type='paradigm_trade';
 -- (a) the cleared block — authoritative for every field. Asset ← PRODUCT (never assume BTC),
 -- structure ← DESCRIPTION. Offsets precomputed: OFFSET_BPS (×10000) for COIN-quoted premiums

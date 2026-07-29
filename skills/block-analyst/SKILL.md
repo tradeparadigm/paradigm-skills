@@ -16,7 +16,7 @@ description: >
   butterflies (BF), condors (CO), calendars (CA), risk reversals (RR), covered
   calls, and custom multi-leg combos (CM). Also handles perp combos.
 compatibility: Resolves the rfq_id by searching the Paradigm trade tape (the
-  hot__recap_30d paradigm_trade rows — Snowflake-free, 30-day horizon) through
+  hot__paradigm_trade_tape_30d rows — Snowflake-free, 30-day horizon) through
   the paradigm-data-discovery skill — see
   references/rfq-lookup.md; falls back to injected block-trade context or the
   Deribit tape. Trade-tape reads use that skill's S3/IRSA credentials. Market
