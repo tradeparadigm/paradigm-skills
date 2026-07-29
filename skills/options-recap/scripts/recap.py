@@ -394,26 +394,70 @@ def load_venue_blocks(csv_dir: str, asset: str) -> list[dict]:
 # Paradigm tape and the exchange's own tape, so merging its venue-tape copy
 # would double-count the brokered flow. Venues NOT in this set are never
 # brokered by Paradigm, so their venue-tape blocks have zero overlap with the
-# Paradigm tape and merge freely — OKX today (Bybit has no group id, so it
-# never reaches `block` rows at all). This structural exclusion is the whole
-# dedupe today.
+# Paradigm tape and always merge — OKX today (Bybit has no group id, so it
+# never reaches `block` rows at all).
 #
-# Exact per-block dedupe by the venue's OWN block id — which would let a
-# brokered venue merge its genuinely non-Paradigm blocks too, keyed on a
-# shared id — needs that id on the slim tape. It is deferred to the
-# Snowflake-off migration (taskwarrior #119), where it lands from S3 with
-# proper CDC dedup rather than as a schema change to the live analytics.trade
-# dbt model. Until then this set is the boundary and only OKX merges.
-_TAPE_BROKERED_VENUES = {"deribit", "deribit-usdc", "paradex", "bullish"}
+# For the brokered venues the dedupe is now EXACT where the data allows:
+# blocks.csv (the hot paradigm_trade tape) carries VENUE_BLOCK_TRADE_ID —
+# the venue's OWN block id (Deribit `BLOCK-…`, Bullish otc id), the same id
+# the venue tape's `block_id` column carries — so a venue-tape block that
+# matches a brokered id is the SAME print and is dropped, while a
+# genuinely non-Paradigm Deribit/Bullish block merges into Block Flow.
+# Guard rails, both falling back to the old structural exclusion (never
+# double-count on uncertainty):
+#   - tape without the column / no stamped ids in the window → structural
+#     for every brokered venue (pre-migration behavior, byte-identical);
+#   - PER-VENUE coverage gate: if any tape block row ON THAT VENUE lacks
+#     the id (e.g. unstamped metadata), that venue's tape copies can't be
+#     matched by id, so its venue-tape rows stay excluded structurally.
+_TAPE_VENUE_CODE = {
+    "deribit": "DBT",
+    "deribit-usdc": "DBT",
+    "paradex": "PRDX",
+    "bullish": "BLSH",
+}
+_TAPE_BROKERED_VENUES = set(_TAPE_VENUE_CODE)
 
 
-def _dedupe_venue_blocks(venue_rows: list[dict]) -> list[dict]:
-    """Keep only venue-tape blocks that can't be a Paradigm-brokered
-    duplicate — those on venues Paradigm never brokers (`_TAPE_BROKERED_VENUES`
-    excluded). Window-independent and dependent on no tape column. See the
-    note above for the id-based dedupe deferred to taskwarrior #119."""
-    return [r for r in venue_rows
-            if (r.get("exchange") or "").lower() not in _TAPE_BROKERED_VENUES]
+def _tape_venue_code(tape_row: dict) -> str:
+    """The venue code off a tape row's PRODUCT ('BTC OPTION - DBT');
+    unknown shape -> '?' (treated as covering NO venue safely)."""
+    product = tape_row.get("PRODUCT") or ""
+    return product.rsplit(" - ", 1)[-1].strip().upper() if " - " in product else "?"
+
+
+def _dedupe_venue_blocks(venue_rows: list[dict],
+                         tape_rows: list[dict] | None = None) -> list[dict]:
+    """Venue-tape blocks minus anything that could be a Paradigm-brokered
+    duplicate. Exact id dedupe against the tape's VENUE_BLOCK_TRADE_ID
+    where the window's coverage supports it (see the note above); the
+    structural `_TAPE_BROKERED_VENUES` exclusion is the fallback per
+    venue and for tapes that predate the column."""
+    tape_rows = tape_rows or []
+    tape_ids = {(r.get("VENUE_BLOCK_TRADE_ID") or "").strip() for r in tape_rows}
+    tape_ids.discard("")
+    if not tape_ids:
+        return [r for r in venue_rows
+                if (r.get("exchange") or "").lower() not in _TAPE_BROKERED_VENUES]
+    # Venue codes whose id coverage is INCOMPLETE this window: any block
+    # row on that venue without a venue id could have an unmatchable
+    # venue-tape copy, so that venue keeps the structural exclusion.
+    unstamped_codes = {
+        _tape_venue_code(r) for r in tape_rows
+        if (r.get("BLOCK_TRADE_ID") or "").strip()
+        and not (r.get("VENUE_BLOCK_TRADE_ID") or "").strip()
+    }
+    out = []
+    for r in venue_rows:
+        exchange = (r.get("exchange") or "").lower()
+        block_id = (r.get("block_id") or "").strip()
+        if block_id and block_id in tape_ids:
+            continue  # the same print, already on the Paradigm tape
+        code = _TAPE_VENUE_CODE.get(exchange)
+        if code is not None and code in unstamped_codes:
+            continue  # coverage incomplete on this venue -> structural
+        out.append(r)
+    return out
 
 
 def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
@@ -617,10 +661,11 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     # Venue-tape blocks join the same pool (min-notional filter, Biggest Print
     # candidacy, top-N ranking on equal underlying-USD terms), after
     # _dedupe_venue_blocks removes anything that could be a Paradigm-brokered
-    # duplicate — today that leaves venues Paradigm never brokers (OKX);
-    # taskwarrior #119 widens it to every venue via exact id dedupe.
+    # duplicate — exact per-block id dedupe against this window's tape rows
+    # where their VENUE_BLOCK_TRADE_ID coverage allows, the structural
+    # brokered-venue exclusion otherwise (see _dedupe_venue_blocks).
     venue_blocks = _venue_tape_blocks(
-        _dedupe_venue_blocks(venue_block_rows or []), spot)
+        _dedupe_venue_blocks(venue_block_rows or [], own_blocks), spot)
     block = build_tape_blocks(own_blocks, iv_lookup=iv_lookup,
                               extra_blocks=venue_blocks)
 

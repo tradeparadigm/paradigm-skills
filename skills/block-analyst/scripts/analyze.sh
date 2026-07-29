@@ -45,11 +45,17 @@ if [ -z "$AK" ] || [ -z "$SK" ] || [ -z "$ST" ]; then
   echo "STS bootstrap failed: $(printf '%s' "$CREDS" | head -c 200)"; exit 1
 fi
 
-TAPE=s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz
+# Snowflake-free Paradigm tape: hot__recap_30d.parquet (row_type=
+# 'paradigm_trade', leg grain, trailing 30 days — exactly the HIST horizon),
+# built by the exchange-venue-data paradigm-trade CronJob from the
+# Airbyte→S3 UM landing. Replaces the Snowflake-egressed
+# paradigm_trade_tape_slim.csv.gz; the temp table below aliases its columns
+# to the old tape names so fill/hist stay shape-identical downstream.
+TAPE=s3://dt-exchange-venue-data/hot/hot__recap_30d.parquet
 # `_` is a LIKE wildcard and ids are r_…-style — escape it so the match is literal.
 CORE_SQL=${CORE//_/\\_}
 
-# ONE DuckDB session: scan the gzip once into a temp table, COPY the FILL rows
+# ONE DuckDB session: scan the tape once into a temp table, COPY the FILL rows
 # (by RFQ_ID) and the 30d HIST recurrence (self-matched on the FILL's own
 # PRODUCT + normalized DESCRIPTION — no description tokens, ID-authoritative).
 cat > "$OUT/q.sql" <<SQL
@@ -59,12 +65,15 @@ SET s3_access_key_id='${AK}';
 SET s3_secret_access_key='${SK}';
 SET s3_session_token='${ST}';
 CREATE TEMP TABLE tape AS
-SELECT DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE,
-       QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID,
-       UPPER(REPLACE(DESCRIPTION,' ','')) AS DESC_N
-FROM read_csv_auto('${TAPE}')
-WHERE RFQ_ID LIKE '%${CORE_SQL}%' ESCAPE '\'
-   OR DATE >= (CURRENT_DATE - INTERVAL 30 DAY);
+SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS DATE,
+       strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS TIME,
+       auction AS AUCTION, product AS PRODUCT, description AS DESCRIPTION,
+       qty AS QTY, price AS PRICE, ref_price AS REF_PRICE, side AS SIDE,
+       currency AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
+       rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID,
+       UPPER(REPLACE(description,' ','')) AS DESC_N
+FROM read_parquet('${TAPE}')
+WHERE row_type='paradigm_trade';
 COPY (SELECT PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, QUOTE_CURRENCY,
              RFQ_ID, TRADE_ID, BLOCK_TRADE_ID
       FROM tape WHERE RFQ_ID LIKE '%${CORE_SQL}%' ESCAPE '\') TO '${OUT}/fill.csv' (HEADER, DELIMITER ',');

@@ -10,11 +10,13 @@ description: >
 compatibility: Deribit public API (curl) for the 7d realized-vol closes only; Paradigm
   data (DuckDB+S3 via IRSA) for everything else — DVOL/spot, $ Volume, multi-venue
   activity/P-C, the vol surface, and the Biggest Print + Block Flow (the multi-venue
-  paradigm_trade_tape_slim block tape). No authentication required for the public API;
+  Paradigm block tape — the hot paradigm_trade rows, with the legacy
+  paradigm_trade_tape_slim csv.gz as fallback until it decommissions). No
+  authentication required for the public API;
   the S3 reads require the IRSA bootstrap (see paradigm-data-discovery skill).
 metadata:
   author: tradeparadigm
-  version: "1.13"
+  version: "1.14"
 ---
 
 # Options Recap
@@ -33,12 +35,14 @@ Any `Nm`/`Nh`/`Nd` window up to 24h works and all render identically: DVOL/spot,
 the `$` Volume line, and the multi-venue activity/P-C all come from one rolling hot
 aggregates file sliced to the window at query time; the surface (and its Δ columns)
 from `v_vol_surface`; and **Biggest Print + Block Flow from the multi-venue Paradigm
-block tape** (`paradigm_trade_tape_slim`) — every venue Paradigm brokers
+block tape** (the hot `paradigm_trade` rows; legacy `paradigm_trade_tape_slim`
+csv.gz as fallback) — every venue Paradigm brokers
 (Deribit/Paradex/Bullish/…), notional already in USD per leg — **plus venue-tape
-blocks for venues Paradigm doesn't broker** (OKX today, off the hot recap file's
-option `block` rows — the only venues with zero Paradigm-tape overlap, so no
-double-count; widening to every venue via id-dedupe is deferred to the
-Snowflake-off migration), which rank in the same pool and render as
+blocks** off the hot recap file's option `block` rows, deduped against the
+Paradigm tape by the venue's OWN block id (`VENUE_BLOCK_TRADE_ID`) where the
+window's id coverage allows — so genuinely non-Paradigm Deribit/Bullish blocks
+merge too — and by the structural brokered-venue exclusion otherwise
+(never double-count on uncertainty; OKX always merges), which rank in the same pool and render as
 `<Venue> Block` rows with a `(venue tape)` detail note. Biggest Print names its
 venue as `via Paradigm/<venue>` (or `via venue tape`). The Paradigm tape has no
 IV, so the top blocks' IV is looked up from the vol surface (Deribit legs only;

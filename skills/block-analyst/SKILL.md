@@ -4,8 +4,8 @@ description: >
   Cross-venue analysis of Paradigm RFQ block trades using live market data from
   Deribit, OKX, and Bybit. Invoked as `/analyze <rfq_id> <rfq description>`:
   resolves the rfq_id by searching the Paradigm trade tape via the
-  paradigm-data-discovery skill (paradigm_trade_tape_slim, keyed by RFQ_ID) for
-  the cleared-block record, then fetches live marks, IVs, and greeks per venue,
+  paradigm-data-discovery skill (the hot paradigm_trade rows, keyed by RFQ_ID)
+  for the cleared-block record, then fetches live marks, IVs, and greeks per venue,
   computes net greeks for multi-leg structures, benchmarks the fill vs mark,
   reports how much of the structure traded over 24h / 7d / 30d and where else
   it printed, reads whether the flow moved the
@@ -15,8 +15,9 @@ description: >
   execution. Covers outright calls/puts (CL/PL), strangles (SN), straddles (ST),
   butterflies (BF), condors (CO), calendars (CA), risk reversals (RR), covered
   calls, and custom multi-leg combos (CM). Also handles perp combos.
-compatibility: Resolves the rfq_id by searching the Paradigm trade tape
-  (paradigm_trade_tape_slim) through the paradigm-data-discovery skill — see
+compatibility: Resolves the rfq_id by searching the Paradigm trade tape (the
+  hot__recap_30d paradigm_trade rows — Snowflake-free, 30-day horizon) through
+  the paradigm-data-discovery skill — see
   references/rfq-lookup.md; falls back to injected block-trade context or the
   Deribit tape. Trade-tape reads use that skill's S3/IRSA credentials. Market
   data needs no auth — deribit__get_ticker MCP (if available), web_fetch, or any
@@ -24,7 +25,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.6"
+  version: "1.7"
 ---
 
 # Paradigm Block Trade Analyst
@@ -46,7 +47,7 @@ greeks").
 > condition — the tape lookup is the PRIMARY path; injected context is only a
 > fallback. Never answer `/analyze` from the `<rfq description>` string alone,
 > and never claim "no context loaded" without first querying
-> `paradigm_trade_tape_slim` (suffix-matched per
+> the Paradigm trade tape (suffix-matched per
 > [`references/rfq-lookup.md`](references/rfq-lookup.md)).**
 >
 > **Only emit the Step 7 unresolved-failure line after the suffix-tolerant query

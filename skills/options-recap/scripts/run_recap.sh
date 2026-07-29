@@ -116,7 +116,17 @@ REC=s3://dt-exchange-venue-data/hot/hot__recap_aggregates_5m_24h.parquet
 # and the structure named in DESCRIPTION — so recap.py needs no cross-venue $
 # normalization and no instrument-name inference. A full scan is sub-second, so
 # it's read fresh per recap; the window is applied here by the DATE+TIME filter.
+# LEGACY source: superseded by the hot paradigm_trade tape (PT below) via the
+# fallback-then-overwrite pair in the SQL — delete this read once the egress
+# decommission (data PR-5) has merged and soaked.
 TAPE=s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz
+
+# Snowflake-free Paradigm tape: hot__recap_30d.parquet (row_type=
+# 'paradigm_trade', leg grain, trailing 30d), built by the
+# exchange-venue-data paradigm-trade CronJob from the Airbyte→S3 UM landing.
+# Same columns as the csv.gz PLUS VENUE_BLOCK_TRADE_ID — the venue's own
+# block id, which unlocks exact block dedupe against the venue tapes.
+PT=s3://dt-exchange-venue-data/hot/hot__recap_30d.parquet
 
 # One DuckDB session → CSVs. One statement per line; `at` is reserved → alias it.
 # dvol_spot + volume come from the rolling recap-aggregates file, windowed at query
@@ -136,7 +146,17 @@ COPY (SELECT asset, exchange, block_id, min(bucket_at) AS bucket_at, sum(volume_
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '${WORK}/surface_now.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h WHERE abs("at"-${START_MS})<=900000 ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '${WORK}/surface_open.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(turnover_usd) AS turnover_usd, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
+COPY (SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS "DATE", strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS "TIME", product AS PRODUCT, description AS DESCRIPTION, qty AS QTY, price AS PRICE, ref_price AS REF_PRICE, side AS SIDE, currency AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD, rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID, venue_block_trade_id AS VENUE_BLOCK_TRADE_ID FROM read_parquet('${PT}') WHERE row_type='paradigm_trade' AND currency='${ASSET}' AND instrument_kind='OPTION' AND traded_at >= ${START_MS}) TO '${WORK}/blocks.csv' (HEADER, DELIMITER ',');
 SQL
+
+# blocks.csv upgrade (the statement just above): OVERWRITES the legacy
+# csv.gz-sourced shape with the same columns off the Snowflake-free hot
+# paradigm_trade tape, PLUS VENUE_BLOCK_TRADE_ID (recap.py's exact block
+# dedupe key — absent column means structural dedupe, today's behavior).
+# Same fallback-then-overwrite pattern as volume.csv: while the hot file
+# doesn't exist yet (paradigm-trade CronJob not deployed) the bind fails,
+# the legacy blocks.csv stands, and nothing changes. Once the egress
+# decommission (data PR-5) merges, the legacy TAPE read above gets deleted.
 
 # volume.csv upgrade (the statement just above): OVERWRITES the legacy shape
 # with one that adds turnover_usd — the pipeline's per-trade USD premium,

@@ -319,6 +319,49 @@ def test_dedupe_excludes_paradigm_brokered_venues():
     check("case-insensitive venue match", kept2 == {"Y"}, kept2)
 
 
+def test_dedupe_exact_id_with_per_venue_coverage_gate():
+    # blocks.csv off the hot paradigm_trade tape carries
+    # VENUE_BLOCK_TRADE_ID → exact dedupe unlocks per venue: a venue-tape
+    # block matching a brokered id is the SAME print (dropped); a
+    # non-matching one on a FULLY-stamped venue merges; a venue with any
+    # unstamped block row keeps the structural exclusion (uncertainty must
+    # never double-count).
+    venue_rows = [
+        {"exchange": "deribit", "block_id": "BLOCK-A"},       # on the tape → dropped
+        {"exchange": "deribit", "block_id": "BLOCK-B"},       # genuinely non-Paradigm → merges
+        {"exchange": "bullish", "block_id": "OTC-1"},         # BLSH coverage incomplete → excluded
+        {"exchange": "okex-options", "block_id": "OKX-1"},    # never brokered → merges
+    ]
+    tape = [
+        {"PRODUCT": "BTC OPTION - DBT", "BLOCK_TRADE_ID": "DRFQv2-1",
+         "VENUE_BLOCK_TRADE_ID": "BLOCK-A"},
+        {"PRODUCT": "BTC OPTION - BLSH", "BLOCK_TRADE_ID": "DRFQv2-2",
+         "VENUE_BLOCK_TRADE_ID": ""},  # unstamped → BLSH stays structural
+    ]
+    kept = {r["block_id"] for r in recap._dedupe_venue_blocks(venue_rows, tape)}
+    check("id-matched brokered copy dropped", "BLOCK-A" not in kept, kept)
+    check("non-Paradigm deribit block merges", "BLOCK-B" in kept, kept)
+    check("unstamped venue keeps structural exclusion", "OTC-1" not in kept, kept)
+    check("never-brokered venue still merges", "OKX-1" in kept, kept)
+    # deribit-usdc shares the DBT venue code: an unstamped DBT row gates it too.
+    tape_dbt_gap = [
+        {"PRODUCT": "BTC OPTION - DBT", "BLOCK_TRADE_ID": "DRFQv2-1",
+         "VENUE_BLOCK_TRADE_ID": "BLOCK-A"},
+        {"PRODUCT": "BTC OPTION - DBT", "BLOCK_TRADE_ID": "DRFQv2-3",
+         "VENUE_BLOCK_TRADE_ID": None},
+    ]
+    kept_gap = {r["block_id"]
+                for r in recap._dedupe_venue_blocks(venue_rows, tape_dbt_gap)}
+    check("matched id still dropped under gap", "BLOCK-A" not in kept_gap, kept_gap)
+    check("unmatched brokered blocked under gap", "BLOCK-B" not in kept_gap, kept_gap)
+    # Tape without the column at all (legacy csv.gz) → structural fallback,
+    # byte-identical to today's behavior.
+    legacy = [{"PRODUCT": "BTC OPTION - DBT", "BLOCK_TRADE_ID": "DRFQv2-1"}]
+    kept_legacy = {r["block_id"]
+                   for r in recap._dedupe_venue_blocks(venue_rows, legacy)}
+    check("legacy tape → structural fallback", kept_legacy == {"OKX-1"}, kept_legacy)
+
+
 def test_venue_tape_blocks_priced_by_coin_volume_not_premium():
     recap.WARNINGS.clear()
     with tempfile.TemporaryDirectory() as d:

@@ -46,14 +46,20 @@ duckdb -c "
 INSTALL httpfs; LOAD httpfs;
 SET s3_region='ap-northeast-1';
 SET s3_access_key_id='$AK'; SET s3_secret_access_key='$SK'; SET s3_session_token='$ST';
--- single decompress → temp table holding the target RFQ + 30d matching structures
+-- single scan → temp table holding the target RFQ + 30d matching structures.
+-- Source is the Snowflake-free hot paradigm_trade tape (trailing 30 days,
+-- leg grain — exactly the HIST horizon), aliased to the legacy tape column
+-- names so everything downstream is unchanged.
 CREATE TEMP TABLE tape AS
-SELECT DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE,
-       QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID,
-       UPPER(REPLACE(DESCRIPTION,' ','')) AS DESC_N
-FROM read_csv_auto('s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz')
-WHERE RFQ_ID LIKE '%<CORE_ID>%' ESCAPE '\'
-   OR DATE >= (CURRENT_DATE - INTERVAL 30 DAY);
+SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS DATE,
+       strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS TIME,
+       auction AS AUCTION, product AS PRODUCT, description AS DESCRIPTION,
+       qty AS QTY, price AS PRICE, ref_price AS REF_PRICE, side AS SIDE,
+       currency AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
+       rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID,
+       UPPER(REPLACE(description,' ','')) AS DESC_N
+FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__recap_30d.parquet')
+WHERE row_type='paradigm_trade';
 -- (a) the cleared block — authoritative for every field. Asset ← PRODUCT (never assume BTC),
 -- structure ← DESCRIPTION. Offsets precomputed: OFFSET_BPS (×10000) for COIN-quoted premiums
 -- (BTC/ETH); OFFSET_PCT (% of mark) for USD/USDC-quoted premiums (SOL/alts — dollar prices,
@@ -120,8 +126,9 @@ structure all *unavailable*) and stop.
 
 ## Field mapping — trade-tape row → analysis fields
 
-`paradigm_trade_tape_slim` carries the information that used to arrive as pasted
-JSON. Map by the tape's actual columns:
+The Paradigm trade tape (hot `paradigm_trade` rows, formerly the
+`paradigm_trade_tape_slim` csv.gz — same columns) carries the information that
+used to arrive as pasted JSON. Map by the tape's actual columns:
 
 | Analysis field (SKILL Step 1) | Trade-tape column |
 |---|---|
