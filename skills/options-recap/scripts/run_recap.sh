@@ -118,7 +118,7 @@ REC=s3://dt-exchange-venue-data/hot/hot__recap_aggregates_5m_24h.parquet
 # it's read fresh per recap; the window is applied here by the DATE+TIME filter.
 # LEGACY source: superseded by the hot paradigm_trade tape (PT below) via the
 # fallback-then-overwrite pair in the SQL — delete this read once the egress
-# decommission (data PR-5) has merged and soaked.
+# decommission (data#712) has merged and soaked.
 TAPE=s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz
 
 # Snowflake-free Paradigm tape: hot__paradigm_trade_tape_30d.parquet (row_type=
@@ -156,7 +156,7 @@ SQL
 # Same fallback-then-overwrite pattern as volume.csv: while the hot file
 # doesn't exist yet (paradigm-trade CronJob not deployed) the bind fails,
 # the legacy blocks.csv stands, and nothing changes. Once the egress
-# decommission (data PR-5) merges, the legacy TAPE read above gets deleted.
+# decommission (data#712) merges, the legacy TAPE read above gets deleted.
 
 # volume.csv upgrade (the statement just above): OVERWRITES the legacy shape
 # with one that adds turnover_usd — the pipeline's per-trade USD premium,

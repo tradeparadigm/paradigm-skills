@@ -56,7 +56,7 @@ volume/`trade_count` rows come from ONE rolling file, `hot__recap_aggregates_5m_
 (5-min buckets over the trailing 24h), windowed at query time by `WHERE bucket_at
 >= now - window` + aggregation; the vol surface + ΔATM/ΔRR/ΔFly come from
 `v_vol_surface`; and Biggest Print / Block Flow come from the multi-venue Paradigm
-block tape (`paradigm_trade_tape_slim`), scanned in the same DuckDB session. The
+block tape (the hot `paradigm_trade` rows), scanned in the same DuckDB session. The
 Deribit public API adds only the 7d realized-vol closes (and a live DVOL/spot
 fallback if the S3 read fails).
 
@@ -113,19 +113,34 @@ There is **no `surface` `row_type`** — the vol surface lives in `v_vol_surface
 Biggest Print / Block Flow are primarily the block tape (below), plus the
 `block` rows for venues the tape doesn't broker. `notional` is `notional_usd`.
 
-**Block tape (Biggest Print + Block Flow).** `s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz`
-— one flat ~1.5MB csv.gz (all dates; a full scan is sub-second, so it's read fresh
-per recap, windowed by the `DATE`+`TIME` filter in `run_recap.sh`). It spans every
-venue Paradigm brokers (`DBT`/`PRDX`/`BLSH`/…) with USD notional **per leg**
-(`NOTIONAL_VOLUME_USD`) and the structure named in `DESCRIPTION`, so `vol_math`
-does no cross-venue $ normalization and no instrument-name inference. `vol_math`
-groups it two ways: by `BLOCK_TRADE_ID` (a block; Σ per-leg notional → the Biggest
-Print is the single largest) and by `RFQ_ID` (a worked order; its blocks roll into
-one Block Flow row with a `Blocks` count). Columns used: `DATE`, `TIME`, `PRODUCT`
-(→ asset + venue), `DESCRIPTION`, `QTY`, `SIDE`, `NOTIONAL_VOLUME_USD`, `RFQ_ID`,
-`BLOCK_TRADE_ID`. The tape carries **no IV** — the top blocks' IV is looked up from
-`v_vol_surface` (Deribit legs only). See the `paradigm-data-discovery` skill for the
-tape schema and the `paradigm-block-analyst` skill for the `DESCRIPTION` grammar.
+**Block tape (Biggest Print + Block Flow).**
+`s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet`
+(`row_type='paradigm_trade'`) — the Snowflake-free tape, built by the
+`exchange-venue-data` paradigm-trade CronJob from the Airbyte→S3 UM landing. Leg
+grain, **trailing 30 days**, read fresh per recap and windowed by `traded_at` in
+`run_recap.sh`.
+
+It supersedes `s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz`
+(a flat csv.gz spanning all dates), which `run_recap.sh` still reads first and then
+overwrites — a deliberate fallback while the egress decommission (data#712) lands
+and soaks. Two differences matter when reading this section: the horizon is 30
+days rather than all history, and the parquet adds `VENUE_BLOCK_TRADE_ID` (the
+venue's own block id), which is what lets `recap.py` dedupe venue-tape blocks
+against the Paradigm tape exactly rather than by the structural brokered-venue
+exclusion.
+
+The tape spans every venue Paradigm brokers (`DBT`/`PRDX`/`BLSH`/…) with USD
+notional **per leg** (`NOTIONAL_VOLUME_USD`) and the structure named in
+`DESCRIPTION`, so `vol_math` does no cross-venue $ normalization and no
+instrument-name inference. `vol_math` groups it two ways: by `BLOCK_TRADE_ID` (a
+block; Σ per-leg notional → the Biggest Print is the single largest) and by
+`RFQ_ID` (a worked order; its blocks roll into one Block Flow row with a `Blocks`
+count). Columns used: `DATE`, `TIME`, `PRODUCT` (→ asset + venue), `DESCRIPTION`,
+`QTY`, `SIDE`, `NOTIONAL_VOLUME_USD`, `RFQ_ID`, `BLOCK_TRADE_ID`,
+`VENUE_BLOCK_TRADE_ID`. The tape carries **no IV** — the top blocks' IV is looked
+up from `v_vol_surface` (Deribit legs only). See the `paradigm-data-discovery`
+skill for the tape schema and the `paradigm-block-analyst` skill for the
+`DESCRIPTION` grammar.
 
 **Venue-tape blocks (`venue_blocks.csv`) — full-market block coverage.** The
 recap file's `block` rows carry every block/OTC print off the exchanges' own
