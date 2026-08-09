@@ -136,9 +136,34 @@ COPY (SELECT asset, exchange, block_id, min(bucket_at) AS bucket_at, sum(volume_
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '${WORK}/surface_now.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h WHERE abs("at"-${START_MS})<=900000 ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '${WORK}/surface_open.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(turnover_usd) AS turnover_usd, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
+COPY (SELECT 'recap_aggregates' AS source, max(bucket_at) AS max_at FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot' UNION ALL SELECT 'vol_surface', max("at") FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND mark_iv IS NOT NULL) TO '${WORK}/freshness.csv' (HEADER, DELIMITER ',');
 SQL
 
-# volume.csv upgrade (the statement just above): OVERWRITES the legacy shape
+# freshness.csv (the statement just above): the max timestamp each continuously
+# -written source carries, NOT windowed. The window filter is deliberately
+# omitted — a source frozen before START_MS returns zero windowed rows, which is
+# indistinguishable from "quiet market" and tells you nothing about the feed. The
+# absolute max is the pipeline's heartbeat, so it answers the only question that
+# matters: is anything still writing this file?
+#
+# WHY THIS EXISTS. hot__market_signals_1m / the recap aggregates went stale on
+# 2026-07-10 and kept rendering July 10 numbers as if live until 2026-08-04 —
+# ~3.5 weeks — because the object's mtime kept changing while its CONTENTS did
+# not, and nothing anywhere compared a timestamp to the clock. recap.py's Deribit
+# fallback already existed but triggers only on ABSENT data (`hot['dvol'] is
+# None`) or a >24h window; stale-but-present sailed straight through it.
+#
+# ONLY heartbeat sources are probed. dvol_spot rows are emitted every 5 min and
+# vol-surface snapshots every minute regardless of trading activity, so a gap in
+# them is unambiguously a pipeline fault. Event-driven sources are NOT probed and
+# must not be: the block tape's newest trade is a function of whether anyone
+# traded, so gating on it would fire on any quiet hour. (Measured: venue `block`
+# rows legitimately sat 1h13m behind with the pipeline perfectly healthy, because
+# only 29 blocks printed in 24h.) Once the tape carries a pipeline-stamped
+# `generated_at` — it does under the hot paradigm_trade tape — that column, not
+# the trade time, is the right thing to add here.
+
+# volume.csv upgrade: OVERWRITES the legacy shape
 # with one that adds turnover_usd — the pipeline's per-trade USD premium,
 # summable across ALL venues (drives the cross-venue $ Volume line). Same
 # fallback-then-overwrite pattern as the VS_COLD surface read: on a recap file

@@ -66,6 +66,27 @@ WARNINGS: list[str] = []
 # store carries the full curve (~12 expiries); the recap only shows the near tenors.
 MAX_SURFACE_ROWS = 5
 
+# ── Freshness gate ──────────────────────────────────────────────────────────
+# How far behind the clock each HEARTBEAT source may fall before the recap stops
+# treating it as live. See run_recap.sh's freshness.csv comment for why only
+# continuously-written sources are probed and event-driven ones must not be.
+#
+# The limits are the publish cadence plus generous slack, sized so normal
+# operation never trips them and a dead feed always does. Measured against a
+# healthy pipeline on 2026-08-09: recap aggregates ran ~13-15 min behind (they
+# are 5-min buckets and the open bucket is not yet published), the vol surface
+# ~2-5 min. The failure this exists to catch was ~3.5 WEEKS, so precision here
+# buys nothing — a wide margin that never cries wolf is worth far more than a
+# tight one that trains people to ignore the banner.
+STALENESS_LIMIT_S = {
+    "recap_aggregates": 45 * 60,
+    "vol_surface": 45 * 60,
+}
+# Sources whose staleness invalidates the Snapshot's DVOL/spot specifically, and
+# so should divert those fields to the live Deribit fallback rather than merely
+# annotate them.
+_SNAPSHOT_SOURCES = ("recap_aggregates",)
+
 
 def warn(msg: str) -> None:
     WARNINGS.append(msg)
@@ -190,6 +211,79 @@ def _num(row: dict, *keys):
             except (TypeError, ValueError):
                 pass
     return None
+
+
+def load_freshness(csv_dir: str) -> dict:
+    """{source: max_at_ms} from freshness.csv, skipping rows with no
+    timestamp.
+
+    A source present in the file but NULL means the read succeeded and the
+    file genuinely holds nothing for this asset — reported as unknown rather
+    than as lag 0, so it can never manufacture a false all-clear."""
+    out = {}
+    for row in _read_csv(csv_dir, "freshness.csv"):
+        source = (row.get("source") or "").strip()
+        at = _num(row, "max_at")
+        if source and at is not None:
+            out[source] = int(at)
+    return out
+
+
+def check_freshness(fresh: dict, now_ms: int) -> list[dict]:
+    """Heartbeat sources that have fallen further behind the clock than their
+    limit, worst first.
+
+    A source MISSING from `fresh` is not reported here. Absence means the probe
+    itself failed (bad credentials, unreadable object, a DuckDB bind error) —
+    the existing `hot['dvol'] is None` path already diverts to Deribit for that,
+    and reporting it as "stale" would blame the data for a plumbing fault. This
+    function answers one question only: is a source that IS readable too old?"""
+    stale = []
+    for source, limit_s in STALENESS_LIMIT_S.items():
+        at = fresh.get(source)
+        if at is None:
+            continue
+        lag_s = (now_ms - at) / 1000.0
+        if lag_s > limit_s:
+            stale.append({"source": source, "lag_s": int(lag_s), "limit_s": limit_s})
+    return sorted(stale, key=lambda d: -d["lag_s"])
+
+
+_STALE_HOT_FIELDS = ("dvol", "dvol_open", "dvol_low", "dvol_high",
+                     "spot_close", "spot_open", "spot_low", "spot_high")
+
+
+def drop_stale_snapshot_fields(hot: dict, market: dict | None) -> bool:
+    """Remove the stale hot DVOL/spot so build() prefers the live Deribit
+    series. Returns whether it dropped them.
+
+    Fetching the replacement is NOT sufficient on its own: build() reads
+    hot['dvol'] and hot['spot_close'] first and consults `market` only when
+    they are absent, so leaving them in place renders the stale numbers even
+    though a fresh copy was just fetched.
+
+    Refuses to drop when the fallback came back empty — a recap with old
+    figures and a banner saying so beats one with no figures at all, and the
+    caller warns in that case."""
+    if not (market or {}).get("dvol"):
+        return False
+    for k in _STALE_HOT_FIELDS:
+        hot.pop(k, None)
+    return True
+
+
+def _fmt_lag(seconds: int) -> str:
+    """Human lag: the banner's whole job is making a month-long gap obvious at
+    a glance, and '2179800s' does not do that."""
+    seconds = max(0, int(seconds))
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
 
 
 # Maps a venue id to its display label. deribit and deribit-usdc are distinct
@@ -516,7 +610,8 @@ def spot_vol_label(spot_open, spot_close, dvol_open, dvol_close):
 
 def build(asset: str, window: str, start_ms: int, end_ms: int,
           deri: dict, hot: dict, block_rows: list[dict] | None = None,
-          venue_block_rows: list[dict] | None = None) -> dict:
+          venue_block_rows: list[dict] | None = None,
+          stale: list[dict] | None = None) -> dict:
     asset = asset.upper()
     mkt = deri.get("market")
     window_h = (end_ms - start_ms) / 3600_000
@@ -690,6 +785,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
                        "n_venue_blocks": block.get("n_venue_blocks", 0)},
         "vol_surface": surface_out,
         "hot_horizon": hot_horizon,
+        "stale_sources": stale or [],
         "warnings": WARNINGS,
     }
 
@@ -730,6 +826,18 @@ def render_md(r: dict) -> str:
     h, s, bp, bf, vs = (r["header"], r["snapshot"], r["biggest_print"],
                         r["block_flow"], r["vol_surface"])
     L: list[str] = []
+
+    # STALENESS FIRST. This banner outranks the others because it is the only
+    # one that says the numbers below may be WRONG rather than missing — a
+    # reader who spots "No data" knows not to trust it, but silently old DVOL
+    # and spot look exactly like live ones. Ordering it first is the whole
+    # point: it is what was absent when a frozen feed rendered for 3.5 weeks.
+    for st in (r.get("stale_sources") or []):
+        L.append(f"⚠ {st['source']} last updated {_fmt_lag(st['lag_s'])} ago "
+                 f"(limit {_fmt_lag(st['limit_s'])}) — figures sourced from it "
+                 f"are NOT live.")
+    if r.get("stale_sources"):
+        L.append("")
 
     crit = [w for w in (r.get("warnings") or []) if any(
         k in w for k in ("missing", "unavailable", "failed"))]
@@ -884,6 +992,9 @@ def main() -> None:
 
     block_rows: list[dict] = []
     venue_block_rows: list[dict] = []
+    # Bound before the branch: --no-s3 reads no hot sources at all, so there is
+    # nothing to be stale, but build() is called on both paths.
+    stale: list[dict] = []
     if args.no_s3:
         # Offline/local: no hot CSVs or block tape; Deribit supplies DVOL/spot/
         # surface. Block flow is empty (No data) since it's S3-only now.
@@ -909,16 +1020,32 @@ def main() -> None:
         # per-strike ticker surface when v_vol_surface also gave us nothing — for
         # a normal dynamic window vs_now is populated, so we skip ~50 serial
         # ticker calls (the bulk of the cost).
-        if hot.get("dvol") is None or (now_ms - start_ms) > 24 * 3600_000:
+        # FRESHNESS GATE. The three triggers below are distinct failures:
+        #   dvol is None          -> the source could not be read at all
+        #   window > 24h          -> the source is fine but under-covers
+        #   stale_snapshot        -> the source read fine and is OUT OF DATE
+        # The third had no trigger until now, so a frozen feed rendered as live:
+        # hot['dvol'] was populated, the window was short, and the recap printed
+        # three-week-old DVOL/spot with no indication anything was wrong.
+        stale = check_freshness(load_freshness(args.csv_dir), now_ms)
+        for s in stale:
+            warn(f"{s['source']} is {_fmt_lag(s['lag_s'])} behind "
+                 f"(limit {_fmt_lag(s['limit_s'])}) — treating as not live")
+        stale_snapshot = any(s["source"] in _SNAPSHOT_SOURCES for s in stale)
+        if (hot.get("dvol") is None or stale_snapshot
+                or (now_ms - start_ms) > 24 * 3600_000):
             want_surface = not hot.get("vs_now")
             try:
                 deri["market"] = _fetch_market_fallback(
                     ASSET, start_ms, now_ms, want_surface=want_surface)
             except Exception as e:  # noqa: BLE001
                 warn(f"deribit market fallback failed: {e}")
+        if stale_snapshot and not drop_stale_snapshot_fields(hot, deri.get("market")):
+            warn("stale hot DVOL/spot retained — Deribit fallback "
+                 "unavailable; Snapshot figures are NOT live")
 
     result = build(asset, args.window, start_ms, now_ms, deri, hot, block_rows,
-                   venue_block_rows)
+                   venue_block_rows, stale=stale)
     if args.render:
         print(render_md(result))
     else:

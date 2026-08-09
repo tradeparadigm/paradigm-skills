@@ -27,6 +27,8 @@ from recap import (  # noqa: E402
     pct, pc_descriptor, dvol_label, spot_vol_label, fmt_hhmm,
     run_duckdb, _load_surface_tickers, _delta_fmt, _venue_label,
     _venue_tape_blocks, MAX_SURFACE_ROWS,
+    load_freshness, check_freshness, drop_stale_snapshot_fields, _fmt_lag,
+    STALENESS_LIMIT_S,
 )
 
 _passed = 0
@@ -1162,6 +1164,111 @@ def test_market_fallback_skips_surface_when_not_wanted():
         check("ticker calls happen when want_surface=True", "ticker" in calls, calls)
     finally:
         recap._get = orig
+
+
+# ── Freshness gate ──────────────────────────────────────────────────────────
+# Regression guards for the failure that motivated the gate: the recap
+# aggregates froze on 2026-07-10 and rendered July 10 DVOL/spot as live until
+# 2026-08-04. The object's mtime kept moving while its contents did not, and
+# nothing compared a timestamp to the clock.
+
+NOW = 1_754_000_000_000  # fixed clock; all lags below are relative to it
+
+
+def test_freshness_loads_and_skips_null_rows():
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "freshness.csv",
+               "source,max_at\n"
+               f"recap_aggregates,{NOW - 60_000}\n"
+               "vol_surface,\n")          # readable, but empty for this asset
+        f = load_freshness(d)
+        check("fresh source parsed", f.get("recap_aggregates") == NOW - 60_000, f)
+        # A NULL max_at must be UNKNOWN, never lag 0. Coercing it to 0 would make
+        # an empty source read as perfectly fresh — a false all-clear, the exact
+        # thing this gate exists to prevent.
+        check("null max_at is absent, not zero", "vol_surface" not in f, f)
+
+
+def test_freshness_missing_file_is_empty_not_fatal():
+    with tempfile.TemporaryDirectory() as d:
+        check("no freshness.csv -> {}", load_freshness(d) == {}, load_freshness(d))
+        check("no sources -> nothing stale", check_freshness({}, NOW) == [])
+
+
+def test_check_freshness_flags_only_over_limit():
+    lim = STALENESS_LIMIT_S["recap_aggregates"]
+    # just inside the limit must NOT fire: a gate that trips in normal operation
+    # trains people to ignore the banner, which is worse than no gate.
+    fresh_ok = {"recap_aggregates": NOW - (lim - 60) * 1000}
+    check("within limit is not stale", check_freshness(fresh_ok, NOW) == [],
+          check_freshness(fresh_ok, NOW))
+    over = {"recap_aggregates": NOW - (lim + 600) * 1000}
+    got = check_freshness(over, NOW)
+    check("over limit is stale", len(got) == 1 and got[0]["source"] == "recap_aggregates", got)
+    check("lag reported", got[0]["lag_s"] >= lim, got)
+
+
+def test_check_freshness_ignores_unreadable_sources():
+    # A source missing from freshness.csv means the PROBE failed, not that the
+    # data is old. Reporting it as stale would blame the data for a plumbing
+    # fault; the existing `hot['dvol'] is None` path already covers unreadable.
+    check("absent source is not stale", check_freshness({"vol_surface": NOW}, NOW) == [])
+
+
+def test_check_freshness_orders_worst_first():
+    la = STALENESS_LIMIT_S["recap_aggregates"]
+    lv = STALENESS_LIMIT_S["vol_surface"]
+    got = check_freshness({"recap_aggregates": NOW - (la + 100) * 1000,
+                           "vol_surface": NOW - (lv + 99_999) * 1000}, NOW)
+    check("worst lag first", [g["source"] for g in got] == ["vol_surface", "recap_aggregates"],
+          [g["source"] for g in got])
+
+
+def test_drop_stale_snapshot_fields_needs_a_live_replacement():
+    hot = {"dvol": 30.0, "spot_close": 1.0, "volume_btc": 5.0}
+    # No usable fallback -> keep what we have (old figures + a banner beat none)
+    check("no market -> no drop", drop_stale_snapshot_fields(hot, None) is False)
+    check("empty market -> no drop", drop_stale_snapshot_fields(hot, {"dvol": []}) is False)
+    check("hot untouched", hot["dvol"] == 30.0, hot)
+    # With a live series -> stale OHLC must GO, or build() renders it anyway
+    check("live market -> drop", drop_stale_snapshot_fields(hot, {"dvol": [[1, 2]]}) is True)
+    check("stale dvol removed", "dvol" not in hot, hot)
+    check("stale spot removed", "spot_close" not in hot, hot)
+    check("unrelated fields kept", hot.get("volume_btc") == 5.0, hot)
+
+
+def test_fmt_lag_is_human():
+    # "2179800s" does not make a 3.5-week outage obvious; "25d 5h" does.
+    check("minutes", _fmt_lag(600) == "10m", _fmt_lag(600))
+    check("hours", _fmt_lag(3 * 3600 + 720) == "3h 12m", _fmt_lag(3 * 3600 + 720))
+    check("days", _fmt_lag(25 * 86400 + 5 * 3600) == "25d 5h", _fmt_lag(25 * 86400 + 5 * 3600))
+    check("negative clamps", _fmt_lag(-5) == "0m", _fmt_lag(-5))
+
+
+def _minimal_result(stale):
+    r = build("BTC", "8h", NOW - 8 * 3600_000, NOW,
+              {"closes_7d": [], "market": None}, {}, [], [], stale=stale)
+    return r
+
+
+def test_stale_banner_renders_first_and_names_the_lag():
+    r = _minimal_result([{"source": "recap_aggregates", "lag_s": 25 * 86400,
+                          "limit_s": 2700}])
+    md = render_md(r)
+    first = md.splitlines()[0]
+    # FIRST line, deliberately: this banner says the numbers may be WRONG, not
+    # merely missing. Stale DVOL looks exactly like live DVOL to a reader.
+    check("stale banner is the first line", first.startswith("⚠ recap_aggregates"), first)
+    check("names the lag in human units", "25d 0h" in first, first)
+    check("says not live", "NOT live" in first, first)
+    check("carried in the result", r["stale_sources"][0]["source"] == "recap_aggregates",
+          r.get("stale_sources"))
+
+
+def test_no_banner_when_nothing_is_stale():
+    md = render_md(_minimal_result([]))
+    check("no stale banner on a healthy run", "NOT live" not in md, md.splitlines()[:3])
+    check("stale_sources empty", _minimal_result([])["stale_sources"] == [])
 
 
 def main():
