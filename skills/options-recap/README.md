@@ -58,7 +58,7 @@ volume/`trade_count` rows come from ONE rolling file, `hot__recap_aggregates_5m_
 `v_vol_surface`; and Biggest Print / Block Flow come from the multi-venue Paradigm
 block tape (`paradigm_trade_tape_slim`), scanned in the same DuckDB session. The
 Deribit public API adds only the 7d realized-vol closes (and a live DVOL/spot
-fallback if the S3 read fails).
+fallback when the S3 read fails **or its data is stale** — see Data freshness).
 
 Notes / non-obvious bits:
 - **`PRESET` is just a label now.** The canonical windows (`5m 10m 20m 1h 4h 8h
@@ -225,6 +225,45 @@ per leg.)
 
 On a hot miss (DuckDB fails / CSVs absent) it degrades: affected sections read
 `No data` and the output is prefixed `⚠ hot surface unavailable`. It never fabricates.
+
+## Data freshness
+
+A hot **miss** was always handled. A hot source that is present but **stale** was
+not, and that is a different failure: the recap aggregates froze on 2026-07-10 and
+kept rendering July 10 DVOL/spot as current until the 2026-08-04 deploy — about
+3.5 weeks. The object's mtime kept changing while its contents did not, so every
+"is it still running?" check passed. Only comparing a data timestamp against the
+clock catches it.
+
+`run_recap.sh` writes `freshness.csv` — the newest timestamp per heartbeat source,
+deliberately **not** window-filtered (a source frozen before window-start returns
+zero windowed rows, which is indistinguishable from a quiet market). `recap.py`
+compares each against the clock:
+
+| source | healthy lag (measured 2026-08-09) | limit |
+|---|---|---|
+| `recap_aggregates` | 13m15s — 5-min buckets, open bucket unpublished | 45m |
+| `vol_surface` | 8m30s | 45m |
+
+Past the limit, the source is banner-flagged on the **first line** of the output
+(`⚠ … NOT live`) and DVOL/spot divert to the live Deribit fallback. The banner
+leads because it is the only warning that says the numbers may be *wrong* rather
+than missing — `No data` is self-evident to a reader, stale DVOL is not. If the
+Deribit fallback is itself unavailable the stale figures are retained rather than
+blanked, with a warning: figures plus a banner beat no figures.
+
+Diverting requires dropping the stale keys from `hot`, not merely fetching the
+replacement — `build()` reads `hot['dvol']` first and consults the Deribit series
+only when it is absent, so leaving them in place renders the old numbers anyway.
+That is `drop_stale_snapshot_fields()`.
+
+**Only heartbeat sources are probed.** `dvol_spot` rows publish every 5 min and
+vol-surface snapshots every minute regardless of trading activity, so a gap is
+unambiguously a fault. Event-driven sources are excluded and must stay excluded:
+the block tape's newest trade depends on whether anyone traded — venue `block`
+rows were measured 1h13m behind on a perfectly healthy pipeline because only 29
+blocks printed in 24h. Once the tape carries a pipeline-stamped `generated_at`,
+that column (not the trade time) is the right thing to add.
 
 ## Performance
 
