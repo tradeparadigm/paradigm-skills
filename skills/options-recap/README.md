@@ -158,8 +158,8 @@ underlying-USD basis the block sections use). `recap.py` then:
   The structural brokered-venue exclusion is still the FALLBACK, and every
   guard fails toward it:
   - ids are scoped per venue (independent, often numeric, id spaces);
-  - a venue only merges once at least one of its ids has actually matched in
-    this window — otherwise a benign format difference (`BLOCK-280624` vs
+  - a venue only merges once EVERY one of its ids on the Paradigm tape has found
+    a counterpart in the venue tape — otherwise a benign format difference (`BLOCK-280624` vs
     `280624`) would match nothing and merge everything, doubling the headline;
   - any tape block row on a venue without a venue id, or an unparseable
     `PRODUCT`, gates that venue (or all of them) back to structural;
@@ -259,11 +259,11 @@ Stdlib-only, no network/S3. Run in CI on any change under `skills/options-recap/
 via `.github/workflows/options-recap-tests.yml`:
 
 ```bash
-python3 tests/test_vol_math.py    # 156 checks — the math formulas + tape parsing
+python3 tests/test_vol_math.py    # 166 checks — the math formulas + tape parsing
                                     #   (parse_tape_description) and block ranking/
                                     #   rollup (build_tape_blocks: Σ-per-block
                                     #   notional, RFQ clip rollup, IV lookup)
-python3 tests/test_recap.py       # 207 checks — orchestrator: window parsing,
+python3 tests/test_recap.py       # 293 checks — orchestrator: window parsing,
                                     #   hot-CSV ingest, the volume-corruption guard,
                                     #   block tape → Biggest Print/Block Flow (multi-
                                     #   venue, venue column, freshness stamp),

@@ -1416,6 +1416,46 @@ def test_main_promotes_the_hot_tape_into_the_pipeline():
         check("staged file consumed", not os.path.exists(os.path.join(d, "blocks_pt.csv")))
 
 
+
+def test_unknown_venue_code_cannot_bypass_the_coverage_gate():
+    # The '?' guard only fired when PRODUCT had no " - " at all. Any other
+    # unknown code landed in ids_by_code, was filtered out of matched_codes,
+    # and tainted nothing — so the remaining ids made the venue look fully
+    # covered and a Paradigm print merged on top of its own tape copy. It is
+    # reachable by ordinary drift: run_recap.sh reads token 2 (split_part)
+    # while _tape_venue_code reads token N (rsplit).
+    for label, product in (("three-token suffix", "BTC OPTION - DBT - USDC"),
+                           ("lowercase suffix", "BTC OPTION - dbt"),
+                           ("padded suffix", "BTC OPTION -  DBT ")):
+        # Y9 is the discriminating row: under the bug DBT reads as fully
+        # covered and Y9 merges. A fixture whose only venue row is the
+        # MATCHING one is dropped either way and proves nothing.
+        out = _dedupe_venue_blocks(
+            [{"exchange": "deribit", "block_id": "X1"},
+             {"exchange": "deribit", "block_id": "Y9"}],
+            [_tape("BTC OPTION - DBT", "D1", "X1"), _tape(product, "D2", "X2")])
+        check(f"{label} taints the brokered venues", out == [], out)
+    # and the clean case is unaffected
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "X1"}, {"exchange": "deribit", "block_id": "Y9"}],
+        [_tape("BTC OPTION - DBT", "D1", "X1")])
+    check("recognised codes still merge", [r["block_id"] for r in out] == ["Y9"], out)
+
+
+def test_legacy_block_source_is_rendered_not_just_warned():
+    # WARNINGS are discarded on --render, the only path users see, so the
+    # zero-row promotion warning was invisible for three cycles: a dead
+    # migration looked exactly like a healthy recap.
+    r = build("BTC", "8h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+              {}, [], [])
+    r["block_source_legacy"] = True
+    md = render_md(r)
+    check("legacy source is on the rendered output", "LEGACY tape" in md, md.splitlines()[:4])
+    r["block_source_legacy"] = False
+    check("silent when the hot tape was promoted",
+          "LEGACY tape" not in render_md(r), render_md(r).splitlines()[:3])
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     print(f"Running {len(tests)} test functions...")

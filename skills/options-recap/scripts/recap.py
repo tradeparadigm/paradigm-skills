@@ -514,8 +514,19 @@ def _dedupe_venue_blocks(venue_rows: list[dict],
     # no real venue code — so a malformed row disabled the very gate it should
     # have tripped. Treat it as compromising every brokered venue, since we
     # cannot tell which one it belonged to.
-    if "?" in unstamped_codes or "?" in ids_by_code:
-        unstamped_codes |= set(_TAPE_VENUE_CODE.values())
+    # ANY code we do not recognise taints every brokered venue, not just the
+    # no-separator '?' case. A parseable-but-unknown code (a three-token
+    # `BTC OPTION - DBT - USDC`, a lowercase or padded suffix) otherwise landed
+    # in ids_by_code, was filtered out of matched_codes, and tainted nothing —
+    # so the remaining ids made DBT look fully covered and a Paradigm print
+    # merged on top of its own tape copy. It also matters that run_recap.sh
+    # reads token 2 via split_part while _tape_venue_code reads token N via
+    # rsplit: they agree only for exactly-two-token products and diverge toward
+    # INCLUSION, so the unknown-code path is reachable by ordinary drift rather
+    # than by malformed data.
+    _known = set(_TAPE_VENUE_CODE.values())
+    if not (set(ids_by_code) | unstamped_codes) <= _known:
+        unstamped_codes |= _known
 
     # PASS 1 — which venues have PROVED their id space is comparable.
     #
@@ -887,6 +898,15 @@ def render_md(r: dict) -> str:
                         r["block_flow"], r["vol_surface"])
     L: list[str] = []
 
+    # THIRD cycle for this: the zero-row warn() lands in WARNINGS, and WARNINGS
+    # is discarded on --render — the only path a user sees. So a dead migration
+    # (hot tape never promoted) was indistinguishable from a healthy recap.
+    # Rendered explicitly rather than routed through the warning machinery.
+    if r.get("block_source_legacy"):
+        L.append("⚠ Block Flow is reading the LEGACY tape — the hot paradigm_trade "
+                 "read returned no rows, so venue-block dedupe is structural only.")
+        L.append("")
+
     crit = [w for w in (r.get("warnings") or []) if any(
         k in w for k in ("missing", "unavailable", "failed"))]
     if crit and s.get("volume_usd_m") is None and vs is None:
@@ -1061,7 +1081,8 @@ def main() -> None:
         # never promoted, VENUE_BLOCK_TRADE_ID was never present, and the
         # dedupe silently took the structural branch forever. That closed the
         # zero-row hole by opening its exact opposite.
-        promote_if_nonempty(args.csv_dir, "blocks_pt.csv", "blocks.csv")
+        block_source_legacy = not promote_if_nonempty(
+            args.csv_dir, "blocks_pt.csv", "blocks.csv")
         hot = load_hot(args.csv_dir, ASSET)
         block_rows = load_blocks(args.csv_dir)
         venue_block_rows = load_venue_blocks(args.csv_dir, ASSET)
@@ -1083,6 +1104,7 @@ def main() -> None:
 
     result = build(asset, args.window, start_ms, now_ms, deri, hot, block_rows,
                    venue_block_rows)
+    result["block_source_legacy"] = bool(locals().get("block_source_legacy"))
     if args.render:
         print(render_md(result))
     else:

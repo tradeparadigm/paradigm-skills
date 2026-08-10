@@ -44,7 +44,8 @@ rank in the same pool as Paradigm blocks and render as `<Venue> Block` rows with
 a `(venue tape)` detail note. They are deduped against the Paradigm tape by the
 venue's OWN block id (`VENUE_BLOCK_TRADE_ID`), so a genuinely non-Paradigm
 Deribit or Bullish block merges rather than being excluded wholesale. Every
-guard fails toward EXCLUSION: a venue merges only once EVERY one of its ids on
+guard on a BROKERED venue fails toward EXCLUSION (venues outside the map are
+never brokered by Paradigm and merge unconditionally by design): a venue merges only once EVERY one of its ids on
 the Paradigm tape has found a counterpart in the venue tape, so an unmatched
 venue-tape block cannot be a mis-formatted Paradigm print. Any gap in that
 coverage — including a single unmatched id — drops the venue back to the

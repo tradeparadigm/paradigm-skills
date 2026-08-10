@@ -68,6 +68,15 @@ esac
 # RECAP_PRINT_SOURCES test hook exercise it with no creds. RECAP_NOW_S pins the
 # clock so tests can assert exact partition paths.
 NOW_S=${RECAP_NOW_S:-$(date -u +%s)}; START_S=$((NOW_S - SECS)); START_MS=$((START_S * 1000))
+# Venue-tape `block` rows are bucketed to 5 minutes while the Paradigm tape
+# carries exact-ms traded_at. Windowing both on START_MS drops any venue block
+# in the first PARTIAL bucket, so a Paradigm print in that bucket has no
+# counterpart, full-coverage proof fails, and the whole venue falls back to
+# structural — measured to leave the id merge inactive about half the time from
+# the bucket edge alone. Flooring the venue window to the containing bucket
+# removes that term. It can only ADD venue rows that were already in-window at
+# 5-minute resolution, so it cannot create a double count.
+START_MS_5M=$(( (START_S - START_S % 300) * 1000 ))
 VS_HOT=s3://dt-paradigm-data/paradigm_data/v_vol_surface/_hot.parquet
 VS_COLD=""
 if [ "$SECS" -gt 3600 ]; then               # window-start may predate _hot's buffer
@@ -142,11 +151,11 @@ SET s3_session_token='${ST}';
 COPY (SELECT asset, exchange, metric, arg_min(open, bucket_at) AS open, arg_max(close, bucket_at) AS close, max(high) AS high, min(low) AS low FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, metric) TO '${WORK}/dvol_spot.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
 COPY (SELECT "DATE", "TIME", PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID FROM read_csv_auto('${TAPE}') WHERE PRODUCT LIKE '${ASSET} OPTION%' AND epoch(CAST(CAST("DATE" AS VARCHAR) || ' ' || CAST("TIME" AS VARCHAR) AS TIMESTAMP)) >= ${START_S}) TO '${WORK}/blocks.csv' (HEADER, DELIMITER ',');
-COPY (SELECT asset, exchange, block_id, min(bucket_at) AS bucket_at, sum(volume_sum) AS volume_coin, sum(notional_usd) AS premium_usd, sum(leg_count) AS leg_count, sum(iv_sum) AS iv_sum, sum(iv_count) AS iv_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='block' AND instrument_kind='option' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, block_id) TO '${WORK}/venue_blocks.csv' (HEADER, DELIMITER ',');
+COPY (SELECT asset, exchange, block_id, min(bucket_at) AS bucket_at, sum(volume_sum) AS volume_coin, sum(notional_usd) AS premium_usd, sum(leg_count) AS leg_count, sum(iv_sum) AS iv_sum, sum(iv_count) AS iv_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='block' AND instrument_kind='option' AND bucket_at >= ${START_MS_5M} GROUP BY asset, exchange, block_id) TO '${WORK}/venue_blocks.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '${WORK}/surface_now.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h WHERE abs("at"-${START_MS})<=900000 ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '${WORK}/surface_open.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(turnover_usd) AS turnover_usd, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
-COPY (SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS "DATE", strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS "TIME", product AS PRODUCT, description AS DESCRIPTION, quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE, taker_side AS SIDE, CASE WHEN instrument_name LIKE '%USDC%' THEN 'USDC' WHEN split_part(product, ' - ', 2) = 'DBT' AND asset IN ('BTC','ETH') THEN asset ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD, rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID, venue_block_trade_id AS VENUE_BLOCK_TRADE_ID FROM read_parquet('${PT}') WHERE row_type='paradigm_trade' AND asset='${ASSET}' AND instrument_kind='OPTION' AND traded_at >= ${START_MS}) TO '${WORK}/blocks_pt.csv' (HEADER, DELIMITER ',');
+COPY (SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS "DATE", strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS "TIME", product AS PRODUCT, description AS DESCRIPTION, quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE, taker_side AS SIDE, CASE WHEN upper(coalesce(instrument_name,'')) LIKE '%USDC%' THEN 'USDC' WHEN upper(trim(split_part(coalesce(product,''), ' - ', 2))) = 'DBT' AND upper(coalesce(asset,'')) IN ('BTC','ETH') THEN upper(asset) ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD, rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID, venue_block_trade_id AS VENUE_BLOCK_TRADE_ID FROM read_parquet('${PT}') WHERE row_type='paradigm_trade' AND asset='${ASSET}' AND instrument_kind='OPTION' AND traded_at >= ${START_MS}) TO '${WORK}/blocks_pt.csv' (HEADER, DELIMITER ',');
 SQL
 
 # blocks.csv upgrade (the statement just above): OVERWRITES the legacy

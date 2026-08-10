@@ -56,7 +56,7 @@ SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS DATE,
        auction AS AUCTION, product AS PRODUCT, description AS DESCRIPTION,
        quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE,
        taker_side AS SIDE,
-       CASE WHEN instrument_name LIKE '%USDC%' THEN 'USDC' WHEN split_part(product, ' - ', 2) = 'DBT' AND asset IN ('BTC','ETH') THEN asset ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
+       CASE WHEN upper(coalesce(instrument_name,'')) LIKE '%USDC%' THEN 'USDC' WHEN upper(trim(split_part(coalesce(product,''), ' - ', 2))) = 'DBT' AND upper(coalesce(asset,'')) IN ('BTC','ETH') THEN upper(asset) ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
        rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID,
        UPPER(REPLACE(description,' ','')) AS DESC_N
 FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet')
