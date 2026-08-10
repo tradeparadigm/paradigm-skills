@@ -76,7 +76,7 @@ Notes / non-obvious bits:
   window into seconds instead of enumerating presets.
 - **~24h Snapshot horizon.** The *Snapshot* flow sources reach back only ~24h:
   Volume / Activity / P-C / DVOL / spot come from the rolling recap-aggregates file
-  (trailing 24h). Block Flow + Biggest Print now come from the months-deep Paradigm
+  (trailing 24h). Block Flow + Biggest Print now come from the 30-day Paradigm
   block tape, and the vol surface (`v_vol_surface`) retains far longer — so those are
   no longer the constraint. For windows >24h, `build()` sets a `hot_horizon` field and
   `render_md` prepends a one-line banner scoped to the hot Snapshot sections (Block
@@ -166,7 +166,20 @@ underlying-USD basis the block sections use). `recap.py` then:
   - block rows are keyed `BLOCK_TRADE_ID or TRADE_ID`, matching `vol_math`.
 
   So the worst case is the pre-id behaviour — a non-Paradigm block is missed —
-  never a double count. OKX is never brokered, so it always merges.
+  and a double count needs BOTH a format regression and full-coverage proof to
+  have been granted, which the coverage rule is designed to withhold in exactly
+  that case. OKX is never brokered, so it always merges. Bybit can never appear
+  at all — its feed has an is-block flag but no group id, so its blocks are
+  unreconstructable and ride the volume/flow rows instead.
+- **Prices them as `volume_coin × spot`** — underlying-USD, the same basis as the
+  tape's `NOTIONAL_VOLUME_USD`, valued at recap-time spot (a disclosed
+  approximation vs the tape's trade-time figures). No spot → skipped with a
+  warning, never guessed.
+- Merges them into the same pool: min-notional filter, Biggest Print candidacy and
+  top-N ranking on equal terms. The venue tape carries **no leg geometry**, so they
+  render as `<Venue> Block` rows (the venue lives in the structure label — there is
+  no per-row venue column) with a `(venue tape)` detail note and `~HH:MM` times
+  (5-min bucket resolution); a venue-tape Biggest Print reads `via venue tape`.
 
 
 **Multi-venue representation (truthful + consistent).** The `volume` rows span

@@ -59,8 +59,21 @@ fi
 # sub-$1 USDC premium in bps (the -324953-bps class of bug). Deribit BTC/ETH
 # options are coin-quoted (inverse); Paradex, Bullish and Deribit's alt books
 # are USDC-linear, so everything else derives USDC — the STABLE branch, which is
-# also the safe default when in doubt. Fix properly by carrying a real currency
-# column on the hot tape; this derivation is the correct-today stopgap.
+# also the safe default when in doubt.
+#
+# `instrument_name LIKE '%USDC%'` comes FIRST because venue alone cannot separate
+# Deribit's inverse book from its USDC-linear sibling: both are venue 'DBT', so a
+# venue-only rule derived BTC for a USDC-linear BTC option and a sub-$1 premium
+# went down the bps branch anyway. Verified against the live tape — 50 of 1782
+# option rows carry USDC in instrument_name, so the distinction is present in the
+# data and does not need to be inferred.
+#
+# Venue comes from the PRODUCT suffix, not the `venue` column, so this agrees
+# with parse_product() / _tape_venue_code() / rfq-lookup.md rather than
+# introducing a second source of truth on the same rows.
+#
+# Fix properly by carrying a real currency column on the hot tape; this
+# derivation is the correct-today stopgap.
 TAPE=s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet
 # `_` is a LIKE wildcard and ids are r_…-style — escape it so the match is literal.
 CORE_SQL=${CORE//_/\\_}
@@ -80,7 +93,7 @@ SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS DATE,
        auction AS AUCTION, product AS PRODUCT, description AS DESCRIPTION,
        quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE,
        taker_side AS SIDE,
-       CASE WHEN venue='DBT' AND asset IN ('BTC','ETH') THEN asset ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
+       CASE WHEN instrument_name LIKE '%USDC%' THEN 'USDC' WHEN split_part(product, ' - ', 2) = 'DBT' AND asset IN ('BTC','ETH') THEN asset ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
        rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID,
        UPPER(REPLACE(description,' ','')) AS DESC_N
 FROM read_parquet('${TAPE}')

@@ -56,6 +56,7 @@ from vol_math import (  # noqa: E402
     realized_vs_implied,
     build_tape_blocks,
     compute_vol_surface,
+    tape_block_key,
     RV_LOOKBACK_DAYS,
 )
 
@@ -426,6 +427,33 @@ def _tape_venue_code(tape_row: dict) -> str:
     return product.rsplit(" - ", 1)[-1].strip().upper() if " - " in product else "?"
 
 
+def promote_if_nonempty(csv_dir: str, staged: str, target: str) -> bool:
+    """Move `staged` over `target` only if it carries at least one data row.
+
+    Two failure modes, opposite directions, both silent:
+      - overwriting unconditionally: a COPY that binds but matches nothing
+        writes a bare header, destroying the legacy tape and emptying Block
+        Flow;
+      - never promoting: the migration's whole point (VENUE_BLOCK_TRADE_ID)
+        never reaches the reader and the dedupe permanently takes the
+        structural branch.
+    A missing staged file is the bind-failure case and is already correct —
+    the legacy target stands. A staged file with only a header is reported,
+    because once the promotion works, "silently keeps serving legacy" is the
+    remaining way this goes wrong unobserved."""
+    src = os.path.join(csv_dir, staged)
+    if not os.path.exists(src):
+        return False                      # bind failed; legacy target stands
+    with open(src, newline="") as f:
+        rows = sum(1 for _ in f)
+    if rows <= 1:
+        warn(f"{staged} matched no rows — {target} keeps its previous contents; "
+             "block dedupe falls back to the structural exclusion")
+        return False
+    os.replace(src, os.path.join(csv_dir, target))
+    return True
+
+
 def _tape_block_id(tape_row: dict) -> str:
     """The id vol_math will actually block this row under.
 
@@ -433,8 +461,7 @@ def _tape_block_id(tape_row: dict) -> str:
     narrower definition here — BLOCK_TRADE_ID only — let a row that DOES
     become a block in Block Flow be invisible to the coverage gate, so a
     venue was treated as fully id-covered when it wasn't."""
-    return ((tape_row.get("BLOCK_TRADE_ID") or "").strip()
-            or (tape_row.get("TRADE_ID") or "").strip())
+    return tape_block_key(tape_row) or ""
 
 
 def _dedupe_venue_blocks(venue_rows: list[dict],
@@ -454,7 +481,13 @@ def _dedupe_venue_blocks(venue_rows: list[dict],
     venue keeps the structural exclusion. A format mismatch therefore
     degrades to the old, safe behaviour (a genuinely non-Paradigm block is
     missed) rather than to double-counting, and every gate below fails in
-    that same direction."""
+    that same direction.
+
+    The guarantee is conditional, not absolute: a double count requires BOTH a
+    format regression AND full-coverage proof to have been granted anyway. The
+    coverage rule is designed to withhold proof in precisely that case, but it
+    is evidence, not a proof of correctness, so the claim is stated as the
+    realistic failure direction rather than an impossibility."""
     tape_rows = tape_rows or []
 
     # Ids are scoped PER VENUE. One global set let an id from one venue delete
@@ -484,18 +517,38 @@ def _dedupe_venue_blocks(venue_rows: list[dict],
     if "?" in unstamped_codes or "?" in ids_by_code:
         unstamped_codes |= set(_TAPE_VENUE_CODE.values())
 
-    # PASS 1 — which venues have PROVED their id space is comparable, by
-    # matching at least once in this window. Non-empty ids are not proof: if
-    # Paradigm stamps `BLOCK-280624` while the venue tape carries `280624`,
-    # every id is present, nothing matches, and every brokered block merges —
-    # the double-count this guard exists to prevent. A single confirmed match
-    # is the cheapest available evidence that the two formats line up.
-    matched_codes = set()
+    # PASS 1 — which venues have PROVED their id space is comparable.
+    #
+    # The bar is FULL coverage, not one match. "At least one match" proves only
+    # that some ids line up, so a PARTIAL format regression — 4 of 5 stamped
+    # consistently — proved the venue on the 4 and then merged the 5th, which
+    # is a Paradigm print counted twice. Mixed stamping is the realistic shape
+    # of such a regression; a uniform mismatch is the one a soak catches
+    # immediately. The venue-code pooling makes it worse: deribit and
+    # deribit-usdc share DBT, so a match in one book would vouch for the other.
+    #
+    # So: every tape id on that venue must find a counterpart in the venue
+    # tape. Then an unmatched venue-tape block cannot be a mis-formatted
+    # Paradigm print — every Paradigm print is already accounted for — and is
+    # therefore genuinely non-Paradigm and safe to merge. One unmatched tape id
+    # is enough to withhold proof, because it is indistinguishable from a
+    # Paradigm print whose id we failed to recognise.
+    #
+    # The cost is real and deliberate: a Paradigm block absent from the venue
+    # tape entirely (it carries only option `block` rows) also withholds proof,
+    # so the venue falls back to structural. That is the pre-PR behaviour and
+    # the safe direction.
+    venue_ids_seen: dict = {}
     for r in venue_rows:
         code = _TAPE_VENUE_CODE.get((r.get("exchange") or "").lower())
         block_id = (r.get("block_id") or "").strip()
-        if code and block_id and block_id in (ids_by_code.get(code) or set()):
-            matched_codes.add(code)
+        if code and block_id:
+            venue_ids_seen.setdefault(code, set()).add(block_id)
+    matched_codes = {
+        code for code, tape_ids in ids_by_code.items()
+        if code in _TAPE_VENUE_CODE.values()
+        and tape_ids and tape_ids <= venue_ids_seen.get(code, set())
+    }
 
     # PASS 2 — apply. Every branch fails toward EXCLUSION, so the worst case is
     # the pre-PR behaviour (a genuinely non-Paradigm block is missed) rather
@@ -1001,6 +1054,14 @@ def main() -> None:
             if duck_fut is not None:
                 duck_fut.result()
             deri = deri_fut.result()
+        # AFTER DuckDB has run — this cannot live in run_recap.sh. That script
+        # only WRITES recap.sql; the statements execute here, inside
+        # run_duckdb(). A promotion gate placed in the shell therefore ran
+        # before blocks_pt.csv could exist, so it never fired: the hot tape was
+        # never promoted, VENUE_BLOCK_TRADE_ID was never present, and the
+        # dedupe silently took the structural branch forever. That closed the
+        # zero-row hole by opening its exact opposite.
+        promote_if_nonempty(args.csv_dir, "blocks_pt.csv", "blocks.csv")
         hot = load_hot(args.csv_dir, ASSET)
         block_rows = load_blocks(args.csv_dir)
         venue_block_rows = load_venue_blocks(args.csv_dir, ASSET)

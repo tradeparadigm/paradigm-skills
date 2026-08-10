@@ -44,10 +44,12 @@ rank in the same pool as Paradigm blocks and render as `<Venue> Block` rows with
 a `(venue tape)` detail note. They are deduped against the Paradigm tape by the
 venue's OWN block id (`VENUE_BLOCK_TRADE_ID`), so a genuinely non-Paradigm
 Deribit or Bullish block merges rather than being excluded wholesale. Every
-guard fails toward EXCLUSION, so the worst case is a missed block, never a
-double count: a venue merges only once one of its ids has actually matched in
-the window, and any gap in id coverage drops it back to the structural
-brokered-venue exclusion. OKX is never brokered by Paradigm, so it always
+guard fails toward EXCLUSION: a venue merges only once EVERY one of its ids on
+the Paradigm tape has found a counterpart in the venue tape, so an unmatched
+venue-tape block cannot be a mis-formatted Paradigm print. Any gap in that
+coverage — including a single unmatched id — drops the venue back to the
+structural brokered-venue exclusion, so the realistic failure is a missed block
+rather than a doubled one. OKX is never brokered by Paradigm, so it always
 merges.
 
 Biggest Print names its venue as `via Paradigm/<venue>` (or `via venue tape`).
@@ -59,7 +61,7 @@ where published; other venues show IV `n/a`). A malformed window exits with a cl
 Volume/Activity/P-C/DVOL/spot) retain only ~24h, so `run_recap.sh` caps any longer
 window (e.g. `2d`) at 24h and prepends a one-line `⚠ window capped at 24h — …` banner
 as the first line of its output — **relay it verbatim** (don't drop or reword it).
-Block Flow itself now comes from the months-deep block tape and isn't the constraint;
+Block Flow itself now comes from the 30-day block tape and isn't the constraint;
 the cap lifts once the Snapshot sources are wired to the cold store.
 
 **Vol-surface Δ coverage:** the window-open surface comes from `_hot.parquet`

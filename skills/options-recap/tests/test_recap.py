@@ -27,6 +27,7 @@ from recap import (  # noqa: E402
     pct, pc_descriptor, dvol_label, spot_vol_label, fmt_hhmm,
     run_duckdb, _load_surface_tickers, _delta_fmt, _venue_label,
     _venue_tape_blocks, MAX_SURFACE_ROWS, _dedupe_venue_blocks,
+    promote_if_nonempty,
 )
 
 _passed = 0
@@ -1319,6 +1320,100 @@ def test_build_passes_the_tape_to_the_dedupe():
     check("and they are the tape rows, not the venue rows",
           any((r or {}).get("VENUE_BLOCK_TRADE_ID") == "BLOCK-1" for r in (seen.get("tape") or [])),
           seen.get("tape"))
+
+
+
+def test_promote_only_when_the_staged_file_has_rows():
+    # Both directions are silent failures: promoting a header-only file destroys
+    # the legacy tape and empties Block Flow; never promoting means
+    # VENUE_BLOCK_TRADE_ID never arrives and the dedupe takes the structural
+    # branch forever. The first version of this gate lived in run_recap.sh,
+    # which only WRITES the SQL — recap.py executes it — so the staged file
+    # could not exist at gate time and the promotion never fired at all.
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "blocks.csv", "A,B\nlegacy,row\n")
+        # (a) staged file absent = bind failure -> legacy stands
+        check("absent staged -> no promote", promote_if_nonempty(d, "blocks_pt.csv", "blocks.csv") is False)
+        check("legacy intact", "legacy" in open(os.path.join(d, "blocks.csv")).read())
+        # (b) header-only -> legacy stands, and it is REPORTED
+        recap.WARNINGS.clear()
+        _write(d, "blocks_pt.csv", "A,B\n")
+        check("header-only -> no promote", promote_if_nonempty(d, "blocks_pt.csv", "blocks.csv") is False)
+        check("legacy still intact", "legacy" in open(os.path.join(d, "blocks.csv")).read())
+        check("and it warns", any("matched no rows" in w for w in recap.WARNINGS), recap.WARNINGS)
+        # (c) real rows -> promoted
+        _write(d, "blocks_pt.csv", "A,B\nhot,row\n")
+        check("rows -> promote", promote_if_nonempty(d, "blocks_pt.csv", "blocks.csv") is True)
+        check("hot content won", "hot" in open(os.path.join(d, "blocks.csv")).read())
+        check("staged consumed", not os.path.exists(os.path.join(d, "blocks_pt.csv")))
+
+
+def test_partial_id_mismatch_does_not_double_count():
+    # THE cycle-2 blocking case. Proof used to be per-VENUE set membership, so
+    # 4 of 5 ids stamped consistently proved the venue and the 5th — a Paradigm
+    # print whose id we simply failed to recognise — merged as if it were a
+    # genuinely non-Paradigm block. Mixed stamping is the realistic shape of a
+    # format regression; a uniform mismatch is the one a soak catches at once.
+    tape = [_tape("BTC OPTION - DBT", f"D{i}", f"X{i}") for i in range(1, 5)]
+    tape.append(_tape("BTC OPTION - DBT", "D5", "BLOCK-X5"))
+    venue = [{"exchange": "deribit", "block_id": f"X{i}"} for i in range(1, 6)]
+    check("one unmatched tape id withholds proof for the venue",
+          _dedupe_venue_blocks(venue, tape) == [], _dedupe_venue_blocks(venue, tape))
+
+
+def test_full_coverage_still_merges_a_genuine_block():
+    # The precision the id path exists for must survive the stricter rule.
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "X1"}, {"exchange": "deribit", "block_id": "Y9"}],
+        [_tape("BTC OPTION - DBT", "D1", "X1")])
+    check("every tape id matched -> the extra block merges",
+          [r["block_id"] for r in out] == ["Y9"], out)
+
+
+def test_one_deribit_book_cannot_vouch_for_the_other():
+    # deribit and deribit-usdc share code DBT, so per-venue proof let a match in
+    # one book prove the other.
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "X1"},
+         {"exchange": "deribit-usdc", "block_id": "X2"}],
+        [_tape("BTC OPTION - DBT", "D1", "X1"), _tape("BTC OPTION - DBT", "D2", "BLOCK-X2")])
+    check("unmatched id in the pool withholds proof", out == [], out)
+
+
+
+def test_main_promotes_the_hot_tape_into_the_pipeline():
+    # The promotion is only useful if main() actually calls it: deleting the
+    # call left every unit test green while the migration was dead on arrival
+    # (VENUE_BLOCK_TRADE_ID never reaching the dedupe). Drive main() and assert
+    # on the file the rest of the pipeline reads.
+    import io as _io, contextlib as _ctx
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "blocks.csv",
+               "DATE,TIME,PRODUCT,DESCRIPTION,QTY,PRICE,REF_PRICE,SIDE,"
+               "QUOTE_CURRENCY,NOTIONAL_VOLUME_USD,RFQ_ID,TRADE_ID,BLOCK_TRADE_ID\n"
+               "2026-08-09,00:00:00,BTC OPTION - DBT,LEGACY,1,0.01,0.01,BUY,BTC,1000,r0,t0,L1\n")
+        _write(d, "blocks_pt.csv",
+               "DATE,TIME,PRODUCT,DESCRIPTION,QTY,PRICE,REF_PRICE,SIDE,"
+               "QUOTE_CURRENCY,NOTIONAL_VOLUME_USD,RFQ_ID,TRADE_ID,BLOCK_TRADE_ID,"
+               "VENUE_BLOCK_TRADE_ID\n"
+               "2026-08-09,00:00:00,BTC OPTION - DBT,HOTTAPE,1,0.01,0.01,BUY,BTC,1000,r1,t1,D1,X1\n")
+        orig_fb, orig_deri = recap._fetch_market_fallback, recap.fetch_deribit
+        recap._fetch_market_fallback = lambda *a, **k: {"dvol": [], "spot": {}, "spot_now": 1.0, "tickers": {}}
+        recap.fetch_deribit = lambda a, st, e, want_market=False: {"closes_7d": [], "market": None}
+        saved = sys.argv
+        try:
+            sys.argv = ["recap.py", "--asset", "BTC", "--window", "8h",
+                        "--csv-dir", d, "--now-ms", "1786324887000", "--render"]
+            with _ctx.redirect_stdout(_io.StringIO()):
+                recap.main()
+        finally:
+            sys.argv = saved
+            recap._fetch_market_fallback, recap.fetch_deribit = orig_fb, orig_deri
+            recap.WARNINGS.clear()
+        body = open(os.path.join(d, "blocks.csv")).read()
+        check("hot tape promoted by main()", "HOTTAPE" in body, body[:120])
+        check("legacy replaced", "LEGACY" not in body, body[:120])
+        check("staged file consumed", not os.path.exists(os.path.join(d, "blocks_pt.csv")))
 
 
 def main():
