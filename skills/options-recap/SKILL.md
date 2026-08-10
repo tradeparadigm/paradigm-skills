@@ -8,14 +8,11 @@ description: >
   options flow summary, "what happened in BTC options", or "last Xh of flow".
   The output format is fixed — always the same four sections in the same order.
 compatibility: Deribit public API (curl) for the 7d realized-vol closes, and as the
-  live fallback for DVOL/spot when the hot source is stale or absent; Paradigm
-  data (DuckDB+S3 via IRSA) for everything else — DVOL/spot, $ Volume, multi-venue
-  activity/P-C, the vol surface, and the Biggest Print + Block Flow (the multi-venue
-  paradigm_trade_tape_slim block tape). Heartbeat sources are freshness-checked
-  before rendering — one that has fallen behind its limit is banner-flagged as NOT
-  live; DVOL/spot then divert to Deribit when that fetch succeeds. No auth for the
-  public API; the S3 reads require the IRSA bootstrap (see paradigm-data-discovery
-  skill).
+  live DVOL/spot fallback when the hot source is stale or absent; Paradigm data
+  (DuckDB+S3 via IRSA) for everything else. Heartbeat sources are
+  freshness-checked before rendering; a source past its limit is banner-flagged
+  and DVOL/spot divert to Deribit where that fetch succeeds. No auth for the
+  public API; S3 reads need the IRSA bootstrap (see paradigm-data-discovery).
 metadata:
   author: tradeparadigm
   version: "1.14"
@@ -118,8 +115,10 @@ into a stronger claim:
   the banner says re-sourced.** `$ Volume`, Activity, P/C and venue Block Flow
   come from the same file and are windowed, so they cover only up to the freeze
   and understate the window — the banner says this too.
-- **`vol_surface` stale** — banner only. There is **no** live fallback for the
-  surface, so ATM/RR/Fly, skew, term and the Δ columns are from that data.
+- **`vol_surface` stale** — banner only; a stale surface does not itself
+  trigger a refetch. ATM/RR/Fly, skew, term and the Δ columns come from that
+  data unless the Deribit ticker surface happens to be fetched for another
+  reason (a stale `recap_aggregates`, or no hot surface at all).
 
 This exists because the recap aggregates froze on 2026-07-10 and rendered July
 10 DVOL/spot as current for ~3.5 weeks. The file's mtime kept changing while its

@@ -1259,35 +1259,50 @@ def test_check_freshness_orders_unknown_first_then_worst_lag():
           [(g["source"], g["status"]) for g in got])
 
 
-def test_drop_stale_snapshot_fields_needs_a_live_replacement():
-    hot = {"dvol": 30.0, "spot_close": 1.0, "surface_spot": 1.0, "volume_btc": 5.0}
-    check("no market -> no drop", drop_stale_snapshot_fields(hot, None) is False)
-    check("empty market -> no drop", drop_stale_snapshot_fields(hot, {"dvol": []}) is False)
-    check("hot untouched", hot["dvol"] == 30.0, hot)
-    check("live market -> drop", drop_stale_snapshot_fields(hot, {"dvol": [[1, 2]]}) is True)
-    check("stale dvol removed", "dvol" not in hot, hot)
-    check("stale spot removed", "spot_close" not in hot, hot)
-    # surface_spot is a COPY of spot_close and build() ranks it ABOVE the
-    # Deribit fallback, so leaving it behind renders the stale price anyway.
-    check("stale surface_spot removed", "surface_spot" not in hot, hot)
-    check("unrelated fields kept", hot.get("volume_btc") == 5.0, hot)
+def test_drop_gates_dvol_and_spot_independently():
+    # A single list gated on `dvol` alone popped the spot keys too, so a
+    # half-successful Deribit fetch destroyed spot under a banner claiming it
+    # was re-sourced live. That is the false-liveness class this PR exists to
+    # eliminate, and it was a regression FROM the surface_spot fix.
+    live = [[1, 2, 3, 4, 5]]
+    hot = {"dvol": 30.0, "spot_close": 61000.0, "surface_spot": 61000.0, "volume_btc": 5.0}
+    got = drop_stale_snapshot_fields(hot, {"dvol": live, "spot": {}, "spot_now": None})
+    check("dvol replaced", got["dvol"] is True, got)
+    check("spot NOT replaced", got["spot"] is False, got)
+    check("dvol dropped", "dvol" not in hot, hot)
+    check("spot retained rather than blanked", hot.get("spot_close") == 61000.0, hot)
+    check("surface_spot retained with it", hot.get("surface_spot") == 61000.0, hot)
+    # the mirror case: spot live, dvol empty
+    hot2 = {"dvol": 30.0, "spot_close": 61000.0, "surface_spot": 61000.0}
+    got2 = drop_stale_snapshot_fields(hot2, {"dvol": [], "spot": {"close": [1.0]}, "spot_now": 1.0})
+    check("dvol NOT replaced", got2["dvol"] is False, got2)
+    check("spot replaced", got2["spot"] is True, got2)
+    check("stale dvol retained", hot2.get("dvol") == 30.0, hot2)
+    check("spot group dropped incl surface_spot",
+          "spot_close" not in hot2 and "surface_spot" not in hot2, hot2)
+    # nothing usable -> nothing dropped
+    hot3 = {"dvol": 30.0, "spot_close": 1.0}
+    got3 = drop_stale_snapshot_fields(hot3, None)
+    check("no market -> no drops", got3 == {"dvol": False, "spot": False}, got3)
+    check("hot untouched", hot3 == {"dvol": 30.0, "spot_close": 1.0}, hot3)
 
 
 def test_stale_surface_spot_cannot_outrank_the_live_fallback():
-    # End-to-end on build(): the divert "succeeds" but Deribit returns no spot
-    # series (a truthy dict with an empty close list). Before surface_spot was
-    # dropped, the July price resurfaced here and fed vol_usd, block notionals
-    # and surface moneyness.
+    # The previous version asserted on snap["spot_close"], which build() never
+    # emits — the rendered price is snap["spot"] — so the subject was None and
+    # `None != 55000.0` passed unconditionally, with the bug fully reintroduced.
+    # Assert on the key the recap actually renders, and positively.
     hot = {"dvol": 30.0, "spot_close": 55000.0, "surface_spot": 55000.0}
-    dvol_series = [[NOW - 3600_000, 40.0, 41.0, 39.0, 40.5],   # ts,o,h,l,c
-                   [NOW, 40.5, 42.0, 40.0, 41.2]]
-    drop_stale_snapshot_fields(hot, {"dvol": dvol_series})
+    dvol_series = [[NOW - 3600_000, 40.0, 41.0, 39.0, 40.5], [NOW, 40.5, 42.0, 40.0, 41.2]]
+    market = {"dvol": dvol_series, "spot": {"close": [120000.0, 121000.0]},
+              "spot_now": 121000.0, "tickers": {}}
+    drop_stale_snapshot_fields(hot, market)
     r = build("BTC", "8h", NOW - 8 * 3600_000, NOW,
-              {"closes_7d": [], "market": {"dvol": dvol_series, "spot": {"close": []},
-                                           "spot_now": None, "tickers": {}}},
-              hot, [], [], stale=[])
+              {"closes_7d": [], "market": market}, hot, [], [], stale=[])
     snap = r["snapshot"]
-    check("stale spot did not resurface", snap.get("spot_close") != 55000.0, snap)
+    check("snapshot exposes spot, not spot_close", "spot" in snap, sorted(snap))
+    check("stale July price did not resurface", snap.get("spot") != 55000, snap.get("spot"))
+    check("and the LIVE value is rendered", snap.get("spot") == 121000, snap.get("spot"))
 
 
 def test_fmt_lag_is_human():
@@ -1304,7 +1319,8 @@ def _minimal_result(stale):
 
 def test_stale_banner_leads_and_states_the_outcome():
     r = _minimal_result([{"source": "recap_aggregates", "status": "stale",
-                          "lag_s": 25 * 86400, "limit_s": 2700, "retained": False}])
+                          "lag_s": 25 * 86400, "limit_s": 2700, "retained": False,
+                          "retained_groups": []}])
     md = render_md(r)
     lines = md.splitlines()
     check("banner is the first line", lines[0].startswith("⚠ recap_aggregates"), lines[0])
@@ -1317,7 +1333,8 @@ def test_stale_banner_leads_and_states_the_outcome():
 
 def test_banner_distinguishes_a_failed_divert():
     r = _minimal_result([{"source": "recap_aggregates", "status": "stale",
-                          "lag_s": 3 * 86400, "limit_s": 2700, "retained": True}])
+                          "lag_s": 3 * 86400, "limit_s": 2700, "retained": True,
+                          "retained_groups": ["dvol", "spot"]}])
     md = render_md(r)
     # Previously byte-identical to a successful divert — the reader could not
     # tell whether the Snapshot figures were live or three weeks old.
@@ -1325,12 +1342,26 @@ def test_banner_distinguishes_a_failed_divert():
     check("not claiming live", "re-sourced live from Deribit" not in md, md.splitlines()[:4])
 
 
+def test_banner_reports_a_PARTIAL_divert():
+    # The half-successful fetch: dvol replaced, spot retained. The banner must
+    # not claim blanket liveness — this is the exact case where the old single
+    # gate destroyed spot and reported success.
+    r = _minimal_result([{"source": "recap_aggregates", "status": "stale",
+                          "lag_s": 3 * 86400, "limit_s": 2700, "retained": True,
+                          "retained_groups": ["spot"]}])
+    md = render_md(r)
+    check("names the group that is stale", "spot could NOT be re-sourced" in md, md.splitlines()[:4])
+    check("credits the group that was replaced", "dvol re-sourced live" in md, md.splitlines()[:4])
+    check("no blanket liveness claim", "DVOL/spot re-sourced live" not in md, md.splitlines()[:4])
+
+
 def test_unknown_freshness_banner_says_so():
     r = _minimal_result([{"source": "vol_surface", "status": "unknown",
                           "lag_s": None, "limit_s": 2700}])
     md = render_md(r)
     check("unknown wording", "could not be verified" in md, md.splitlines()[:3])
-    # vol_surface has no live fallback; the banner must not imply one.
+    # vol_surface triggers no refetch of its own; the banner must not imply
+    # a divert happened for it.
     check("no false divert claim", "re-sourced live" not in md, md.splitlines()[:4])
     check("names what is affected", "Vol Surface" in md, md.splitlines()[:4])
 
@@ -1370,6 +1401,7 @@ def _run_main(csv_dir, market=None, now_ms=NOW, extra_argv=()):
     finally:
         sys.argv = saved_argv
         recap._fetch_market_fallback, recap.fetch_deribit = orig_fb, orig_deri
+        calls["warnings"] = list(recap.WARNINGS)   # snapshot before clearing
         recap.WARNINGS.clear()
     return buf.getvalue(), calls
 
@@ -1416,6 +1448,11 @@ def test_main_reports_a_failed_divert_rather_than_implying_live():
     # kills: deleting the warn-on-retained block / dropping `retained`
     check("says could NOT be re-sourced", "could NOT be re-sourced" in out,
           out.splitlines()[:4])
+    # mutant H: deleting the warn() left the suite green. The banner carries the
+    # user-facing signal, but the warning is the --json record, so pin it.
+    check("retained groups recorded in warnings",
+          any("retained — no live replacement" in w for w in calls["warnings"]),
+          calls["warnings"])
     check("does not claim live", "re-sourced live from Deribit" not in out,
           out.splitlines()[:4])
 
@@ -1465,10 +1502,22 @@ def test_freshness_probe_contract_matches_its_reader():
     for body, fname in copies:
         check(f"{fname} aliases the column load_freshness reads",
               "AS max_at" in body, body[:120])
-    # the recap_aggregates probe must not flatten its constituent series
+    # Assert the exact grouping key set, not merely that a GROUP BY exists. The
+    # loose version let two distinct defects through at full green:
+    #   GROUP BY exchange, metric -> probe measures a SUPERSET of what load_hot
+    #     renders (it collapses to Deribit), so another venue lagging fires a
+    #     false banner and forces a refetch every run;
+    #   GROUP BY exchange         -> collapses dvol and spot back into one flat
+    #     max, restoring the original masked-freeze bug.
     rec = next(b for b, f in copies if f == "freshness_rec.csv")
-    check("recap probe takes min over per-group maxima",
-          "min(mx)" in rec and "GROUP BY" in rec, rec[:160])
+    check("recap probe takes min over per-metric maxima", "min(mx)" in rec, rec[:160])
+    check("grouped by metric ALONE", "GROUP BY metric)" in rec, rec[:200])
+    check("not grouped by exchange", "exchange" not in rec, rec[:200])
+    # The vol_surface probe must measure the rows the recap consumes. Deleting
+    # this predicate survived at full green: BTC's surface could freeze while
+    # ETH rows keep landing in the shared file and the probe reads fresh.
+    vs = next(b for b, f in copies if f == "freshness_vs.csv")
+    check("surface probe is asset-scoped", "symbol LIKE" in vs, vs[:200])
 
 
 def test_no_banner_when_nothing_is_stale():

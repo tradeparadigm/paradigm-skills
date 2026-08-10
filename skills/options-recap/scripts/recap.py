@@ -274,36 +274,46 @@ def check_freshness(fresh: dict, now_ms: int) -> list[dict]:
     return sorted(out, key=lambda d: (d["lag_s"] is not None, -(d["lag_s"] or 0)))
 
 
-_STALE_HOT_FIELDS = ("dvol", "dvol_open", "dvol_low", "dvol_high",
-                     "spot_close", "spot_open", "spot_low", "spot_high",
-                     # surface_spot is a COPY of spot_close (load_hot seeds it
-                     # from the same value), and build() ranks it ABOVE the
-                     # Deribit fallback: `spot_close or surface_spot or
-                     # spot_now`. Dropping spot_close alone therefore leaves the
-                     # stale price alive one slot down, where it feeds vol_usd,
-                     # every venue-tape block notional and surface moneyness —
-                     # a "successful" divert that still renders a stale price,
-                     # and an internally contradictory recap.
-                     "surface_spot")
+# Two INDEPENDENTLY gated groups. A single list gated on `dvol` alone popped the
+# spot keys too, so a half-successful Deribit fetch — get_volatility_index_data
+# succeeds, get_tradingview_chart_data returns 200 with no series — destroyed
+# spot and then reported "re-sourced live from Deribit". That is the
+# false-liveness class this whole gate exists to eliminate, and it was a
+# regression FROM the surface_spot fix: before surface_spot joined the drop set
+# it backstopped `spot`, so the path degraded instead of blanking.
+_STALE_DVOL_FIELDS = ("dvol", "dvol_open", "dvol_low", "dvol_high")
+# surface_spot is a COPY of spot_close (load_hot seeds it from the same value)
+# and build() ranks it ABOVE the Deribit value — `spot_close or surface_spot or
+# spot_now` — so it belongs to the SPOT group or the stale price survives one
+# slot down, feeding vol_usd, venue-tape block notionals and surface moneyness.
+_STALE_SPOT_FIELDS = ("spot_close", "spot_open", "spot_low", "surface_spot")
 
 
-def drop_stale_snapshot_fields(hot: dict, market: dict | None) -> bool:
-    """Remove the stale hot DVOL/spot so build() prefers the live Deribit
-    series. Returns whether it dropped them.
+def _usable_spot(market: dict | None) -> bool:
+    """A spot series we can actually render from. `market["spot"]` can be a
+    truthy dict with an empty close list (status: no_data, a rate limit, a thin
+    instrument), which is why presence is not enough."""
+    m = market or {}
+    return bool((m.get("spot") or {}).get("close")) or m.get("spot_now") is not None
 
-    Fetching the replacement is NOT sufficient on its own: build() reads
-    hot['dvol'] and hot['spot_close'] first and consults `market` only when
-    they are absent, so leaving them in place renders the stale numbers even
-    though a fresh copy was just fetched.
 
-    Refuses to drop when the fallback came back empty — a recap with old
-    figures and a banner saying so beats one with no figures at all, and the
-    caller warns in that case."""
-    if not (market or {}).get("dvol"):
-        return False
-    for k in _STALE_HOT_FIELDS:
-        hot.pop(k, None)
-    return True
+def drop_stale_snapshot_fields(hot: dict, market: dict | None) -> dict:
+    """Drop each stale group only where a live replacement exists.
+
+    Returns {"dvol": bool, "spot": bool} — whether each group was replaced.
+    Gating them together meant one endpoint failing blanked the other's data
+    under a success banner. Refuses to drop a group with no replacement: stale
+    figures plus an accurate banner beat blank ones, and the caller reports it."""
+    replaced = {"dvol": False, "spot": False}
+    if (market or {}).get("dvol"):
+        for k in _STALE_DVOL_FIELDS:
+            hot.pop(k, None)
+        replaced["dvol"] = True
+    if _usable_spot(market):
+        for k in _STALE_SPOT_FIELDS:
+            hot.pop(k, None)
+        replaced["spot"] = True
+    return replaced
 
 
 def _fmt_lag(seconds: int) -> str:
@@ -820,7 +830,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "vol_surface": surface_out,
         "hot_horizon": hot_horizon,
         "stale_sources": stale or [],
-        "warnings": WARNINGS,
+        "warnings": list(WARNINGS),
     }
 
 
@@ -877,9 +887,13 @@ def render_md(r: dict) -> str:
         # sourced from it are NOT live" left the reader unable to tell which
         # figures, whether the divert worked, or that the window was truncated.
         if st["source"] == "recap_aggregates":
-            if st.get("retained"):
-                L.append("   DVOL/spot could NOT be re-sourced — the values "
-                         "below are from that stale data.")
+            kept = st.get("retained_groups") or []
+            if kept:
+                got = [g for g in ("dvol", "spot") if g not in kept]
+                line = f"   {'/'.join(kept)} could NOT be re-sourced — those values below are stale."
+                if got:
+                    line += f" ({'/'.join(got)} re-sourced live from Deribit.)"
+                L.append(line)
             else:
                 L.append("   DVOL/spot re-sourced live from Deribit.")
             # These come from the SAME parquet but are windowed by bucket_at, so
@@ -892,7 +906,10 @@ def render_md(r: dict) -> str:
                      "UNDERSTATE the window.")
         elif st["source"] == "vol_surface":
             L.append("   Vol Surface (ATM/RR/Fly, skew, term) and its Δ columns "
-                     "are from that data; there is no live fallback for them.")
+                     "are from that data. A stale surface does not itself "
+                     "trigger a refetch — only recap_aggregates does — so the "
+                     "Deribit ticker surface backfills these only when that "
+                     "fallback runs for another reason.")
     if r.get("stale_sources"):
         L.append("")
 
@@ -1104,16 +1121,18 @@ def main() -> None:
             # stale figures survived, which leaves the reader unable to answer
             # the one question the feature exists for: are these numbers live?
             replaced = drop_stale_snapshot_fields(hot, deri.get("market"))
+            kept = [g for g, ok in replaced.items() if not ok]
             for s in stale:
                 if s["source"] in _SNAPSHOT_SOURCES:
-                    s["retained"] = not replaced
-            if not replaced:
+                    s["retained"] = bool(kept)
+                    s["retained_groups"] = kept
+            if kept:
                 # No "unavailable"/"missing"/"failed" wording: those substrings
                 # route this into render_md's `crit` bucket, whose own guard
                 # (volume_usd_m is None and vs is None) never fires on a
                 # stale-but-present feed, so it would be silently swallowed.
-                warn("stale hot DVOL/spot retained — no live replacement; "
-                     "Snapshot figures are NOT live")
+                warn(f"stale hot {'/'.join(kept)} retained — no live replacement; "
+                     "those Snapshot figures are NOT live")
 
     result = build(asset, args.window, start_ms, now_ms, deri, hot, block_rows,
                    venue_block_rows, stale=stale)

@@ -281,7 +281,8 @@ consequence is spelled out per source rather than left generic:
   full window. The Snapshot divert does not help them, so the banner discloses
   the truncation explicitly.
 - **`vol_surface`** — banner only. `_SNAPSHOT_SOURCES` covers `recap_aggregates`
-  alone, so a stale surface triggers no fetch and no field drop; ATM/RR/Fly,
+  alone, so a stale surface triggers no fetch of its own (the Deribit ticker
+  surface can still backfill it when the fallback runs for another reason); ATM/RR/Fly,
   skew, term and the Δ columns all come from the frozen snapshot (with the Δs
   computed between two frozen readings, so they read flat).
 
@@ -315,7 +316,7 @@ python3 tests/test_vol_math.py    # 166 checks — the math formulas + tape pars
                                     #   (parse_tape_description) and block ranking/
                                     #   rollup (build_tape_blocks: Σ-per-block
                                     #   notional, RFQ clip rollup, IV lookup)
-python3 tests/test_recap.py       # 316 checks — orchestrator: window parsing,
+python3 tests/test_recap.py       # 327 checks — orchestrator: window parsing,
                                     #   hot-CSV ingest, the volume-corruption guard,
                                     #   block tape → Biggest Print/Block Flow (multi-
                                     #   venue, venue column, freshness stamp),
