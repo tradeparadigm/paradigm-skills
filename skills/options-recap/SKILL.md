@@ -36,18 +36,24 @@ the `$` Volume line, and the multi-venue activity/P-C all come from one rolling 
 aggregates file sliced to the window at query time; the surface (and its Δ columns)
 from `v_vol_surface`; and **Biggest Print + Block Flow from the multi-venue Paradigm
 block tape** (the hot `paradigm_trade` rows; legacy `paradigm_trade_tape_slim`
-csv.gz as fallback) — every venue Paradigm brokers
-(Deribit/Paradex/Bullish/…), notional already in USD per leg — **plus venue-tape
-blocks** off the hot recap file's option `block` rows, deduped against the
-Paradigm tape by the venue's OWN block id (`VENUE_BLOCK_TRADE_ID`) where the
-window's id coverage allows — so genuinely non-Paradigm Deribit/Bullish blocks
-merge too — and by the structural brokered-venue exclusion otherwise
-(never double-count on uncertainty; OKX always merges), which rank in the same pool and render as
-`<Venue> Block` rows with a `(venue tape)` detail note. Biggest Print names its
-venue as `via Paradigm/<venue>` (or `via venue tape`). The Paradigm tape has no
-IV, so the top blocks' IV is looked up from the vol surface (Deribit legs only;
-venue-tape blocks carry their venue's per-trade IV where published; other venues
-show IV `n/a`). A malformed window exits with a clear error.
+csv.gz as fallback) — every venue Paradigm brokers (Deribit/Paradex/Bullish/…),
+notional already in USD per leg.
+
+**Plus venue-tape blocks** off the hot recap file's option `block` rows. These
+rank in the same pool as Paradigm blocks and render as `<Venue> Block` rows with
+a `(venue tape)` detail note. They are deduped against the Paradigm tape by the
+venue's OWN block id (`VENUE_BLOCK_TRADE_ID`), so a genuinely non-Paradigm
+Deribit or Bullish block merges rather than being excluded wholesale. Every
+guard fails toward EXCLUSION, so the worst case is a missed block, never a
+double count: a venue merges only once one of its ids has actually matched in
+the window, and any gap in id coverage drops it back to the structural
+brokered-venue exclusion. OKX is never brokered by Paradigm, so it always
+merges.
+
+Biggest Print names its venue as `via Paradigm/<venue>` (or `via venue tape`).
+The Paradigm tape has no IV, so the top blocks' IV is looked up from the vol
+surface (Deribit legs only; venue-tape blocks carry their venue's per-trade IV
+where published; other venues show IV `n/a`). A malformed window exits with a clear error.
 
 **Windows beyond 24h:** the Snapshot flow sources (the rolling hot aggregates file →
 Volume/Activity/P-C/DVOL/spot) retain only ~24h, so `run_recap.sh` caps any longer
