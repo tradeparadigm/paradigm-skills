@@ -42,7 +42,7 @@ fi
 # Cap at 24h. The Snapshot flow sources (rolling recap-aggregates file →
 # Volume/Activity/P-C/DVOL/spot) hold only ~24h, so a longer window rendered
 # partially-covered Snapshot flow under a full-window header. Block Flow itself
-# now comes from the months-deep Paradigm tape and isn't the constraint, but the
+# now comes from the 30-day Paradigm tape and is not the constraint, but the
 # Snapshot still is — until those are wired to the cold store, clamp and DISCLOSE
 # (the banner line below is part of the recap output).
 CAP_NOTE=""
@@ -68,6 +68,15 @@ esac
 # RECAP_PRINT_SOURCES test hook exercise it with no creds. RECAP_NOW_S pins the
 # clock so tests can assert exact partition paths.
 NOW_S=${RECAP_NOW_S:-$(date -u +%s)}; START_S=$((NOW_S - SECS)); START_MS=$((START_S * 1000))
+# Venue-tape `block` rows are bucketed to 5 minutes while the Paradigm tape
+# carries exact-ms traded_at. Windowing both on START_MS drops any venue block
+# in the first PARTIAL bucket, so a Paradigm print in that bucket has no
+# counterpart, full-coverage proof fails, and the whole venue falls back to
+# structural — measured to leave the id merge inactive about half the time from
+# the bucket edge alone. Flooring the venue window to the containing bucket
+# removes that term. It can only ADD venue rows that were already in-window at
+# 5-minute resolution, so it cannot create a double count.
+START_MS_5M=$(( (START_S - START_S % 300) * 1000 ))
 VS_HOT=s3://dt-paradigm-data/paradigm_data/v_vol_surface/_hot.parquet
 VS_COLD=""
 if [ "$SECS" -gt 3600 ]; then               # window-start may predate _hot's buffer
@@ -116,7 +125,17 @@ REC=s3://dt-exchange-venue-data/hot/hot__recap_aggregates_5m_24h.parquet
 # and the structure named in DESCRIPTION — so recap.py needs no cross-venue $
 # normalization and no instrument-name inference. A full scan is sub-second, so
 # it's read fresh per recap; the window is applied here by the DATE+TIME filter.
+# LEGACY source: superseded by the hot paradigm_trade tape (PT below) via the
+# fallback-then-overwrite pair in the SQL — delete this read once the egress
+# decommission (data#712) has merged and soaked.
 TAPE=s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz
+
+# Snowflake-free Paradigm tape: hot__paradigm_trade_tape_30d.parquet (row_type=
+# 'paradigm_trade', leg grain, trailing 30d), built by the
+# exchange-venue-data paradigm-trade CronJob from the Airbyte→S3 UM landing.
+# Same columns as the csv.gz PLUS VENUE_BLOCK_TRADE_ID — the venue's own
+# block id, which unlocks exact block dedupe against the venue tapes.
+PT=s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet
 
 # One DuckDB session → CSVs. One statement per line; `at` is reserved → alias it.
 # dvol_spot + volume come from the rolling recap-aggregates file, windowed at query
@@ -132,11 +151,28 @@ SET s3_session_token='${ST}';
 COPY (SELECT asset, exchange, metric, arg_min(open, bucket_at) AS open, arg_max(close, bucket_at) AS close, max(high) AS high, min(low) AS low FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, metric) TO '${WORK}/dvol_spot.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
 COPY (SELECT "DATE", "TIME", PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID FROM read_csv_auto('${TAPE}') WHERE PRODUCT LIKE '${ASSET} OPTION%' AND epoch(CAST(CAST("DATE" AS VARCHAR) || ' ' || CAST("TIME" AS VARCHAR) AS TIMESTAMP)) >= ${START_S}) TO '${WORK}/blocks.csv' (HEADER, DELIMITER ',');
-COPY (SELECT asset, exchange, block_id, min(bucket_at) AS bucket_at, sum(volume_sum) AS volume_coin, sum(notional_usd) AS premium_usd, sum(leg_count) AS leg_count, sum(iv_sum) AS iv_sum, sum(iv_count) AS iv_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='block' AND instrument_kind='option' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, block_id) TO '${WORK}/venue_blocks.csv' (HEADER, DELIMITER ',');
+COPY (SELECT asset, exchange, block_id, min(bucket_at) AS bucket_at, sum(volume_sum) AS volume_coin, sum(notional_usd) AS premium_usd, sum(leg_count) AS leg_count, sum(iv_sum) AS iv_sum, sum(iv_count) AS iv_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='block' AND instrument_kind='option' AND bucket_at >= ${START_MS_5M} GROUP BY asset, exchange, block_id) TO '${WORK}/venue_blocks.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '${WORK}/surface_now.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h WHERE abs("at"-${START_MS})<=900000 ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '${WORK}/surface_open.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(turnover_usd) AS turnover_usd, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
+COPY (SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS "DATE", strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS "TIME", product AS PRODUCT, description AS DESCRIPTION, quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE, taker_side AS SIDE, CASE WHEN upper(trim(split_part(coalesce(product,''), ' - ', 2))) = 'DBT' AND upper(coalesce(asset,'')) IN ('BTC','ETH') AND instrument_name IS NOT NULL AND upper(instrument_name) NOT LIKE '%USDC%' THEN upper(asset) ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD, rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID, venue_block_trade_id AS VENUE_BLOCK_TRADE_ID FROM read_parquet('${PT}') WHERE row_type='paradigm_trade' AND asset='${ASSET}' AND instrument_kind='OPTION' AND traded_at >= ${START_MS}) TO '${WORK}/blocks_pt.csv' (HEADER, DELIMITER ',');
 SQL
+
+# blocks.csv upgrade (the statement just above): OVERWRITES the legacy
+# csv.gz-sourced shape with the same columns off the Snowflake-free hot
+# paradigm_trade tape, PLUS VENUE_BLOCK_TRADE_ID (recap.py's exact block
+# dedupe key — absent column means structural dedupe, today's behavior).
+# Same fallback-then-overwrite pattern as volume.csv: while the hot file
+# did not exist (the paradigm-trade CronJob deployed 2026-08-04) the bind fails,
+# the legacy blocks.csv stands, and nothing changes.
+#
+# The bind-failure fallback does NOT cover a zero-row result: a COPY that
+# binds cleanly but matches nothing still truncates the target to a bare
+# header, destroying good legacy data. So the overwrite is staged through a
+# temp file and only promoted when it actually carries rows — a predicate
+# that silently matches nothing now leaves the legacy tape intact instead of
+# emptying Block Flow. Once the egress
+# decommission (data#712) merges, the legacy TAPE read above gets deleted.
 
 # volume.csv upgrade (the statement just above): OVERWRITES the legacy shape
 # with one that adds turnover_usd — the pipeline's per-trade USD premium,

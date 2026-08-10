@@ -13,7 +13,7 @@ fields that used to be pasted as JSON).
 
 ### 1. ONE combined tape read — fill row **and** 30d recurrence in a single scan (primary)
 
-The trade tape is a gzipped CSV on S3. Decompressing it is the dominant cost, so
+The trade tape is a parquet on S3 (trailing 30 days). The read is the dominant cost, so
 **scan it exactly once**: materialize the relevant rows into a temp table, then
 read both the fill row (Step 0) and the 30d structure recurrence (Step 3a) out of
 that temp table. **Do not run a second tape query later** — this one covers both.
@@ -46,14 +46,21 @@ duckdb -c "
 INSTALL httpfs; LOAD httpfs;
 SET s3_region='ap-northeast-1';
 SET s3_access_key_id='$AK'; SET s3_secret_access_key='$SK'; SET s3_session_token='$ST';
--- single decompress → temp table holding the target RFQ + 30d matching structures
+-- single scan → temp table holding the target RFQ + 30d matching structures.
+-- Source is the Snowflake-free hot paradigm_trade tape (trailing 30 days,
+-- leg grain — exactly the HIST horizon), aliased to the legacy tape column
+-- names so everything downstream is unchanged.
 CREATE TEMP TABLE tape AS
-SELECT DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE,
-       QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID,
-       UPPER(REPLACE(DESCRIPTION,' ','')) AS DESC_N
-FROM read_csv_auto('s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz')
-WHERE RFQ_ID LIKE '%<CORE_ID>%' ESCAPE '\'
-   OR DATE >= (CURRENT_DATE - INTERVAL 30 DAY);
+SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS DATE,
+       strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS TIME,
+       auction AS AUCTION, product AS PRODUCT, description AS DESCRIPTION,
+       quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE,
+       taker_side AS SIDE,
+       CASE WHEN upper(trim(split_part(coalesce(product,''), ' - ', 2))) = 'DBT' AND upper(coalesce(asset,'')) IN ('BTC','ETH') AND instrument_name IS NOT NULL AND upper(instrument_name) NOT LIKE '%USDC%' THEN upper(asset) ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
+       rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID,
+       UPPER(REPLACE(description,' ','')) AS DESC_N
+FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet')
+WHERE row_type='paradigm_trade';
 -- (a) the cleared block — authoritative for every field. Asset ← PRODUCT (never assume BTC),
 -- structure ← DESCRIPTION. Offsets precomputed: OFFSET_BPS (×10000) for COIN-quoted premiums
 -- (BTC/ETH); OFFSET_PCT (% of mark) for USD/USDC-quoted premiums (SOL/alts — dollar prices,
@@ -120,8 +127,9 @@ structure all *unavailable*) and stop.
 
 ## Field mapping — trade-tape row → analysis fields
 
-`paradigm_trade_tape_slim` carries the information that used to arrive as pasted
-JSON. Map by the tape's actual columns:
+The Paradigm trade tape (hot `paradigm_trade` rows, formerly the
+`paradigm_trade_tape_slim` csv.gz — same columns) carries the information that
+used to arrive as pasted JSON. Map by the tape's actual columns:
 
 | Analysis field (SKILL Step 1) | Trade-tape column |
 |---|---|
