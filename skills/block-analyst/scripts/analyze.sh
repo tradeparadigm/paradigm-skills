@@ -61,7 +61,17 @@ fi
 # are USDC-linear, so everything else derives USDC — the STABLE branch, which is
 # also the safe default when in doubt.
 #
-# `instrument_name LIKE '%USDC%'` comes FIRST because venue alone cannot separate
+# INVERTED DEFAULT: the coin quote requires a POSITIVE inverse signal, and
+# everything else — including anything unknown — lands on 'USDC', the STABLE
+# branch, which routes offset() to percent. That is the safe direction: reporting
+# a coin fraction in percent understates, whereas reporting a dollar price in bps
+# is the -324953-bps bug. `coalesce(instrument_name,'')` in the old form was a
+# no-op (SQL CASE already treats a NULL WHEN as not-true), so a NULL name still
+# derived the coin; requiring `IS NOT NULL` positively is what actually fixes it.
+# This is also the right shape given the predicate is a no-op on live data (see
+# below) — defensive code should fail safe, not merely be present.
+#
+# venue alone cannot separate
 # Deribit's inverse book from its USDC-linear sibling: both are venue 'DBT', so a
 # venue-only rule derived BTC for a USDC-linear BTC option and a sub-$1 premium
 # went down the bps branch anyway. Verified against the live tape — 50 of 1782
@@ -93,7 +103,7 @@ SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS DATE,
        auction AS AUCTION, product AS PRODUCT, description AS DESCRIPTION,
        quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE,
        taker_side AS SIDE,
-       CASE WHEN upper(coalesce(instrument_name,'')) LIKE '%USDC%' THEN 'USDC' WHEN upper(trim(split_part(coalesce(product,''), ' - ', 2))) = 'DBT' AND upper(coalesce(asset,'')) IN ('BTC','ETH') THEN upper(asset) ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
+       CASE WHEN upper(trim(split_part(coalesce(product,''), ' - ', 2))) = 'DBT' AND upper(coalesce(asset,'')) IN ('BTC','ETH') AND instrument_name IS NOT NULL AND upper(instrument_name) NOT LIKE '%USDC%' THEN upper(asset) ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
        rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID,
        UPPER(REPLACE(description,' ','')) AS DESC_N
 FROM read_parquet('${TAPE}')

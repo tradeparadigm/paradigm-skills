@@ -57,6 +57,7 @@ from vol_math import (  # noqa: E402
     build_tape_blocks,
     compute_vol_surface,
     tape_block_key,
+    _TAPE_VENUE as _VOL_MATH_VENUE_CODES,
     RV_LOOKBACK_DAYS,
 )
 
@@ -481,7 +482,9 @@ def _dedupe_venue_blocks(venue_rows: list[dict],
     venue keeps the structural exclusion. A format mismatch therefore
     degrades to the old, safe behaviour (a genuinely non-Paradigm block is
     missed) rather than to double-counting, and every gate below fails in
-    that same direction.
+    that same direction — for BROKERED venues. A venue outside
+    _TAPE_VENUE_CODE is not deduped at all and merges unconditionally, which is
+    a real double-count path if such a venue ever appears on both tapes.
 
     The guarantee is conditional, not absolute: a double count requires BOTH a
     format regression AND full-coverage proof to have been granted anyway. The
@@ -524,7 +527,12 @@ def _dedupe_venue_blocks(venue_rows: list[dict],
     # rsplit: they agree only for exactly-two-token products and diverge toward
     # INCLUSION, so the unknown-code path is reachable by ordinary drift rather
     # than by malformed data.
-    _known = set(_TAPE_VENUE_CODE.values())
+    # Known codes come from vol_math's venue list, not just the 4-entry dedupe
+    # map: BYB and BIT are ordinary Paradigm-tape suffixes, so treating them as
+    # "unrecognised" let a single Bybit print taint every brokered venue and
+    # silently revert the merge for the whole window. Recognised-but-not-deduped
+    # is a different thing from unrecognised.
+    _known = set(_TAPE_VENUE_CODE.values()) | set(_VOL_MATH_VENUE_CODES)
     if not (set(ids_by_code) | unstamped_codes) <= _known:
         unstamped_codes |= _known
 
@@ -786,8 +794,19 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     # duplicate — exact per-block id dedupe against this window's tape rows
     # where their VENUE_BLOCK_TRADE_ID coverage allows, the structural
     # brokered-venue exclusion otherwise (see _dedupe_venue_blocks).
-    venue_blocks = _venue_tape_blocks(
-        _dedupe_venue_blocks(venue_block_rows or [], own_blocks), spot)
+    # The venue fetch is deliberately widened to the 5-minute bucket CONTAINING
+    # window-open, because the coverage gate needs the counterpart of any
+    # Paradigm print in that bucket. But roughly half of a straddling bucket
+    # precedes the window, so those rows must not reach the ranked pool: a
+    # pre-window block was entering Block Flow and could win Biggest Print,
+    # rendering a timestamp outside the window banner printed above it.
+    # "Not duplicated" and "in the window" are different claims — the widening
+    # is correct for the GATE and wrong for the OUTPUT, so it is re-filtered
+    # here rather than narrowed at the source.
+    _deduped = _dedupe_venue_blocks(venue_block_rows or [], own_blocks)
+    _in_window = [r for r in _deduped
+                  if (_num(r, "bucket_at") or 0) >= start_ms]
+    venue_blocks = _venue_tape_blocks(_in_window, spot)
     block = build_tape_blocks(own_blocks, iv_lookup=iv_lookup,
                               extra_blocks=venue_blocks)
 
@@ -1058,6 +1077,7 @@ def main() -> None:
     now_ms = args.now_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = now_ms - parse_window_ms(args.window)
 
+    block_source_legacy = False
     block_rows: list[dict] = []
     venue_block_rows: list[dict] = []
     if args.no_s3:
@@ -1104,7 +1124,7 @@ def main() -> None:
 
     result = build(asset, args.window, start_ms, now_ms, deri, hot, block_rows,
                    venue_block_rows)
-    result["block_source_legacy"] = bool(locals().get("block_source_legacy"))
+    result["block_source_legacy"] = block_source_legacy
     if args.render:
         print(render_md(result))
     else:

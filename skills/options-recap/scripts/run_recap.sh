@@ -155,7 +155,7 @@ COPY (SELECT asset, exchange, block_id, min(bucket_at) AS bucket_at, sum(volume_
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '${WORK}/surface_now.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h WHERE abs("at"-${START_MS})<=900000 ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '${WORK}/surface_open.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(turnover_usd) AS turnover_usd, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
-COPY (SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS "DATE", strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS "TIME", product AS PRODUCT, description AS DESCRIPTION, quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE, taker_side AS SIDE, CASE WHEN upper(coalesce(instrument_name,'')) LIKE '%USDC%' THEN 'USDC' WHEN upper(trim(split_part(coalesce(product,''), ' - ', 2))) = 'DBT' AND upper(coalesce(asset,'')) IN ('BTC','ETH') THEN upper(asset) ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD, rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID, venue_block_trade_id AS VENUE_BLOCK_TRADE_ID FROM read_parquet('${PT}') WHERE row_type='paradigm_trade' AND asset='${ASSET}' AND instrument_kind='OPTION' AND traded_at >= ${START_MS}) TO '${WORK}/blocks_pt.csv' (HEADER, DELIMITER ',');
+COPY (SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS "DATE", strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS "TIME", product AS PRODUCT, description AS DESCRIPTION, quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE, taker_side AS SIDE, CASE WHEN upper(trim(split_part(coalesce(product,''), ' - ', 2))) = 'DBT' AND upper(coalesce(asset,'')) IN ('BTC','ETH') AND instrument_name IS NOT NULL AND upper(instrument_name) NOT LIKE '%USDC%' THEN upper(asset) ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD, rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID, venue_block_trade_id AS VENUE_BLOCK_TRADE_ID FROM read_parquet('${PT}') WHERE row_type='paradigm_trade' AND asset='${ASSET}' AND instrument_kind='OPTION' AND traded_at >= ${START_MS}) TO '${WORK}/blocks_pt.csv' (HEADER, DELIMITER ',');
 SQL
 
 # blocks.csv upgrade (the statement just above): OVERWRITES the legacy
@@ -163,7 +163,7 @@ SQL
 # paradigm_trade tape, PLUS VENUE_BLOCK_TRADE_ID (recap.py's exact block
 # dedupe key — absent column means structural dedupe, today's behavior).
 # Same fallback-then-overwrite pattern as volume.csv: while the hot file
-# doesn't exist yet (paradigm-trade CronJob not deployed) the bind fails,
+# did not exist (the paradigm-trade CronJob deployed 2026-08-04) the bind fails,
 # the legacy blocks.csv stands, and nothing changes.
 #
 # The bind-failure fallback does NOT cover a zero-row result: a COPY that

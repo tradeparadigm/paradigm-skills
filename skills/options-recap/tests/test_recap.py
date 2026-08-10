@@ -1456,6 +1456,64 @@ def test_legacy_block_source_is_rendered_not_just_warned():
           "LEGACY tape" not in render_md(r), render_md(r).splitlines()[:3])
 
 
+
+def test_pre_window_venue_block_never_reaches_the_pool():
+    # The venue fetch is widened to the bucket CONTAINING window-open so the
+    # coverage gate can see counterparts, but ~half of a straddling bucket
+    # precedes the window. Without a Python-side re-filter a pre-window block
+    # entered Block Flow and could win Biggest Print, rendering a timestamp
+    # outside the window banner printed above it. "Not duplicated" and "in the
+    # window" are different claims.
+    start = 1_000_000_000_000
+    bucket = start - 120_000            # inside the straddling bucket, BEFORE open
+    r = build("BTC", "8h", start, start + 8 * 3600_000,
+              {"closes_7d": [], "market": None}, {"spot_close": 100_000.0}, [],
+              [{"exchange": "okex-options", "block_id": "STALE", "bucket_at": str(bucket),
+                "volume_coin": "500", "premium_usd": "50000000", "leg_count": "1"},
+               {"exchange": "okex-options", "block_id": "FRESH",
+                "bucket_at": str(start + 60_000),
+                "volume_coin": "10", "premium_usd": "1000000", "leg_count": "1"}])
+    rows = str(r["block_flow"]["rows"]) + str(r["biggest_print"] or {})
+    check("pre-window block excluded from Block Flow", "STALE" not in rows, rows[:200])
+    check("in-window block kept", r["block_flow"]["n_blocks"] >= 1, r["block_flow"])
+    check("pre-window block cannot win Biggest Print",
+          "50" not in str((r["biggest_print"] or {}).get("notional_m", "")),
+          r["biggest_print"])
+
+
+def test_ordinary_bybit_print_does_not_disable_the_merge():
+    # _TAPE_VENUE_CODE has only the 3 deduped venues, but BYB/BIT are ordinary
+    # Paradigm-tape suffixes. Treating them as unrecognised let one Bybit print
+    # taint every brokered venue and silently revert the merge for the window.
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "X1"}, {"exchange": "deribit", "block_id": "Y9"}],
+        [_tape("BTC OPTION - DBT", "D1", "X1"), _tape("BTC OPTION - BYB", "D2", "X2")])
+    check("recognised-but-not-deduped does not taint",
+          [r["block_id"] for r in out] == ["Y9"], out)
+    # a genuinely unknown code must still taint
+    out2 = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "X1"}, {"exchange": "deribit", "block_id": "Y9"}],
+        [_tape("BTC OPTION - DBT", "D1", "X1"), _tape("BTC OPTION - ZZZ", "D2", "X2")])
+    check("unknown code still taints", out2 == [], out2)
+
+
+def test_venue_window_is_floored_to_the_containing_bucket():
+    # The grain alignment had no test at all — reverting START_MS_5M survived
+    # every suite. Assert the shell computes the floor and uses it for the
+    # venue read only (blocks.csv must stay on exact START_MS).
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "..", "scripts", "run_recap.sh")
+    with open(src) as f:
+        sh = f.read()
+    check("floor is computed", "START_MS_5M=$(( (START_S - START_S % 300) * 1000 ))" in sh,
+          "missing START_MS_5M")
+    venue = next(l for l in sh.splitlines() if "venue_blocks.csv" in l and l.startswith("COPY"))
+    check("venue read uses the floored bound", "${START_MS_5M}" in venue, venue[:160])
+    tape = next(l for l in sh.splitlines() if "blocks_pt.csv" in l and l.startswith("COPY"))
+    check("tape read stays on exact START_MS",
+          "${START_MS}" in tape and "START_MS_5M" not in tape, tape[:160])
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     print(f"Running {len(tests)} test functions...")
