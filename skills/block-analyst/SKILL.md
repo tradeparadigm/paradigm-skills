@@ -16,7 +16,7 @@ description: >
   butterflies (BF), condors (CO), calendars (CA), risk reversals (RR), covered
   calls, and custom multi-leg combos (CM). Also handles perp combos.
 compatibility: Resolves the rfq_id by searching the Paradigm trade tape (the
-  hot__paradigm_trade_tape_30d rows — Snowflake-free, 30-day horizon) through
+  hot__paradigm_trade_tape_30d rows) through
   the paradigm-data-discovery skill — see
   references/rfq-lookup.md; falls back to injected block-trade context or the
   Deribit tape. Trade-tape reads use that skill's S3/IRSA credentials. Market
@@ -103,7 +103,7 @@ The input is **`/analyze <rfq_id> <rfq description>`**. Split it:
 - **`<rfq_id>`** — the first token after `/analyze`. This is the authoritative
   key. **Resolve it with the single combined tape read in
   [`references/rfq-lookup.md`](references/rfq-lookup.md)** — that one `exec`
-  scans the gzipped tape **once** and returns BOTH the cleared block (`FILL`
+  scans the tape **once** and returns BOTH the cleared block (`FILL`
   row: `DESCRIPTION`, `PRICE`, `REF_PRICE`, `QTY`, `SIDE`, `PRODUCT`,
   `QUOTE_CURRENCY`, `NOTIONAL_VOLUME_USD`) **and** the 30d recurrence of the
   same structure (`HIST` rows — this IS the Step 3a answer). The STS/IRSA

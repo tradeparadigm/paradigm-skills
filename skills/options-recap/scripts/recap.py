@@ -426,36 +426,94 @@ def _tape_venue_code(tape_row: dict) -> str:
     return product.rsplit(" - ", 1)[-1].strip().upper() if " - " in product else "?"
 
 
+def _tape_block_id(tape_row: dict) -> str:
+    """The id vol_math will actually block this row under.
+
+    MUST match build_tape_blocks' key (`BLOCK_TRADE_ID or TRADE_ID`). A
+    narrower definition here — BLOCK_TRADE_ID only — let a row that DOES
+    become a block in Block Flow be invisible to the coverage gate, so a
+    venue was treated as fully id-covered when it wasn't."""
+    return ((tape_row.get("BLOCK_TRADE_ID") or "").strip()
+            or (tape_row.get("TRADE_ID") or "").strip())
+
+
 def _dedupe_venue_blocks(venue_rows: list[dict],
                          tape_rows: list[dict] | None = None) -> list[dict]:
     """Venue-tape blocks minus anything that could be a Paradigm-brokered
-    duplicate. Exact id dedupe against the tape's VENUE_BLOCK_TRADE_ID
-    where the window's coverage supports it (see the note above); the
-    structural `_TAPE_BROKERED_VENUES` exclusion is the fallback per
-    venue and for tapes that predate the column."""
+    duplicate.
+
+    The pre-id design made double-counting STRUCTURALLY impossible for the
+    brokered venues: they were simply never merged. Exact-id dedupe is more
+    precise but it trades that invariant for string equality in which a
+    NON-match means merge — so any benign format difference between the two
+    independent pipelines (`BLOCK-280624` vs `280624`, case, zero-padding)
+    silently double-counts the headline number instead of failing closed.
+
+    So the id path is only trusted for a venue once it has PROVED itself on
+    that venue, in this window, by matching at least once. Until then the
+    venue keeps the structural exclusion. A format mismatch therefore
+    degrades to the old, safe behaviour (a genuinely non-Paradigm block is
+    missed) rather than to double-counting, and every gate below fails in
+    that same direction."""
     tape_rows = tape_rows or []
-    tape_ids = {(r.get("VENUE_BLOCK_TRADE_ID") or "").strip() for r in tape_rows}
-    tape_ids.discard("")
-    if not tape_ids:
+
+    # Ids are scoped PER VENUE. One global set let an id from one venue delete
+    # a block on another: venue id spaces are independent and several are plain
+    # numeric, so a Bullish id could erase a genuinely non-Paradigm OKX block —
+    # a silent under-count on a venue Paradigm never brokers at all.
+    ids_by_code: dict = {}
+    unstamped_codes = set()
+    for r in tape_rows:
+        code = _tape_venue_code(r)
+        venue_id = (r.get("VENUE_BLOCK_TRADE_ID") or "").strip()
+        if venue_id:
+            ids_by_code.setdefault(code, set()).add(venue_id)
+        elif _tape_block_id(r):
+            # A block row with no venue id: its venue-tape copy cannot be
+            # matched, so that venue's coverage is incomplete.
+            unstamped_codes.add(code)
+    if not any(ids_by_code.values()):
         return [r for r in venue_rows
                 if (r.get("exchange") or "").lower() not in _TAPE_BROKERED_VENUES]
-    # Venue codes whose id coverage is INCOMPLETE this window: any block
-    # row on that venue without a venue id could have an unmatchable
-    # venue-tape copy, so that venue keeps the structural exclusion.
-    unstamped_codes = {
-        _tape_venue_code(r) for r in tape_rows
-        if (r.get("BLOCK_TRADE_ID") or "").strip()
-        and not (r.get("VENUE_BLOCK_TRADE_ID") or "").strip()
-    }
+
+    # An UNPARSEABLE PRODUCT ('?') must remove trust, not silently grant it.
+    # Previously '?' could only ever land in `unstamped_codes`, where it matched
+    # no real venue code — so a malformed row disabled the very gate it should
+    # have tripped. Treat it as compromising every brokered venue, since we
+    # cannot tell which one it belonged to.
+    if "?" in unstamped_codes or "?" in ids_by_code:
+        unstamped_codes |= set(_TAPE_VENUE_CODE.values())
+
+    # PASS 1 — which venues have PROVED their id space is comparable, by
+    # matching at least once in this window. Non-empty ids are not proof: if
+    # Paradigm stamps `BLOCK-280624` while the venue tape carries `280624`,
+    # every id is present, nothing matches, and every brokered block merges —
+    # the double-count this guard exists to prevent. A single confirmed match
+    # is the cheapest available evidence that the two formats line up.
+    matched_codes = set()
+    for r in venue_rows:
+        code = _TAPE_VENUE_CODE.get((r.get("exchange") or "").lower())
+        block_id = (r.get("block_id") or "").strip()
+        if code and block_id and block_id in (ids_by_code.get(code) or set()):
+            matched_codes.add(code)
+
+    # PASS 2 — apply. Every branch fails toward EXCLUSION, so the worst case is
+    # the pre-PR behaviour (a genuinely non-Paradigm block is missed) rather
+    # than an inflated headline.
     out = []
     for r in venue_rows:
         exchange = (r.get("exchange") or "").lower()
-        block_id = (r.get("block_id") or "").strip()
-        if block_id and block_id in tape_ids:
-            continue  # the same print, already on the Paradigm tape
         code = _TAPE_VENUE_CODE.get(exchange)
-        if code is not None and code in unstamped_codes:
-            continue  # coverage incomplete on this venue -> structural
+        block_id = (r.get("block_id") or "").strip()
+        if code is None:
+            out.append(r)          # never brokered by Paradigm -> always merges
+            continue
+        if block_id and block_id in (ids_by_code.get(code) or set()):
+            continue               # the same print, already on the Paradigm tape
+        if code in unstamped_codes:
+            continue               # incomplete id coverage -> structural
+        if code not in matched_codes:
+            continue               # id space unproven for this venue -> structural
         out.append(r)
     return out
 

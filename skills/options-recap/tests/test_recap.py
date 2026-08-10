@@ -26,7 +26,7 @@ from recap import (  # noqa: E402
     parse_window_ms, load_hot, load_blocks, load_venue_blocks, build, render_md,
     pct, pc_descriptor, dvol_label, spot_vol_label, fmt_hhmm,
     run_duckdb, _load_surface_tickers, _delta_fmt, _venue_label,
-    _venue_tape_blocks, MAX_SURFACE_ROWS,
+    _venue_tape_blocks, MAX_SURFACE_ROWS, _dedupe_venue_blocks,
 )
 
 _passed = 0
@@ -1205,6 +1205,120 @@ def test_market_fallback_skips_surface_when_not_wanted():
         check("ticker calls happen when want_surface=True", "ticker" in calls, calls)
     finally:
         recap._get = orig
+
+
+
+# ── Venue-block dedupe: fail-closed guarantees ──────────────────────────────
+# The exact-id path replaced a STRUCTURAL invariant (brokered venues never
+# merged) with string equality where a non-match means merge. Each case below
+# is a way that trade could have silently inflated or deflated Block Flow.
+
+def _tape(product, block_id="B1", venue_id="", trade_id=""):
+    return {"PRODUCT": product, "BLOCK_TRADE_ID": block_id,
+            "TRADE_ID": trade_id, "VENUE_BLOCK_TRADE_ID": venue_id}
+
+
+def test_dedupe_ids_are_scoped_per_venue():
+    # Venue id spaces are independent and often plain numeric, so a collision
+    # across them is not hypothetical. An unbrokered venue must be untouched...
+    out = _dedupe_venue_blocks([{"exchange": "okex-options", "block_id": "9182736"}],
+                               [_tape("BTC OPTION - BLSH", "B1", "9182736")])
+    check("okx block survives a cross-venue id collision", len(out) == 1, out)
+    # ...and a BROKERED venue must not have its block deleted by another
+    # venue's id. DBT is proven here (V1 matches), so the only thing that can
+    # drop 'P1' is treating a PRDX id as a DBT one.
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "V1"},
+         {"exchange": "deribit", "block_id": "P1"}],
+        [_tape("BTC OPTION - DBT", "D1", "V1"), _tape("BTC OPTION - PRDX", "P9", "P1")])
+    check("a PRDX id does not delete a DBT block",
+          [r["block_id"] for r in out] == ["P1"], out)
+
+
+def test_dedupe_unparseable_product_fails_closed():
+    # '?' could only land in unstamped_codes, where it matched no real venue
+    # code — so a malformed row DISABLED the gate it should have tripped.
+    # DBT is otherwise PROVEN (V1 matches), so the malformed row is the only
+    # thing that can gate it — without that, the proof requirement would mask
+    # this and the mutant survives.
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "V1"},
+         {"exchange": "deribit", "block_id": "V9"}],
+        [_tape("BTC OPTION - DBT", "D1", "V1"), _tape("BTC OPTION", "D2", "")])
+    check("malformed PRODUCT gates every brokered venue", out == [], out)
+
+
+def test_dedupe_counts_trade_id_only_rows_as_blocks():
+    # vol_math keys blocks on `BLOCK_TRADE_ID or TRADE_ID`; a narrower
+    # definition here made a row that DOES become a block invisible to the
+    # coverage gate, so the venue looked fully covered when it wasn't.
+    # Again with DBT otherwise proven, so the TRADE_ID-only row is the only
+    # thing that can gate it.
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "V1"},
+         {"exchange": "deribit", "block_id": "V9"}],
+        [_tape("BTC OPTION - DBT", "D1", "V1"),
+         _tape("BTC OPTION - DBT", "", "", trade_id="T9")])
+    check("TRADE_ID-only row gates its venue", out == [], out)
+
+
+def test_dedupe_id_format_mismatch_does_not_double_count():
+    # THE design risk: two independent pipelines, one stamping BLOCK-280624 and
+    # the other 280624. Every id present, nothing matches, and the old code
+    # merged every brokered block — silently doubling the headline number.
+    out = _dedupe_venue_blocks([{"exchange": "deribit", "block_id": "280624"}],
+                               [_tape("BTC OPTION - DBT", "D1", "BLOCK-280624")])
+    check("unproven id space excludes rather than doubles", out == [], out)
+
+
+def test_dedupe_merges_once_the_id_space_is_proven():
+    # The precision the id path exists for must still work: one confirmed match
+    # proves the formats align, so a genuinely non-Paradigm block on that venue
+    # merges.
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "BLOCK-1"},
+         {"exchange": "deribit", "block_id": "BLOCK-9"}],
+        [_tape("BTC OPTION - DBT", "D1", "BLOCK-1")])
+    check("matched block dropped", all(r["block_id"] != "BLOCK-1" for r in out), out)
+    check("unmatched block merges on a proven venue",
+          [r["block_id"] for r in out] == ["BLOCK-9"], out)
+
+
+def test_dedupe_usdc_shares_the_deribit_venue_code():
+    # deribit-usdc maps to DBT, so an unstamped DBT row must gate it too. The
+    # previous fixture asserted this in a comment without an actual usdc row.
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit-usdc", "block_id": "BLOCK-U"}],
+        [_tape("BTC OPTION - PRDX", "P1", "X1"), _tape("BTC OPTION - DBT", "D1", "")])
+    check("deribit-usdc gated by an unstamped DBT row", out == [], out)
+
+
+def test_build_passes_the_tape_to_the_dedupe():
+    # Reverting to the single-argument form left all checks green: the only
+    # build()-level venue test used a fixture with no VENUE_BLOCK_TRADE_ID, so
+    # tape_ids was empty and the structural fallback ran either way.
+    seen = {}
+    orig = recap._dedupe_venue_blocks
+
+    def spy(venue_rows, tape_rows=None):
+        seen["tape"] = tape_rows
+        return orig(venue_rows, tape_rows)
+
+    recap._dedupe_venue_blocks = spy
+    try:
+        build("BTC", "8h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+              {"spot_close": 100000.0},
+              [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "C", "QTY": "1",
+                "NOTIONAL_VOLUME_USD": "1000", "SIDE": "BUY", "BLOCK_TRADE_ID": "D1",
+                "VENUE_BLOCK_TRADE_ID": "BLOCK-1", "RFQ_ID": "r1"}],
+              [{"exchange": "deribit", "block_id": "BLOCK-1", "volume_coin": "1",
+                "premium_usd": "10", "leg_count": "1"}])
+    finally:
+        recap._dedupe_venue_blocks = orig
+    check("tape rows reached the dedupe", seen.get("tape") is not None, seen)
+    check("and they are the tape rows, not the venue rows",
+          any((r or {}).get("VENUE_BLOCK_TRADE_ID") == "BLOCK-1" for r in (seen.get("tape") or [])),
+          seen.get("tape"))
 
 
 def main():

@@ -152,30 +152,22 @@ block must never compete in an options recap) with **unit-explicit columns**:
 debuggability, **never displayed as notional**: it's ~50–100× below the
 underlying-USD basis the block sections use). `recap.py` then:
 
-- **Merges only venues Paradigm never brokers** (`_dedupe_venue_blocks` /
-  `_TAPE_BROKERED_VENUES`). A block on a venue Paradigm brokers
-  (Deribit/Bullish/Paradex) can appear on *both* the Paradigm tape and the
-  exchange's own tape, and the slim tape carries no shared id to dedupe on, so
-  those venues are excluded — leaving the venues with zero Paradigm overlap.
-  **OKX today** (Bybit has no group id, so it never reaches `block` rows at
-  all). This structural exclusion is window-independent and depends on no tape
-  column. **Deferred to the Snowflake-off migration (taskwarrior #119):**
-  exporting the venue's own block id (`VENUE_BLOCK_TRADE_ID` — Deribit
-  `BLOCK-…`, Bullish `otc_trade_id`) onto the slim tape, which then lets *every*
-  venue merge by exact id-dedupe with no double-count. That export was
-  deliberately **not** bolted onto the live `analytics.trade` dbt model (too
-  much blast radius); it lands from S3 with proper CDC dedup under #119.
-- **Prices them as `volume_coin × spot`** — underlying-USD, the same basis as the
-  tape's `NOTIONAL_VOLUME_USD`, valued at recap-time spot (a disclosed
-  approximation vs the tape's trade-time figures). No spot → skipped with a
-  warning, never guessed.
-- Merges them into the same pool: min-notional filter, Biggest Print candidacy and
-  top-N ranking on equal terms. The venue tape carries **no leg geometry**, so they
-  render as `<Venue> Block` rows (the venue lives in the structure label — there is
-  no per-row venue column) with a `(venue tape)` detail note and `~HH:MM` times
-  (5-min bucket resolution); a venue-tape Biggest Print reads `via venue tape`.
-  Bybit can never appear here — its feed has an is-block flag but no group id, so
-  its blocks are unreconstructable and ride the volume/flow rows.
+- **Exact id dedupe where the venue has proved it.** A venue-tape block whose
+  `block_id` matches a `VENUE_BLOCK_TRADE_ID` on the Paradigm tape is the same
+  print and is dropped; a genuinely non-Paradigm block on that venue merges.
+  The structural brokered-venue exclusion is still the FALLBACK, and every
+  guard fails toward it:
+  - ids are scoped per venue (independent, often numeric, id spaces);
+  - a venue only merges once at least one of its ids has actually matched in
+    this window — otherwise a benign format difference (`BLOCK-280624` vs
+    `280624`) would match nothing and merge everything, doubling the headline;
+  - any tape block row on a venue without a venue id, or an unparseable
+    `PRODUCT`, gates that venue (or all of them) back to structural;
+  - block rows are keyed `BLOCK_TRADE_ID or TRADE_ID`, matching `vol_math`.
+
+  So the worst case is the pre-id behaviour — a non-Paradigm block is missed —
+  never a double count. OKX is never brokered, so it always merges.
+
 
 **Multi-venue representation (truthful + consistent).** The `volume` rows span
 Deribit, OKX, Bybit, Bullish. The dollar **Volume** line sums **`turnover_usd`**

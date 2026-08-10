@@ -51,6 +51,16 @@ fi
 # Airbyte→S3 UM landing. Replaces the Snowflake-egressed
 # paradigm_trade_tape_slim.csv.gz; the temp table below aliases its columns
 # to the old tape names so fill/hist stay shape-identical downstream.
+#
+# QUOTE_CURRENCY is DERIVED, not renamed. The legacy column was the premium
+# currency (BTC/ETH/USD); the parquet has no such column — `asset` is the
+# UNDERLYING. Aliasing asset onto it fed the wrong value to analyze_core.offset,
+# whose `quote not in _STABLE_QUOTES and abs(ref) < 1` branch then reports a
+# sub-$1 USDC premium in bps (the -324953-bps class of bug). Deribit BTC/ETH
+# options are coin-quoted (inverse); Paradex, Bullish and Deribit's alt books
+# are USDC-linear, so everything else derives USDC — the STABLE branch, which is
+# also the safe default when in doubt. Fix properly by carrying a real currency
+# column on the hot tape; this derivation is the correct-today stopgap.
 TAPE=s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet
 # `_` is a LIKE wildcard and ids are r_…-style — escape it so the match is literal.
 CORE_SQL=${CORE//_/\\_}
@@ -70,7 +80,7 @@ SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS DATE,
        auction AS AUCTION, product AS PRODUCT, description AS DESCRIPTION,
        quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE,
        taker_side AS SIDE,
-       asset AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
+       CASE WHEN venue='DBT' AND asset IN ('BTC','ETH') THEN asset ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
        rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID,
        UPPER(REPLACE(description,' ','')) AS DESC_N
 FROM read_parquet('${TAPE}')

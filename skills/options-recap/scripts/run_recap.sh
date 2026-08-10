@@ -146,7 +146,7 @@ COPY (SELECT asset, exchange, block_id, min(bucket_at) AS bucket_at, sum(volume_
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '${WORK}/surface_now.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h WHERE abs("at"-${START_MS})<=900000 ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '${WORK}/surface_open.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(turnover_usd) AS turnover_usd, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
-COPY (SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS "DATE", strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS "TIME", product AS PRODUCT, description AS DESCRIPTION, quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE, taker_side AS SIDE, asset AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD, rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID, venue_block_trade_id AS VENUE_BLOCK_TRADE_ID FROM read_parquet('${PT}') WHERE row_type='paradigm_trade' AND asset='${ASSET}' AND instrument_kind='OPTION' AND traded_at >= ${START_MS}) TO '${WORK}/blocks.csv' (HEADER, DELIMITER ',');
+COPY (SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS "DATE", strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS "TIME", product AS PRODUCT, description AS DESCRIPTION, quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE, taker_side AS SIDE, CASE WHEN venue='DBT' AND asset IN ('BTC','ETH') THEN asset ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD, rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID, venue_block_trade_id AS VENUE_BLOCK_TRADE_ID FROM read_parquet('${PT}') WHERE row_type='paradigm_trade' AND asset='${ASSET}' AND instrument_kind='OPTION' AND traded_at >= ${START_MS}) TO '${WORK}/blocks_pt.csv' (HEADER, DELIMITER ',');
 SQL
 
 # blocks.csv upgrade (the statement just above): OVERWRITES the legacy
@@ -155,7 +155,14 @@ SQL
 # dedupe key — absent column means structural dedupe, today's behavior).
 # Same fallback-then-overwrite pattern as volume.csv: while the hot file
 # doesn't exist yet (paradigm-trade CronJob not deployed) the bind fails,
-# the legacy blocks.csv stands, and nothing changes. Once the egress
+# the legacy blocks.csv stands, and nothing changes.
+#
+# The bind-failure fallback does NOT cover a zero-row result: a COPY that
+# binds cleanly but matches nothing still truncates the target to a bare
+# header, destroying good legacy data. So the overwrite is staged through a
+# temp file and only promoted when it actually carries rows — a predicate
+# that silently matches nothing now leaves the legacy tape intact instead of
+# emptying Block Flow. Once the egress
 # decommission (data#712) merges, the legacy TAPE read above gets deleted.
 
 # volume.csv upgrade (the statement just above): OVERWRITES the legacy shape
@@ -185,6 +192,16 @@ if [ -n "$VS_COLD" ]; then
   cat >> "$WORK/recap.sql" <<SQL
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_COLD}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '${WORK}/surface_open.csv' (HEADER, DELIMITER ',');
 SQL
+fi
+
+# Promote the staged hot-tape blocks ONLY if they carry at least one data row.
+# A zero-row COPY writes a header and nothing else; blindly moving that over
+# blocks.csv would destroy the legacy tape's rows on any predicate that
+# silently matches nothing (wrong asset casing, an instrument_kind rename, a
+# window with no prints) and empty Block Flow with no error anywhere. Bind
+# failure already leaves blocks_pt.csv absent, which this also covers.
+if [ -s "$WORK/blocks_pt.csv" ] && [ "$(wc -l < "$WORK/blocks_pt.csv")" -gt 1 ]; then
+  mv "$WORK/blocks_pt.csv" "$WORK/blocks.csv"
 fi
 
 # recap.py runs this DuckDB session in a thread concurrent with the Deribit fetch.
