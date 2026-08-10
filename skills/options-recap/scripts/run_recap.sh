@@ -136,15 +136,32 @@ COPY (SELECT asset, exchange, block_id, min(bucket_at) AS bucket_at, sum(volume_
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '${WORK}/surface_now.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h WHERE abs("at"-${START_MS})<=900000 ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '${WORK}/surface_open.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(turnover_usd) AS turnover_usd, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
-COPY (SELECT 'recap_aggregates' AS source, max(bucket_at) AS max_at FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot' UNION ALL SELECT 'vol_surface', max("at") FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND mark_iv IS NOT NULL) TO '${WORK}/freshness.csv' (HEADER, DELIMITER ',');
+COPY (SELECT 'recap_aggregates' AS source, min(mx) AS max_at FROM (SELECT exchange, metric, max(bucket_at) AS mx FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot' GROUP BY exchange, metric)) TO '${WORK}/freshness_rec.csv' (HEADER, DELIMITER ',');
+COPY (SELECT 'vol_surface' AS source, max("at") AS max_at FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) TO '${WORK}/freshness_vs.csv' (HEADER, DELIMITER ',');
 SQL
 
-# freshness.csv (the statement just above): the max timestamp each continuously
-# -written source carries, NOT windowed. The window filter is deliberately
-# omitted — a source frozen before START_MS returns zero windowed rows, which is
-# indistinguishable from "quiet market" and tells you nothing about the feed. The
-# absolute max is the pipeline's heartbeat, so it answers the only question that
-# matters: is anything still writing this file?
+# freshness_*.csv (the two statements just above): the newest timestamp each
+# continuously-written source carries, NOT windowed. The window filter is
+# deliberately omitted — a source frozen before START_MS returns zero windowed
+# rows, which is indistinguishable from "quiet market" and tells you nothing
+# about the feed. The absolute max is the pipeline's heartbeat, so it answers
+# the only question that matters: is anything still writing this file?
+#
+# ONE FILE PER SOURCE, not one UNION ALL. A single COPY spanning both reads
+# means either read failing writes ZERO bytes, silently disabling the gate for
+# BOTH sources — and a disabled gate is indistinguishable in the output from
+# "everything fresh", which is the original bug wearing a different hat. Split,
+# a ${VS_HOT} outage costs only the vol_surface probe and recap_aggregates is
+# still checked. recap.py treats a source it cannot read as UNKNOWN and says so
+# rather than assuming fresh; see load_freshness / check_freshness.
+#
+# MIN OVER THE PER-GROUP MAXIMA for recap_aggregates, not a flat max.
+# `row_type='dvol_spot'` is two series (metric='dvol' and metric='spot'), read
+# as separate fields by load_hot, and potentially several exchanges. A flat max
+# reports the FRESHEST constituent, so a dead DVOL scraper hides behind a live
+# spot ticker and the recap renders frozen DVOL with no banner — the exact
+# failure class this gate exists for, one level narrower than the incident that
+# motivated it. The laggiest constituent has to set the reading.
 #
 # WHY THIS EXISTS. hot__market_signals_1m / the recap aggregates went stale on
 # 2026-07-10 and kept rendering July 10 numbers as if live until 2026-08-04 —

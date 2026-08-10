@@ -13,12 +13,12 @@ compatibility: Deribit public API (curl) for the 7d realized-vol closes, and as 
   activity/P-C, the vol surface, and the Biggest Print + Block Flow (the multi-venue
   paradigm_trade_tape_slim block tape). Heartbeat sources are freshness-checked
   before rendering — one that has fallen behind its limit is banner-flagged as NOT
-  live and, for DVOL/spot, diverted to Deribit. No authentication required for the
+  live; DVOL/spot then divert to Deribit when that fetch succeeds. No auth for the
   public API; the S3 reads require the IRSA bootstrap (see paradigm-data-discovery
   skill).
 metadata:
   author: tradeparadigm
-  version: "1.14"
+  version: "1.15"
 ---
 
 # Options Recap
@@ -103,10 +103,23 @@ prepend one line: `⚠ Data estimated — no live feed available.`
 ## Data freshness
 
 `run_recap.sh` probes the newest timestamp on each continuously-written source
-before rendering. A source past its limit gets a `⚠ … NOT live` banner as the
-**first line** of the output, and for DVOL/spot the figures are re-sourced live
-from Deribit. **Relay that banner verbatim** — it is the only signal that the
-numbers below may be wrong rather than missing.
+before rendering. A source past its limit — **or one whose freshness could not
+be verified at all** — gets a `⚠` banner as the **first line** of the output.
+**Relay that banner verbatim, including its indented follow-on lines** — it is
+the only signal that the numbers below may be wrong rather than missing.
+
+The banner states the consequence per source, and you must not paraphrase it
+into a stronger claim:
+
+- **`recap_aggregates` stale** — DVOL/spot are re-sourced live from Deribit
+  **when that fetch succeeds**; the banner then says `re-sourced live from
+  Deribit`. If it fails, the stale figures are retained and the banner says
+  `could NOT be re-sourced`. **Never tell a user the figures are live unless
+  the banner says re-sourced.** `$ Volume`, Activity, P/C and venue Block Flow
+  come from the same file and are windowed, so they cover only up to the freeze
+  and understate the window — the banner says this too.
+- **`vol_surface` stale** — banner only. There is **no** live fallback for the
+  surface, so ATM/RR/Fly, skew, term and the Δ columns are from that data.
 
 This exists because the recap aggregates froze on 2026-07-10 and rendered July
 10 DVOL/spot as current for ~3.5 weeks. The file's mtime kept changing while its
