@@ -18,7 +18,7 @@ compatibility: Deribit public API (curl) for the 7d realized-vol closes, and as 
   skill).
 metadata:
   author: tradeparadigm
-  version: "1.15"
+  version: "1.14"
 ---
 
 # Options Recap
