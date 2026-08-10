@@ -56,7 +56,7 @@ volume/`trade_count` rows come from ONE rolling file, `hot__recap_aggregates_5m_
 (5-min buckets over the trailing 24h), windowed at query time by `WHERE bucket_at
 >= now - window` + aggregation; the vol surface + ΔATM/ΔRR/ΔFly come from
 `v_vol_surface`; and Biggest Print / Block Flow come from the multi-venue Paradigm
-block tape (`paradigm_trade_tape_slim`), scanned in the same DuckDB session. The
+block tape (the hot `paradigm_trade` rows), scanned in the same DuckDB session. The
 Deribit public API adds only the 7d realized-vol closes (and a live DVOL/spot
 fallback when the S3 read fails **or its data is stale** — see Data freshness).
 
@@ -76,7 +76,7 @@ Notes / non-obvious bits:
   window into seconds instead of enumerating presets.
 - **~24h Snapshot horizon.** The *Snapshot* flow sources reach back only ~24h:
   Volume / Activity / P-C / DVOL / spot come from the rolling recap-aggregates file
-  (trailing 24h). Block Flow + Biggest Print now come from the months-deep Paradigm
+  (trailing 24h). Block Flow + Biggest Print now come from the 30-day Paradigm
   block tape, and the vol surface (`v_vol_surface`) retains far longer — so those are
   no longer the constraint. For windows >24h, `build()` sets a `hot_horizon` field and
   `render_md` prepends a one-line banner scoped to the hot Snapshot sections (Block
@@ -115,19 +115,34 @@ There is **no `surface` `row_type`** — the vol surface lives in `v_vol_surface
 Biggest Print / Block Flow are primarily the block tape (below), plus the
 `block` rows for venues the tape doesn't broker. `notional` is `notional_usd`.
 
-**Block tape (Biggest Print + Block Flow).** `s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz`
-— one flat ~1.5MB csv.gz (all dates; a full scan is sub-second, so it's read fresh
-per recap, windowed by the `DATE`+`TIME` filter in `run_recap.sh`). It spans every
-venue Paradigm brokers (`DBT`/`PRDX`/`BLSH`/…) with USD notional **per leg**
-(`NOTIONAL_VOLUME_USD`) and the structure named in `DESCRIPTION`, so `vol_math`
-does no cross-venue $ normalization and no instrument-name inference. `vol_math`
-groups it two ways: by `BLOCK_TRADE_ID` (a block; Σ per-leg notional → the Biggest
-Print is the single largest) and by `RFQ_ID` (a worked order; its blocks roll into
-one Block Flow row with a `Blocks` count). Columns used: `DATE`, `TIME`, `PRODUCT`
-(→ asset + venue), `DESCRIPTION`, `QTY`, `SIDE`, `NOTIONAL_VOLUME_USD`, `RFQ_ID`,
-`BLOCK_TRADE_ID`. The tape carries **no IV** — the top blocks' IV is looked up from
-`v_vol_surface` (Deribit legs only). See the `paradigm-data-discovery` skill for the
-tape schema and the `paradigm-block-analyst` skill for the `DESCRIPTION` grammar.
+**Block tape (Biggest Print + Block Flow).**
+`s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet`
+(`row_type='paradigm_trade'`) — the Snowflake-free tape, built by the
+`exchange-venue-data` paradigm-trade CronJob from the Airbyte→S3 UM landing. Leg
+grain, **trailing 30 days**, read fresh per recap and windowed by `traded_at` in
+`run_recap.sh`.
+
+It supersedes `s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz`
+(a flat csv.gz spanning all dates), which `run_recap.sh` still reads first and then
+overwrites — a deliberate fallback while the egress decommission (data#712) lands
+and soaks. Two differences matter when reading this section: the horizon is 30
+days rather than all history, and the parquet adds `VENUE_BLOCK_TRADE_ID` (the
+venue's own block id), which is what lets `recap.py` dedupe venue-tape blocks
+against the Paradigm tape exactly rather than by the structural brokered-venue
+exclusion.
+
+The tape spans every venue Paradigm brokers (`DBT`/`PRDX`/`BLSH`/…) with USD
+notional **per leg** (`NOTIONAL_VOLUME_USD`) and the structure named in
+`DESCRIPTION`, so `vol_math` does no cross-venue $ normalization and no
+instrument-name inference. `vol_math` groups it two ways: by `BLOCK_TRADE_ID` (a
+block; Σ per-leg notional → the Biggest Print is the single largest) and by
+`RFQ_ID` (a worked order; its blocks roll into one Block Flow row with a `Blocks`
+count). Columns used: `DATE`, `TIME`, `PRODUCT` (→ asset + venue), `DESCRIPTION`,
+`QTY`, `SIDE`, `NOTIONAL_VOLUME_USD`, `RFQ_ID`, `BLOCK_TRADE_ID`,
+`VENUE_BLOCK_TRADE_ID`. The tape carries **no IV** — the top blocks' IV is looked
+up from `v_vol_surface` (Deribit legs only). See the `paradigm-data-discovery`
+skill for the tape schema and the `paradigm-block-analyst` skill for the
+`DESCRIPTION` grammar.
 
 **Venue-tape blocks (`venue_blocks.csv`) — full-market block coverage.** The
 recap file's `block` rows carry every block/OTC print off the exchanges' own
@@ -139,19 +154,25 @@ block must never compete in an options recap) with **unit-explicit columns**:
 debuggability, **never displayed as notional**: it's ~50–100× below the
 underlying-USD basis the block sections use). `recap.py` then:
 
-- **Merges only venues Paradigm never brokers** (`_dedupe_venue_blocks` /
-  `_TAPE_BROKERED_VENUES`). A block on a venue Paradigm brokers
-  (Deribit/Bullish/Paradex) can appear on *both* the Paradigm tape and the
-  exchange's own tape, and the slim tape carries no shared id to dedupe on, so
-  those venues are excluded — leaving the venues with zero Paradigm overlap.
-  **OKX today** (Bybit has no group id, so it never reaches `block` rows at
-  all). This structural exclusion is window-independent and depends on no tape
-  column. **Deferred to the Snowflake-off migration (taskwarrior #119):**
-  exporting the venue's own block id (`VENUE_BLOCK_TRADE_ID` — Deribit
-  `BLOCK-…`, Bullish `otc_trade_id`) onto the slim tape, which then lets *every*
-  venue merge by exact id-dedupe with no double-count. That export was
-  deliberately **not** bolted onto the live `analytics.trade` dbt model (too
-  much blast radius); it lands from S3 with proper CDC dedup under #119.
+- **Exact id dedupe where the venue has proved it.** A venue-tape block whose
+  `block_id` matches a `VENUE_BLOCK_TRADE_ID` on the Paradigm tape is the same
+  print and is dropped; a genuinely non-Paradigm block on that venue merges.
+  The structural brokered-venue exclusion is still the FALLBACK, and every
+  guard fails toward it:
+  - ids are scoped per venue (independent, often numeric, id spaces);
+  - a venue only merges once EVERY one of its ids on the Paradigm tape has found
+    a counterpart in the venue tape — otherwise a benign format difference (`BLOCK-280624` vs
+    `280624`) would match nothing and merge everything, doubling the headline;
+  - any tape block row on a venue without a venue id, or an unparseable
+    `PRODUCT`, gates that venue (or all of them) back to structural;
+  - block rows are keyed `BLOCK_TRADE_ID or TRADE_ID`, matching `vol_math`.
+
+  So the worst case is the pre-id behaviour — a non-Paradigm block is missed —
+  and a double count needs BOTH a format regression and full-coverage proof to
+  have been granted, which the coverage rule is designed to withhold in exactly
+  that case. OKX is never brokered, so it always merges. Bybit can never appear
+  at all — its feed has an is-block flag but no group id, so its blocks are
+  unreconstructable and ride the volume/flow rows instead.
 - **Prices them as `volume_coin × spot`** — underlying-USD, the same basis as the
   tape's `NOTIONAL_VOLUME_USD`, valued at recap-time spot (a disclosed
   approximation vs the tape's trade-time figures). No spot → skipped with a
@@ -161,8 +182,7 @@ underlying-USD basis the block sections use). `recap.py` then:
   render as `<Venue> Block` rows (the venue lives in the structure label — there is
   no per-row venue column) with a `(venue tape)` detail note and `~HH:MM` times
   (5-min bucket resolution); a venue-tape Biggest Print reads `via venue tape`.
-  Bybit can never appear here — its feed has an is-block flag but no group id, so
-  its blocks are unreconstructable and ride the volume/flow rows.
+
 
 **Multi-venue representation (truthful + consistent).** The `volume` rows span
 Deribit, OKX, Bybit, Bullish. The dollar **Volume** line sums **`turnover_usd`**
@@ -317,6 +337,7 @@ python3 tests/test_vol_math.py    # 166 checks — the math formulas + tape pars
                                     #   rollup (build_tape_blocks: Σ-per-block
                                     #   notional, RFQ clip rollup, IV lookup)
 python3 tests/test_recap.py       # 327 checks — orchestrator: window parsing,
+python3 tests/test_recap.py       # 293 checks — orchestrator: window parsing,
                                     #   hot-CSV ingest, the volume-corruption guard,
                                     #   block tape → Biggest Print/Block Flow (multi-
                                     #   venue, venue column, freshness stamp),

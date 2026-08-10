@@ -9,13 +9,13 @@ description: >
   The output format is fixed — always the same four sections in the same order.
 compatibility: Deribit public API (curl) for the 7d realized-vol closes, and as the
   live DVOL/spot fallback when the hot source is stale or absent; Paradigm data
-  (DuckDB+S3 via IRSA) for everything else. Heartbeat sources are
-  freshness-checked before rendering; a source past its limit is banner-flagged
-  and DVOL/spot divert to Deribit where that fetch succeeds. No auth for the
-  public API; S3 reads need the IRSA bootstrap (see paradigm-data-discovery).
+  (DuckDB+S3 via IRSA) for the rest, incl. Biggest Print + Block Flow off the hot
+  paradigm_trade tape (legacy csv.gz as fallback until decommissioned). Heartbeat
+  sources are freshness-checked before rendering; one past its limit is
+  banner-flagged. S3 reads need the IRSA bootstrap (see paradigm-data-discovery).
 metadata:
   author: tradeparadigm
-  version: "1.14"
+  version: "1.15"
 ---
 
 # Options Recap
@@ -34,23 +34,34 @@ Any `Nm`/`Nh`/`Nd` window up to 24h works and all render identically: DVOL/spot,
 the `$` Volume line, and the multi-venue activity/P-C all come from one rolling hot
 aggregates file sliced to the window at query time; the surface (and its Δ columns)
 from `v_vol_surface`; and **Biggest Print + Block Flow from the multi-venue Paradigm
-block tape** (`paradigm_trade_tape_slim`) — every venue Paradigm brokers
-(Deribit/Paradex/Bullish/…), notional already in USD per leg — **plus venue-tape
-blocks for venues Paradigm doesn't broker** (OKX today, off the hot recap file's
-option `block` rows — the only venues with zero Paradigm-tape overlap, so no
-double-count; widening to every venue via id-dedupe is deferred to the
-Snowflake-off migration), which rank in the same pool and render as
-`<Venue> Block` rows with a `(venue tape)` detail note. Biggest Print names its
-venue as `via Paradigm/<venue>` (or `via venue tape`). The Paradigm tape has no
-IV, so the top blocks' IV is looked up from the vol surface (Deribit legs only;
-venue-tape blocks carry their venue's per-trade IV where published; other venues
-show IV `n/a`). A malformed window exits with a clear error.
+block tape** (the hot `paradigm_trade` rows; legacy `paradigm_trade_tape_slim`
+csv.gz as fallback) — every venue Paradigm brokers (Deribit/Paradex/Bullish/…),
+notional already in USD per leg.
+
+**Plus venue-tape blocks** off the hot recap file's option `block` rows. These
+rank in the same pool as Paradigm blocks and render as `<Venue> Block` rows with
+a `(venue tape)` detail note. They are deduped against the Paradigm tape by the
+venue's OWN block id (`VENUE_BLOCK_TRADE_ID`), so a genuinely non-Paradigm
+Deribit or Bullish block merges rather than being excluded wholesale. Every
+guard on a BROKERED venue fails toward EXCLUSION (venues outside the map are
+never brokered by Paradigm and merge unconditionally by design): a venue merges only once EVERY one of its ids on
+the Paradigm tape has found a counterpart in the venue tape, so an unmatched
+venue-tape block cannot be a mis-formatted Paradigm print. Any gap in that
+coverage — including a single unmatched id — drops the venue back to the
+structural brokered-venue exclusion, so the realistic failure is a missed block
+rather than a doubled one. OKX is never brokered by Paradigm, so it always
+merges.
+
+Biggest Print names its venue as `via Paradigm/<venue>` (or `via venue tape`).
+The Paradigm tape has no IV, so the top blocks' IV is looked up from the vol
+surface (Deribit legs only; venue-tape blocks carry their venue's per-trade IV
+where published; other venues show IV `n/a`). A malformed window exits with a clear error.
 
 **Windows beyond 24h:** the Snapshot flow sources (the rolling hot aggregates file →
 Volume/Activity/P-C/DVOL/spot) retain only ~24h, so `run_recap.sh` caps any longer
 window (e.g. `2d`) at 24h and prepends a one-line `⚠ window capped at 24h — …` banner
 as the first line of its output — **relay it verbatim** (don't drop or reword it).
-Block Flow itself now comes from the months-deep block tape and isn't the constraint;
+Block Flow itself now comes from the 30-day block tape and isn't the constraint;
 the cap lifts once the Snapshot sources are wired to the cold store.
 
 **Vol-surface Δ coverage:** the window-open surface comes from `_hot.parquet`

@@ -56,6 +56,8 @@ from vol_math import (  # noqa: E402
     realized_vs_implied,
     build_tape_blocks,
     compute_vol_surface,
+    tape_block_key,
+    _TAPE_VENUE as _VOL_MATH_VENUE_CODES,
     RV_LOOKBACK_DAYS,
 )
 
@@ -532,26 +534,198 @@ def load_venue_blocks(csv_dir: str, asset: str) -> list[dict]:
 # Paradigm tape and the exchange's own tape, so merging its venue-tape copy
 # would double-count the brokered flow. Venues NOT in this set are never
 # brokered by Paradigm, so their venue-tape blocks have zero overlap with the
-# Paradigm tape and merge freely — OKX today (Bybit has no group id, so it
-# never reaches `block` rows at all). This structural exclusion is the whole
-# dedupe today.
+# Paradigm tape and always merge — OKX today (Bybit has no group id, so it
+# never reaches `block` rows at all).
 #
-# Exact per-block dedupe by the venue's OWN block id — which would let a
-# brokered venue merge its genuinely non-Paradigm blocks too, keyed on a
-# shared id — needs that id on the slim tape. It is deferred to the
-# Snowflake-off migration (taskwarrior #119), where it lands from S3 with
-# proper CDC dedup rather than as a schema change to the live analytics.trade
-# dbt model. Until then this set is the boundary and only OKX merges.
-_TAPE_BROKERED_VENUES = {"deribit", "deribit-usdc", "paradex", "bullish"}
+# For the brokered venues the dedupe is now EXACT where the data allows:
+# blocks.csv (the hot paradigm_trade tape) carries VENUE_BLOCK_TRADE_ID —
+# the venue's OWN block id (Deribit `BLOCK-…`, Bullish otc id), the same id
+# the venue tape's `block_id` column carries — so a venue-tape block that
+# matches a brokered id is the SAME print and is dropped, while a
+# genuinely non-Paradigm Deribit/Bullish block merges into Block Flow.
+# Guard rails, both falling back to the old structural exclusion (never
+# double-count on uncertainty):
+#   - tape without the column / no stamped ids in the window → structural
+#     for every brokered venue (pre-migration behavior, byte-identical);
+#   - PER-VENUE coverage gate: if any tape block row ON THAT VENUE lacks
+#     the id (e.g. unstamped metadata), that venue's tape copies can't be
+#     matched by id, so its venue-tape rows stay excluded structurally.
+_TAPE_VENUE_CODE = {
+    "deribit": "DBT",
+    "deribit-usdc": "DBT",
+    "paradex": "PRDX",
+    "bullish": "BLSH",
+}
+_TAPE_BROKERED_VENUES = set(_TAPE_VENUE_CODE)
 
 
-def _dedupe_venue_blocks(venue_rows: list[dict]) -> list[dict]:
-    """Keep only venue-tape blocks that can't be a Paradigm-brokered
-    duplicate — those on venues Paradigm never brokers (`_TAPE_BROKERED_VENUES`
-    excluded). Window-independent and dependent on no tape column. See the
-    note above for the id-based dedupe deferred to taskwarrior #119."""
-    return [r for r in venue_rows
-            if (r.get("exchange") or "").lower() not in _TAPE_BROKERED_VENUES]
+def _tape_venue_code(tape_row: dict) -> str:
+    """The venue code off a tape row's PRODUCT ('BTC OPTION - DBT');
+    unknown shape -> '?' (treated as covering NO venue safely)."""
+    product = tape_row.get("PRODUCT") or ""
+    return product.rsplit(" - ", 1)[-1].strip().upper() if " - " in product else "?"
+
+
+def promote_if_nonempty(csv_dir: str, staged: str, target: str) -> bool:
+    """Move `staged` over `target` only if it carries at least one data row.
+
+    Two failure modes, opposite directions, both silent:
+      - overwriting unconditionally: a COPY that binds but matches nothing
+        writes a bare header, destroying the legacy tape and emptying Block
+        Flow;
+      - never promoting: the migration's whole point (VENUE_BLOCK_TRADE_ID)
+        never reaches the reader and the dedupe permanently takes the
+        structural branch.
+    A missing staged file is the bind-failure case and is already correct —
+    the legacy target stands. A staged file with only a header is reported,
+    because once the promotion works, "silently keeps serving legacy" is the
+    remaining way this goes wrong unobserved."""
+    src = os.path.join(csv_dir, staged)
+    if not os.path.exists(src):
+        return False                      # bind failed; legacy target stands
+    with open(src, newline="") as f:
+        rows = sum(1 for _ in f)
+    if rows <= 1:
+        warn(f"{staged} matched no rows — {target} keeps its previous contents; "
+             "block dedupe falls back to the structural exclusion")
+        return False
+    os.replace(src, os.path.join(csv_dir, target))
+    return True
+
+
+def _tape_block_id(tape_row: dict) -> str:
+    """The id vol_math will actually block this row under.
+
+    MUST match build_tape_blocks' key (`BLOCK_TRADE_ID or TRADE_ID`). A
+    narrower definition here — BLOCK_TRADE_ID only — let a row that DOES
+    become a block in Block Flow be invisible to the coverage gate, so a
+    venue was treated as fully id-covered when it wasn't."""
+    return tape_block_key(tape_row) or ""
+
+
+def _dedupe_venue_blocks(venue_rows: list[dict],
+                         tape_rows: list[dict] | None = None) -> list[dict]:
+    """Venue-tape blocks minus anything that could be a Paradigm-brokered
+    duplicate.
+
+    The pre-id design made double-counting STRUCTURALLY impossible for the
+    brokered venues: they were simply never merged. Exact-id dedupe is more
+    precise but it trades that invariant for string equality in which a
+    NON-match means merge — so any benign format difference between the two
+    independent pipelines (`BLOCK-280624` vs `280624`, case, zero-padding)
+    silently double-counts the headline number instead of failing closed.
+
+    So the id path is only trusted for a venue once it has PROVED itself on
+    that venue, in this window, by matching at least once. Until then the
+    venue keeps the structural exclusion. A format mismatch therefore
+    degrades to the old, safe behaviour (a genuinely non-Paradigm block is
+    missed) rather than to double-counting, and every gate below fails in
+    that same direction — for BROKERED venues. A venue outside
+    _TAPE_VENUE_CODE is not deduped at all and merges unconditionally, which is
+    a real double-count path if such a venue ever appears on both tapes.
+
+    The guarantee is conditional, not absolute: a double count requires BOTH a
+    format regression AND full-coverage proof to have been granted anyway. The
+    coverage rule is designed to withhold proof in precisely that case, but it
+    is evidence, not a proof of correctness, so the claim is stated as the
+    realistic failure direction rather than an impossibility."""
+    tape_rows = tape_rows or []
+
+    # Ids are scoped PER VENUE. One global set let an id from one venue delete
+    # a block on another: venue id spaces are independent and several are plain
+    # numeric, so a Bullish id could erase a genuinely non-Paradigm OKX block —
+    # a silent under-count on a venue Paradigm never brokers at all.
+    ids_by_code: dict = {}
+    unstamped_codes = set()
+    for r in tape_rows:
+        code = _tape_venue_code(r)
+        venue_id = (r.get("VENUE_BLOCK_TRADE_ID") or "").strip()
+        if venue_id:
+            ids_by_code.setdefault(code, set()).add(venue_id)
+        elif _tape_block_id(r):
+            # A block row with no venue id: its venue-tape copy cannot be
+            # matched, so that venue's coverage is incomplete.
+            unstamped_codes.add(code)
+    if not any(ids_by_code.values()):
+        return [r for r in venue_rows
+                if (r.get("exchange") or "").lower() not in _TAPE_BROKERED_VENUES]
+
+    # An UNPARSEABLE PRODUCT ('?') must remove trust, not silently grant it.
+    # Previously '?' could only ever land in `unstamped_codes`, where it matched
+    # no real venue code — so a malformed row disabled the very gate it should
+    # have tripped. Treat it as compromising every brokered venue, since we
+    # cannot tell which one it belonged to.
+    # ANY code we do not recognise taints every brokered venue, not just the
+    # no-separator '?' case. A parseable-but-unknown code (a three-token
+    # `BTC OPTION - DBT - USDC`, a lowercase or padded suffix) otherwise landed
+    # in ids_by_code, was filtered out of matched_codes, and tainted nothing —
+    # so the remaining ids made DBT look fully covered and a Paradigm print
+    # merged on top of its own tape copy. It also matters that run_recap.sh
+    # reads token 2 via split_part while _tape_venue_code reads token N via
+    # rsplit: they agree only for exactly-two-token products and diverge toward
+    # INCLUSION, so the unknown-code path is reachable by ordinary drift rather
+    # than by malformed data.
+    # Known codes come from vol_math's venue list, not just the 4-entry dedupe
+    # map: BYB and BIT are ordinary Paradigm-tape suffixes, so treating them as
+    # "unrecognised" let a single Bybit print taint every brokered venue and
+    # silently revert the merge for the whole window. Recognised-but-not-deduped
+    # is a different thing from unrecognised.
+    _known = set(_TAPE_VENUE_CODE.values()) | set(_VOL_MATH_VENUE_CODES)
+    if not (set(ids_by_code) | unstamped_codes) <= _known:
+        unstamped_codes |= _known
+
+    # PASS 1 — which venues have PROVED their id space is comparable.
+    #
+    # The bar is FULL coverage, not one match. "At least one match" proves only
+    # that some ids line up, so a PARTIAL format regression — 4 of 5 stamped
+    # consistently — proved the venue on the 4 and then merged the 5th, which
+    # is a Paradigm print counted twice. Mixed stamping is the realistic shape
+    # of such a regression; a uniform mismatch is the one a soak catches
+    # immediately. The venue-code pooling makes it worse: deribit and
+    # deribit-usdc share DBT, so a match in one book would vouch for the other.
+    #
+    # So: every tape id on that venue must find a counterpart in the venue
+    # tape. Then an unmatched venue-tape block cannot be a mis-formatted
+    # Paradigm print — every Paradigm print is already accounted for — and is
+    # therefore genuinely non-Paradigm and safe to merge. One unmatched tape id
+    # is enough to withhold proof, because it is indistinguishable from a
+    # Paradigm print whose id we failed to recognise.
+    #
+    # The cost is real and deliberate: a Paradigm block absent from the venue
+    # tape entirely (it carries only option `block` rows) also withholds proof,
+    # so the venue falls back to structural. That is the pre-PR behaviour and
+    # the safe direction.
+    venue_ids_seen: dict = {}
+    for r in venue_rows:
+        code = _TAPE_VENUE_CODE.get((r.get("exchange") or "").lower())
+        block_id = (r.get("block_id") or "").strip()
+        if code and block_id:
+            venue_ids_seen.setdefault(code, set()).add(block_id)
+    matched_codes = {
+        code for code, tape_ids in ids_by_code.items()
+        if code in _TAPE_VENUE_CODE.values()
+        and tape_ids and tape_ids <= venue_ids_seen.get(code, set())
+    }
+
+    # PASS 2 — apply. Every branch fails toward EXCLUSION, so the worst case is
+    # the pre-PR behaviour (a genuinely non-Paradigm block is missed) rather
+    # than an inflated headline.
+    out = []
+    for r in venue_rows:
+        exchange = (r.get("exchange") or "").lower()
+        code = _TAPE_VENUE_CODE.get(exchange)
+        block_id = (r.get("block_id") or "").strip()
+        if code is None:
+            out.append(r)          # never brokered by Paradigm -> always merges
+            continue
+        if block_id and block_id in (ids_by_code.get(code) or set()):
+            continue               # the same print, already on the Paradigm tape
+        if code in unstamped_codes:
+            continue               # incomplete id coverage -> structural
+        if code not in matched_codes:
+            continue               # id space unproven for this venue -> structural
+        out.append(r)
+    return out
 
 
 def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
@@ -756,10 +930,22 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     # Venue-tape blocks join the same pool (min-notional filter, Biggest Print
     # candidacy, top-N ranking on equal underlying-USD terms), after
     # _dedupe_venue_blocks removes anything that could be a Paradigm-brokered
-    # duplicate — today that leaves venues Paradigm never brokers (OKX);
-    # taskwarrior #119 widens it to every venue via exact id dedupe.
-    venue_blocks = _venue_tape_blocks(
-        _dedupe_venue_blocks(venue_block_rows or []), spot)
+    # duplicate — exact per-block id dedupe against this window's tape rows
+    # where their VENUE_BLOCK_TRADE_ID coverage allows, the structural
+    # brokered-venue exclusion otherwise (see _dedupe_venue_blocks).
+    # The venue fetch is deliberately widened to the 5-minute bucket CONTAINING
+    # window-open, because the coverage gate needs the counterpart of any
+    # Paradigm print in that bucket. But roughly half of a straddling bucket
+    # precedes the window, so those rows must not reach the ranked pool: a
+    # pre-window block was entering Block Flow and could win Biggest Print,
+    # rendering a timestamp outside the window banner printed above it.
+    # "Not duplicated" and "in the window" are different claims — the widening
+    # is correct for the GATE and wrong for the OUTPUT, so it is re-filtered
+    # here rather than narrowed at the source.
+    _deduped = _dedupe_venue_blocks(venue_block_rows or [], own_blocks)
+    _in_window = [r for r in _deduped
+                  if (_num(r, "bucket_at") or 0) >= start_ms]
+    venue_blocks = _venue_tape_blocks(_in_window, spot)
     block = build_tape_blocks(own_blocks, iv_lookup=iv_lookup,
                               extra_blocks=venue_blocks)
 
@@ -913,6 +1099,15 @@ def render_md(r: dict) -> str:
     if r.get("stale_sources"):
         L.append("")
 
+    # THIRD cycle for this: the zero-row warn() lands in WARNINGS, and WARNINGS
+    # is discarded on --render — the only path a user sees. So a dead migration
+    # (hot tape never promoted) was indistinguishable from a healthy recap.
+    # Rendered explicitly rather than routed through the warning machinery.
+    if r.get("block_source_legacy"):
+        L.append("⚠ Block Flow is reading the LEGACY tape — the hot paradigm_trade "
+                 "read returned no rows, so venue-block dedupe is structural only.")
+        L.append("")
+
     crit = [w for w in (r.get("warnings") or []) if any(
         k in w for k in ("missing", "unavailable", "failed"))]
     if crit and s.get("volume_usd_m") is None and vs is None:
@@ -1064,6 +1259,7 @@ def main() -> None:
     now_ms = args.now_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = now_ms - parse_window_ms(args.window)
 
+    block_source_legacy = False
     block_rows: list[dict] = []
     venue_block_rows: list[dict] = []
     # Bound before the branch: --no-s3 reads no hot sources at all, so there is
@@ -1083,6 +1279,15 @@ def main() -> None:
             if duck_fut is not None:
                 duck_fut.result()
             deri = deri_fut.result()
+        # AFTER DuckDB has run — this cannot live in run_recap.sh. That script
+        # only WRITES recap.sql; the statements execute here, inside
+        # run_duckdb(). A promotion gate placed in the shell therefore ran
+        # before blocks_pt.csv could exist, so it never fired: the hot tape was
+        # never promoted, VENUE_BLOCK_TRADE_ID was never present, and the
+        # dedupe silently took the structural branch forever. That closed the
+        # zero-row hole by opening its exact opposite.
+        block_source_legacy = not promote_if_nonempty(
+            args.csv_dir, "blocks_pt.csv", "blocks.csv")
         hot = load_hot(args.csv_dir, ASSET)
         block_rows = load_blocks(args.csv_dir)
         venue_block_rows = load_venue_blocks(args.csv_dir, ASSET)
@@ -1136,6 +1341,7 @@ def main() -> None:
 
     result = build(asset, args.window, start_ms, now_ms, deri, hot, block_rows,
                    venue_block_rows, stale=stale)
+    result["block_source_legacy"] = block_source_legacy
     if args.render:
         print(render_md(result))
     else:

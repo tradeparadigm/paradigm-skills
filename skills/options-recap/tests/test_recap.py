@@ -29,6 +29,8 @@ from recap import (  # noqa: E402
     _venue_tape_blocks, MAX_SURFACE_ROWS,
     load_freshness, check_freshness, drop_stale_snapshot_fields, _fmt_lag,
     STALENESS_LIMIT_S,
+    _venue_tape_blocks, MAX_SURFACE_ROWS, _dedupe_venue_blocks,
+    promote_if_nonempty,
 )
 
 _passed = 0
@@ -319,6 +321,49 @@ def test_dedupe_excludes_paradigm_brokered_venues():
              {"exchange": "OKEX-OPTIONS", "block_id": "Y"}]
     kept2 = {r["block_id"] for r in recap._dedupe_venue_blocks(mixed)}
     check("case-insensitive venue match", kept2 == {"Y"}, kept2)
+
+
+def test_dedupe_exact_id_with_per_venue_coverage_gate():
+    # blocks.csv off the hot paradigm_trade tape carries
+    # VENUE_BLOCK_TRADE_ID → exact dedupe unlocks per venue: a venue-tape
+    # block matching a brokered id is the SAME print (dropped); a
+    # non-matching one on a FULLY-stamped venue merges; a venue with any
+    # unstamped block row keeps the structural exclusion (uncertainty must
+    # never double-count).
+    venue_rows = [
+        {"exchange": "deribit", "block_id": "BLOCK-A"},       # on the tape → dropped
+        {"exchange": "deribit", "block_id": "BLOCK-B"},       # genuinely non-Paradigm → merges
+        {"exchange": "bullish", "block_id": "OTC-1"},         # BLSH coverage incomplete → excluded
+        {"exchange": "okex-options", "block_id": "OKX-1"},    # never brokered → merges
+    ]
+    tape = [
+        {"PRODUCT": "BTC OPTION - DBT", "BLOCK_TRADE_ID": "DRFQv2-1",
+         "VENUE_BLOCK_TRADE_ID": "BLOCK-A"},
+        {"PRODUCT": "BTC OPTION - BLSH", "BLOCK_TRADE_ID": "DRFQv2-2",
+         "VENUE_BLOCK_TRADE_ID": ""},  # unstamped → BLSH stays structural
+    ]
+    kept = {r["block_id"] for r in recap._dedupe_venue_blocks(venue_rows, tape)}
+    check("id-matched brokered copy dropped", "BLOCK-A" not in kept, kept)
+    check("non-Paradigm deribit block merges", "BLOCK-B" in kept, kept)
+    check("unstamped venue keeps structural exclusion", "OTC-1" not in kept, kept)
+    check("never-brokered venue still merges", "OKX-1" in kept, kept)
+    # deribit-usdc shares the DBT venue code: an unstamped DBT row gates it too.
+    tape_dbt_gap = [
+        {"PRODUCT": "BTC OPTION - DBT", "BLOCK_TRADE_ID": "DRFQv2-1",
+         "VENUE_BLOCK_TRADE_ID": "BLOCK-A"},
+        {"PRODUCT": "BTC OPTION - DBT", "BLOCK_TRADE_ID": "DRFQv2-3",
+         "VENUE_BLOCK_TRADE_ID": None},
+    ]
+    kept_gap = {r["block_id"]
+                for r in recap._dedupe_venue_blocks(venue_rows, tape_dbt_gap)}
+    check("matched id still dropped under gap", "BLOCK-A" not in kept_gap, kept_gap)
+    check("unmatched brokered blocked under gap", "BLOCK-B" not in kept_gap, kept_gap)
+    # Tape without the column at all (legacy csv.gz) → structural fallback,
+    # byte-identical to today's behavior.
+    legacy = [{"PRODUCT": "BTC OPTION - DBT", "BLOCK_TRADE_ID": "DRFQv2-1"}]
+    kept_legacy = {r["block_id"]
+                   for r in recap._dedupe_venue_blocks(venue_rows, legacy)}
+    check("legacy tape → structural fallback", kept_legacy == {"OKX-1"}, kept_legacy)
 
 
 def test_venue_tape_blocks_priced_by_coin_volume_not_premium():
@@ -1518,6 +1563,311 @@ def test_freshness_probe_contract_matches_its_reader():
     # ETH rows keep landing in the shared file and the probe reads fresh.
     vs = next(b for b, f in copies if f == "freshness_vs.csv")
     check("surface probe is asset-scoped", "symbol LIKE" in vs, vs[:200])
+
+
+# ── Venue-block dedupe: fail-closed guarantees ──────────────────────────────
+# The exact-id path replaced a STRUCTURAL invariant (brokered venues never
+# merged) with string equality where a non-match means merge. Each case below
+# is a way that trade could have silently inflated or deflated Block Flow.
+
+def _tape(product, block_id="B1", venue_id="", trade_id=""):
+    return {"PRODUCT": product, "BLOCK_TRADE_ID": block_id,
+            "TRADE_ID": trade_id, "VENUE_BLOCK_TRADE_ID": venue_id}
+
+
+def test_dedupe_ids_are_scoped_per_venue():
+    # Venue id spaces are independent and often plain numeric, so a collision
+    # across them is not hypothetical. An unbrokered venue must be untouched...
+    out = _dedupe_venue_blocks([{"exchange": "okex-options", "block_id": "9182736"}],
+                               [_tape("BTC OPTION - BLSH", "B1", "9182736")])
+    check("okx block survives a cross-venue id collision", len(out) == 1, out)
+    # ...and a BROKERED venue must not have its block deleted by another
+    # venue's id. DBT is proven here (V1 matches), so the only thing that can
+    # drop 'P1' is treating a PRDX id as a DBT one.
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "V1"},
+         {"exchange": "deribit", "block_id": "P1"}],
+        [_tape("BTC OPTION - DBT", "D1", "V1"), _tape("BTC OPTION - PRDX", "P9", "P1")])
+    check("a PRDX id does not delete a DBT block",
+          [r["block_id"] for r in out] == ["P1"], out)
+
+
+def test_dedupe_unparseable_product_fails_closed():
+    # '?' could only land in unstamped_codes, where it matched no real venue
+    # code — so a malformed row DISABLED the gate it should have tripped.
+    # DBT is otherwise PROVEN (V1 matches), so the malformed row is the only
+    # thing that can gate it — without that, the proof requirement would mask
+    # this and the mutant survives.
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "V1"},
+         {"exchange": "deribit", "block_id": "V9"}],
+        [_tape("BTC OPTION - DBT", "D1", "V1"), _tape("BTC OPTION", "D2", "")])
+    check("malformed PRODUCT gates every brokered venue", out == [], out)
+
+
+def test_dedupe_counts_trade_id_only_rows_as_blocks():
+    # vol_math keys blocks on `BLOCK_TRADE_ID or TRADE_ID`; a narrower
+    # definition here made a row that DOES become a block invisible to the
+    # coverage gate, so the venue looked fully covered when it wasn't.
+    # Again with DBT otherwise proven, so the TRADE_ID-only row is the only
+    # thing that can gate it.
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "V1"},
+         {"exchange": "deribit", "block_id": "V9"}],
+        [_tape("BTC OPTION - DBT", "D1", "V1"),
+         _tape("BTC OPTION - DBT", "", "", trade_id="T9")])
+    check("TRADE_ID-only row gates its venue", out == [], out)
+
+
+def test_dedupe_id_format_mismatch_does_not_double_count():
+    # THE design risk: two independent pipelines, one stamping BLOCK-280624 and
+    # the other 280624. Every id present, nothing matches, and the old code
+    # merged every brokered block — silently doubling the headline number.
+    out = _dedupe_venue_blocks([{"exchange": "deribit", "block_id": "280624"}],
+                               [_tape("BTC OPTION - DBT", "D1", "BLOCK-280624")])
+    check("unproven id space excludes rather than doubles", out == [], out)
+
+
+def test_dedupe_merges_once_the_id_space_is_proven():
+    # The precision the id path exists for must still work: one confirmed match
+    # proves the formats align, so a genuinely non-Paradigm block on that venue
+    # merges.
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "BLOCK-1"},
+         {"exchange": "deribit", "block_id": "BLOCK-9"}],
+        [_tape("BTC OPTION - DBT", "D1", "BLOCK-1")])
+    check("matched block dropped", all(r["block_id"] != "BLOCK-1" for r in out), out)
+    check("unmatched block merges on a proven venue",
+          [r["block_id"] for r in out] == ["BLOCK-9"], out)
+
+
+def test_dedupe_usdc_shares_the_deribit_venue_code():
+    # deribit-usdc maps to DBT, so an unstamped DBT row must gate it too. The
+    # previous fixture asserted this in a comment without an actual usdc row.
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit-usdc", "block_id": "BLOCK-U"}],
+        [_tape("BTC OPTION - PRDX", "P1", "X1"), _tape("BTC OPTION - DBT", "D1", "")])
+    check("deribit-usdc gated by an unstamped DBT row", out == [], out)
+
+
+def test_build_passes_the_tape_to_the_dedupe():
+    # Reverting to the single-argument form left all checks green: the only
+    # build()-level venue test used a fixture with no VENUE_BLOCK_TRADE_ID, so
+    # tape_ids was empty and the structural fallback ran either way.
+    seen = {}
+    orig = recap._dedupe_venue_blocks
+
+    def spy(venue_rows, tape_rows=None):
+        seen["tape"] = tape_rows
+        return orig(venue_rows, tape_rows)
+
+    recap._dedupe_venue_blocks = spy
+    try:
+        build("BTC", "8h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+              {"spot_close": 100000.0},
+              [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "C", "QTY": "1",
+                "NOTIONAL_VOLUME_USD": "1000", "SIDE": "BUY", "BLOCK_TRADE_ID": "D1",
+                "VENUE_BLOCK_TRADE_ID": "BLOCK-1", "RFQ_ID": "r1"}],
+              [{"exchange": "deribit", "block_id": "BLOCK-1", "volume_coin": "1",
+                "premium_usd": "10", "leg_count": "1"}])
+    finally:
+        recap._dedupe_venue_blocks = orig
+    check("tape rows reached the dedupe", seen.get("tape") is not None, seen)
+    check("and they are the tape rows, not the venue rows",
+          any((r or {}).get("VENUE_BLOCK_TRADE_ID") == "BLOCK-1" for r in (seen.get("tape") or [])),
+          seen.get("tape"))
+
+
+
+def test_promote_only_when_the_staged_file_has_rows():
+    # Both directions are silent failures: promoting a header-only file destroys
+    # the legacy tape and empties Block Flow; never promoting means
+    # VENUE_BLOCK_TRADE_ID never arrives and the dedupe takes the structural
+    # branch forever. The first version of this gate lived in run_recap.sh,
+    # which only WRITES the SQL — recap.py executes it — so the staged file
+    # could not exist at gate time and the promotion never fired at all.
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "blocks.csv", "A,B\nlegacy,row\n")
+        # (a) staged file absent = bind failure -> legacy stands
+        check("absent staged -> no promote", promote_if_nonempty(d, "blocks_pt.csv", "blocks.csv") is False)
+        check("legacy intact", "legacy" in open(os.path.join(d, "blocks.csv")).read())
+        # (b) header-only -> legacy stands, and it is REPORTED
+        recap.WARNINGS.clear()
+        _write(d, "blocks_pt.csv", "A,B\n")
+        check("header-only -> no promote", promote_if_nonempty(d, "blocks_pt.csv", "blocks.csv") is False)
+        check("legacy still intact", "legacy" in open(os.path.join(d, "blocks.csv")).read())
+        check("and it warns", any("matched no rows" in w for w in recap.WARNINGS), recap.WARNINGS)
+        # (c) real rows -> promoted
+        _write(d, "blocks_pt.csv", "A,B\nhot,row\n")
+        check("rows -> promote", promote_if_nonempty(d, "blocks_pt.csv", "blocks.csv") is True)
+        check("hot content won", "hot" in open(os.path.join(d, "blocks.csv")).read())
+        check("staged consumed", not os.path.exists(os.path.join(d, "blocks_pt.csv")))
+
+
+def test_partial_id_mismatch_does_not_double_count():
+    # THE cycle-2 blocking case. Proof used to be per-VENUE set membership, so
+    # 4 of 5 ids stamped consistently proved the venue and the 5th — a Paradigm
+    # print whose id we simply failed to recognise — merged as if it were a
+    # genuinely non-Paradigm block. Mixed stamping is the realistic shape of a
+    # format regression; a uniform mismatch is the one a soak catches at once.
+    tape = [_tape("BTC OPTION - DBT", f"D{i}", f"X{i}") for i in range(1, 5)]
+    tape.append(_tape("BTC OPTION - DBT", "D5", "BLOCK-X5"))
+    venue = [{"exchange": "deribit", "block_id": f"X{i}"} for i in range(1, 6)]
+    check("one unmatched tape id withholds proof for the venue",
+          _dedupe_venue_blocks(venue, tape) == [], _dedupe_venue_blocks(venue, tape))
+
+
+def test_full_coverage_still_merges_a_genuine_block():
+    # The precision the id path exists for must survive the stricter rule.
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "X1"}, {"exchange": "deribit", "block_id": "Y9"}],
+        [_tape("BTC OPTION - DBT", "D1", "X1")])
+    check("every tape id matched -> the extra block merges",
+          [r["block_id"] for r in out] == ["Y9"], out)
+
+
+def test_one_deribit_book_cannot_vouch_for_the_other():
+    # deribit and deribit-usdc share code DBT, so per-venue proof let a match in
+    # one book prove the other.
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "X1"},
+         {"exchange": "deribit-usdc", "block_id": "X2"}],
+        [_tape("BTC OPTION - DBT", "D1", "X1"), _tape("BTC OPTION - DBT", "D2", "BLOCK-X2")])
+    check("unmatched id in the pool withholds proof", out == [], out)
+
+
+
+def test_main_promotes_the_hot_tape_into_the_pipeline():
+    # The promotion is only useful if main() actually calls it: deleting the
+    # call left every unit test green while the migration was dead on arrival
+    # (VENUE_BLOCK_TRADE_ID never reaching the dedupe). Drive main() and assert
+    # on the file the rest of the pipeline reads.
+    import io as _io, contextlib as _ctx
+    with tempfile.TemporaryDirectory() as d:
+        _write(d, "blocks.csv",
+               "DATE,TIME,PRODUCT,DESCRIPTION,QTY,PRICE,REF_PRICE,SIDE,"
+               "QUOTE_CURRENCY,NOTIONAL_VOLUME_USD,RFQ_ID,TRADE_ID,BLOCK_TRADE_ID\n"
+               "2026-08-09,00:00:00,BTC OPTION - DBT,LEGACY,1,0.01,0.01,BUY,BTC,1000,r0,t0,L1\n")
+        _write(d, "blocks_pt.csv",
+               "DATE,TIME,PRODUCT,DESCRIPTION,QTY,PRICE,REF_PRICE,SIDE,"
+               "QUOTE_CURRENCY,NOTIONAL_VOLUME_USD,RFQ_ID,TRADE_ID,BLOCK_TRADE_ID,"
+               "VENUE_BLOCK_TRADE_ID\n"
+               "2026-08-09,00:00:00,BTC OPTION - DBT,HOTTAPE,1,0.01,0.01,BUY,BTC,1000,r1,t1,D1,X1\n")
+        orig_fb, orig_deri = recap._fetch_market_fallback, recap.fetch_deribit
+        recap._fetch_market_fallback = lambda *a, **k: {"dvol": [], "spot": {}, "spot_now": 1.0, "tickers": {}}
+        recap.fetch_deribit = lambda a, st, e, want_market=False: {"closes_7d": [], "market": None}
+        saved = sys.argv
+        try:
+            sys.argv = ["recap.py", "--asset", "BTC", "--window", "8h",
+                        "--csv-dir", d, "--now-ms", "1786324887000", "--render"]
+            with _ctx.redirect_stdout(_io.StringIO()):
+                recap.main()
+        finally:
+            sys.argv = saved
+            recap._fetch_market_fallback, recap.fetch_deribit = orig_fb, orig_deri
+            recap.WARNINGS.clear()
+        body = open(os.path.join(d, "blocks.csv")).read()
+        check("hot tape promoted by main()", "HOTTAPE" in body, body[:120])
+        check("legacy replaced", "LEGACY" not in body, body[:120])
+        check("staged file consumed", not os.path.exists(os.path.join(d, "blocks_pt.csv")))
+
+
+
+def test_unknown_venue_code_cannot_bypass_the_coverage_gate():
+    # The '?' guard only fired when PRODUCT had no " - " at all. Any other
+    # unknown code landed in ids_by_code, was filtered out of matched_codes,
+    # and tainted nothing — so the remaining ids made the venue look fully
+    # covered and a Paradigm print merged on top of its own tape copy. It is
+    # reachable by ordinary drift: run_recap.sh reads token 2 (split_part)
+    # while _tape_venue_code reads token N (rsplit).
+    for label, product in (("three-token suffix", "BTC OPTION - DBT - USDC"),
+                           ("lowercase suffix", "BTC OPTION - dbt"),
+                           ("padded suffix", "BTC OPTION -  DBT ")):
+        # Y9 is the discriminating row: under the bug DBT reads as fully
+        # covered and Y9 merges. A fixture whose only venue row is the
+        # MATCHING one is dropped either way and proves nothing.
+        out = _dedupe_venue_blocks(
+            [{"exchange": "deribit", "block_id": "X1"},
+             {"exchange": "deribit", "block_id": "Y9"}],
+            [_tape("BTC OPTION - DBT", "D1", "X1"), _tape(product, "D2", "X2")])
+        check(f"{label} taints the brokered venues", out == [], out)
+    # and the clean case is unaffected
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "X1"}, {"exchange": "deribit", "block_id": "Y9"}],
+        [_tape("BTC OPTION - DBT", "D1", "X1")])
+    check("recognised codes still merge", [r["block_id"] for r in out] == ["Y9"], out)
+
+
+def test_legacy_block_source_is_rendered_not_just_warned():
+    # WARNINGS are discarded on --render, the only path users see, so the
+    # zero-row promotion warning was invisible for three cycles: a dead
+    # migration looked exactly like a healthy recap.
+    r = build("BTC", "8h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+              {}, [], [])
+    r["block_source_legacy"] = True
+    md = render_md(r)
+    check("legacy source is on the rendered output", "LEGACY tape" in md, md.splitlines()[:4])
+    r["block_source_legacy"] = False
+    check("silent when the hot tape was promoted",
+          "LEGACY tape" not in render_md(r), render_md(r).splitlines()[:3])
+
+
+
+def test_pre_window_venue_block_never_reaches_the_pool():
+    # The venue fetch is widened to the bucket CONTAINING window-open so the
+    # coverage gate can see counterparts, but ~half of a straddling bucket
+    # precedes the window. Without a Python-side re-filter a pre-window block
+    # entered Block Flow and could win Biggest Print, rendering a timestamp
+    # outside the window banner printed above it. "Not duplicated" and "in the
+    # window" are different claims.
+    start = 1_000_000_000_000
+    bucket = start - 120_000            # inside the straddling bucket, BEFORE open
+    r = build("BTC", "8h", start, start + 8 * 3600_000,
+              {"closes_7d": [], "market": None}, {"spot_close": 100_000.0}, [],
+              [{"exchange": "okex-options", "block_id": "STALE", "bucket_at": str(bucket),
+                "volume_coin": "500", "premium_usd": "50000000", "leg_count": "1"},
+               {"exchange": "okex-options", "block_id": "FRESH",
+                "bucket_at": str(start + 60_000),
+                "volume_coin": "10", "premium_usd": "1000000", "leg_count": "1"}])
+    rows = str(r["block_flow"]["rows"]) + str(r["biggest_print"] or {})
+    check("pre-window block excluded from Block Flow", "STALE" not in rows, rows[:200])
+    check("in-window block kept", r["block_flow"]["n_blocks"] >= 1, r["block_flow"])
+    check("pre-window block cannot win Biggest Print",
+          "50" not in str((r["biggest_print"] or {}).get("notional_m", "")),
+          r["biggest_print"])
+
+
+def test_ordinary_bybit_print_does_not_disable_the_merge():
+    # _TAPE_VENUE_CODE has only the 3 deduped venues, but BYB/BIT are ordinary
+    # Paradigm-tape suffixes. Treating them as unrecognised let one Bybit print
+    # taint every brokered venue and silently revert the merge for the window.
+    out = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "X1"}, {"exchange": "deribit", "block_id": "Y9"}],
+        [_tape("BTC OPTION - DBT", "D1", "X1"), _tape("BTC OPTION - BYB", "D2", "X2")])
+    check("recognised-but-not-deduped does not taint",
+          [r["block_id"] for r in out] == ["Y9"], out)
+    # a genuinely unknown code must still taint
+    out2 = _dedupe_venue_blocks(
+        [{"exchange": "deribit", "block_id": "X1"}, {"exchange": "deribit", "block_id": "Y9"}],
+        [_tape("BTC OPTION - DBT", "D1", "X1"), _tape("BTC OPTION - ZZZ", "D2", "X2")])
+    check("unknown code still taints", out2 == [], out2)
+
+
+def test_venue_window_is_floored_to_the_containing_bucket():
+    # The grain alignment had no test at all — reverting START_MS_5M survived
+    # every suite. Assert the shell computes the floor and uses it for the
+    # venue read only (blocks.csv must stay on exact START_MS).
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "..", "scripts", "run_recap.sh")
+    with open(src) as f:
+        sh = f.read()
+    check("floor is computed",
+          "START_MS_5M=$(( (START_S - START_S % 300) * 1000 ))" in sh, "missing START_MS_5M")
+    venue = next(l for l in sh.splitlines() if "venue_blocks.csv" in l and l.startswith("COPY"))
+    check("venue read uses the floored bound", "${START_MS_5M}" in venue, venue[:160])
+    tape = next(l for l in sh.splitlines() if "blocks_pt.csv" in l and l.startswith("COPY"))
+    check("tape read stays on exact START_MS",
+          "${START_MS}" in tape and "START_MS_5M" not in tape, tape[:160])
 
 
 def test_no_banner_when_nothing_is_stale():

@@ -813,6 +813,14 @@ def _tape_detail_iv(asset, venue, legs, unit, side, raw_desc, iv_lookup):
     return detail, avg_iv
 
 
+def tape_block_key(row: dict):
+    """The id a tape row is blocked under. SHARED so recap.py's coverage gate
+    and build_tape_blocks cannot diverge: a private copy in recap.py had
+    already drifted (it stripped whitespace, this does not), which is the
+    exact class of bug the shared key exists to prevent."""
+    return row.get("BLOCK_TRADE_ID") or row.get("TRADE_ID")
+
+
 def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
                       min_notional_usd: float = 250_000,
                       extra_blocks: list[dict] | None = None) -> dict:
@@ -837,7 +845,7 @@ def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
     n_venue_blocks}."""
     by_block: dict[str, list] = defaultdict(list)
     for r in rows:
-        bid = r.get("BLOCK_TRADE_ID") or r.get("TRADE_ID")
+        bid = tape_block_key(r)
         if bid:
             by_block[bid].append(r)
 
