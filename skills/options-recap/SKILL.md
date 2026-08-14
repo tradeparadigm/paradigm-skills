@@ -7,16 +7,15 @@ description: >
   and vol surface. Use when the user types /recap or asks for a market recap,
   options flow summary, "what happened in BTC options", or "last Xh of flow".
   The output format is fixed — always the same four sections in the same order.
-compatibility: Deribit public API (curl) for the 7d realized-vol closes only; Paradigm
-  data (DuckDB+S3 via IRSA) for everything else — DVOL/spot, $ Volume, multi-venue
-  activity/P-C, the vol surface, and the Biggest Print + Block Flow (the multi-venue
-  Paradigm block tape — the hot paradigm_trade rows, with the legacy
-  paradigm_trade_tape_slim csv.gz as fallback until it decommissions). No
-  authentication required for the public API;
-  the S3 reads require the IRSA bootstrap (see paradigm-data-discovery skill).
+compatibility: Deribit public API (curl) for the 7d realized-vol closes, and as the
+  live DVOL/spot fallback when the hot source is stale or absent; Paradigm data
+  (DuckDB+S3 via IRSA) for the rest, incl. Biggest Print + Block Flow off the hot
+  paradigm_trade tape (legacy csv.gz as fallback until decommissioned). Heartbeat
+  sources are freshness-checked before rendering; one past its limit is
+  banner-flagged. S3 reads need the IRSA bootstrap (see paradigm-data-discovery).
 metadata:
   author: tradeparadigm
-  version: "1.14"
+  version: "1.15"
 ---
 
 # Options Recap
@@ -108,6 +107,38 @@ directly; do not recompute them and do not add a disclaimer.
 **Simulate (no tools and no injected data).** Produce the four sections with
 plausible example values following `references/output-format.md` exactly, and
 prepend one line: `⚠ Data estimated — no live feed available.`
+
+## Data freshness
+
+`run_recap.sh` probes the newest timestamp on each continuously-written source
+before rendering. A source past its limit — **or one whose freshness could not
+be verified at all** — gets a `⚠` banner as the **first line** of the output.
+**Relay that banner verbatim, including its indented follow-on lines** — it is
+the only signal that the numbers below may be wrong rather than missing.
+
+The banner states the consequence per source, and you must not paraphrase it
+into a stronger claim:
+
+- **`recap_aggregates` stale** — DVOL/spot are re-sourced live from Deribit
+  **when that fetch succeeds**; the banner then says `re-sourced live from
+  Deribit`. If it fails, the stale figures are retained and the banner says
+  `could NOT be re-sourced`. **Never tell a user the figures are live unless
+  the banner says re-sourced.** `$ Volume`, Activity, P/C and venue Block Flow
+  come from the same file and are windowed, so they cover only up to the freeze
+  and understate the window — the banner says this too.
+- **`vol_surface` stale** — banner only; a stale surface does not itself
+  trigger a refetch. ATM/RR/Fly, skew, term and the Δ columns come from that
+  data unless the Deribit ticker surface happens to be fetched for another
+  reason (a stale `recap_aggregates`, or no hot surface at all).
+
+This exists because the recap aggregates froze on 2026-07-10 and rendered July
+10 DVOL/spot as current for ~3.5 weeks. The file's mtime kept changing while its
+contents did not, so every "is it running?" check passed. Only comparing a data
+timestamp against the clock catches that.
+
+Only heartbeat sources are checked. Event-driven ones (the block tape) are not
+and must not be: their newest row depends on whether anyone traded, so a quiet
+hour would fire a false alarm.
 
 ## Output Format
 

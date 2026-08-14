@@ -58,7 +58,7 @@ volume/`trade_count` rows come from ONE rolling file, `hot__recap_aggregates_5m_
 `v_vol_surface`; and Biggest Print / Block Flow come from the multi-venue Paradigm
 block tape (the hot `paradigm_trade` rows), scanned in the same DuckDB session. The
 Deribit public API adds only the 7d realized-vol closes (and a live DVOL/spot
-fallback if the S3 read fails).
+fallback when the S3 read fails **or its data is stale** — see Data freshness).
 
 Notes / non-obvious bits:
 - **`PRESET` is just a label now.** The canonical windows (`5m 10m 20m 1h 4h 8h
@@ -97,8 +97,10 @@ script (agent types one short line) and pre-rendering the markdown in `recap.py`
 
 Three S3 sources in one DuckDB session: the recap aggregates file (DVOL/spot,
 volume, activity/P-C), the `v_vol_surface` store (surface + Δ), and the Paradigm
-block tape (Biggest Print + Block Flow). The Deribit public API adds only the 7d
-realized-vol closes. `recap.py` reads the `dvol_spot` + `volume` rows from the
+block tape (Biggest Print + Block Flow). The Deribit public API adds the 7d
+realized-vol closes, and serves as the live DVOL/spot fallback when the recap
+aggregates are unreadable or stale (see §Data freshness — do not treat
+`_fetch_market_fallback` as dead code). `recap.py` reads the `dvol_spot` + `volume` rows from the
 recap file. The `row_type` map in `hot__recap_aggregates_5m_24h.parquet` (a single
 rolling file of 5-min buckets over the trailing 24h; windowed at query time via
 `WHERE bucket_at >= now - window` + aggregation):
@@ -246,6 +248,77 @@ per leg.)
 On a hot miss (DuckDB fails / CSVs absent) it degrades: affected sections read
 `No data` and the output is prefixed `⚠ hot surface unavailable`. It never fabricates.
 
+## Data freshness
+
+A hot **miss** was always handled. A hot source that is present but **stale** was
+not, and that is a different failure: the recap aggregates froze on 2026-07-10 and
+kept rendering July 10 DVOL/spot as current until the 2026-08-04 deploy — about
+3.5 weeks. The object's mtime kept changing while its contents did not, so every
+"is it still running?" check passed. Only comparing a data timestamp against the
+clock catches it.
+
+`run_recap.sh` writes one probe CSV **per source** (`freshness_rec.csv`,
+`freshness_vs.csv`) — the newest timestamp that source carries, deliberately
+**not** window-filtered (a source frozen before window-start returns zero
+windowed rows, which is indistinguishable from a quiet market). One file per
+source, not one `UNION ALL`: a single COPY spanning both means either read
+failing writes zero bytes and silently disables the gate for *both*.
+
+For `recap_aggregates` the probe takes the **min over per-(exchange, metric)
+maxima**, not a flat max. `row_type='dvol_spot'` is two series; a flat max
+reports the freshest, so a dead DVOL scraper hides behind a live spot ticker.
+
+`recap.py` classifies each source into one of three states:
+
+| state | meaning |
+|---|---|
+| fresh | read fine, within limit |
+| `stale` | read fine, lag exceeds the limit |
+| `unknown` | the probe yielded no usable timestamp — freshness **cannot** be asserted |
+
+`unknown` does not fail open. It is reachable when a COPY errors, the SQL alias
+is renamed, or a value will not parse, and each of those used to leave the
+source simply absent — read downstream as "nothing to report", i.e. a silent
+all-clear. Limits, against lags measured on a healthy pipeline (2026-08-09):
+
+| source | healthy lag | limit |
+|---|---|---|
+| `recap_aggregates` | 13m15s — 5-min buckets, open bucket unpublished | 45m |
+| `vol_surface` | 8m30s | 45m |
+
+The banner leads the output because it is the only warning that says the numbers
+may be *wrong* rather than missing — `No data` is self-evident to a reader,
+stale DVOL is not. **What follows the banner differs by source**, and the
+consequence is spelled out per source rather than left generic:
+
+- **`recap_aggregates`** — DVOL/spot divert to the live Deribit fallback. If
+  that fetch fails the stale figures are retained rather than blanked (figures
+  plus a banner beat no figures) and the banner says `could NOT be re-sourced`
+  instead of `re-sourced live from Deribit`, so the two outcomes are
+  distinguishable on screen. `$ Volume`, Activity, P/C and venue Block Flow come
+  from the *same* parquet and are windowed by `bucket_at`, so a partial freeze
+  truncates them: they cover only up to the freeze while the header claims the
+  full window. The Snapshot divert does not help them, so the banner discloses
+  the truncation explicitly.
+- **`vol_surface`** — banner only. `_SNAPSHOT_SOURCES` covers `recap_aggregates`
+  alone, so a stale surface triggers no fetch of its own (the Deribit ticker
+  surface can still backfill it when the fallback runs for another reason); ATM/RR/Fly,
+  skew, term and the Δ columns all come from the frozen snapshot (with the Δs
+  computed between two frozen readings, so they read flat).
+
+Diverting requires dropping the stale keys from `hot`, not merely fetching the
+replacement — `build()` reads `hot['dvol']` first and consults the Deribit series
+only when it is absent, so leaving them in place renders the old numbers anyway.
+That is `drop_stale_snapshot_fields()`.
+
+**Only heartbeat sources are probed.** `dvol_spot` rows publish every 5 min and
+vol-surface snapshots every minute regardless of trading activity, so a gap is
+unambiguously a fault. Event-driven sources are excluded and must stay excluded:
+the block tape's newest trade depends on whether anyone traded — venue `block`
+rows were measured 1h13m behind on a perfectly healthy pipeline because only 29
+blocks printed in 24h. Once the tape carries a pipeline-stamped `generated_at`,
+that column (not the trade time) is the right thing to add.
+
 ## Performance
 
 - Mechanical path (STS + DuckDB ‖ Deribit + compute + render): ~1.3s.
@@ -263,6 +336,7 @@ python3 tests/test_vol_math.py    # 166 checks — the math formulas + tape pars
                                     #   (parse_tape_description) and block ranking/
                                     #   rollup (build_tape_blocks: Σ-per-block
                                     #   notional, RFQ clip rollup, IV lookup)
+python3 tests/test_recap.py       # 327 checks — orchestrator: window parsing,
 python3 tests/test_recap.py       # 293 checks — orchestrator: window parsing,
                                     #   hot-CSV ingest, the volume-corruption guard,
                                     #   block tape → Biggest Print/Block Flow (multi-
