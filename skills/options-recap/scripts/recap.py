@@ -1316,7 +1316,11 @@ def main() -> None:
     # empty blocks.csv is no longer "serving stale" — it is Block Flow missing
     # outright. Still rendered rather than warned: WARNINGS are discarded on
     # --render, which is the only path a user sees.
-    result["block_tape_empty"] = not block_rows
+    # NOT on --no-s3: that path never attempts a block read at all, so the
+    # banner's claim ("a missing feed") would be literally false on every
+    # offline run — and a banner that cries wolf offline is exactly the
+    # ignore-the-banner outcome this PR is trying to avoid.
+    result["block_tape_empty"] = not args.no_s3 and not block_rows
     if args.render:
         print(render_md(result))
     else:

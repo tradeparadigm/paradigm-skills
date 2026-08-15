@@ -1842,6 +1842,43 @@ def test_run_recap_has_no_legacy_csv_read_left():
     check("and it is the hot tape", "read_parquet('${PT}')" in blocks[0], blocks[0][:120])
 
 
+
+def test_no_s3_does_not_claim_a_missing_feed():
+    # `block_tape_empty = not block_rows` was unconditional, so every offline
+    # run printed "NOT a quiet market, they are a missing feed" — literally
+    # false, since --no-s3 never attempts a block read. A banner that cries
+    # wolf offline trains people to ignore it, which is the failure this whole
+    # PR exists to prevent.
+    with tempfile.TemporaryDirectory() as d:
+        out, _ = _run_main(d, market=_LIVE_MARKET, extra_argv=("--no-s3",))
+    check("no false missing-feed banner offline",
+          "Block Flow unavailable" not in out, out.splitlines()[:4])
+    check("still renders", "Options ·" in out, out.splitlines()[:3])
+    # ...but ONLINE with a genuinely empty read it must still fire
+    with tempfile.TemporaryDirectory() as d:
+        _fresh_files(d, rec=NOW - 60_000, vs=NOW - 60_000)
+        out2, _ = _run_main(d, market=_LIVE_MARKET)
+    check("fires online when the read is empty",
+          "Block Flow unavailable" in out2, out2.splitlines()[:4])
+
+
+def test_unknown_freshness_reaches_the_divert_through_main():
+    # The realistic partial failure: the probe COPY fails while the data COPY
+    # succeeds, so dvol is POPULATED but freshness is unverifiable. Unit tests
+    # covered `unknown`; nothing drove it end-to-end, which is the same
+    # untested-wiring gap that let earlier mutants live.
+    with tempfile.TemporaryDirectory() as d:
+        # data present, probe files absent -> unknown, not stale
+        _write(d, "dvol_spot.csv",
+               "asset,exchange,metric,open,close,high,low\n"
+               "BTC,deribit,dvol,38.0,38.2,39.0,37.5\n"
+               "BTC,deribit,spot,108000,108411,109000,107000\n")
+        out, calls = _run_main(d, market=_LIVE_MARKET)
+    check("unknown is banner-flagged", "could not be verified" in out, out.splitlines()[:4])
+    check("and it diverts rather than trusting the data", calls["fallback"] == 1, calls)
+    check("stale hot DVOL not rendered", "38.2" not in out, out.splitlines()[:14])
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     print(f"Running {len(tests)} test functions...")

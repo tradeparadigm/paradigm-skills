@@ -10,7 +10,7 @@ description: >
 compatibility: Deribit public API (curl) for the 7d realized-vol closes, and as the
   live DVOL/spot fallback when the hot source is stale or absent; Paradigm data
   (DuckDB+S3 via IRSA) for the rest, incl. Biggest Print + Block Flow off the hot
-  paradigm_trade tape (legacy csv.gz as fallback until decommissioned). Heartbeat
+  paradigm_trade tape, which is now the SOLE block source. Heartbeat
   sources are freshness-checked before rendering; one past its limit is
   banner-flagged. S3 reads need the IRSA bootstrap (see paradigm-data-discovery).
 metadata:
@@ -34,9 +34,12 @@ Any `Nm`/`Nh`/`Nd` window up to 24h works and all render identically: DVOL/spot,
 the `$` Volume line, and the multi-venue activity/P-C all come from one rolling hot
 aggregates file sliced to the window at query time; the surface (and its Δ columns)
 from `v_vol_surface`; and **Biggest Print + Block Flow from the multi-venue Paradigm
-block tape** (the hot `paradigm_trade` rows; legacy `paradigm_trade_tape_slim`
-csv.gz as fallback) — every venue Paradigm brokers (Deribit/Paradex/Bullish/…),
-notional already in USD per leg.
+block tape** (the hot `paradigm_trade` rows — the SOLE source; the legacy
+`paradigm_trade_tape_slim` csv.gz fallback was removed once its producer was
+decommissioned) — every venue Paradigm brokers (Deribit/Paradex/Bullish/…),
+notional already in USD per leg. There is no fallback: if that read returns
+nothing, Block Flow is MISSING and the output says so — do not report it as a
+quiet market.
 
 **Plus venue-tape blocks** off the hot recap file's option `block` rows. These
 rank in the same pool as Paradigm blocks and render as `<Venue> Block` rows with

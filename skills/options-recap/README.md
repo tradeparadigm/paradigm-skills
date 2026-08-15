@@ -122,10 +122,13 @@ Biggest Print / Block Flow are primarily the block tape (below), plus the
 grain, **trailing 30 days**, read fresh per recap and windowed by `traded_at` in
 `run_recap.sh`.
 
-It supersedes `s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz`
-(a flat csv.gz spanning all dates), which `run_recap.sh` still reads first and then
-overwrites — a deliberate fallback while the egress decommission (data#712) lands
-and soaks. Two differences matter when reading this section: the horizon is 30
+It REPLACED `s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz`
+(a flat csv.gz spanning all dates). That read was removed in this PR: data#712
+decommissioned its producer on 2026-08-10, so it froze that day and returns zero
+rows for any recent window — it could no longer act as a fallback, only mask a
+failure of the hot-tape read. There is now no fallback at all, which is why an
+empty result renders as Block Flow MISSING rather than quiet. Two differences
+matter when reading this section: the horizon is 30
 days rather than all history, and the parquet adds `VENUE_BLOCK_TRADE_ID` (the
 venue's own block id), which is what lets `recap.py` dedupe venue-tape blocks
 against the Paradigm tape exactly rather than by the structural brokered-venue
