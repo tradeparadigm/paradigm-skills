@@ -26,8 +26,10 @@ from recap import (  # noqa: E402
     parse_window_ms, load_hot, load_blocks, load_venue_blocks, build, render_md,
     pct, pc_descriptor, dvol_label, spot_vol_label, fmt_hhmm,
     run_duckdb, _load_surface_tickers, _delta_fmt, _venue_label,
+    _venue_tape_blocks, MAX_SURFACE_ROWS,
+    load_freshness, check_freshness, drop_stale_snapshot_fields, _fmt_lag,
+    STALENESS_LIMIT_S,
     _venue_tape_blocks, MAX_SURFACE_ROWS, _dedupe_venue_blocks,
-    promote_if_nonempty,
 )
 
 _passed = 0
@@ -1208,6 +1210,359 @@ def test_market_fallback_skips_surface_when_not_wanted():
         recap._get = orig
 
 
+# ── Freshness gate ──────────────────────────────────────────────────────────
+# Regression guards for the failure that motivated the gate: the recap
+# aggregates froze on 2026-07-10 and rendered July 10 DVOL/spot as live until
+# 2026-08-04. The object's mtime kept moving while its contents did not, and
+# nothing compared a timestamp to the clock.
+
+NOW = 1_754_000_000_000  # fixed clock; all lags below are relative to it
+
+
+def _fresh_files(d, rec=None, vs=None, rec_col="max_at", vs_col="max_at"):
+    """Write the two per-source probe CSVs run_recap.sh emits."""
+    if rec is not None:
+        _write(d, "freshness_rec.csv", f"source,{rec_col}\nrecap_aggregates,{rec}\n")
+    if vs is not None:
+        _write(d, "freshness_vs.csv", f"source,{vs_col}\nvol_surface,{vs}\n")
+
+
+def test_freshness_reports_every_source_even_when_unreadable():
+    with tempfile.TemporaryDirectory() as d:
+        _fresh_files(d, rec=NOW - 60_000, vs="")   # vs present but NULL
+        f = load_freshness(d)
+        check("fresh source parsed", f.get("recap_aggregates") == NOW - 60_000, f)
+        # NULL must be None, never 0 and never a missing key. Both of those read
+        # downstream as "nothing to report", which is a false all-clear — the
+        # original bug with extra steps.
+        check("null max_at -> None", f.get("vol_surface", "MISSING") is None, f)
+        check("key always present", set(f) == {"recap_aggregates", "vol_surface"}, f)
+
+
+def test_freshness_missing_files_are_unknown_not_fresh():
+    with tempfile.TemporaryDirectory() as d:
+        f = load_freshness(d)            # neither COPY ran
+        check("both keys present", set(f) == {"recap_aggregates", "vol_surface"}, f)
+        check("both None", all(v is None for v in f.values()), f)
+        got = check_freshness(f, NOW)
+        check("both reported unknown", len(got) == 2, got)
+        check("status unknown", all(g["status"] == "unknown" for g in got), got)
+
+
+def test_freshness_survives_one_probe_failing():
+    # The two probes are separate COPY statements precisely so a ${VS_HOT}
+    # outage cannot take the recap_aggregates reading down with it. A single
+    # UNION ALL wrote zero bytes on either failure and disabled the whole gate.
+    with tempfile.TemporaryDirectory() as d:
+        _fresh_files(d, rec=NOW - 60_000)          # vs file never written
+        got = check_freshness(load_freshness(d), NOW)
+        by = {g["source"]: g for g in got}
+        check("vol_surface unknown", by["vol_surface"]["status"] == "unknown", got)
+        check("recap_aggregates still verified fresh", "recap_aggregates" not in by, got)
+
+
+def test_freshness_renamed_column_is_unknown_not_silent_pass():
+    # Renaming the SQL alias used to return {} and read as a clean bill of
+    # health on every run — a permanent, invisible all-clear.
+    with tempfile.TemporaryDirectory() as d:
+        _fresh_files(d, rec=NOW - 60_000, vs=NOW - 60_000,
+                     rec_col="max_ts", vs_col="max_ts")
+        got = check_freshness(load_freshness(d), NOW)
+        check("renamed column -> unknown, not fresh", len(got) == 2, got)
+        check("all unknown", all(g["status"] == "unknown" for g in got), got)
+
+
+def test_freshness_unparseable_value_is_unknown():
+    with tempfile.TemporaryDirectory() as d:
+        _fresh_files(d, rec="2026-08-09 12:34:56", vs=NOW)   # TIMESTAMP, not epoch ms
+        got = {g["source"]: g for g in check_freshness(load_freshness(d), NOW)}
+        check("unparseable -> unknown", got["recap_aggregates"]["status"] == "unknown", got)
+
+
+def test_check_freshness_flags_only_over_limit():
+    lim = STALENESS_LIMIT_S["recap_aggregates"]
+    both_ok = {"recap_aggregates": NOW - (lim - 60) * 1000,
+               "vol_surface": NOW - (lim - 60) * 1000}
+    # Just inside the limit must NOT fire: a gate that trips in normal operation
+    # trains people to ignore the banner, which is worse than no gate.
+    check("within limit is not stale", check_freshness(both_ok, NOW) == [],
+          check_freshness(both_ok, NOW))
+    over = dict(both_ok, recap_aggregates=NOW - (lim + 600) * 1000)
+    got = check_freshness(over, NOW)
+    check("over limit is stale", len(got) == 1 and got[0]["source"] == "recap_aggregates", got)
+    check("status stale", got[0]["status"] == "stale", got)
+    check("lag reported", got[0]["lag_s"] >= lim, got)
+
+
+def test_check_freshness_orders_unknown_first_then_worst_lag():
+    la = STALENESS_LIMIT_S["recap_aggregates"]
+    got = check_freshness({"recap_aggregates": NOW - (la + 100) * 1000,
+                           "vol_surface": None}, NOW)
+    # Unverifiable outranks a known lag: "I cannot tell" is the worse state.
+    check("unknown first", [g["source"] for g in got] == ["vol_surface", "recap_aggregates"],
+          [(g["source"], g["status"]) for g in got])
+
+
+def test_drop_gates_dvol_and_spot_independently():
+    # A single list gated on `dvol` alone popped the spot keys too, so a
+    # half-successful Deribit fetch destroyed spot under a banner claiming it
+    # was re-sourced live. That is the false-liveness class this PR exists to
+    # eliminate, and it was a regression FROM the surface_spot fix.
+    live = [[1, 2, 3, 4, 5]]
+    hot = {"dvol": 30.0, "spot_close": 61000.0, "surface_spot": 61000.0, "volume_btc": 5.0}
+    got = drop_stale_snapshot_fields(hot, {"dvol": live, "spot": {}, "spot_now": None})
+    check("dvol replaced", got["dvol"] is True, got)
+    check("spot NOT replaced", got["spot"] is False, got)
+    check("dvol dropped", "dvol" not in hot, hot)
+    check("spot retained rather than blanked", hot.get("spot_close") == 61000.0, hot)
+    check("surface_spot retained with it", hot.get("surface_spot") == 61000.0, hot)
+    # the mirror case: spot live, dvol empty
+    hot2 = {"dvol": 30.0, "spot_close": 61000.0, "surface_spot": 61000.0}
+    got2 = drop_stale_snapshot_fields(hot2, {"dvol": [], "spot": {"close": [1.0]}, "spot_now": 1.0})
+    check("dvol NOT replaced", got2["dvol"] is False, got2)
+    check("spot replaced", got2["spot"] is True, got2)
+    check("stale dvol retained", hot2.get("dvol") == 30.0, hot2)
+    check("spot group dropped incl surface_spot",
+          "spot_close" not in hot2 and "surface_spot" not in hot2, hot2)
+    # nothing usable -> nothing dropped
+    hot3 = {"dvol": 30.0, "spot_close": 1.0}
+    got3 = drop_stale_snapshot_fields(hot3, None)
+    check("no market -> no drops", got3 == {"dvol": False, "spot": False}, got3)
+    check("hot untouched", hot3 == {"dvol": 30.0, "spot_close": 1.0}, hot3)
+
+
+def test_stale_surface_spot_cannot_outrank_the_live_fallback():
+    # The previous version asserted on snap["spot_close"], which build() never
+    # emits — the rendered price is snap["spot"] — so the subject was None and
+    # `None != 55000.0` passed unconditionally, with the bug fully reintroduced.
+    # Assert on the key the recap actually renders, and positively.
+    hot = {"dvol": 30.0, "spot_close": 55000.0, "surface_spot": 55000.0}
+    dvol_series = [[NOW - 3600_000, 40.0, 41.0, 39.0, 40.5], [NOW, 40.5, 42.0, 40.0, 41.2]]
+    market = {"dvol": dvol_series, "spot": {"close": [120000.0, 121000.0]},
+              "spot_now": 121000.0, "tickers": {}}
+    drop_stale_snapshot_fields(hot, market)
+    r = build("BTC", "8h", NOW - 8 * 3600_000, NOW,
+              {"closes_7d": [], "market": market}, hot, [], [], stale=[])
+    snap = r["snapshot"]
+    check("snapshot exposes spot, not spot_close", "spot" in snap, sorted(snap))
+    check("stale July price did not resurface", snap.get("spot") != 55000, snap.get("spot"))
+    check("and the LIVE value is rendered", snap.get("spot") == 121000, snap.get("spot"))
+
+
+def test_fmt_lag_is_human():
+    check("minutes", _fmt_lag(600) == "10m", _fmt_lag(600))
+    check("hours", _fmt_lag(3 * 3600 + 720) == "3h 12m", _fmt_lag(3 * 3600 + 720))
+    check("days", _fmt_lag(25 * 86400 + 5 * 3600) == "25d 5h", _fmt_lag(25 * 86400 + 5 * 3600))
+    check("negative clamps", _fmt_lag(-5) == "0m", _fmt_lag(-5))
+
+
+def _minimal_result(stale):
+    return build("BTC", "8h", NOW - 8 * 3600_000, NOW,
+                 {"closes_7d": [], "market": None}, {}, [], [], stale=stale)
+
+
+def test_stale_banner_leads_and_states_the_outcome():
+    r = _minimal_result([{"source": "recap_aggregates", "status": "stale",
+                          "lag_s": 25 * 86400, "limit_s": 2700, "retained": False,
+                          "retained_groups": []}])
+    md = render_md(r)
+    lines = md.splitlines()
+    check("banner is the first line", lines[0].startswith("⚠ recap_aggregates"), lines[0])
+    check("names the lag in human units", "25d 0h" in lines[0], lines[0])
+    check("says the divert worked", "re-sourced live from Deribit" in md, lines[:4])
+    # The truncation disclosure is the point of finding #5: these come from the
+    # same parquet, are windowed, and the Snapshot divert does not help them.
+    check("discloses truncated volume", "UNDERSTATE" in md, lines[:5])
+
+
+def test_banner_distinguishes_a_failed_divert():
+    r = _minimal_result([{"source": "recap_aggregates", "status": "stale",
+                          "lag_s": 3 * 86400, "limit_s": 2700, "retained": True,
+                          "retained_groups": ["dvol", "spot"]}])
+    md = render_md(r)
+    # Previously byte-identical to a successful divert — the reader could not
+    # tell whether the Snapshot figures were live or three weeks old.
+    check("says it could NOT be re-sourced", "could NOT be re-sourced" in md, md.splitlines()[:4])
+    check("not claiming live", "re-sourced live from Deribit" not in md, md.splitlines()[:4])
+
+
+def test_banner_reports_a_PARTIAL_divert():
+    # The half-successful fetch: dvol replaced, spot retained. The banner must
+    # not claim blanket liveness — this is the exact case where the old single
+    # gate destroyed spot and reported success.
+    r = _minimal_result([{"source": "recap_aggregates", "status": "stale",
+                          "lag_s": 3 * 86400, "limit_s": 2700, "retained": True,
+                          "retained_groups": ["spot"]}])
+    md = render_md(r)
+    check("names the group that is stale", "spot could NOT be re-sourced" in md, md.splitlines()[:4])
+    check("credits the group that was replaced", "dvol re-sourced live" in md, md.splitlines()[:4])
+    check("no blanket liveness claim", "DVOL/spot re-sourced live" not in md, md.splitlines()[:4])
+
+
+def test_unknown_freshness_banner_says_so():
+    r = _minimal_result([{"source": "vol_surface", "status": "unknown",
+                          "lag_s": None, "limit_s": 2700}])
+    md = render_md(r)
+    check("unknown wording", "could not be verified" in md, md.splitlines()[:3])
+    # vol_surface triggers no refetch of its own; the banner must not imply
+    # a divert happened for it.
+    check("no false divert claim", "re-sourced live" not in md, md.splitlines()[:4])
+    check("names what is affected", "Vol Surface" in md, md.splitlines()[:4])
+
+
+def _run_main(csv_dir, market=None, now_ms=NOW, extra_argv=()):
+    """Drive recap.main() end to end with no network and no DuckDB.
+
+    Nothing in this suite called main(), so the ENTIRE wiring was untested:
+    seven separate mutations of it survived a fully green run, including two
+    that are outright breakage — deleting the `stale` binding is a NameError on
+    the --no-s3 path, and renaming the SQL alias silently returns a permanent
+    all-clear. Unit-testing the pieces cannot catch a piece that is never
+    called."""
+    import io as _io
+    import contextlib as _ctx
+    calls = {"fallback": 0}
+
+    def fake_fallback(asset, start_ms, end_ms, want_surface=True):
+        calls["fallback"] += 1
+        if market is None:
+            raise RuntimeError("deribit unreachable")
+        return market
+
+    orig_fb, orig_deri = recap._fetch_market_fallback, recap.fetch_deribit
+    recap._fetch_market_fallback = fake_fallback
+    recap.fetch_deribit = (lambda a, s, e, want_market=False:
+                           {"closes_7d": [],
+                            "market": market if want_market else None})
+    argv = ["recap.py", "--asset", "BTC", "--window", "8h",
+            "--csv-dir", csv_dir, "--now-ms", str(now_ms), "--render", *extra_argv]
+    buf = _io.StringIO()
+    saved_argv = sys.argv
+    try:
+        sys.argv = argv
+        with _ctx.redirect_stdout(buf):
+            recap.main()
+    finally:
+        sys.argv = saved_argv
+        recap._fetch_market_fallback, recap.fetch_deribit = orig_fb, orig_deri
+        calls["warnings"] = list(recap.WARNINGS)   # snapshot before clearing
+        recap.WARNINGS.clear()
+    return buf.getvalue(), calls
+
+
+_LIVE_MARKET = {"dvol": [[NOW - 3600_000, 40.0, 41.0, 39.0, 40.5],
+                         [NOW, 40.5, 42.0, 40.0, 41.2]],
+                "spot": {"close": [120000.0, 121000.0]},
+                "spot_now": 121000.0, "tickers": {}}
+
+
+def _stale_csv_dir(d):
+    """Hot CSVs that are POPULATED but three weeks old — the exact shape the
+    pre-gate code rendered as live (dvol present, short window, no banner)."""
+    _fresh_files(d, rec=NOW - 21 * 86400 * 1000, vs=NOW - 60_000)
+    _write(d, "dvol_spot.csv",
+           "asset,exchange,metric,open,close,high,low\n"
+           "BTC,deribit,dvol,38.0,38.2,39.0,37.5\n"
+           "BTC,deribit,spot,108000,108411,109000,107000\n")
+
+
+def test_main_wires_the_gate_end_to_end():
+    with tempfile.TemporaryDirectory() as d:
+        _stale_csv_dir(d)
+        out, calls = _run_main(d, market=_LIVE_MARKET)
+    # gate detected -> banner rendered (kills: stale=[], stale=[] into build(),
+    # and the check_freshness call being bypassed)
+    check("banner present", "⚠ recap_aggregates" in out, out.splitlines()[:3])
+    check("banner leads", out.splitlines()[0].startswith("⚠ recap_aggregates"),
+          out.splitlines()[:2])
+    # divert actually happened (kills: stale_snapshot=False, _SNAPSHOT_SOURCES
+    # pointed at the wrong source)
+    check("deribit fallback invoked", calls["fallback"] == 1, calls)
+    check("says re-sourced", "re-sourced live from Deribit" in out, out.splitlines()[:4])
+    # and the STALE numbers are gone from the rendered Snapshot
+    check("stale DVOL not rendered", "38.2" not in out, out.splitlines()[:14])
+    check("stale spot not rendered", "108,411" not in out, out.splitlines()[:14])
+
+
+def test_main_reports_a_failed_divert_rather_than_implying_live():
+    with tempfile.TemporaryDirectory() as d:
+        _stale_csv_dir(d)
+        out, calls = _run_main(d, market=None)   # Deribit unreachable
+    check("fallback attempted", calls["fallback"] == 1, calls)
+    # kills: deleting the warn-on-retained block / dropping `retained`
+    check("says could NOT be re-sourced", "could NOT be re-sourced" in out,
+          out.splitlines()[:4])
+    # mutant H: deleting the warn() left the suite green. The banner carries the
+    # user-facing signal, but the warning is the --json record, so pin it.
+    check("retained groups recorded in warnings",
+          any("retained — no live replacement" in w for w in calls["warnings"]),
+          calls["warnings"])
+    check("does not claim live", "re-sourced live from Deribit" not in out,
+          out.splitlines()[:4])
+
+
+def test_main_stays_silent_on_a_fresh_feed():
+    with tempfile.TemporaryDirectory() as d:
+        _fresh_files(d, rec=NOW - 60_000, vs=NOW - 60_000)
+        _write(d, "dvol_spot.csv",
+               "asset,exchange,metric,open,close,high,low\n"
+               "BTC,deribit,dvol,38.0,38.2,39.0,37.5\n"
+               "BTC,deribit,spot,108000,108411,109000,107000\n")
+        out, calls = _run_main(d, market=_LIVE_MARKET)
+    # The false-positive guard: a healthy pipeline must not raise a FRESHNESS
+    # banner or pay for an unnecessary Deribit round-trip. (The unrelated
+    # "hot surface unavailable" banner does fire here — this fixture has no
+    # volume/surface CSVs — so assert on the freshness wording specifically
+    # rather than on any "⚠" at all.)
+    check("no freshness banner", "recap_aggregates" not in out and
+          "could not be verified" not in out, out.splitlines()[:3])
+    check("no needless fallback", calls["fallback"] == 0, calls)
+    check("hot figures rendered", "38.2" in out, out.splitlines()[:14])
+
+
+def test_main_no_s3_path_does_not_crash():
+    # `stale` is bound before the if/else and referenced after it; deleting that
+    # binding is a NameError only on --no-s3, which nothing exercised.
+    with tempfile.TemporaryDirectory() as d:
+        out, _ = _run_main(d, market=_LIVE_MARKET, extra_argv=("--no-s3",))
+    check("renders without crashing", "Options ·" in out, out.splitlines()[:3])
+    check("no stale banner offline", "⚠ recap_aggregates" not in out, out.splitlines()[:3])
+
+
+def test_freshness_probe_contract_matches_its_reader():
+    # The shell->Python contract crosses a process boundary that CI cannot
+    # execute (run_recap.sh needs IRSA credentials), so it is asserted on the
+    # generated SQL instead. Renaming the alias or the output filename used to
+    # leave both suites green while the gate returned a permanent all-clear.
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "..", "scripts", "run_recap.sh")
+    with open(src) as f:
+        sh = f.read()
+    import re as _re
+    copies = _re.findall(r"COPY \((.*?)\) TO '\$\{WORK\}/(freshness_[a-z]+\.csv)'", sh)
+    files = {c[1] for c in copies}
+    expected = set(recap._FRESHNESS_FILES.values())
+    check("one COPY per source", files == expected, f"{files} vs {expected}")
+    for body, fname in copies:
+        check(f"{fname} aliases the column load_freshness reads",
+              "AS max_at" in body, body[:120])
+    # Assert the exact grouping key set, not merely that a GROUP BY exists. The
+    # loose version let two distinct defects through at full green:
+    #   GROUP BY exchange, metric -> probe measures a SUPERSET of what load_hot
+    #     renders (it collapses to Deribit), so another venue lagging fires a
+    #     false banner and forces a refetch every run;
+    #   GROUP BY exchange         -> collapses dvol and spot back into one flat
+    #     max, restoring the original masked-freeze bug.
+    rec = next(b for b, f in copies if f == "freshness_rec.csv")
+    check("recap probe takes min over per-metric maxima", "min(mx)" in rec, rec[:160])
+    check("grouped by metric ALONE", "GROUP BY metric)" in rec, rec[:200])
+    check("not grouped by exchange", "exchange" not in rec, rec[:200])
+    # The vol_surface probe must measure the rows the recap consumes. Deleting
+    # this predicate survived at full green: BTC's surface could freeze while
+    # ETH rows keep landing in the shared file and the probe reads fresh.
+    vs = next(b for b, f in copies if f == "freshness_vs.csv")
+    check("surface probe is asset-scoped", "symbol LIKE" in vs, vs[:200])
+
 
 # ── Venue-block dedupe: fail-closed guarantees ──────────────────────────────
 # The exact-id path replaced a STRUCTURAL invariant (brokered venues never
@@ -1323,30 +1678,6 @@ def test_build_passes_the_tape_to_the_dedupe():
 
 
 
-def test_promote_only_when_the_staged_file_has_rows():
-    # Both directions are silent failures: promoting a header-only file destroys
-    # the legacy tape and empties Block Flow; never promoting means
-    # VENUE_BLOCK_TRADE_ID never arrives and the dedupe takes the structural
-    # branch forever. The first version of this gate lived in run_recap.sh,
-    # which only WRITES the SQL — recap.py executes it — so the staged file
-    # could not exist at gate time and the promotion never fired at all.
-    with tempfile.TemporaryDirectory() as d:
-        _write(d, "blocks.csv", "A,B\nlegacy,row\n")
-        # (a) staged file absent = bind failure -> legacy stands
-        check("absent staged -> no promote", promote_if_nonempty(d, "blocks_pt.csv", "blocks.csv") is False)
-        check("legacy intact", "legacy" in open(os.path.join(d, "blocks.csv")).read())
-        # (b) header-only -> legacy stands, and it is REPORTED
-        recap.WARNINGS.clear()
-        _write(d, "blocks_pt.csv", "A,B\n")
-        check("header-only -> no promote", promote_if_nonempty(d, "blocks_pt.csv", "blocks.csv") is False)
-        check("legacy still intact", "legacy" in open(os.path.join(d, "blocks.csv")).read())
-        check("and it warns", any("matched no rows" in w for w in recap.WARNINGS), recap.WARNINGS)
-        # (c) real rows -> promoted
-        _write(d, "blocks_pt.csv", "A,B\nhot,row\n")
-        check("rows -> promote", promote_if_nonempty(d, "blocks_pt.csv", "blocks.csv") is True)
-        check("hot content won", "hot" in open(os.path.join(d, "blocks.csv")).read())
-        check("staged consumed", not os.path.exists(os.path.join(d, "blocks_pt.csv")))
-
 
 def test_partial_id_mismatch_does_not_double_count():
     # THE cycle-2 blocking case. Proof used to be per-VENUE set membership, so
@@ -1381,41 +1712,6 @@ def test_one_deribit_book_cannot_vouch_for_the_other():
 
 
 
-def test_main_promotes_the_hot_tape_into_the_pipeline():
-    # The promotion is only useful if main() actually calls it: deleting the
-    # call left every unit test green while the migration was dead on arrival
-    # (VENUE_BLOCK_TRADE_ID never reaching the dedupe). Drive main() and assert
-    # on the file the rest of the pipeline reads.
-    import io as _io, contextlib as _ctx
-    with tempfile.TemporaryDirectory() as d:
-        _write(d, "blocks.csv",
-               "DATE,TIME,PRODUCT,DESCRIPTION,QTY,PRICE,REF_PRICE,SIDE,"
-               "QUOTE_CURRENCY,NOTIONAL_VOLUME_USD,RFQ_ID,TRADE_ID,BLOCK_TRADE_ID\n"
-               "2026-08-09,00:00:00,BTC OPTION - DBT,LEGACY,1,0.01,0.01,BUY,BTC,1000,r0,t0,L1\n")
-        _write(d, "blocks_pt.csv",
-               "DATE,TIME,PRODUCT,DESCRIPTION,QTY,PRICE,REF_PRICE,SIDE,"
-               "QUOTE_CURRENCY,NOTIONAL_VOLUME_USD,RFQ_ID,TRADE_ID,BLOCK_TRADE_ID,"
-               "VENUE_BLOCK_TRADE_ID\n"
-               "2026-08-09,00:00:00,BTC OPTION - DBT,HOTTAPE,1,0.01,0.01,BUY,BTC,1000,r1,t1,D1,X1\n")
-        orig_fb, orig_deri = recap._fetch_market_fallback, recap.fetch_deribit
-        recap._fetch_market_fallback = lambda *a, **k: {"dvol": [], "spot": {}, "spot_now": 1.0, "tickers": {}}
-        recap.fetch_deribit = lambda a, st, e, want_market=False: {"closes_7d": [], "market": None}
-        saved = sys.argv
-        try:
-            sys.argv = ["recap.py", "--asset", "BTC", "--window", "8h",
-                        "--csv-dir", d, "--now-ms", "1786324887000", "--render"]
-            with _ctx.redirect_stdout(_io.StringIO()):
-                recap.main()
-        finally:
-            sys.argv = saved
-            recap._fetch_market_fallback, recap.fetch_deribit = orig_fb, orig_deri
-            recap.WARNINGS.clear()
-        body = open(os.path.join(d, "blocks.csv")).read()
-        check("hot tape promoted by main()", "HOTTAPE" in body, body[:120])
-        check("legacy replaced", "LEGACY" not in body, body[:120])
-        check("staged file consumed", not os.path.exists(os.path.join(d, "blocks_pt.csv")))
-
-
 
 def test_unknown_venue_code_cannot_bypass_the_coverage_gate():
     # The '?' guard only fired when PRODUCT had no " - " at all. Any other
@@ -1440,20 +1736,6 @@ def test_unknown_venue_code_cannot_bypass_the_coverage_gate():
         [{"exchange": "deribit", "block_id": "X1"}, {"exchange": "deribit", "block_id": "Y9"}],
         [_tape("BTC OPTION - DBT", "D1", "X1")])
     check("recognised codes still merge", [r["block_id"] for r in out] == ["Y9"], out)
-
-
-def test_legacy_block_source_is_rendered_not_just_warned():
-    # WARNINGS are discarded on --render, the only path users see, so the
-    # zero-row promotion warning was invisible for three cycles: a dead
-    # migration looked exactly like a healthy recap.
-    r = build("BTC", "8h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
-              {}, [], [])
-    r["block_source_legacy"] = True
-    md = render_md(r)
-    check("legacy source is on the rendered output", "LEGACY tape" in md, md.splitlines()[:4])
-    r["block_source_legacy"] = False
-    check("silent when the hot tape was promoted",
-          "LEGACY tape" not in render_md(r), render_md(r).splitlines()[:3])
 
 
 
@@ -1505,13 +1787,96 @@ def test_venue_window_is_floored_to_the_containing_bucket():
                        "..", "scripts", "run_recap.sh")
     with open(src) as f:
         sh = f.read()
-    check("floor is computed", "START_MS_5M=$(( (START_S - START_S % 300) * 1000 ))" in sh,
-          "missing START_MS_5M")
+    check("floor is computed",
+          "START_MS_5M=$(( (START_S - START_S % 300) * 1000 ))" in sh, "missing START_MS_5M")
     venue = next(l for l in sh.splitlines() if "venue_blocks.csv" in l and l.startswith("COPY"))
     check("venue read uses the floored bound", "${START_MS_5M}" in venue, venue[:160])
-    tape = next(l for l in sh.splitlines() if "blocks_pt.csv" in l and l.startswith("COPY"))
+    tape = next(l for l in sh.splitlines()
+                if l.startswith("COPY") and "read_parquet('${PT}')" in l)
     check("tape read stays on exact START_MS",
           "${START_MS}" in tape and "START_MS_5M" not in tape, tape[:160])
+
+
+def test_no_banner_when_nothing_is_stale():
+    md = render_md(_minimal_result([]))
+    check("no stale banner on a healthy run", "NOT live" not in md, md.splitlines()[:3])
+    check("no unknown banner either", "could not be verified" not in md, md.splitlines()[:3])
+    check("stale_sources empty", _minimal_result([])["stale_sources"] == [])
+
+
+
+def test_empty_block_tape_is_rendered_not_silently_quiet():
+    # With the legacy csv.gz read removed there is nothing to fall back TO, so
+    # an empty blocks.csv means the feed is MISSING — which on screen is
+    # indistinguishable from a genuinely quiet window unless it is said out
+    # loud. WARNINGS are discarded on --render, so this is rendered.
+    r = build("BTC", "8h", NOW - 8 * 3600_000, NOW,
+              {"closes_7d": [], "market": None}, {}, [], [])
+    r["block_tape_empty"] = True
+    md = render_md(r)
+    check("empty feed is announced", "Block Flow unavailable" in md, md.splitlines()[:4])
+    check("and distinguished from a quiet market", "NOT a quiet market" in md,
+          md.splitlines()[:4])
+    r["block_tape_empty"] = False
+    check("silent when the tape has rows", "Block Flow unavailable" not in render_md(r),
+          render_md(r).splitlines()[:3])
+
+
+def test_run_recap_has_no_legacy_csv_read_left():
+    # The csv.gz stopped refreshing on 2026-08-10 (data#712) and returns zero
+    # rows for any recent window, so the fallback can only mask, never help.
+    # Pin its removal so it cannot creep back.
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "..", "scripts", "run_recap.sh")
+    with open(src) as f:
+        sh = f.read()
+    # Assert the CONSTRUCT is gone, not the word — the comment deliberately
+    # retains the history of why the fallback existed and why it was removed.
+    check("no TAPE variable",
+          not any(l.startswith("TAPE=") for l in sh.splitlines()), "TAPE= still assigned")
+    check("no read_csv_auto", "read_csv_auto" not in sh, "legacy read still present")
+    check("no staging file", "blocks_pt" not in sh, "staging still present")
+    blocks = [l for l in sh.splitlines()
+              if l.startswith("COPY") and "/blocks.csv'" in l]
+    check("exactly one blocks.csv writer", len(blocks) == 1, blocks)
+    check("and it is the hot tape", "read_parquet('${PT}')" in blocks[0], blocks[0][:120])
+
+
+
+def test_no_s3_does_not_claim_a_missing_feed():
+    # `block_tape_empty = not block_rows` was unconditional, so every offline
+    # run printed "NOT a quiet market, they are a missing feed" — literally
+    # false, since --no-s3 never attempts a block read. A banner that cries
+    # wolf offline trains people to ignore it, which is the failure this whole
+    # PR exists to prevent.
+    with tempfile.TemporaryDirectory() as d:
+        out, _ = _run_main(d, market=_LIVE_MARKET, extra_argv=("--no-s3",))
+    check("no false missing-feed banner offline",
+          "Block Flow unavailable" not in out, out.splitlines()[:4])
+    check("still renders", "Options ·" in out, out.splitlines()[:3])
+    # ...but ONLINE with a genuinely empty read it must still fire
+    with tempfile.TemporaryDirectory() as d:
+        _fresh_files(d, rec=NOW - 60_000, vs=NOW - 60_000)
+        out2, _ = _run_main(d, market=_LIVE_MARKET)
+    check("fires online when the read is empty",
+          "Block Flow unavailable" in out2, out2.splitlines()[:4])
+
+
+def test_unknown_freshness_reaches_the_divert_through_main():
+    # The realistic partial failure: the probe COPY fails while the data COPY
+    # succeeds, so dvol is POPULATED but freshness is unverifiable. Unit tests
+    # covered `unknown`; nothing drove it end-to-end, which is the same
+    # untested-wiring gap that let earlier mutants live.
+    with tempfile.TemporaryDirectory() as d:
+        # data present, probe files absent -> unknown, not stale
+        _write(d, "dvol_spot.csv",
+               "asset,exchange,metric,open,close,high,low\n"
+               "BTC,deribit,dvol,38.0,38.2,39.0,37.5\n"
+               "BTC,deribit,spot,108000,108411,109000,107000\n")
+        out, calls = _run_main(d, market=_LIVE_MARKET)
+    check("unknown is banner-flagged", "could not be verified" in out, out.splitlines()[:4])
+    check("and it diverts rather than trusting the data", calls["fallback"] == 1, calls)
+    check("stale hot DVOL not rendered", "38.2" not in out, out.splitlines()[:14])
 
 
 def main():

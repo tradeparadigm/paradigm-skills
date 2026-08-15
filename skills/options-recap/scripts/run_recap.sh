@@ -119,22 +119,22 @@ ST=$(printf '%s' "$CREDS" | grep -o '<SessionToken>[^<]*'    | cut -d'>' -f2)
 # tape; the surface from v_vol_surface below).
 REC=s3://dt-exchange-venue-data/hot/hot__recap_aggregates_5m_24h.parquet
 
-# Multi-venue Paradigm block tape (paradigm_trade_tape_slim): the source for
-# Biggest Print + Block Flow. One flat csv.gz (~1.5MB, all dates) spanning every
-# venue Paradigm brokers (Deribit/Paradex/Bullish/…), with USD notional PER LEG
-# and the structure named in DESCRIPTION — so recap.py needs no cross-venue $
-# normalization and no instrument-name inference. A full scan is sub-second, so
-# it's read fresh per recap; the window is applied here by the DATE+TIME filter.
-# LEGACY source: superseded by the hot paradigm_trade tape (PT below) via the
-# fallback-then-overwrite pair in the SQL — delete this read once the egress
-# decommission (data#712) has merged and soaked.
-TAPE=s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz
-
-# Snowflake-free Paradigm tape: hot__paradigm_trade_tape_30d.parquet (row_type=
-# 'paradigm_trade', leg grain, trailing 30d), built by the
-# exchange-venue-data paradigm-trade CronJob from the Airbyte→S3 UM landing.
-# Same columns as the csv.gz PLUS VENUE_BLOCK_TRADE_ID — the venue's own
-# block id, which unlocks exact block dedupe against the venue tapes.
+# Multi-venue Paradigm block tape — the SOLE source for Biggest Print + Block
+# Flow. hot__paradigm_trade_tape_30d.parquet (row_type='paradigm_trade', leg
+# grain, trailing 30d), built by the exchange-venue-data paradigm-trade CronJob
+# from the Airbyte→S3 UM landing. Spans every venue Paradigm brokers
+# (Deribit/Paradex/Bullish/…) with USD notional PER LEG and the structure named
+# in DESCRIPTION, so recap.py needs no cross-venue $ normalization and no
+# instrument-name inference. It also carries VENUE_BLOCK_TRADE_ID — the venue's
+# own block id — which is what unlocks exact block dedupe against the venue
+# tapes.
+#
+# The Snowflake-egressed paradigm_trade_tape_slim.csv.gz that used to be read
+# first and overwritten is GONE. Its producer was decommissioned in data#712 on
+# 2026-08-10, so it froze that day and returns zero rows for any recent window:
+# it could no longer serve as a fallback, only mask a failure of this read. With
+# it removed there is nothing to fall back TO, so an empty result is Block Flow
+# MISSING rather than stale — recap.py renders that distinction explicitly.
 PT=s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet
 
 # One DuckDB session → CSVs. One statement per line; `at` is reserved → alias it.
@@ -150,13 +150,15 @@ SET s3_secret_access_key='${SK}';
 SET s3_session_token='${ST}';
 COPY (SELECT asset, exchange, metric, arg_min(open, bucket_at) AS open, arg_max(close, bucket_at) AS close, max(high) AS high, min(low) AS low FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, metric) TO '${WORK}/dvol_spot.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
-COPY (SELECT "DATE", "TIME", PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID FROM read_csv_auto('${TAPE}') WHERE PRODUCT LIKE '${ASSET} OPTION%' AND epoch(CAST(CAST("DATE" AS VARCHAR) || ' ' || CAST("TIME" AS VARCHAR) AS TIMESTAMP)) >= ${START_S}) TO '${WORK}/blocks.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, block_id, min(bucket_at) AS bucket_at, sum(volume_sum) AS volume_coin, sum(notional_usd) AS premium_usd, sum(leg_count) AS leg_count, sum(iv_sum) AS iv_sum, sum(iv_count) AS iv_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='block' AND instrument_kind='option' AND bucket_at >= ${START_MS_5M} GROUP BY asset, exchange, block_id) TO '${WORK}/venue_blocks.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '${WORK}/surface_now.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h WHERE abs("at"-${START_MS})<=900000 ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '${WORK}/surface_open.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(turnover_usd) AS turnover_usd, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
-COPY (SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS "DATE", strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS "TIME", product AS PRODUCT, description AS DESCRIPTION, quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE, taker_side AS SIDE, CASE WHEN upper(trim(split_part(coalesce(product,''), ' - ', 2))) = 'DBT' AND upper(coalesce(asset,'')) IN ('BTC','ETH') AND instrument_name IS NOT NULL AND upper(instrument_name) NOT LIKE '%USDC%' THEN upper(asset) ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD, rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID, venue_block_trade_id AS VENUE_BLOCK_TRADE_ID FROM read_parquet('${PT}') WHERE row_type='paradigm_trade' AND asset='${ASSET}' AND instrument_kind='OPTION' AND traded_at >= ${START_MS}) TO '${WORK}/blocks_pt.csv' (HEADER, DELIMITER ',');
+COPY (SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS "DATE", strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS "TIME", product AS PRODUCT, description AS DESCRIPTION, quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE, taker_side AS SIDE, CASE WHEN upper(trim(split_part(coalesce(product,''), ' - ', 2))) = 'DBT' AND upper(coalesce(asset,'')) IN ('BTC','ETH') AND instrument_name IS NOT NULL AND upper(instrument_name) NOT LIKE '%USDC%' THEN upper(asset) ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD, rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID, venue_block_trade_id AS VENUE_BLOCK_TRADE_ID FROM read_parquet('${PT}') WHERE row_type='paradigm_trade' AND asset='${ASSET}' AND instrument_kind='OPTION' AND traded_at >= ${START_MS}) TO '${WORK}/blocks.csv' (HEADER, DELIMITER ',');
+COPY (SELECT 'recap_aggregates' AS source, min(mx) AS max_at FROM (SELECT metric, max(bucket_at) AS mx FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot' GROUP BY metric) AS g) TO '${WORK}/freshness_rec.csv' (HEADER, DELIMITER ',');
+COPY (SELECT 'vol_surface' AS source, max("at") AS max_at FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) TO '${WORK}/freshness_vs.csv' (HEADER, DELIMITER ',');
 SQL
+
 
 # blocks.csv upgrade (the statement just above): OVERWRITES the legacy
 # csv.gz-sourced shape with the same columns off the Snowflake-free hot
@@ -174,8 +176,58 @@ SQL
 # emptying Block Flow. Once the egress
 # decommission (data#712) merges, the legacy TAPE read above gets deleted.
 
-# volume.csv upgrade (the statement just above): OVERWRITES the legacy shape
-# with one that adds turnover_usd — the pipeline's per-trade USD premium,
+
+# freshness_*.csv (the two statements just above): the newest timestamp each
+# continuously-written source carries, NOT windowed. The window filter is
+# deliberately omitted — a source frozen before START_MS returns zero windowed
+# rows, which is indistinguishable from "quiet market" and tells you nothing
+# about the feed. The absolute max is the pipeline's heartbeat, so it answers
+# the only question that matters: is anything still writing this file?
+#
+# ONE FILE PER SOURCE, not one UNION ALL. A single COPY spanning both reads
+# means either read failing writes ZERO bytes, silently disabling the gate for
+# BOTH sources — and a disabled gate is indistinguishable in the output from
+# "everything fresh", which is the original bug wearing a different hat. Split,
+# a ${VS_HOT} outage costs only the vol_surface probe and recap_aggregates is
+# still checked. recap.py treats a source it cannot read as UNKNOWN and says so
+# rather than assuming fresh; see load_freshness / check_freshness.
+#
+# MIN OVER THE PER-METRIC MAXIMA for recap_aggregates, not a flat max.
+# `row_type='dvol_spot'` is two series (metric='dvol' and metric='spot') read as
+# separate fields by load_hot. A flat max reports the FRESHEST constituent, so a
+# dead DVOL scraper hides behind a live spot ticker and the recap renders frozen
+# DVOL with no banner.
+#
+# GROUP BY metric ONLY — deliberately NOT `exchange, metric`. load_hot collapses
+# every exchange to one dvol and one spot, sorting so Deribit wins, so the recap
+# renders DERIBIT's numbers. Grouping by exchange made the probe measure a
+# superset of what is rendered: any other venue emitting sparse dvol_spot rows
+# (deribit-usdc, Paradex) and lagging past the limit would fire the banner,
+# discard a perfectly live Deribit snapshot and force a serial refetch on every
+# run — the cry-wolf outcome the limits are explicitly sized to avoid.
+#
+# Note the reading is the laggiest PRESENT constituent: `min` cannot see a group
+# that does not exist, so a metric absent entirely does not register here. That
+# case is caught downstream by `hot['dvol'] is None`, which already diverts.
+#
+# WHY THIS EXISTS. hot__market_signals_1m / the recap aggregates went stale on
+# 2026-07-10 and kept rendering July 10 numbers as if live until 2026-08-04 —
+# ~3.5 weeks — because the object's mtime kept changing while its CONTENTS did
+# not, and nothing anywhere compared a timestamp to the clock. recap.py's Deribit
+# fallback already existed but triggers only on ABSENT data (`hot['dvol'] is
+# None`) or a >24h window; stale-but-present sailed straight through it.
+#
+# ONLY heartbeat sources are probed. dvol_spot rows are emitted every 5 min and
+# vol-surface snapshots every minute regardless of trading activity, so a gap in
+# them is unambiguously a pipeline fault. Event-driven sources are NOT probed and
+# must not be: the block tape's newest trade is a function of whether anyone
+# traded, so gating on it would fire on any quiet hour. (Measured: venue `block`
+# rows legitimately sat 1h13m behind with the pipeline perfectly healthy, because
+# only 29 blocks printed in 24h.) Once the tape carries a pipeline-stamped
+# `generated_at` — it does under the hot paradigm_trade tape — that column, not
+# the trade time, is the right thing to add here.
+
+# volume.csv upgrade (the statement just above): OVERWRITES the legacy shape# with one that adds turnover_usd — the pipeline's per-trade USD premium,
 # summable across ALL venues (drives the cross-venue $ Volume line). Same
 # fallback-then-overwrite pattern as the VS_COLD surface read: on a recap file
 # that predates the column this bind fails, the legacy volume.csv

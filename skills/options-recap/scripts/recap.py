@@ -68,6 +68,27 @@ WARNINGS: list[str] = []
 # store carries the full curve (~12 expiries); the recap only shows the near tenors.
 MAX_SURFACE_ROWS = 5
 
+# ── Freshness gate ──────────────────────────────────────────────────────────
+# How far behind the clock each HEARTBEAT source may fall before the recap stops
+# treating it as live. See run_recap.sh's freshness.csv comment for why only
+# continuously-written sources are probed and event-driven ones must not be.
+#
+# The limits are the publish cadence plus generous slack, sized so normal
+# operation never trips them and a dead feed always does. Measured against a
+# healthy pipeline on 2026-08-09: recap aggregates ran ~13-15 min behind (they
+# are 5-min buckets and the open bucket is not yet published), the vol surface
+# 8m30s. The failure this exists to catch was ~3.5 WEEKS, so precision here
+# buys nothing — a wide margin that never cries wolf is worth far more than a
+# tight one that trains people to ignore the banner.
+STALENESS_LIMIT_S = {
+    "recap_aggregates": 45 * 60,
+    "vol_surface": 45 * 60,
+}
+# Sources whose staleness invalidates the Snapshot's DVOL/spot specifically, and
+# so should divert those fields to the live Deribit fallback rather than merely
+# annotate them.
+_SNAPSHOT_SOURCES = ("recap_aggregates",)
+
 
 def warn(msg: str) -> None:
     WARNINGS.append(msg)
@@ -192,6 +213,123 @@ def _num(row: dict, *keys):
             except (TypeError, ValueError):
                 pass
     return None
+
+
+# One CSV per source, written by separate COPY statements — see run_recap.sh.
+_FRESHNESS_FILES = {"recap_aggregates": "freshness_rec.csv",
+                    "vol_surface": "freshness_vs.csv"}
+
+
+def load_freshness(csv_dir: str) -> dict:
+    """{source: max_at_ms or None}. None means the probe did not yield a
+    usable timestamp; the key is ALWAYS present for every known source.
+
+    Reporting None rather than omitting the key is the point. A probe can fail
+    for reasons that say nothing about the data — the COPY erroring, the file
+    never being written, the column being renamed, a value that will not parse
+    — and every one of those used to leave the source simply absent, which
+    check_freshness then read as "nothing to report" and the recap rendered a
+    clean bill of health. A gate that cannot distinguish "fresh" from "I could
+    not tell" is the original bug with extra steps."""
+    out: dict = {}
+    for source, filename in _FRESHNESS_FILES.items():
+        at = None
+        for row in _read_csv(csv_dir, filename):
+            # `source` column is informational; the FILE identifies the source,
+            # so a renamed/absent column cannot silently orphan the reading.
+            value = _num(row, "max_at")
+            if value is not None:
+                at = int(value)
+                break
+        out[source] = at
+    return out
+
+
+def check_freshness(fresh: dict, now_ms: int) -> list[dict]:
+    """Every heartbeat source that is not demonstrably fresh, worst first.
+
+    Two statuses, and the distinction matters to the reader:
+      stale   — read fine, too old. Lag is known.
+      unknown — the probe produced no usable timestamp, so freshness CANNOT be
+                asserted either way.
+
+    `unknown` deliberately does NOT fail open. The earlier version skipped it,
+    reasoning that the existing `hot['dvol'] is None` path already covers an
+    unreadable source. That holds for ABSENT data, but the failure this gate
+    exists for is stale-but-POPULATED: there `hot['dvol']` is set, nothing
+    diverts, nothing banners, and a silently disabled gate is indistinguishable
+    from an all-clear. Verified reachable three ways — a failing COPY writing
+    zero bytes, the SQL column being renamed, and a value that will not parse.
+    So an unverifiable source is surfaced and treated as not-live."""
+    out = []
+    for source, limit_s in STALENESS_LIMIT_S.items():
+        at = fresh.get(source)
+        if at is None:
+            out.append({"source": source, "status": "unknown",
+                        "lag_s": None, "limit_s": limit_s})
+            continue
+        lag_s = int((now_ms - at) / 1000)
+        if lag_s > limit_s:
+            out.append({"source": source, "status": "stale",
+                        "lag_s": lag_s, "limit_s": limit_s})
+    # unknown first (freshness unverifiable outranks a known lag), then by lag.
+    return sorted(out, key=lambda d: (d["lag_s"] is not None, -(d["lag_s"] or 0)))
+
+
+# Two INDEPENDENTLY gated groups. A single list gated on `dvol` alone popped the
+# spot keys too, so a half-successful Deribit fetch — get_volatility_index_data
+# succeeds, get_tradingview_chart_data returns 200 with no series — destroyed
+# spot and then reported "re-sourced live from Deribit". That is the
+# false-liveness class this whole gate exists to eliminate, and it was a
+# regression FROM the surface_spot fix: before surface_spot joined the drop set
+# it backstopped `spot`, so the path degraded instead of blanking.
+_STALE_DVOL_FIELDS = ("dvol", "dvol_open", "dvol_low", "dvol_high")
+# surface_spot is a COPY of spot_close (load_hot seeds it from the same value)
+# and build() ranks it ABOVE the Deribit value — `spot_close or surface_spot or
+# spot_now` — so it belongs to the SPOT group or the stale price survives one
+# slot down, feeding vol_usd, venue-tape block notionals and surface moneyness.
+_STALE_SPOT_FIELDS = ("spot_close", "spot_open", "spot_low", "surface_spot")
+
+
+def _usable_spot(market: dict | None) -> bool:
+    """A spot series we can actually render from. `market["spot"]` can be a
+    truthy dict with an empty close list (status: no_data, a rate limit, a thin
+    instrument), which is why presence is not enough."""
+    m = market or {}
+    return bool((m.get("spot") or {}).get("close")) or m.get("spot_now") is not None
+
+
+def drop_stale_snapshot_fields(hot: dict, market: dict | None) -> dict:
+    """Drop each stale group only where a live replacement exists.
+
+    Returns {"dvol": bool, "spot": bool} — whether each group was replaced.
+    Gating them together meant one endpoint failing blanked the other's data
+    under a success banner. Refuses to drop a group with no replacement: stale
+    figures plus an accurate banner beat blank ones, and the caller reports it."""
+    replaced = {"dvol": False, "spot": False}
+    if (market or {}).get("dvol"):
+        for k in _STALE_DVOL_FIELDS:
+            hot.pop(k, None)
+        replaced["dvol"] = True
+    if _usable_spot(market):
+        for k in _STALE_SPOT_FIELDS:
+            hot.pop(k, None)
+        replaced["spot"] = True
+    return replaced
+
+
+def _fmt_lag(seconds: int) -> str:
+    """Human lag: the banner's whole job is making a month-long gap obvious at
+    a glance, and '2179800s' does not do that."""
+    seconds = max(0, int(seconds))
+    d, rem = divmod(seconds, 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
 
 
 # Maps a venue id to its display label. deribit and deribit-usdc are distinct
@@ -426,33 +564,6 @@ def _tape_venue_code(tape_row: dict) -> str:
     unknown shape -> '?' (treated as covering NO venue safely)."""
     product = tape_row.get("PRODUCT") or ""
     return product.rsplit(" - ", 1)[-1].strip().upper() if " - " in product else "?"
-
-
-def promote_if_nonempty(csv_dir: str, staged: str, target: str) -> bool:
-    """Move `staged` over `target` only if it carries at least one data row.
-
-    Two failure modes, opposite directions, both silent:
-      - overwriting unconditionally: a COPY that binds but matches nothing
-        writes a bare header, destroying the legacy tape and emptying Block
-        Flow;
-      - never promoting: the migration's whole point (VENUE_BLOCK_TRADE_ID)
-        never reaches the reader and the dedupe permanently takes the
-        structural branch.
-    A missing staged file is the bind-failure case and is already correct —
-    the legacy target stands. A staged file with only a header is reported,
-    because once the promotion works, "silently keeps serving legacy" is the
-    remaining way this goes wrong unobserved."""
-    src = os.path.join(csv_dir, staged)
-    if not os.path.exists(src):
-        return False                      # bind failed; legacy target stands
-    with open(src, newline="") as f:
-        rows = sum(1 for _ in f)
-    if rows <= 1:
-        warn(f"{staged} matched no rows — {target} keeps its previous contents; "
-             "block dedupe falls back to the structural exclusion")
-        return False
-    os.replace(src, os.path.join(csv_dir, target))
-    return True
 
 
 def _tape_block_id(tape_row: dict) -> str:
@@ -690,7 +801,8 @@ def spot_vol_label(spot_open, spot_close, dvol_open, dvol_close):
 
 def build(asset: str, window: str, start_ms: int, end_ms: int,
           deri: dict, hot: dict, block_rows: list[dict] | None = None,
-          venue_block_rows: list[dict] | None = None) -> dict:
+          venue_block_rows: list[dict] | None = None,
+          stale: list[dict] | None = None) -> dict:
     asset = asset.upper()
     mkt = deri.get("market")
     window_h = (end_ms - start_ms) / 3600_000
@@ -876,7 +988,8 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
                        "n_venue_blocks": block.get("n_venue_blocks", 0)},
         "vol_surface": surface_out,
         "hot_horizon": hot_horizon,
-        "warnings": WARNINGS,
+        "stale_sources": stale or [],
+        "warnings": list(WARNINGS),
     }
 
 
@@ -917,13 +1030,56 @@ def render_md(r: dict) -> str:
                         r["block_flow"], r["vol_surface"])
     L: list[str] = []
 
+    # STALENESS FIRST. This banner outranks the others because it is the only
+    # one that says the numbers below may be WRONG rather than missing — a
+    # reader who spots "No data" knows not to trust it, but silently old DVOL
+    # and spot look exactly like live ones. Ordering it first is the whole
+    # point: it is what was absent when a frozen feed rendered for 3.5 weeks.
+    for st in (r.get("stale_sources") or []):
+        if st.get("status") == "unknown":
+            age = "freshness could not be verified"
+        else:
+            age = (f"last updated {_fmt_lag(st['lag_s'])} ago "
+                   f"(limit {_fmt_lag(st['limit_s'])})")
+        L.append(f"⚠ {st['source']}: {age}.")
+        # Name the CONSEQUENCE per source, not one generic line. "figures
+        # sourced from it are NOT live" left the reader unable to tell which
+        # figures, whether the divert worked, or that the window was truncated.
+        if st["source"] == "recap_aggregates":
+            kept = st.get("retained_groups") or []
+            if kept:
+                got = [g for g in ("dvol", "spot") if g not in kept]
+                line = f"   {'/'.join(kept)} could NOT be re-sourced — those values below are stale."
+                if got:
+                    line += f" ({'/'.join(got)} re-sourced live from Deribit.)"
+                L.append(line)
+            else:
+                L.append("   DVOL/spot re-sourced live from Deribit.")
+            # These come from the SAME parquet but are windowed by bucket_at, so
+            # a partial freeze silently truncates them — they cover only up to
+            # the freeze, under a header claiming the full window. The Snapshot
+            # divert does not help them, and an understated volume that looks
+            # precise is the same class of harm as the stale DVOL.
+            L.append("   $ Volume · Activity · P/C · venue Block Flow come from "
+                     "the same source and cover only up to that point — they "
+                     "UNDERSTATE the window.")
+        elif st["source"] == "vol_surface":
+            L.append("   Vol Surface (ATM/RR/Fly, skew, term) and its Δ columns "
+                     "are from that data. A stale surface does not itself "
+                     "trigger a refetch — only recap_aggregates does — so the "
+                     "Deribit ticker surface backfills these only when that "
+                     "fallback runs for another reason.")
+    if r.get("stale_sources"):
+        L.append("")
+
     # THIRD cycle for this: the zero-row warn() lands in WARNINGS, and WARNINGS
     # is discarded on --render — the only path a user sees. So a dead migration
     # (hot tape never promoted) was indistinguishable from a healthy recap.
     # Rendered explicitly rather than routed through the warning machinery.
-    if r.get("block_source_legacy"):
-        L.append("⚠ Block Flow is reading the LEGACY tape — the hot paradigm_trade "
-                 "read returned no rows, so venue-block dedupe is structural only.")
+    if r.get("block_tape_empty"):
+        L.append("⚠ Block Flow unavailable — the hot paradigm_trade read returned "
+                 "no rows. Biggest Print and Block Flow below are NOT a quiet "
+                 "market, they are a missing feed.")
         L.append("")
 
     crit = [w for w in (r.get("warnings") or []) if any(
@@ -1077,9 +1233,11 @@ def main() -> None:
     now_ms = args.now_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = now_ms - parse_window_ms(args.window)
 
-    block_source_legacy = False
     block_rows: list[dict] = []
     venue_block_rows: list[dict] = []
+    # Bound before the branch: --no-s3 reads no hot sources at all, so there is
+    # nothing to be stale, but build() is called on both paths.
+    stale: list[dict] = []
     if args.no_s3:
         # Offline/local: no hot CSVs or block tape; Deribit supplies DVOL/spot/
         # surface. Block flow is empty (No data) since it's S3-only now.
@@ -1101,8 +1259,6 @@ def main() -> None:
         # never promoted, VENUE_BLOCK_TRADE_ID was never present, and the
         # dedupe silently took the structural branch forever. That closed the
         # zero-row hole by opening its exact opposite.
-        block_source_legacy = not promote_if_nonempty(
-            args.csv_dir, "blocks_pt.csv", "blocks.csv")
         hot = load_hot(args.csv_dir, ASSET)
         block_rows = load_blocks(args.csv_dir)
         venue_block_rows = load_venue_blocks(args.csv_dir, ASSET)
@@ -1114,17 +1270,57 @@ def main() -> None:
         # per-strike ticker surface when v_vol_surface also gave us nothing — for
         # a normal dynamic window vs_now is populated, so we skip ~50 serial
         # ticker calls (the bulk of the cost).
-        if hot.get("dvol") is None or (now_ms - start_ms) > 24 * 3600_000:
+        # FRESHNESS GATE. The three triggers below are distinct failures:
+        #   dvol is None          -> the source could not be read at all
+        #   window > 24h          -> the source is fine but under-covers
+        #   stale_snapshot        -> the source read fine and is OUT OF DATE
+        # The third had no trigger until now, so a frozen feed rendered as live:
+        # hot['dvol'] was populated, the window was short, and the recap printed
+        # three-week-old DVOL/spot with no indication anything was wrong.
+        stale = check_freshness(load_freshness(args.csv_dir), now_ms)
+        for s in stale:
+            warn(f"{s['source']} {s['status']} "
+                 f"({_fmt_lag(s['lag_s']) if s['lag_s'] is not None else 'no reading'}, "
+                 f"limit {_fmt_lag(s['limit_s'])}) — treating as not live")
+        stale_snapshot = any(s["source"] in _SNAPSHOT_SOURCES for s in stale)
+        if (hot.get("dvol") is None or stale_snapshot
+                or (now_ms - start_ms) > 24 * 3600_000):
             want_surface = not hot.get("vs_now")
             try:
                 deri["market"] = _fetch_market_fallback(
                     ASSET, start_ms, now_ms, want_surface=want_surface)
             except Exception as e:  # noqa: BLE001
                 warn(f"deribit market fallback failed: {e}")
+        if stale_snapshot:
+            # Record the OUTCOME on the entries the banner is built from. Without
+            # this the banner reads identically whether the divert worked or the
+            # stale figures survived, which leaves the reader unable to answer
+            # the one question the feature exists for: are these numbers live?
+            replaced = drop_stale_snapshot_fields(hot, deri.get("market"))
+            kept = [g for g, ok in replaced.items() if not ok]
+            for s in stale:
+                if s["source"] in _SNAPSHOT_SOURCES:
+                    s["retained"] = bool(kept)
+                    s["retained_groups"] = kept
+            if kept:
+                # No "unavailable"/"missing"/"failed" wording: those substrings
+                # route this into render_md's `crit` bucket, whose own guard
+                # (volume_usd_m is None and vs is None) never fires on a
+                # stale-but-present feed, so it would be silently swallowed.
+                warn(f"stale hot {'/'.join(kept)} retained — no live replacement; "
+                     "those Snapshot figures are NOT live")
 
     result = build(asset, args.window, start_ms, now_ms, deri, hot, block_rows,
-                   venue_block_rows)
-    result["block_source_legacy"] = block_source_legacy
+                   venue_block_rows, stale=stale)
+    # With the legacy csv.gz read gone there is nothing to fall back TO, so an
+    # empty blocks.csv is no longer "serving stale" — it is Block Flow missing
+    # outright. Still rendered rather than warned: WARNINGS are discarded on
+    # --render, which is the only path a user sees.
+    # NOT on --no-s3: that path never attempts a block read at all, so the
+    # banner's claim ("a missing feed") would be literally false on every
+    # offline run — and a banner that cries wolf offline is exactly the
+    # ignore-the-banner outcome this PR is trying to avoid.
+    result["block_tape_empty"] = not args.no_s3 and not block_rows
     if args.render:
         print(render_md(result))
     else:
