@@ -2,9 +2,9 @@
 
 The block analyst's input is `/analyze <rfq_id> <rfq description>`. The `rfq_id`
 is the authoritative key. **Resolve it by searching the Paradigm trade tape** —
-this file is the complete, self-contained recipe (the IRSA→STS credential
-bootstrap is inlined below; do not open `paradigm-data-discovery`'s docs for it)
-for turning the `rfq_id` into the full trade record the analysis needs (the same
+this file is the complete, self-contained recipe (credentials need no bootstrap:
+DuckDB resolves the pod's IRSA identity itself, see the preamble below) for
+turning the `rfq_id` into the full trade record the analysis needs (the same
 fields that used to be pasted as JSON).
 
 ---
@@ -18,7 +18,7 @@ The trade tape is a parquet on S3 (trailing 30 days). The read is the dominant c
 read both the fill row (Step 0) and the 30d structure recurrence (Step 3a) out of
 that temp table. **Do not run a second tape query later** — this one covers both.
 
-This recipe is **self-contained**: the IRSA→STS bootstrap is inlined below, so you
+This recipe is **self-contained**: credentials resolve inside DuckDB, so you
 do **not** need to open `paradigm-data-discovery`'s `SKILL.md` or `s3-access.md`
 first. The **only** token is `<CORE_ID>` (the `r_…` id with any `DRFQv2-`/`GRFQ-` prefix
 stripped) — **nothing from the `<rfq description>`**. The `<rfq_id>` is the sole authoritative
@@ -34,18 +34,14 @@ filter. HIST recurrence self-derives from the FILL row's own `PRODUCT` + normali
 Run it as one `exec`:
 
 ```bash
-# POST with the token read straight from its file keeps it out of argv/ps.
-CREDS=$(curl -s --max-time 20 -X POST "https://sts.ap-northeast-1.amazonaws.com/" \
-  --data "Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleSessionName=duckdb" \
-  --data-urlencode "RoleArn=${AWS_ROLE_ARN}" \
-  --data-urlencode "WebIdentityToken@${AWS_WEB_IDENTITY_TOKEN_FILE}")
-AK=$(echo "$CREDS" | grep -o '<AccessKeyId>[^<]*' | cut -d'>' -f2)
-SK=$(echo "$CREDS" | grep -o '<SecretAccessKey>[^<]*' | cut -d'>' -f2)
-ST=$(echo "$CREDS" | grep -o '<SessionToken>[^<]*' | cut -d'>' -f2)
+# One process, no shell state: the whole thing is a single duckdb -c call.
+# DuckDB's aws extension resolves the pod's IRSA credentials in-process — do
+# NOT read the token file or call STS in shell (see data-discovery's
+# references/s3-access.md for why that fails through exec).
 duckdb -c "
 INSTALL httpfs; LOAD httpfs;
-SET s3_region='ap-northeast-1';
-SET s3_access_key_id='$AK'; SET s3_secret_access_key='$SK'; SET s3_session_token='$ST';
+INSTALL aws;    LOAD aws;
+CREATE OR REPLACE SECRET s3_irsa (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1');
 -- single scan → temp table holding the target RFQ + 30d matching structures.
 -- Source is the Snowflake-free hot paradigm_trade tape (trailing 30 days,
 -- leg grain — exactly the HIST horizon), aliased to the legacy tape column

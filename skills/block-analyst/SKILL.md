@@ -25,7 +25,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape (the
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.7"
+  version: "1.8"
 ---
 
 # Paradigm Block Trade Analyst
@@ -106,8 +106,8 @@ The input is **`/analyze <rfq_id> <rfq description>`**. Split it:
   scans the tape **once** and returns BOTH the cleared block (`FILL`
   row: `DESCRIPTION`, `PRICE`, `REF_PRICE`, `QTY`, `SIDE`, `PRODUCT`,
   `QUOTE_CURRENCY`, `NOTIONAL_VOLUME_USD`) **and** the 30d recurrence of the
-  same structure (`HIST` rows — this IS the Step 3a answer). The STS/IRSA
-  credential bootstrap is inlined in that recipe, so **do not open
+  same structure (`HIST` rows — this IS the Step 3a answer). Credentials need no
+  bootstrap — DuckDB resolves the pod's IRSA identity itself — so **do not open
   `paradigm-data-discovery`'s `SKILL.md` or `s3-access.md`** — read only this
   skill's `references/rfq-lookup.md`. **Run the tape query exactly once**; never
   issue a second tape scan in Step 3. Spot and per-leg greeks/IV are **not** in
