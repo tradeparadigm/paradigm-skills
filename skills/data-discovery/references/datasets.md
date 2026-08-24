@@ -12,8 +12,9 @@ options (Paradigm RFQ flow) and the on-chain Paradex perp trade tape.
 ## S3 Buckets
 
 Market data is spread across **three buckets**, all in region
-`ap-northeast-1` and reachable with the **same IRSA credentials** (EKS
-web identity → STS) — see `s3-access.md`:
+`ap-northeast-1` and reachable with the **same IRSA credentials**, which
+DuckDB resolves itself via `PROVIDER CREDENTIAL_CHAIN` — see `s3-access.md`
+for the query preamble:
 
 - **`s3://dt-paradigm-data`** — the Paradigm datasets, **keeping the
   `paradigm_data/` prefix**: the executed block-trade tape

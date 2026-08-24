@@ -15,12 +15,12 @@ description: >
   path + ready-to-run DuckDB query. Does NOT cover live Paradex
   markets, positions, vaults, or order placement.
 compatibility: Read-only data catalog. No authentication required to view the
-  catalog itself. Running the suggested DuckDB/S3 queries requires IRSA
-  credentials (AWS_WEB_IDENTITY_TOKEN_FILE, AWS_ROLE_ARN) — see
-  references/s3-access.md for the credential bootstrap.
+  catalog itself. Running the suggested DuckDB/S3 queries needs no credential
+  setup — DuckDB's aws extension resolves the pod's IRSA identity itself via
+  PROVIDER CREDENTIAL_CHAIN. See references/s3-access.md for the query preamble.
 metadata:
   author: tradeparadigm
-  version: "1.5"
+  version: "1.6"
 ---
 
 ## Hard Rules
@@ -202,8 +202,9 @@ always include a runnable DuckDB query. Pattern:
 **Paradigm tape — biggest RFQ block trades in a window:**
 
 ```sql
--- Credential bootstrap assumed (see references/s3-access.md)
 INSTALL httpfs; LOAD httpfs;
+INSTALL aws;    LOAD aws;
+CREATE OR REPLACE SECRET s3_irsa (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1');
 
 SELECT
   DATE, TIME, PRODUCT, DESCRIPTION, QTY, PRICE,
@@ -219,6 +220,8 @@ LIMIT 25;
 
 ```sql
 INSTALL httpfs; LOAD httpfs;
+INSTALL aws;    LOAD aws;
+CREATE OR REPLACE SECRET s3_irsa (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1');
 
 SELECT
   TRADE_AT, MARKET, PRICE, SIZE, TAKER_SIDE,
@@ -234,7 +237,10 @@ LIMIT 25;
 
 Query-template guidelines:
 
-- Always include `INSTALL httpfs; LOAD httpfs;` at top.
+- Always open with the credential preamble (`INSTALL`/`LOAD` httpfs + aws,
+  then `CREATE OR REPLACE SECRET … PROVIDER CREDENTIAL_CHAIN`) — see
+  `references/s3-access.md`. It goes inside the same `duckdb -c` call as the
+  query; never bootstrap credentials in shell.
 - For **Paradigm** tape questions, use `paradigm_trade_tape_slim.csv.gz` for
   *executed* block trades; use `paradigm_rfq_tape_slim.csv.gz` if they want
   RFQ-level stats (fill rate, unfilled, lifespan).
@@ -263,10 +269,11 @@ questions, give the path + query + a one-line interpretation.
   `paradigm_data/` prefix), `s3://dt-exchange-venue-data` (hot surface +
   recap aggregates, at bucket root), and `s3://dt-paradex-data` (the
   Paradex DEX trade tape, under `paradex_data/`).
-- **Auth:** IRSA (web identity → STS AssumeRoleWithWebIdentity) — see
-  `references/s3-access.md`. Tokens expire ~1 hour; refresh on
-  HTTP 400 `InvalidToken`.
-- **DuckDB:** `INSTALL httpfs; LOAD httpfs;` every new session.
+- **Auth:** IRSA, resolved inside DuckDB by the `aws` extension
+  (`PROVIDER CREDENTIAL_CHAIN`). No shell bootstrap, no STS call, no keys to
+  pass — see `references/s3-access.md`.
+- **DuckDB:** open every query with the preamble from `references/s3-access.md`
+  (httpfs + aws loaded, then `CREATE OR REPLACE SECRET`).
 - **Join keys across Paradigm tapes:** `RFQ_ID`, `BLOCK_TRADE_ID`.
 - **Paradigm exchange suffixes:** `DBT` = Deribit, `PRDX` = Paradex,
   `BYB` = Bybit.
