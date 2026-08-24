@@ -29,24 +29,29 @@ no-op after the first use and never hits the extension repository.
 
 Do **not** read `$AWS_WEB_IDENTITY_TOKEN_FILE`, call STS with `curl`, scrape
 `<AccessKeyId>` out of the XML response, or pass keys in with
-`SET s3_access_key_id=…`. That approach fails in this runtime, and it fails
-silently:
+`SET s3_access_key_id=…`. Failure modes observed in real sessions:
 
-- The agent's `exec` tool is not a shell. It splits a multi-line script into
-  separate steps and runs each one on its own, so a variable assigned on one
-  line (`TOKEN=…`, `CREDS=…`) is already gone by the next line.
-- A leading `#` comment becomes a step that tries to execute a program named
-  `#`, which aborts the whole chain.
-- Quoted shell metacharacters get misread — `cut -d'>'` is parsed as a file
-  redirect.
+- **"Bootstrap once per session" is not possible.** Every `exec` call gets a
+  fresh shell, so credentials exported in one call are gone by the next. The
+  bootstrap and the query that needs it have to be the same call — at which
+  point the bootstrap buys nothing over `CREDENTIAL_CHAIN`.
+- **The shell is `sh`, not bash.** Bash-isms fail outright: `${AK:0:4}` returns
+  `Bad substitution`.
+- **Expansion order fails silently, and the error points at the wrong thing.**
+  A heredoc that expands `$AK` before the credentials are sourced writes empty
+  strings into the `SET` statements, and the query returns
+  `HTTP 403 AccessDenied` — indistinguishable from a missing IAM grant. This is
+  the expensive one: it sends you debugging bucket permissions when the bug is
+  shell ordering.
+- **Keys land in argv**, readable by anything that can see the process list.
 
-The result the user sees is a bare `Exec failed` with no output to diagnose.
-Keep everything inside one `duckdb -c "…"` call and none of this applies.
+None of these exist when the credential step is a SQL statement inside the same
+`duckdb -c "…"` call as the query.
 
 (The same STS logic *is* fine inside a committed `.sh` file — e.g.
-`options-recap/scripts/run_recap.sh` — because `bash script.sh` is a single
-process with normal shell state. The rule here is about inline shell that an
-agent pastes into `exec`.)
+`options-recap/scripts/run_recap.sh` — because `bash script.sh` is one process
+with normal shell state and a known interpreter. The rule here is about inline
+shell an agent assembles across `exec` calls.)
 
 ## Token lifecycle
 
