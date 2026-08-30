@@ -22,10 +22,10 @@ reference.
 ## Validation
 
 ```bash
-python3 tests/test_recap.py
 python3 tests/test_run_recap.py
 python3 tests/test_vol_math.py
 ```
 
-These tests cover the collector contract and retained deterministic analytical
-helpers; they do not prescribe the model's interpretation of the evidence.
+These tests cover the collector contract and the retained pure-math helpers in
+`scripts/vol_math.py`; they do not prescribe the model's interpretation of the
+evidence. The prior hot-file renderer (`recap.py`) has been removed entirely.

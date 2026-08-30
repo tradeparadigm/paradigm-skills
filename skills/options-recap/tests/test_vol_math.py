@@ -3,8 +3,8 @@
 Unit tests for vol_math.py — no network, no auth, no deps.
 
 Run: python3 tests/test_vol_math.py
-These pin the formulas so the production CLI and the eval fixture generator
-can't drift, and so a human can verify the math once by inspection.
+These pin the formulas so the eval fixture generator can't drift, and so a
+human can verify the math once by inspection.
 """
 
 import math

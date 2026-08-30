@@ -2,9 +2,9 @@
 vol_math.py — deterministic vol calculations for the options-recap skill.
 
 Single source of truth for the math the agent must NOT do by mental arithmetic:
-realized volatility and Black-76 flow greeks. Both the production CLI
-(recap.py) and the eval fixture generator (../evals/
-generate_fixture.py) import from here, so the formula never forks.
+realized volatility and Black-76 flow greeks. The eval fixture generator
+(../evals/generate_fixture.py) imports from here, so the formula never forks
+from the tested ground truth.
 
 Pure functions, no I/O, no network — unit-tested in test_vol_math.py.
 """
@@ -814,10 +814,10 @@ def _tape_detail_iv(asset, venue, legs, unit, side, raw_desc, iv_lookup):
 
 
 def tape_block_key(row: dict):
-    """The id a tape row is blocked under. SHARED so recap.py's coverage gate
-    and build_tape_blocks cannot diverge: a private copy in recap.py had
-    already drifted (it stripped whitespace, this does not), which is the
-    exact class of bug the shared key exists to prevent."""
+    """The id a tape row is blocked under. SHARED so every consumer of
+    build_tape_blocks uses the same key: a private copy in a since-removed
+    caller had already drifted (it stripped whitespace, this does not), which
+    is the exact class of bug the shared key exists to prevent."""
     return row.get("BLOCK_TRADE_ID") or row.get("TRADE_ID")
 
 
@@ -835,7 +835,7 @@ def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
 
     `extra_blocks` are PRE-SHAPED block dicts (same keys _block_from_rows emits,
     with source="venue") from exchange tapes the Paradigm tape doesn't cover —
-    e.g. OKX blocks off the hot recap file. They enter the pool before the
+    e.g. OKX blocks from raw venue trade data. They enter the pool before the
     min-notional filter and compete for Biggest Print / top-N on equal terms;
     each is its own worked order (rfq_id = its block id). Their notional_usd
     MUST already be underlying-USD, the same basis as NOTIONAL_VOLUME_USD.

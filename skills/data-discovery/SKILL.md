@@ -49,9 +49,7 @@ volume, OI, spot, or perps. It documents:
 - the non-hot Paradigm RFQ/trade tapes and Paradex trade tape.
 
 Read [references/datasets.md](references/datasets.md) for the detailed Paradigm
-RFQ and executed-trade tape schemas and the Paradex DEX trade schema. Treat its
-exchange hot-surface section as historical documentation only; the hard rule
-above wins.
+RFQ and executed-trade tape schemas and the Paradex DEX trade schema.
 
 The three buckets are all in `ap-northeast-1`:
 

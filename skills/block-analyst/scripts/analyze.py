@@ -11,8 +11,9 @@ this renderer.
 
 analyze.py — orchestrator for the prior block analyst implementation.
 
-ONE invocation does everything after the tape resolve: it reads the FILL/HIST
-CSVs the DuckDB step wrote (from analyze.sh), parses the structure, fetches every
+ONE invocation does everything after the tape resolve: it reads locally
+supplied FILL/HIST CSVs (Paradigm trade-tape schema; only the frozen non-hot
+executed tape is a permitted source), parses the structure, fetches every
 leg's Deribit ticker + 30d trade buckets CONCURRENTLY, computes net greeks /
 direction / fill-offset / recurrence, and prints the finished block (--render).
 
