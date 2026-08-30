@@ -103,6 +103,11 @@ When the agent can execute the query, answer from the results rather than
 returning SQL alone. When execution is unavailable, provide a ready-to-run
 query with explicit paths and time bounds.
 
+For "latest option trade data" questions, name both the venue's raw
+`option_trade` path and its companion raw `option_summary` path, then verify
+`max(timestamp)` in a narrow recent partition. Never invent example row counts,
+timestamps, or records and present them as query output.
+
 ## Output
 
 For inventory or schema questions, answer concisely with the relevant paths,
@@ -119,6 +124,7 @@ Do not dump the full catalog unless the user asks for it.
 
 - Paradigm tapes join on `RFQ_ID`; executed rows also carry
   `BLOCK_TRADE_ID`.
+- Filter the Paradigm tapes to options with `PRODUCT LIKE '%OPTION%'`.
 - The current RFQ tape does not contain execution price, mark, side, trade id,
   or block id.
 - The non-hot executed Paradigm CSV stopped updating on 2026-08-10.

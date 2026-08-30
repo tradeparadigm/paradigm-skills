@@ -102,6 +102,19 @@ net_greek = sum(position_sign * leg_ratio * instrument_greek) * quantity
   or mark an estimate with `~`.
 - For multi-leg option packages, calculate fill and mark on the same signed,
   ratio-weighted legs. Exclude perp hedge legs from option-premium offset.
+- When resolved tape evidence supplies one row per leg, use the smallest
+  absolute option-leg `QTY` as the package unit and weight every option row by
+  `abs(QTY) / package_unit`. `BUY` is premium paid and `SELL` is premium
+  received; authoritative row sides override shorthand signs in DESCRIPTION.
+- Net the package before reporting it: `signed_price = sum(BUY price * ratio) -
+  sum(SELL price * ratio)`, and apply the identical weights/sides to
+  `REF_PRICE`. Positive is `Paid`; negative is `Recd`. Report the absolute
+  package value. Fill-versus-mark in bps is
+  `(abs(signed_fill) - abs(signed_ref)) * 10,000`; never reuse a per-leg
+  `OFFSET_BPS` as the package offset.
+- Keep the resolved tape `REF_PRICE` as the execution benchmark. A newer live
+  mark belongs in `[Live]`; it must not replace or contradict the tape-based
+  fill-versus-mark calculation.
 - Attribute a vol-surface move only when raw trade IV and later summary IV,
   timing, and size support it.
 

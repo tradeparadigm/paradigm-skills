@@ -5,10 +5,12 @@ import importlib.util
 import os
 import subprocess
 import sys
+import types
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "scripts", "analyze.sh")
 COLLECTOR = os.path.join(ROOT, "scripts", "collect_analysis.py")
+sys.modules.setdefault("duckdb", types.SimpleNamespace(Error=Exception, connect=None))
 spec = importlib.util.spec_from_file_location("collect_analysis", COLLECTOR)
 collector = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = collector
@@ -50,6 +52,10 @@ def test_raw_lookup_is_bounded_to_event_hours():
 
 def test_unresolved_anchor_does_not_scan_bucket():
     assert collector.raw_deribit_paths({"DESCRIPTION": "user supplied guess"}) == []
+    assert collector.raw_deribit_paths({
+        "DATE": "2026-08-30", "TIME": "00:30:00",
+        "PRODUCT": "BTC OPTION - PRDX", "DESCRIPTION": "Call",
+    }) == []
 
 
 if __name__ == "__main__":

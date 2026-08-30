@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["duckdb>=1.3"]
+# ///
 """Collect bounded direct exchange evidence without deciding the recap narrative."""
 
 from __future__ import annotations
@@ -7,12 +11,12 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import json
-import os
 import re
-import subprocess
 import sys
 from dataclasses import dataclass
 from typing import Any
+
+import duckdb
 
 BUCKET = "s3://dt-exchange-venue-data"
 VENUES = ("deribit", "deribit-usdc", "okex-options", "bybit-options", "bullish")
@@ -62,8 +66,8 @@ def sql_list(values: list[str]) -> str:
 
 
 DUCKDB_PREFIX = """
-LOAD httpfs;
-LOAD aws;
+INSTALL httpfs; LOAD httpfs;
+INSTALL aws; LOAD aws;
 CREATE OR REPLACE SECRET dime_s3 (
   TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1'
 );
@@ -87,24 +91,17 @@ def run_query(query: Query) -> tuple[dict[str, Any], list[Any]]:
         "units": query.units,
     }
     try:
-        completed = subprocess.run(
-            [os.environ.get("DIME_DUCKDB", "duckdb"), "-json"],
-            input=DUCKDB_PREFIX + query.sql, capture_output=True, check=False,
-            text=True, timeout=120,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        source.update(status="unavailable", row_count=0, error=str(exc))
+        connection = duckdb.connect()
+        connection.execute(DUCKDB_PREFIX)
+        result = connection.execute(query.sql)
+        columns = [column[0] for column in result.description]
+        rows = [dict(zip(columns, row)) for row in result.fetchall()]
+    except duckdb.Error as exc:
+        source.update(status="unavailable", row_count=0, error=str(exc)[-1000:])
         return source, []
-    if completed.returncode:
-        source.update(status="unavailable", row_count=0,
-                      error=(completed.stderr.strip() or "DuckDB query failed")[-1000:])
-        return source, []
-    try:
-        rows = json.loads(completed.stdout or "[]")
-    except json.JSONDecodeError as exc:
-        source.update(status="unavailable", row_count=0,
-                      error=f"DuckDB returned invalid JSON: {exc}")
-        return source, []
+    finally:
+        if "connection" in locals():
+            connection.close()
     source.update(status="ok", row_count=len(rows))
     timestamps = [row.get("max_event_at") for row in rows if isinstance(row, dict) and row.get("max_event_at")]
     if timestamps:
@@ -148,13 +145,19 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime) -> list[Quer
             FROM read_parquet({sql_list(summary_paths)}, union_by_name=true, hive_partitioning=true)
             WHERE {between}
           )
-          SELECT CASE WHEN open_rank=1 THEN 'window_open' ELSE 'latest' END AS observation,
-                 exchange, timestamp, symbol, expirationDate, strikePrice, optionType,
-                 markIV, bestBidIV, bestAskIV, markPrice, bestBidPrice, bestAskPrice,
-                 delta, gamma, vega, theta, openInterest, underlyingPrice,
-                 max(timestamp) OVER () AS max_event_at
-          FROM observations WHERE open_rank=1 OR latest_rank=1
-          ORDER BY observation, expirationDate, abs(delta) LIMIT 60
+          SELECT * EXCLUDE(evidence_rank) FROM (
+            SELECT CASE WHEN open_rank=1 THEN 'window_open' ELSE 'latest' END AS observation,
+                   exchange, timestamp, symbol, expirationDate, strikePrice, optionType,
+                   markIV, bestBidIV, bestAskIV, markPrice, bestBidPrice, bestAskPrice,
+                   delta, gamma, vega, theta, openInterest, underlyingPrice,
+                   max(timestamp) OVER () AS max_event_at,
+                   row_number() OVER (
+                     PARTITION BY CASE WHEN open_rank=1 THEN 'window_open' ELSE 'latest' END
+                     ORDER BY expirationDate, abs(delta)
+                   ) AS evidence_rank
+            FROM observations WHERE open_rank=1 OR latest_rank=1
+          ) WHERE evidence_rank <= 30
+          ORDER BY observation, expirationDate, abs(delta)
         """, {"markIV": "vol points", "openInterest": "coin where normalized metadata supports it"}, True))
 
         block_paths = hour_patterns("raw", venue, "option_trade", currency, start, end)

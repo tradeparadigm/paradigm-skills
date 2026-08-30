@@ -6,10 +6,13 @@ import importlib.util
 import os
 import subprocess
 import sys
+import types
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "scripts", "run_recap.sh")
 COLLECTOR = os.path.join(ROOT, "scripts", "collect_recap.py")
+
+sys.modules.setdefault("duckdb", types.SimpleNamespace(Error=Exception, connect=None))
 
 spec = importlib.util.spec_from_file_location("collect_recap", COLLECTOR)
 collector = importlib.util.module_from_spec(spec)
@@ -62,20 +65,31 @@ def test_partition_plan_is_explicit_and_hot_free():
     check("no hot path", all("/hot/" not in p and "hot__" not in p for p in paths))
     check("hours are explicit", all("hour=*" not in p for p in paths))
     check("window covers three UTC hours", len(queries[0].paths) == 3, len(queries[0].paths))
+    surface_sql = next(query.sql for query in queries if query.name == "option_surface_deribit")
+    check("surface caps open and latest independently", "PARTITION BY CASE WHEN open_rank=1" in surface_sql)
 
 
 def test_evidence_contract_names_provenance_and_freshness():
     source = collector.Query("x", ["s3://direct"], "SELECT 1", {"price": "USD"}, True)
-    original = collector.subprocess.run
-    class Result:
-        returncode = 0
-        stdout = '[{"max_event_at":"2026-08-30T12:00:00Z","price":1}]'
-        stderr = ""
-    collector.subprocess.run = lambda *args, **kwargs: Result()
+    original = collector.duckdb.connect
+
+    class Connection:
+        description = [("max_event_at",), ("price",)]
+
+        def execute(self, _sql):
+            return self
+
+        def fetchall(self):
+            return [("2026-08-30T12:00:00Z", 1)]
+
+        def close(self):
+            pass
+
+    collector.duckdb.connect = Connection
     try:
         metadata, rows = collector.run_query(source)
     finally:
-        collector.subprocess.run = original
+        collector.duckdb.connect = original
     check("source plan retained", metadata["path_plan"] == {
         "pattern_count": 1, "first_pattern": "s3://direct", "last_pattern": "s3://direct"})
     check("units retained", metadata["units"] == {"price": "USD"})

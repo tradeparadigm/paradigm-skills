@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["duckdb>=1.3"]
+# ///
 """Collect authoritative RFQ and raw venue evidence without rendering analysis."""
 
 from __future__ import annotations
@@ -6,19 +10,19 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
-import os
 import re
-import subprocess
 import sys
 from typing import Any
+
+import duckdb
 
 RFQ_TAPE = "s3://dt-paradigm-data/paradigm_data/paradigm_rfq_tape_slim.csv.gz"
 TRADE_TAPE = "s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz"
 FREEZE_DATE = "2026-08-10"
 
 PREFIX = """
-LOAD httpfs;
-LOAD aws;
+INSTALL httpfs; LOAD httpfs;
+INSTALL aws; LOAD aws;
 CREATE OR REPLACE SECRET dime_s3 (
   TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1'
 );
@@ -27,18 +31,16 @@ CREATE OR REPLACE SECRET dime_s3 (
 
 def run_sql(sql: str) -> tuple[list[dict[str, Any]], str | None]:
     try:
-        completed = subprocess.run(
-            [os.environ.get("DIME_DUCKDB", "duckdb"), "-json"],
-            input=PREFIX + sql, capture_output=True, check=False, text=True, timeout=120,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return [], str(exc)
-    if completed.returncode:
-        return [], (completed.stderr.strip() or "DuckDB query failed")[-1000:]
-    try:
-        return json.loads(completed.stdout or "[]"), None
-    except json.JSONDecodeError as exc:
-        return [], f"DuckDB returned invalid JSON: {exc}"
+        connection = duckdb.connect()
+        connection.execute(PREFIX)
+        result = connection.execute(sql)
+        columns = [column[0] for column in result.description]
+        return [dict(zip(columns, row)) for row in result.fetchall()], None
+    except duckdb.Error as exc:
+        return [], str(exc)[-1000:]
+    finally:
+        if "connection" in locals():
+            connection.close()
 
 
 def suffix_predicate(column: str, core: str) -> str:
@@ -64,6 +66,8 @@ def event_bounds(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
 def raw_deribit_paths(row: dict[str, Any]) -> list[str]:
     product = str(value(row, "PRODUCT", "product") or "").upper()
     description = str(value(row, "DESCRIPTION", "description") or "").upper()
+    if not re.search(r"(?:^|\s|-)DBT(?:$|\s|-)", product):
+        return []
     asset_match = re.search(r"\b(BTC|ETH|SOL|XRP)\b", product + " " + description)
     date_text = value(row, "DATE", "CREATED_AT", "REQUESTED_AT", "RFQ_CREATED_AT", "TIMESTAMP")
     time_text = value(row, "TIME")
@@ -157,9 +161,12 @@ def main() -> int:
     gaps = []
     if request_error:
         gaps.append({"source": "current_paradigm_rfq_tape", "reason": request_error})
+    if venue_error:
+        gaps.append({"source": "raw_deribit_option_trades", "reason": venue_error})
     if status == "request_found_execution_unresolved":
         gaps.append({"field": "execution", "reason": "No authoritative id-linked execution was available."})
-    if not venue_paths and anchor:
+    anchor_product = str(value(anchor, "PRODUCT", "product") or "").upper()
+    if not venue_paths and anchor and "DBT" in anchor_product:
         gaps.append({"source": "raw_exchange_trades", "reason": "RFQ evidence did not establish both asset and event date for a bounded partition read."})
 
     print(json.dumps({

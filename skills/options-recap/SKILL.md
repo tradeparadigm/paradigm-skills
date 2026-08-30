@@ -35,6 +35,9 @@ the actual interval queried rather than silently capping or changing it.
    the result venue-local and label the native unit.
 6. A missing or unreadable source is not a quiet market. Name the missing
    section or field; do not estimate, simulate, or fill it from a stale object.
+7. When the prompt supplies fixture or injected evidence, treat those values as
+   authoritative. Do not add invented "live" observations or replace fixture
+   opens/closes with plausible numbers.
 
 ## Choose the raw inputs
 
@@ -77,6 +80,10 @@ gap. It must not use a hot or pre-shaped recap file.
 - Convert decimal IV venues to vol points before comparing them with Deribit.
 - Build surface deltas from a window-open raw snapshot and the latest raw
   snapshot; show `n/a` when either side is unavailable.
+- Derive DVOL open/close from the first/last event-time observations in the
+  requested window. Do not substitute a different point from the range.
+- For a mixed-direction biggest block, state each proven leg side (for example,
+  `buy put / sell call`); "two-way" alone does not establish the structure.
 - Deduplicate a Paradigm and venue block only when a real shared identifier or
   uniquely provable match exists. Otherwise describe the overlap uncertainty.
 
