@@ -4,18 +4,17 @@
 # dependencies = []
 # ///
 """
-analyze.py — single-call orchestrator for the block analyst.
+Legacy deterministic block calculations retained as a tested analytical
+library. The active id workflow starts with collect_analysis.py, whose general
+direct-data evidence is interpreted by the model; analyze.sh does not invoke
+this renderer.
+
+analyze.py — orchestrator for the prior block analyst implementation.
 
 ONE invocation does everything after the tape resolve: it reads the FILL/HIST
 CSVs the DuckDB step wrote (from analyze.sh), parses the structure, fetches every
 leg's Deribit ticker + 30d trade buckets CONCURRENTLY, computes net greeks /
 direction / fill-offset / recurrence, and prints the finished block (--render).
-
-The agent runs `bash scripts/analyze.sh <rfq_id>` and relays stdout. The only
-piece it may finalise itself is the [Greeks] net line when the structure's signs
-aren't reliably derivable from the tape (risk reversals, calendars, exotics) —
-those rows are printed as per-leg greeks with a `⚠ net: confirm signs` marker and
-all the numbers it needs are right there.
 
 Deterministic + no per-turn tool orchestration ⇒ fast and run-to-run stable.
 """

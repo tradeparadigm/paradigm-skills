@@ -4,16 +4,18 @@
 # dependencies = []
 # ///
 """
-recap.py — single-call orchestrator for the options recap.
+Legacy deterministic recap calculations retained as a tested analytical
+library. The active skill starts with collect_recap.py, whose general direct-
+data evidence is interpreted by the model; run_recap.sh does not invoke this
+renderer.
+
+recap.py — single-call orchestrator for the prior options recap implementation.
 
 ONE invocation does the entire recap: it fetches the Deribit 7d closes (the
 realized-vol input), ingests the DuckDB-written CSVs (hot surface + the
 multi-venue block tape), runs the vol math (realized-vs-implied, block
 ranking/rollup, vol-surface skew/term), and prints ONE JSON object whose fields
 map 1:1 to the four output sections.
-
-The agent runs this once and renders the four sections from the JSON. It must
-not paginate, merge, cluster, or hand-assemble a snapshot — all of that is here.
 
 Pipeline (concurrent where independent):
   • Deribit 7d hourly closes        → realized vol (no non-Deribit source)

@@ -5,43 +5,43 @@
     {
       "id": 1,
       "prompt": "what data do we have available to query?",
-      "expected_output": "An inventory-style response listing the dataset families across the three market-data buckets: the Paradigm executed block trade tape and RFQ activity tape under s3://dt-paradigm-data/paradigm_data/, the on-chain Paradex DEX trade tape under s3://dt-paradex-data/paradex_data/, and the hot surface + recap aggregates under s3://dt-exchange-venue-data/hot/. Mentions the bucket names, region (ap-northeast-1), and that access goes via DuckDB + IRSA-issued STS credentials. Stays concise — does not dump full schemas unless asked.",
+      "expected_output": "An inventory-style response listing the three market-data families: raw/normalized per-venue exchange files plus instrument metadata under s3://dt-exchange-venue-data, the Paradigm RFQ and historical executed tapes under s3://dt-paradigm-data/paradigm_data/, and the Paradex DEX trade tape under s3://dt-paradex-data/paradex_data/. Mentions ap-northeast-1 and DuckDB IRSA credential-chain access. Does not use the hot prefix.",
       "assertions": [
         "Response names the S3 buckets (s3://dt-paradigm-data, s3://dt-exchange-venue-data, s3://dt-paradex-data)",
-        "Response lists the dataset families: Paradigm trade tape, Paradigm RFQ tape, Paradex DEX trade tape, hot surface",
-        "Response does not list a raw per-exchange option/future trade feed (e.g. standalone Deribit or OKX option-trade datasets) as queryable — referencing the hot surface's venues or the v_vol_surface pointer is fine, since both are in the catalog",
+        "Response lists raw exchange venue files and metadata, Paradigm RFQ/executed tapes, and the Paradex DEX trade tape",
+        "Response does not recommend s3://dt-exchange-venue-data/hot/ or any hot__ object",
         "Response is structured as a catalog summary, not a query — it does not attempt to run SQL"
       ]
     },
     {
       "id": 2,
       "prompt": "do we have OKX combo quotes?",
-      "expected_output": "A direct answer: no — combo quotes are not in this catalog (nor any raw per-exchange option feed). Points the user at what IS available: Deribit/Paradex block flow via the Paradigm trade tape (s3://dt-paradigm-data), and current ATM IV / DVOL / recent flow via the hot surface (s3://dt-exchange-venue-data/hot/). Does not fabricate an external/tardis or terminal-dime-prod path.",
+      "expected_output": "A direct answer: there is no dedicated OKX combo-quote feed. Points to raw OKX option_trade and option_summary partitions as the available leg-level trade/quote evidence, explains that block_trade_id can group real block legs, and does not fabricate a path or recommend hot files.",
       "assertions": [
-        "Response clearly states OKX combo quotes are not in the catalog",
-        "Response points to the Paradigm tape and/or hot surface as what is available",
+        "Response clearly states there is no dedicated OKX combo-quote feed",
+        "Response points to raw OKX option_trade and/or option_summary data as what is available",
         "Response does not fabricate an S3 path (no external/tardis, no terminal-dime-prod)"
       ]
     },
     {
       "id": 3,
       "prompt": "what columns does the Paradigm trade tape have and where does it live?",
-      "expected_output": "Response gives the S3 path s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz, last verified coverage 2025-11-09 to 2026-05-09, and lists the columns: DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID. Notes that PRODUCT taxonomy includes BTC/ETH/SOL/XRP options on Deribit, BTC options on Paradex, plus perps and futures. Mentions the join key RFQ_ID links to the RFQ tape.",
+      "expected_output": "Response gives s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz and lists DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID. It states that the non-hot object is frozen at 2026-08-10 and is historical only, and that RFQ_ID links to the current RFQ tape.",
       "assertions": [
         "Response returns the correct S3 path: s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz",
         "Response lists the schema columns including DATE, PRODUCT, DESCRIPTION, PRICE, NOTIONAL_VOLUME_USD, RFQ_ID, BLOCK_TRADE_ID",
         "Response mentions or implies how to filter for options only (e.g. PRODUCT LIKE '%OPTION%')",
-        "Response notes the dataset is a single flat CSV.gz (not date-partitioned)"
+        "Response notes the dataset is a single flat CSV.gz frozen at 2026-08-10 and is not current"
       ]
     },
     {
       "id": 4,
       "prompt": "what's the latest Deribit option trade data available?",
-      "expected_output": "A helpful answer: the raw per-exchange Deribit option tick/trade feed is no longer in this catalog, but Deribit option data IS available — option block flow in the Paradigm trade tape (product 'BTC OPTION - DBT', s3://dt-paradigm-data) and current Deribit ATM IV / DVOL in the hot surface (s3://dt-exchange-venue-data/hot/). Does not cite a terminal-dime-prod or external/tardis path.",
+      "expected_output": "A helpful answer pointing to the raw Deribit option_trade and option_summary partitions under s3://dt-exchange-venue-data/raw/exchange=deribit/, with dvol and perp_summary as related raw feeds. Explains the partition layout and recommends checking max(timestamp) in the narrow latest partition. Does not cite hot, terminal-dime-prod, or external/tardis paths.",
       "assertions": [
-        "Response points to a real catalog source for Deribit option data — the Paradigm trade tape (Deribit option block flow) and/or the hot surface",
+        "Response points to raw Deribit option_trade and option_summary paths under s3://dt-exchange-venue-data/raw/",
         "Response does not cite a terminal-dime-prod or external/tardis S3 path",
-        "Response does not claim a standalone raw Deribit option-trade tick dataset with its own coverage range"
+        "Response recommends checking record timestamps in a narrow raw partition rather than assuming coverage"
       ]
     }
   ],

@@ -4,32 +4,35 @@
   "evals": [
     {
       "id": 1,
+      "requires_live": true,
       "prompt": "/recap btc options 8h",
-      "expected_output": "A BTC options recap for the last 8 hours in the fixed 4-section format: (1) Snapshot yaml block — Spot, DVOL open→close, RV 7d, VRP, Volume, P/C; (2) Biggest Print — single largest block one-liner (venue named as via Paradigm/<venue>); (3) Block Flow table — numbered rows with Structure, Notl, Blocks, Detail columns; (4) Vol Surface — skew/term line + expiry table (ATM, 25d RR, Fly). Data labeled as estimated when live tools unavailable.",
+      "expected_output": "A BTC options recap for the last 8 hours in the fixed 4-section format, built from bounded raw exchange partitions and source tapes. Missing reads are named explicitly; no values are estimated or simulated.",
       "assertions": [
         "Response includes a Snapshot section as a code block with Spot, DVOL, RV 7d, VRP, Volume, and P/C fields",
         "Response includes a Biggest Print section with a single largest block identified",
         "Response includes a Block Flow section with a numbered table (Structure, Notl, Blocks, Detail columns)",
         "Response includes a Vol Surface section with a skew/term summary line and a table showing ATM, 25d RR, and Fly per expiry",
         "Response does NOT include a Themes section, a dealer positioning line, or a Bottom Line section — those have been removed from the format",
-        "Response clearly labels any data as estimated or simulated when live tools are unavailable — does not present fabricated numbers as confirmed live data"
+        "Response does not estimate or simulate missing data and does not recommend any hot__ object"
       ]
     },
     {
       "id": 2,
+      "requires_live": true,
       "prompt": "/recap eth options 4h",
-      "expected_output": "An ETH options recap for the last 4 hours in the fixed 4-section format, scoped to ETH: ETH snapshot (DVOL levels, spot range, volumes, P/C), ETH biggest print, ETH block flow, and ETH vol surface. Data labeled as estimated.",
+      "expected_output": "An ETH options recap for the last 4 hours in the fixed 4-section format, scoped to ETH and built from raw exchange data. Missing fields are unavailable rather than estimated.",
       "assertions": [
         "Response covers ETH options — instrument names, DVOL reference, or spot prices are ETH-specific",
         "Response includes a Snapshot section for ETH with DVOL and spot data",
         "Response includes a Block Flow section or states No data",
         "Response includes a Vol Surface section",
         "Response does NOT include a Themes section or a Bottom Line section",
-        "Response clearly labels any data as estimated or simulated when live tools are unavailable"
+        "Response does not estimate or simulate missing data and does not recommend any hot__ object"
       ]
     },
     {
       "id": 3,
+      "requires_live": true,
       "prompt": "gimme a recap of what happened in the btc options market over the last 8 hours",
       "expected_output": "Same as eval 1 — a natural-language paraphrase of /recap btc options 8h produces the same fixed 4-section recap.",
       "assertions": [
@@ -37,20 +40,21 @@
         "Response includes a Block Flow section with a structure table",
         "Response includes a Vol Surface section with expiry-level ATM IVs",
         "Response does NOT include a Themes section or a Bottom Line section",
-        "Response clearly labels any data as estimated or simulated when live tools are unavailable"
+        "Response does not estimate or simulate missing data and does not recommend any hot__ object"
       ]
     },
     {
       "id": 4,
+      "requires_live": true,
       "prompt": "/recap",
-      "expected_output": "Bare /recap defaults to BTC options, last 24h. Response is a full 4-section recap for BTC options over 24 hours with data labeled as estimated.",
+      "expected_output": "Bare /recap defaults to BTC options, last 24h. Response is a full 4-section raw-data recap, with unavailable fields stated rather than estimated.",
       "assertions": [
         "Response covers BTC options (default asset) — header or content references BTC",
         "Response covers a 24h window — header or context indicates 24h or 1d",
         "Response includes a Snapshot section",
         "Response includes a Block Flow section",
         "Response includes a Vol Surface section",
-        "Response clearly labels any data as estimated or simulated when live tools are unavailable"
+        "Response does not estimate or simulate missing data and does not recommend any hot__ object"
       ]
     },
     {

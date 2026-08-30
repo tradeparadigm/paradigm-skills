@@ -1530,38 +1530,13 @@ def test_main_no_s3_path_does_not_crash():
 
 
 def test_freshness_probe_contract_matches_its_reader():
-    # The shell->Python contract crosses a process boundary that CI cannot
-    # execute (run_recap.sh needs IRSA credentials), so it is asserted on the
-    # generated SQL instead. Renaming the alias or the output filename used to
-    # leave both suites green while the gate returned a permanent all-clear.
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "..", "scripts", "run_recap.sh")
     with open(src) as f:
         sh = f.read()
-    import re as _re
-    copies = _re.findall(r"COPY \((.*?)\) TO '\$\{WORK\}/(freshness_[a-z]+\.csv)'", sh)
-    files = {c[1] for c in copies}
-    expected = set(recap._FRESHNESS_FILES.values())
-    check("one COPY per source", files == expected, f"{files} vs {expected}")
-    for body, fname in copies:
-        check(f"{fname} aliases the column load_freshness reads",
-              "AS max_at" in body, body[:120])
-    # Assert the exact grouping key set, not merely that a GROUP BY exists. The
-    # loose version let two distinct defects through at full green:
-    #   GROUP BY exchange, metric -> probe measures a SUPERSET of what load_hot
-    #     renders (it collapses to Deribit), so another venue lagging fires a
-    #     false banner and forces a refetch every run;
-    #   GROUP BY exchange         -> collapses dvol and spot back into one flat
-    #     max, restoring the original masked-freeze bug.
-    rec = next(b for b, f in copies if f == "freshness_rec.csv")
-    check("recap probe takes min over per-metric maxima", "min(mx)" in rec, rec[:160])
-    check("grouped by metric ALONE", "GROUP BY metric)" in rec, rec[:200])
-    check("not grouped by exchange", "exchange" not in rec, rec[:200])
-    # The vol_surface probe must measure the rows the recap consumes. Deleting
-    # this predicate survived at full green: BTC's surface could freeze while
-    # ETH rows keep landing in the shared file and the probe reads fresh.
-    vs = next(b for b, f in copies if f == "freshness_vs.csv")
-    check("surface probe is asset-scoped", "symbol LIKE" in vs, vs[:200])
+    check("wrapper delegates to collector", "collect_recap.py" in sh, sh)
+    check("wrapper no longer builds presentation files", "COPY (" not in sh, sh)
+    check("wrapper does not render", "--render" not in sh, sh)
 
 
 # ── Venue-block dedupe: fail-closed guarantees ──────────────────────────────
@@ -1780,21 +1755,12 @@ def test_ordinary_bybit_print_does_not_disable_the_merge():
 
 
 def test_venue_window_is_floored_to_the_containing_bucket():
-    # The grain alignment had no test at all — reverting START_MS_5M survived
-    # every suite. Assert the shell computes the floor and uses it for the
-    # venue read only (blocks.csv must stay on exact START_MS).
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "..", "scripts", "run_recap.sh")
+                       "..", "scripts", "collect_recap.py")
     with open(src) as f:
-        sh = f.read()
-    check("floor is computed",
-          "START_MS_5M=$(( (START_S - START_S % 300) * 1000 ))" in sh, "missing START_MS_5M")
-    venue = next(l for l in sh.splitlines() if "venue_blocks.csv" in l and l.startswith("COPY"))
-    check("venue read uses the floored bound", "${START_MS_5M}" in venue, venue[:160])
-    tape = next(l for l in sh.splitlines()
-                if l.startswith("COPY") and "read_parquet('${PT}')" in l)
-    check("tape read stays on exact START_MS",
-          "${START_MS}" in tape and "START_MS_5M" not in tape, tape[:160])
+        collector = f.read()
+    check("collector filters on event time", "TRY_CAST(timestamp AS TIMESTAMPTZ)" in collector)
+    check("collector exposes source paths", "path_plan" in collector)
 
 
 def test_no_banner_when_nothing_is_stale():
@@ -1823,23 +1789,13 @@ def test_empty_block_tape_is_rendered_not_silently_quiet():
 
 
 def test_run_recap_has_no_legacy_csv_read_left():
-    # The csv.gz stopped refreshing on 2026-08-10 (data#712) and returns zero
-    # rows for any recent window, so the fallback can only mask, never help.
-    # Pin its removal so it cannot creep back.
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "..", "scripts", "run_recap.sh")
     with open(src) as f:
         sh = f.read()
-    # Assert the CONSTRUCT is gone, not the word — the comment deliberately
-    # retains the history of why the fallback existed and why it was removed.
-    check("no TAPE variable",
-          not any(l.startswith("TAPE=") for l in sh.splitlines()), "TAPE= still assigned")
-    check("no read_csv_auto", "read_csv_auto" not in sh, "legacy read still present")
-    check("no staging file", "blocks_pt" not in sh, "staging still present")
-    blocks = [l for l in sh.splitlines()
-              if l.startswith("COPY") and "/blocks.csv'" in l]
-    check("exactly one blocks.csv writer", len(blocks) == 1, blocks)
-    check("and it is the hot tape", "read_parquet('${PT}')" in blocks[0], blocks[0][:120])
+    check("no hot path", "/hot/" not in sh and "hot__" not in sh, sh)
+    check("no legacy CSV read", "read_csv_auto" not in sh, sh)
+    check("stdout belongs to collector", sh.rstrip().endswith('--window "$WINDOW"'), sh[-160:])
 
 
 
