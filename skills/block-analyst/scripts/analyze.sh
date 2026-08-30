@@ -9,7 +9,7 @@ case "$CORE" in
   ''|*[!A-Za-z0-9_-]*) echo "analyze: invalid rfq_id" >&2; exit 2;;
 esac
 
-[ -n "${ANALYZE_PRINT_ID:-}" ] && { echo "$CORE"; exit 0; }
+[ -n "${ANALYZE_PRINT_ID:-}" ] && { printf '%s\n' "$CORE"; exit 0; }
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-exec uv run "$DIR/scripts/collect_analysis.py" --rfq-id "$SUPPLIED_ID"
+exec uv run "$DIR/scripts/collect_analysis.py" --rfq-id="$SUPPLIED_ID"

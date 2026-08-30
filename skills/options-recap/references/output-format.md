@@ -29,19 +29,23 @@ Volume    $[X]M       all venues
 P/C       [X.Xx]      [descriptor] (all venues, by trades)
 ```
 
-The Volume note names the venues whose normalized `turnover_usd` observations
-drove the number. Do not write `all venues` when any venue trade source is a
-gap, and do not combine `amount_native` across venues.
+The Volume note names the venues whose normalized `premium_turnover_usd`
+aggregates drove the number. Do not write `all venues` when any venue trade
+source is a gap; when a venue's `turnover_rows` is below its `trade_count`,
+its turnover coverage is partial — say so rather than presenting the sum as
+complete. Do not combine `amount_native` across venues.
 
 **Biggest Print**
 
 ```yaml
-[DDMMMYY] [structure]   [Nx]   $[X]M   [HH:MM] UTC   via Paradigm/[Venue] ([Buy/Sell, ][IV]v avg)
+[DDMMMYY] [structure]   [Nx]   $[X]M   [HH:MM] UTC   via [Venue] ([Buy/Sell, ][IV]v avg)
 ```
 
 The single largest **proven block** in the window, ranked by USD premium
 turnover when available. Group legs only on a real venue block/OTC id. The
-`via …` tag names the source and venue. A raw venue block without provable leg
+`via …` tag names the venue whose rows prove the block; write
+`via Paradigm/[Venue]` only when a Paradigm linkage is actually proven by a
+shared identifier. A raw venue block without provable leg
 geometry renders as
 `[Venue] Block   [Nx]   $[X]M   ~[HH:MM] UTC   via venue tape`
 (`~` = 5-min bucket resolution; `[Nx]` is its total coin size). The side word appears only when
@@ -80,12 +84,14 @@ The Structure column has a 27-char floor but stretches to the longest label in
 the window (a typed cross-expiry label like `24JUL26/31JUL26 Call Diagonal`
 runs past 27), so the header and rows stay aligned to whatever width the widest
 structure needs. There is no per-row venue column — the Biggest Print line's
-`via Paradigm/<venue>` tag is where the venue shows, and a venue-tape row
+`via <venue>` tag is where the venue shows, and a venue-tape row
 carries its venue in the structure label (`OKX Block`).
 
-Two granularities, both always stated: tape **blocks** (`BLOCK_TRADE_ID`s, the
-industry term for the individual prints) and **structures** (clips of one worked
-order — the blocks sharing an `RFQ_ID` — grouped into one row). Rows are
+Two granularities, both always stated: **blocks** (individual prints, one per
+real venue block/OTC id) and **structures** (the blocks of one worked order
+grouped into one row — group only on a published venue order identifier such
+as Deribit's `block_rfq_id`; where a venue publishes none, each block is its
+own structure). Rows are
 structures and `#` numbers them; the Blocks column carries each row's block
 count, so it sums to the header `[N]` and the row count equals `[M]`. When more
 than 8 structures qualify, the header gains the `(top 8 by notional)` suffix.
@@ -117,8 +123,9 @@ Expiry     ATM      ΔATM     25d RR    ΔRR      Fly     ΔFly
 Formatting rules: ATM/RR/Fly are current (close) values, `X.Xv` precision. The Δ
 columns are the window-over-window change (current − window-open), signed `+X.Xv`;
 `flat` when the change rounds to zero, `n/a` when no window-open surface was
-available (window-start outside the `v_vol_surface` history — deeper than the
-cold backfill, or in a partition gap). Append `*` to any cell derived from
+available (no normalized `option_summary` rows in the window-open five-minute
+bucket — a partition gap, or a window start that predates the normalized
+history). Append `*` to any cell derived from
 extrapolated wings (e.g. `-4.0v*`).
 
 ---

@@ -66,6 +66,18 @@
         "Response identifies the structure from the resolved DESCRIPTION as a −2/+1 put ratio (structure qty 20: long 40× 59000 P, short 20× 65000 P from the taker's perspective per leg SIDEs)",
         "Response includes a yaml code block with [Greeks], [Fair], [History], and [Live] rows"
       ]
+    },
+    {
+      "id": 6,
+      "prompt": "/analyze DRFQv2-r_unresolved99",
+      "expected_output": "The RFQ request is found on the current RFQ tape (created after the 2026-08-10 executed-tape freeze), but no id-linked execution can be resolved from raw exchange data, so the response is exactly the mandated failure line and nothing else.",
+      "assertions": [
+        "Response is exactly 'RFQ DRFQv2-r_unresolved99 found, but its executed fill could not be resolved from current raw exchange data.' with no additional analysis sections",
+        "Response does not fabricate a fill, price, mark, side, or greeks",
+        "Response does not use the inline description or a default asset as a substitute fill",
+        "Response does not recommend or read any hot__ object, hot/ path, or other rollup object"
+      ],
+      "requires_live": true
     }
   ],
   "trigger_evals": [

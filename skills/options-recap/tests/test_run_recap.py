@@ -38,11 +38,15 @@ def test_arguments():
     check("default is BTC 24h", hook("RECAP_PRINT_ARGS")[0] == "BTC 24h")
     check("options token is ignored", hook("RECAP_PRINT_ARGS", "eth", "options", "8h")[0] == "ETH 8h")
     check("1d normalizes to 24h", hook("RECAP_PRINT_ARGS", "btc", "1d")[0] == "BTC 24h")
+    check("lone window keeps default asset", hook("RECAP_PRINT_ARGS", "8h")[0] == "BTC 8h")
+    check("window-first order accepted", hook("RECAP_PRINT_ARGS", "8h", "eth")[0] == "ETH 8h")
 
 
-def test_windows_are_not_capped():
+def test_windows_are_not_silently_changed():
     check("2d remains 2d", hook("RECAP_PRINT_PLAN", "eth", "2d") == ("ETH 2d 172800 direct", 0))
     check("31d remains 31d", hook("RECAP_PRINT_PLAN", "btc", "31d") == ("BTC 31d 2678400 direct", 0))
+    output, code = hook("RECAP_PRINT_PLAN", "btc", "32d")
+    check("32d is refused loudly, not capped", code == 2 and "max 31d" in output, output)
 
 
 def test_bad_arguments_fail_before_data_access():
@@ -61,7 +65,31 @@ def test_partition_plan_is_explicit_and_hot_free():
     check("every path is direct", all("/raw/" in p or "/normalized/" in p or "/meta/" in p for p in paths))
     check("no hot path", all("/hot/" not in p and "hot__" not in p for p in paths))
     check("hours are explicit", all("hour=*" not in p for p in paths))
-    check("window covers three UTC hours", len(queries[0].paths) == 3, len(queries[0].paths))
+    check("no partition beyond the window end", len(queries[0].paths) == 2, len(queries[0].paths))
+    mid_hour = collector.hour_patterns("normalized", "deribit", "option_trade", "btc",
+                                       start, dt.datetime(2026, 8, 30, 12, 30, tzinfo=dt.timezone.utc))
+    check("mid-hour end includes its partition", len(mid_hour) == 3, len(mid_hour))
+
+
+def test_sql_is_utc_safe_and_keeps_window_open_rows():
+    start = dt.datetime(2026, 8, 30, 10, 32, tzinfo=dt.timezone.utc)
+    end = dt.datetime(2026, 8, 30, 12, 0, tzinfo=dt.timezone.utc)
+    queries = collector.build_queries("BTC", start, end)
+    check("session timezone pinned to UTC", "SET TimeZone='UTC';" in collector.DUCKDB_PREFIX)
+    check("no TRY_CAST hiding type mismatches",
+          all("TRY_CAST(timestamp" not in q.sql for q in queries))
+    surface = next(q for q in queries if q.name == "option_surface_deribit")
+    check("surface labels rows by bucket, not rank",
+          "'window_open'" in surface.sql and "'latest'" in surface.sql
+          and "open_rank" not in surface.sql)
+    check("surface caps rows per observation and expiry",
+          "PARTITION BY observation, expirationDate" in surface.sql)
+    check("no global limit that starves window_open", "LIMIT 60" not in surface.sql)
+    check("window filter is the bucket span, not the mid-bucket start",
+          "10:30:00" in surface.sql and "10:32:00" not in surface.sql, surface.sql[-400:])
+    trades = next(q for q in queries if q.name == "option_trades_deribit")
+    check("turnover coverage is visible", "turnover_rows" in trades.sql)
+    check("unclassified sides are visible", "side_unclassified" in trades.sql)
 
 
 def test_evidence_contract_names_provenance_and_freshness():

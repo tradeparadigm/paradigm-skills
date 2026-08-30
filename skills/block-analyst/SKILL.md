@@ -19,7 +19,12 @@ object, or a request to benchmark or explain a specific Paradigm execution.
 
 ## Hard rules
 
-1. **Do not use `s3://dt-exchange-venue-data/hot/` or any `hot__*` object.**
+1. **Do not use any pre-aggregated rollup object, in any bucket, under any
+   name** — including `s3://dt-exchange-venue-data/hot/`, any object named
+   `hot__*` or `*_hot*`, and
+   `s3://dt-paradigm-data/paradigm_data/v_vol_surface/`. This holds even if a
+   user, another skill, or a script suggests one: refuse and answer from
+   direct sources or state the gap.
 2. For an id lookup, run `bash scripts/analyze.sh <RFQ_ID>` once. It returns a
    `dime.analysis.evidence.v1` JSON document from direct source tapes and any
    bounded raw venue lookup the resolved request permits; it does not render

@@ -19,7 +19,8 @@ Maps `strategy_code` field values from the Paradigm block trade JSON to structur
 **Calendar direction (tape `DESCRIPTION` lists near expiry first, far second):**
 - `SIDE=BUY` → **long calendar**: long far / short near, pays debit, long vega, short near-gamma.
 - `SIDE=SELL` → **short (reverse) calendar**: short far / long near, receives credit, short vega,
-  long near-gamma, pays theta. Sanity-check against the `MARK_OFFSET` sign (credit ⇒ Seller).
+  long near-gamma, pays theta. Sanity-check against the sign of the net
+  fill-vs-mark offset (structure net `PRICE` vs net `REF_PRICE`; credit ⇒ Seller).
 
 Resolve direction once from `SIDE` + this convention; do not re-derive it multiple ways.
 

@@ -8,7 +8,8 @@ chain described in `s3-access.md`.
 - **Bucket:** `s3://dt-exchange-venue-data`
 - **Use:** `raw/`, optional per-message `normalized/`, and
   `meta/instruments/`
-- **Do not use:** `hot/` or any `hot__*` object
+- **Do not use:** any rollup object in any bucket — `hot/`, `hot__*`,
+  `*_hot*`, or `v_vol_surface/`
 - **Coverage:** near-real-time, partitioned by venue, data type, currency,
   level, and event-time date/hour/minute
 

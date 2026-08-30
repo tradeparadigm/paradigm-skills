@@ -12,7 +12,7 @@
   is the tell it's an alt, not BTC/ETH. Confirm the instrument exists before treating an empty
   ticker as "no data" (a `BTC-…-88-C` guess returns empty because that strike is nonsensical for BTC).
 
-**Tool:** `deribit__get_ticker` (native — fastest, most complete)
+**Tool:** direct Deribit public API (`/api/v2/public/ticker`)
 
 **Returns:** mark_price, best_bid_price, best_ask_price, mark_iv, bid_iv, ask_iv,
 greeks (delta, gamma, theta, vega), open_interest, underlying_price
@@ -32,7 +32,7 @@ Paradigm-routed flow settles on Deribit) carry extra fields:
 - Trades with **no** `block_trade_id` are on-screen / central-limit-order-book flow.
 So to reconstruct Paradigm-style blocks from the public tape: pull `get_last_trades_by_instrument`
 per leg, keep rows with a `block_trade_id`, and cluster by that id (and timestamp) to see prior
-packaged blocks on the same strikes — the best proxy when the native Paradigm tape isn't injected.
+packaged blocks on the same strikes — the recurrence evidence for Paradigm-routed flow.
 Useful windowing params: `start_timestamp` / `end_timestamp` (epoch ms), `count` (max 1000).
 
 ---
@@ -155,7 +155,7 @@ Before calling Bybit options endpoints, follow the Bybit skill Module Router:
 
 **Approach:**
 1. Attempt `web_fetch` on the IBIT public API (endpoint to be resolved from known base URL)
-2. If unreachable: record "IBIT unavailable" in data trace — do not fabricate counts
+2. If unreachable: state the IBIT gap in the output's unavailable fields — do not fabricate counts
 3. If the user's intent is the IBIT ETF options (CBOE-listed equity options):
    note that these are equity options, not crypto, and a direct structure comparison is
    not meaningful — flag this distinction for the user
@@ -173,14 +173,14 @@ Before calling Bybit options endpoints, follow the Bybit skill Module Router:
 | Greeks in response | ✅ Native | ✅ opt-summary | ❌ No |
 | Strike granularity | Fine | Medium | Sparse |
 | Coin-margined | ✅ Yes | ✅ Yes (_UM) | ✅ Yes |
-| Data source method | `deribit__get_ticker` | `web_fetch` | `web_fetch` (+ skill module) |
+| Data source method | Deribit public API | `web_fetch` | `web_fetch` (+ skill module) |
 | Paradigm venue code | `DBT` | `OKX` | — |
 
-### Trade History (30-day tape check)
+### Trade History (recurrence check)
 
 | Venue | Method | Granularity | Notes |
 |---|---|---|---|
-| Paradigm | injected tape | Full structured blocks | Best for block-trade recurrence |
+| Paradigm | current RFQ tape (requests only) + executed tape frozen at 2026-08-10 | Structured requests / historical legs | No current Paradigm block tape exists; recent recurrence comes from raw venue `option_trade` partitions or venue APIs |
 | Paradex | `web_fetch /v1/trades` | Per-instrument trades | Perp legs most relevant |
 | Deribit | `web_fetch /api/v2/public/get_last_trades_by_instrument` | Per-leg trades | Deepest options history |
 | OKX | `web_fetch /api/v5/market/trades` | Per-leg trades | Good secondary source |

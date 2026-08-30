@@ -108,6 +108,27 @@ snapshots.
 - Bullish `spot_trade` / `perp_trade`: event-level `price`, `amount`, `side`,
   timestamp, and OTC ids when present.
 
+## Normalized per-message fields
+
+The `normalized/` layer harmonises the raw per-venue names. The fields the
+Dime collectors select (and follow-up normalized queries should use):
+
+- `option_trade`: `exchange`, `timestamp`, `symbol`, `side` (`buy`/`sell`),
+  `amount`, `price`, `iv`, `index_price`, `turnover_usd`, `block_id`, `id`
+- `option_summary`: `exchange`, `timestamp`, `symbol`, `expirationDate`,
+  `strikePrice`, `optionType`, `markIV`, `bestBidIV`, `bestAskIV`,
+  `markPrice`, `bestBidPrice`, `bestAskPrice`, `delta`, `gamma`, `vega`,
+  `theta`, `openInterest`, `underlyingPrice`
+- `perp_summary`: `exchange`, `timestamp`, `symbol`, `funding_rate`,
+  `funding_interval_hours`, `index_price`, `mark_price`,
+  `open_interest_coin`, `open_interest_usd`
+
+These names differ from the raw per-venue names below (`mark_iv`, `markVol`,
+`markPriceIv`, …) — do not mix the two vocabularies in one query. Before
+combining normalized IV or OI across venues, verify the normalized units
+against a small sample partition for each venue; do not assume the
+normalization layer converted decimal-IV venues to vol points.
+
 ## Units
 
 Use instrument metadata rather than hardcoded multipliers when it is available.

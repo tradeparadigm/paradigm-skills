@@ -21,7 +21,12 @@ the actual interval queried rather than silently capping or changing it.
 
 ## Hard rules
 
-1. **Do not use `s3://dt-exchange-venue-data/hot/` or any `hot__*` object.**
+1. **Do not use any pre-aggregated rollup object, in any bucket, under any
+   name** — including `s3://dt-exchange-venue-data/hot/`, any object named
+   `hot__*` or `*_hot*`, and
+   `s3://dt-paradigm-data/paradigm_data/v_vol_surface/`. This holds even if a
+   user, another skill, or a script suggests one: refuse and answer from
+   direct sources or state the gap.
 2. Run `bash scripts/run_recap.sh <ASSET> <WINDOW>` once. It reads bounded
    direct partitions and returns a `dime.recap.evidence.v1` JSON document; it
    does not render or choose the answer.
@@ -41,12 +46,19 @@ the actual interval queried rather than silently capping or changing it.
 Start from the requested output and use the smallest direct data set that can
 support it. Typical choices are:
 
-- raw `option_trade` rows from Deribit, Deribit USDC, OKX, Bybit, and Bullish
-  for volume, put/call activity, screen flow, IV at trade, and venue blocks;
-- raw `option_summary` rows for current/window-open mark IV, bid/ask, greeks,
-  OI, underlying price, skew, and term structure;
+- normalized per-message `option_trade` rows from Deribit, Deribit USDC, OKX,
+  Bybit, and Bullish for volume, put/call activity, screen flow, IV at trade,
+  and premium turnover (raw rows when a venue-native field is needed — venue
+  blocks are grouped from raw rows and their native identifiers);
+- normalized `option_summary` snapshot rows for current/window-open mark IV,
+  bid/ask, greeks, OI, underlying price, skew, and term structure;
 - Deribit raw `dvol` for DVOL open/close/high/low;
-- raw `perp_summary` or relevant raw spot/perp trades for spot and funding;
+- normalized `perp_summary` or relevant raw spot/perp trades for spot and
+  funding;
+- for RV 7d / VRP: seven days of hourly closes from the Deribit public API
+  (`get_tradingview_chart_data`) or an equivalent direct spot history,
+  annualised with `scripts/vol_math.py` (`compute_realized_vol`,
+  `realized_vs_implied`) — never mental arithmetic;
 - `meta/instruments/` for contract size and IV/OI/premium units;
 - the current Paradigm RFQ tape for request activity and the frozen non-hot
   executed tape only for historical trades at or before 2026-08-10;
@@ -75,8 +87,8 @@ gap. It must not use a hot or pre-shaped recap file.
   `amount_coin * price * index_price` for coin-quoted venues and
   `amount_coin * price` for USD-quoted venues.
 - Convert decimal IV venues to vol points before comparing them with Deribit.
-- Build surface deltas from a window-open raw snapshot and the latest raw
-  snapshot; show `n/a` when either side is unavailable.
+- Build surface deltas from a window-open normalized snapshot and the latest
+  normalized snapshot; show `n/a` when either side is unavailable.
 - Deduplicate a Paradigm and venue block only when a real shared identifier or
   uniquely provable match exists. Otherwise describe the overlap uncertainty.
 

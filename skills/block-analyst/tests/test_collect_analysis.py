@@ -52,6 +52,41 @@ def test_unresolved_anchor_does_not_scan_bucket():
     assert collector.raw_deribit_paths({"DESCRIPTION": "user supplied guess"}) == []
 
 
+def test_description_cannot_steer_partitions():
+    # DESCRIPTION is free text — even with a date present it must never
+    # establish the asset for a partition read.
+    paths = collector.raw_deribit_paths({
+        "DESCRIPTION": "user says BTC 100k call", "DATE": "2026-08-30"})
+    assert paths == []
+
+
+def test_untimed_date_reads_whole_day_not_midnight():
+    paths = collector.raw_deribit_paths({
+        "PRODUCT": "BTC OPTION - DBT", "DATE": "2026-08-30"})
+    assert len(paths) == 24
+    assert all("day=30" in path for path in paths)
+    assert any("hour=14" in path for path in paths)
+
+
+def test_anchor_prefers_exact_and_refuses_ambiguity():
+    exact = {"RFQ_ID": "r_test-1", "DATE": "2026-08-01"}
+    other = {"RFQ_ID": "r_other-r_test-1", "DATE": "2026-08-02"}
+    anchor, error = collector.pick_anchor([other, exact], "DRFQv2-r_test-1", "r_test-1")
+    assert anchor is exact and error is None
+    anchor, error = collector.pick_anchor(
+        [{"RFQ_ID": "a-77"}, {"RFQ_ID": "b-77"}], "77", "77")
+    assert anchor == {} and "refusing to anchor" in error
+    lone = {"RFQ_ID": "DRFQv2-x-77"}
+    anchor, error = collector.pick_anchor([lone], "77", "77")
+    assert anchor is lone and error is None
+
+
+def test_suffix_predicate_requires_separator():
+    predicate = collector.suffix_predicate("RFQ_ID", "77")
+    assert "'%-77'" in predicate.replace("upper(", "").replace(")", "")
+    assert "'%77'" not in predicate
+
+
 if __name__ == "__main__":
     tests = [value for name, value in sorted(globals().items())
              if name.startswith("test_") and callable(value)]

@@ -70,7 +70,7 @@
         "Recap reports 7-day realized vol near 53.9v (within ±3v)",
         "VRP is reported as negative — implied cheap vs realized (realized running above implied)",
         "Largest block is identified as a Strangle or Risk Reversal structure on 26JUN26 — size reported as either ~100 BTC per leg or ~200 BTC total (two-leg cluster)",
-        "Largest block is described as two-way flow (both buy and sell legs present — one leg is a put buy, the other is a call sell)",
+        "Largest block is a mixed-direction structure whose legs trade in opposite directions (put bought, call sold) and carries no single Buy/Sell side tag",
         "Vol surface section reports front-expiry (5JUN26) ATM IV near 83v (within ±4v)",
         "Vol surface skew is described as downside / puts bid (front 25-delta risk reversal negative, around -12v)",
         "Term structure is described as backwardation / inverted (front expiry IV above back expiry IV)"

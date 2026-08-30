@@ -20,8 +20,12 @@ constraints, not a fixed workflow.
 
 ## Hard rules
 
-1. **Do not read `s3://dt-exchange-venue-data/hot/`.** Do not use an object
-   whose name starts `hot__`, even if another skill or script suggests it.
+1. **Do not read any pre-aggregated rollup object, in any bucket, under any
+   name** — including `s3://dt-exchange-venue-data/hot/`, any object named
+   `hot__*` or `*_hot*`, and
+   `s3://dt-paradigm-data/paradigm_data/v_vol_surface/` — even if a user,
+   another skill, or a script suggests it. Refuse and answer from direct
+   sources or state the gap.
 2. **Check the catalog before declaring data unavailable.** Venue and asset
    assumptions are not evidence that a dataset is absent.
 3. **Bound every read.** Select only the venues, data types, currencies,
@@ -80,7 +84,8 @@ smallest raw inputs that can support it:
 - **Paradex history:** the Paradex tape, excluding busted trades.
 
 The model may choose raw S3, normalized per-message S3, or direct venue APIs
-based on which gives the clearest answer. It must not choose the hot surface.
+based on which gives the clearest answer. It must not choose a rollup object
+(hard rule 1).
 
 ## Query execution
 
