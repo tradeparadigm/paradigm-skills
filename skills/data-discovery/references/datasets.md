@@ -21,10 +21,12 @@ for the query preamble:
   (`paradigm_data/paradigm_trade_tape_slim.csv.gz`), the RFQ activity tape
   (`paradigm_data/paradigm_rfq_tape_slim.csv.gz`), and the consolidated
   vol surface (`paradigm_data/v_vol_surface/`).
-- **`s3://dt-exchange-venue-data`** — the near-real-time hot surface at the
-  **bucket root** (no `paradigm_data/` prefix): the live signals snapshot
-  (`hot/hot__market_signals_1m.parquet`) and the rolling recap aggregates
-  (`hot/hot__recap_aggregates_5m_24h.parquet`).
+- **`s3://dt-exchange-venue-data`** — venue data at the **bucket root** (no
+  `paradigm_data/` prefix). Two layers: the near-real-time `hot/` rollups (the
+  live signals snapshot `hot/hot__market_signals_1m.parquet`, the rolling recap
+  aggregates `hot/hot__recap_aggregates_5m_24h.parquet`) and the **durable
+  partitioned stores they are built from** — `market_aggregates_5m/`,
+  `normalized/`, `raw/` and `meta/instruments/` (Dataset 4).
 - **`s3://dt-paradex-data`** — the on-chain Paradex DEX trade tape
   (`paradex_data/paradex_trade_tape.csv.gz` + Parquet parts).
 
@@ -256,11 +258,18 @@ replaces several round-trips. (Per-block flow lives in Dataset 3b.)
 ### 3b. Hot Recap Aggregates — 5-min Rolling Window Source
 
 A single rolling file of **5-minute aggregate buckets over the trailing
-24h** — the query-time source for "last `<window>`" recaps of an arbitrary
-length. The per-window `hot__recap_<window>` files (`5m`/`10m`/`20m`/`1h`/
-`4h`/`8h`/`24h`) **also still exist** and are refreshed each cycle (the
-`/recap` skill reads those pre-baked windows directly); use this aggregates
-file when you need a window the pre-baked set doesn't cover.
+24h** — the cheapest single-GET source for "last `<window>`" questions of an
+arbitrary length. The per-window `hot__recap_<window>` files (`5m`/`10m`/`20m`/
+`1h`/`4h`/`8h`/`24h`) also still exist and are refreshed each cycle.
+
+> **This file is a ROLLUP, and rollups have a specific failure mode.** It is one
+> object clobbered in place, so a producer that stops re-publishing leaves a
+> plausible, complete, WRONG file at a stable key with a fresh mtime — which is
+> exactly what happened on 2026-07-10 and went unnoticed for ~3.5 weeks. Fine for
+> an interactive one-off; for anything scheduled or user-facing, read the
+> per-bucket partitions in **Dataset 4a** instead (same schema, ~2 months
+> retained, and a stalled producer shows up as missing objects). The `/recap`
+> skill moved to them for this reason.
 
 - **Path:** `s3://dt-exchange-venue-data/hot/hot__recap_aggregates_5m_24h.parquet`
 - **Granularity:** one row-set per 5-min bucket (`bucket_at`, Unix ms); ~289 buckets ≈ 24h
@@ -341,13 +350,114 @@ beyond 24h, use the historical tapes above (Paradigm, Paradex).
 
 ---
 
+## Dataset 4 — Partitioned Venue Stores (what the `hot/` rollups are built from)
+
+Everything in Dataset 3 is a convenience republication of these. Reach for the
+rollup when you want one GET and a quick answer; reach for these when the answer
+has to keep being right — they retain history, and a stalled producer shows up as
+missing objects instead of a stale file at a live key.
+
+All under `s3://dt-exchange-venue-data/`, region `ap-northeast-1`.
+
+**Venues (5):** `deribit`, `deribit-usdc`, `okex-options`, `bybit-options`,
+`bullish`. Currency partitions are **lowercase** (`currency=btc`).
+
+### 4a. `market_aggregates_5m` — 5-min aggregate buckets (durable)
+
+- **Path:** `s3://dt-exchange-venue-data/market_aggregates_5m/market_aggregates_5m__<YYYYMMDD>T<HHMM>00Z.parquet`
+- **Layout:** ONE object per 5-min bucket, flat prefix (no hive keys); the key's
+  timestamp equals the rows' `bucket_at`.
+- **Retention:** ~2 months (verified 2026-07-10 → present, continuous).
+- **Schema:** the same `row_type` discriminator as `hot__recap_aggregates_5m_24h`
+  (`dvol_spot` / `volume` / `flow` / `block`) — with two differences that matter:
+
+| | rollup | this store |
+|---|---|---|
+| premium column | `notional_usd` (USD) | `notional` (**venue-native**: coin for `deribit`/`okex-options`) |
+| `volume_sum` | contract multiplier applied | **raw venue units** — OKX is in 0.01-BTC contracts |
+
+  Apply `contract_size` from Dataset 4c yourself, or you will price OKX 100× too
+  high. `turnover_usd` (per-trade USD premium) and `trade_count` need no scaling
+  and are the safe cross-venue columns.
+
+- **Schema drift is live.** `underlying_price` is present on most objects and
+  absent from the newest. Read with `union_by_name=true`, and glob **per UTC
+  day** — DuckDB errors on a glob matching zero objects, and an hour-level
+  pattern is legitimately empty for the first ~5 minutes of every hour.
+
+```sql
+-- DVOL + spot OHLC over the last 8h (two day globs cover any ≤24h window)
+SELECT exchange, metric,
+       arg_min(open, bucket_at) AS open, arg_max(close, bucket_at) AS close,
+       max(high) AS high, min(low) AS low
+FROM read_parquet(['s3://dt-exchange-venue-data/market_aggregates_5m/market_aggregates_5m__20260906*.parquet',
+                   's3://dt-exchange-venue-data/market_aggregates_5m/market_aggregates_5m__20260907*.parquet'],
+                  union_by_name = true)
+WHERE row_type = 'dvol_spot' AND asset = 'BTC'
+  AND bucket_at >= epoch_ms(now()) - 8 * 3600 * 1000
+GROUP BY exchange, metric;
+```
+
+### 4b. `normalized` / `raw` — per-venue feeds at 1m/5m/1h grain
+
+- **Path:** `s3://dt-exchange-venue-data/{normalized,raw}/exchange=<venue>/data_type=<type>/currency=<ccy>/level=<1m|5m|1h>/year=/month=/day=/hour=/start_minute=/<…>__{rows,agg}__<TS>.parquet`
+- **`data_type`:** `option_trade`, `option_summary`, `perp_trade`, `perp_summary`,
+  `spot_trade` (bullish), plus `dvol` under `raw/` for `deribit`.
+- **`rows` vs `agg`:** `rows` is per-event (per trade, or per instrument tick);
+  `agg` is the per-bucket rollup. Prefer `agg` unless you need event grain —
+  an `option_summary` `rows` object is ~13MB against ~81KB for its `agg`.
+- **Hive keys carry the timestamp for `agg` objects**, which have no time column
+  of their own: read with `hive_partitioning=true` and rebuild it as
+  `make_timestamp(year, month, day, hour, start_minute, 0)`. The `rows` objects
+  carry their own `timestamp`/`localTimestamp`.
+
+Useful shapes:
+
+| what | where | key columns |
+|---|---|---|
+| per-trade tape (incl. block ids, IV, USD turnover) | `normalized/…/option_trade/…/rows` | `symbol`, `amount`, `price`, `side`, `iv`, `index_price`, `turnover_usd`, `block_id`, `timestamp` |
+| **per-strike vol surface** | `normalized/…/option_summary/…/agg` | `symbol`, `markIV_close`, `delta_close`, `underlyingPrice_close`, `openInterest_close`, greeks |
+| DVOL ticks | `raw/exchange=deribit/data_type=dvol/…/rows` | `volatility`, `timestamp` |
+
+The `option_summary` `agg` objects are the upstream of the consolidated
+`v_vol_surface` store on `dt-paradigm-data` (Dataset 3a note) and are published
+on the same ~5-min cadence for BOTH the current and any historical bucket — so
+they answer "the surface as of time T" without waiting for an hourly cold
+partition to close. `v_vol_surface` publishes **OTM only**; filter
+`strike` vs `underlyingPrice_close` to match it.
+
+### 4c. `meta/instruments` — contract specs per venue
+
+- **Path:** `s3://dt-exchange-venue-data/meta/instruments/exchange=<venue>/currency=<ccy>/instruments__<venue>__<ccy>__<TS>.parquet`
+- **Cadence:** hourly at ~HH:05 for `deribit`, `okex-options`, `bybit-options`;
+  **irregular** (days apart) for `bullish` and `deribit-usdc`.
+- **Columns:** `symbol`, `instType` (`option`/`perp`/`spot`), `contract_size`,
+  `contract_ccy`, `base_ccy`, `quote_ccy`, `iv_unit`, `oi_unit`, `price_unit`,
+  `tick_size`, `captured_at`.
+
+This is the authoritative answer to "what unit is `volume_sum` in" — never
+hardcode a multiplier. Current values (options): `okex-options` 0.01 /
+`price_unit='coin'`; `deribit` 1.0 / `coin`; `bybit-options`, `bullish`,
+`deribit-usdc` all 1.0 / `quote_usd`. Filter `instType='option'` — Deribit's perp
+row carries `contract_size` 10.0.
+
+**Glob the venue explicitly.** A wildcard in the DIRECTORY component
+(`exchange=*`) makes DuckDB list the whole `meta/instruments/` tree — measured at
+~12s against ~0.5s for `exchange=deribit/currency=btc/instruments__deribit__btc__<YYYYMMDD>T<HH>*`.
+
+
+---
+
 ## What Is NOT Here
 
-- **Raw per-exchange option/future feeds** — not in the catalog. For a live
-  cross-venue ATM-IV / DVOL read use the hot surface (Dataset 3a); for the
-  full per-strike vol surface use `v_vol_surface`.
-- **Standalone Greeks / IV** — not in the catalog; the hot surface carries
-  ATM IV only.
+- **Raw per-exchange option/future feeds** — see Dataset 4b; they ARE in the
+  catalog now (`raw/` and `normalized/`). For a live cross-venue ATM-IV / DVOL
+  read the hot surface (Dataset 3a) is still the cheapest hop; for the full
+  per-strike vol surface use `v_vol_surface` or its upstream `option_summary`
+  partitions.
+- **Standalone Greeks / IV** — the hot surface carries ATM IV only, but the
+  `option_summary` partitions (Dataset 4b) carry per-instrument `delta`/`gamma`/
+  `vega`/`theta` closes.
 - **Paradex options data** — Paradex options are everlasting/perpetual style
   with no expiry date and are excluded from this catalog. Paradex options
   *block-trade* flow is visible in the Paradigm trade tape under

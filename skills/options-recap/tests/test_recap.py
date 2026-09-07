@@ -1557,11 +1557,32 @@ def test_freshness_probe_contract_matches_its_reader():
     check("recap probe takes min over per-metric maxima", "min(mx)" in rec, rec[:160])
     check("grouped by metric ALONE", "GROUP BY metric)" in rec, rec[:200])
     check("not grouped by exchange", "exchange" not in rec, rec[:200])
-    # The vol_surface probe must measure the rows the recap consumes. Deleting
-    # this predicate survived at full green: BTC's surface could freeze while
-    # ETH rows keep landing in the shared file and the probe reads fresh.
+    # The vol_surface probe must measure the rows the recap consumes. When the
+    # surface came from a shared multi-asset file this needed its own asset
+    # predicate — without one, BTC's surface could freeze while ETH rows kept
+    # landing and the probe read fresh. The probe now reads the SAME staging
+    # table the surface CSVs are copied from, which is a stronger guarantee
+    # than a repeated predicate: the two cannot drift apart. So assert that
+    # relationship, and assert the loader that fills the table is asset-scoped.
     vs = next(b for b, f in copies if f == "freshness_vs.csv")
-    check("surface probe is asset-scoped", "symbol LIKE" in vs, vs[:200])
+    check("surface probe reads the surface staging table", "FROM osum" in vs, vs[:200])
+    surf_copies = _re.findall(r"COPY \((.*?)\) TO '\$\{WORK\}/surface_[a-z]+\.csv'", sh)
+    check("surface CSVs come from that same table", surf_copies and
+          all("FROM osum" in b for b in surf_copies), surf_copies)
+    loads = [ln for ln in sh.splitlines() if "INSERT INTO osum" in ln]
+    check("surface loader is asset-scoped", loads and
+          all("symbol LIKE '${ASSET}-%'" in ln and "${NRM}/" in ln for ln in loads),
+          loads[:1])
+    check("surface partition root is asset-scoped",
+          "\nNRM=" in sh and "currency=${CCY}" in sh.split("\nNRM=")[1].split("\n")[0],
+          sh.split("\nNRM=")[1].split("\n")[0] if "\nNRM=" in sh else "NRM unset")
+    # Same contract for the aggregates: one staging table, asset-filtered at
+    # ingest, and every Snapshot/venue-block COPY reading it rather than
+    # re-scanning the partitions (which would be ~300 objects per statement).
+    agg_loads = [ln for ln in sh.splitlines() if "INSERT INTO agg" in ln]
+    check("aggregate loader is asset-scoped", agg_loads and
+          all("WHERE asset='${ASSET}'" in ln for ln in agg_loads), agg_loads[:1])
+    check("recap probe reads the aggregate staging table", "FROM agg" in rec, rec[:200])
 
 
 # ── Venue-block dedupe: fail-closed guarantees ──────────────────────────────
