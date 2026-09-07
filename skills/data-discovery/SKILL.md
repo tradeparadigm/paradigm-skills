@@ -20,7 +20,7 @@ compatibility: Read-only data catalog. No authentication required to view the
   PROVIDER CREDENTIAL_CHAIN. See references/s3-access.md for the query preamble.
 metadata:
   author: tradeparadigm
-  version: "1.6"
+  version: "1.7"
 ---
 
 ## Hard Rules
@@ -60,8 +60,10 @@ Two jobs:
 
 In scope: anything in the market-data buckets (`s3://dt-paradigm-data`,
 `s3://dt-exchange-venue-data`, and `s3://dt-paradex-data`) —
-Paradigm block-trade tapes, the on-chain Paradex perp trade tape, and the
-near-real-time **hot surface** (`s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet`).
+Paradigm block-trade tapes, the on-chain Paradex perp trade tape, the
+near-real-time **hot surface** (`s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet`),
+and the partitioned venue stores under that bucket's root (5-min market
+aggregates, normalized/raw per-venue feeds, instrument specs).
 
 Out of scope: anything **live** that isn't in the hot surface — live Paradex
 markets, positions, funding, vaults, raw orderbook, order placement,
@@ -71,11 +73,15 @@ Rule of thumb:
 
 - If the user's question is anchored to a past date or date range, or
   asks about a tape / snapshot / historical aggregate → historical
-  datasets (1–2).
+  datasets (1–2), or **Dataset 4** for per-venue detail within the last
+  ~2 months.
 - If the user asks "what's happening right now" / "current ATM IV" /
   "spot move in the last minute" / "DVOL right now" / "any blocks just
   printed" → reach for **Dataset 3 (hot surface)** first. One S3 read
   replaces several `web_fetch` round-trips.
+- If the answer will be re-run on a schedule or shown to users, prefer
+  **Dataset 4** over the Dataset 3 rollups — same data, one layer earlier,
+  and a stalled producer is visible instead of silent.
 - If the user wants live Paradex account state or order placement →
   stand down (route to live-trading skills).
 
@@ -164,6 +170,19 @@ Pull from `references/datasets.md`. Grouped into:
      Apply the window in-query (`WHERE bucket_at >= now - window`). No
      `surface` rows — the vol surface is in `v_vol_surface` on
      `dt-paradigm-data`. See Dataset 3b for the schema and read pattern.
+   - Both are ROLLUPS clobbered in place. Cheap and fine for a one-off; for
+     anything scheduled or user-facing, offer Dataset 4 instead — a stalled
+     producer leaves a rollup looking healthy at a live key (this went
+     unnoticed for ~3.5 weeks in 2026-07), while a partitioned store just
+     stops gaining objects.
+4. **Partitioned venue stores** (`s3://dt-exchange-venue-data/`, bucket root)
+   — what the `hot/` rollups are built from, and deeper: `market_aggregates_5m/`
+     (one object per 5-min bucket, ~2 months), `normalized/` + `raw/`
+     (per-venue trades, option summaries incl. the per-strike vol surface, DVOL
+     ticks), `meta/instruments/` (contract sizes and price units — the
+     authoritative answer to "what unit is this in"). Note the aggregates here
+     are **venue-native**: `volume_sum` and `notional` are unscaled, so apply
+     `contract_size` from `meta/instruments/`. See Dataset 4.
 
 For each, report: S3 path (flat file for the Paradigm and Paradex tapes),
 last verified coverage, schema,
@@ -267,7 +286,8 @@ questions, give the path + query + a one-line interpretation.
 - **Buckets** (all region `ap-northeast-1`, same IRSA creds):
   `s3://dt-paradigm-data` (Paradigm tapes + `v_vol_surface`, keeps the
   `paradigm_data/` prefix), `s3://dt-exchange-venue-data` (hot surface +
-  recap aggregates, at bucket root), and `s3://dt-paradex-data` (the
+  recap aggregates, plus the partitioned venue stores they are built from —
+  all at bucket root), and `s3://dt-paradex-data` (the
   Paradex DEX trade tape, under `paradex_data/`).
 - **Auth:** IRSA, resolved inside DuckDB by the `aws` extension
   (`PROVIDER CREDENTIAL_CHAIN`). No shell bootstrap, no STS call, no keys to

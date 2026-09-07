@@ -14,6 +14,7 @@ Run: python3 tests/test_run_recap.py
 """
 
 import os
+import re as _re
 import subprocess
 import sys
 import time
@@ -52,8 +53,10 @@ def plan(*args):
 
 def sources(now_s, *args):
     """Run with the print-sources hook and a pinned clock; return
-    "ASSET WIN START_MS VS_COLD|-". Exercises the real surface-open source
-    resolution (window-start date math → cold partition path) with no creds."""
+    "ASSET WIN START_MS <agg days,> <surface-open hour>". Exercises the real
+    partition resolution (window-start date math → the UTC day globs for the
+    5-min aggregates and the hour holding the window-open surface) with no
+    creds."""
     env = dict(os.environ, RECAP_PRINT_SOURCES="1", RECAP_NOW_S=str(now_s))
     r = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True,
                        env=env, timeout=20)
@@ -129,47 +132,152 @@ def test_windows_beyond_24h_cap():
     check("31d caps to 24h (not 324h)", plan("btc", "31d") == ("BTC 24h 86400 1", 0))
 
 
-# ── Surface-open source resolution (RECAP_PRINT_SOURCES) ────────────────────
-# ΔATM/ΔRR/ΔFly need a window-open surface. Windows ≤1h read it from _hot only
-# (VS_COLD "-"); >1h windows also target the cold hour-partition containing
-# window-start. The bash date math must be UTC and zero-padded on both GNU and
-# BSD date — a wrong partition path silently degrades every Δ column to n/a,
-# which is exactly the bug that shipped when the cold store was empty.
+# ── Partition resolution (RECAP_PRINT_SOURCES) ──────────────────────────────
+# Both stores are read as globs built from window-start date math, so the bash
+# must be UTC and zero-padded on GNU and BSD date alike:
+#   • the 5-min market aggregates, one glob per UTC DAY the window touches;
+#   • the vol surface, whose window-open snapshot is in the HOUR partition
+#     holding window-start — a wrong path there silently degrades every Δ
+#     column to n/a, which is exactly the bug that shipped when the cold store
+#     was empty.
+# One day glob, not one per hour: a day-level pattern always matches at least
+# one object, while an hour-level one is empty for the first ~5 minutes of every
+# hour and DuckDB errors on a glob that matches nothing.
 
-COLD_FMT = ("s3://dt-paradigm-data/paradigm_data/v_vol_surface/"
-            "base={a}/year={t.tm_year:04d}/month={t.tm_mon:02d}/day={t.tm_mday:02d}/"
-            "hour={t.tm_hour:02d}/v_vol_surface.parquet")
 
-
-def expect(asset, win, now_s, secs, cold):
+def expect(asset, win, now_s, secs):
     start = now_s - secs
-    c = COLD_FMT.format(a=asset, t=time.gmtime(start)) if cold else "-"
-    return f"{asset} {win} {start * 1000} {c}"
+    days = sorted({time.strftime("%Y%m%d", time.gmtime(t)) for t in (start, now_s)})
+    hour = time.strftime("%Y/%m/%d/%H", time.gmtime(start))
+    return f"{asset} {win} {start * 1000} {','.join(days)} {hour}"
 
 
-def test_sources_hot_only_up_to_1h():
+def test_sources_single_day_window():
     now = 1_784_536_200  # 2026-07-20 08:30:00 UTC
-    check("30m stays on _hot", sources(now, "btc", "30m") == expect("BTC", "30m", now, 1800, False))
-    check("1h stays on _hot", sources(now, "btc", "1h") == expect("BTC", "1h", now, 3600, False))
-
-
-def test_sources_cold_partition_over_1h():
-    now = 1_784_536_200  # 2026-07-20 08:30:00 UTC
+    out = sources(now, "btc", "30m")
+    check("30m stays within one day glob", out == expect("BTC", "30m", now, 1800), out)
+    check("30m surface-open hour is 08", out.endswith("2026/07/20/08"), out)
     out = sources(now, "btc", "8h")
-    check("8h resolves cold partition", out == expect("BTC", "8h", now, 28800, True), out)
-    check("8h cold path zero-padded/UTC",
-          "base=BTC/year=2026/month=07/day=20/hour=00/" in out, out)
-    out = sources(now, "eth", "90m")
-    check("90m (61–120min) also targets cold", out == expect("ETH", "90m", now, 5400, True), out)
+    check("8h stays within one day glob", out == expect("BTC", "8h", now, 28800), out)
+    check("8h surface-open hour zero-padded/UTC",
+          out.endswith("20260720 2026/07/20/00"), out)
+    check("90m resolves for ETH too",
+          sources(now, "eth", "90m") == expect("ETH", "90m", now, 5400))
 
 
 def test_sources_day_boundary():
-    # Window-start crosses midnight UTC: day/hour must roll back correctly.
+    # Window-start crosses midnight UTC: the day list must carry BOTH days and
+    # the surface-open hour must roll back into the previous one.
     now = 1_784_514_600  # 2026-07-20 02:30:00 UTC
     out = sources(now, "btc", "8h")
-    check("8h across midnight → day=19 hour=18",
-          "year=2026/month=07/day=19/hour=18/" in out, out)
-    check("8h across midnight full line", out == expect("BTC", "8h", now, 28800, True), out)
+    check("8h across midnight globs both days",
+          "20260719,20260720" in out, out)
+    check("8h across midnight → open hour 18 on day 19",
+          out.endswith("2026/07/19/18"), out)
+    check("8h across midnight full line", out == expect("BTC", "8h", now, 28800), out)
+
+
+def test_sources_24h_window_spans_two_days():
+    # The cap makes 24h the widest read, so it is the worst case for the day
+    # globs: exactly two, never more.
+    now = 1_784_536_200  # 2026-07-20 08:30:00 UTC
+    out = sources(now, "btc", "24h")
+    check("24h globs exactly two days", out.split()[3] == "20260719,20260720", out)
+    check("24h full line", out == expect("BTC", "24h", now, 86400), out)
+
+
+# ── The generated DuckDB session (RECAP_PRINT_SQL) ──────────────────────────
+# Asserting on the real emitted plan rather than on the script's source text:
+# these are the properties that make reading partitioned stores safe, and every
+# one of them is a silent failure if it regresses.
+
+def plan_sql(*args, now_s=1_784_536_200):
+    env = dict(os.environ, RECAP_PRINT_SQL="1", RECAP_NOW_S=str(now_s))
+    r = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True,
+                       env=env, timeout=20)
+    return r.stdout
+
+
+def test_plan_reads_partitioned_stores_not_hot_rollups():
+    sql = plan_sql("btc", "8h")
+    check("no recap-aggregates rollup",
+          "hot__recap_aggregates" not in sql, sql[:200])
+    check("no _hot vol surface", "_hot.parquet" not in sql, sql[:200])
+    check("reads the 5-min aggregate partitions",
+          "market_aggregates_5m/market_aggregates_5m__" in sql)
+    check("reads the normalized option summaries",
+          "data_type=option_summary" in sql)
+    check("reads the instrument specs", "meta/instruments/exchange=" in sql)
+    # The Paradigm tape is the one rollup still read — its upstream lives in a
+    # bucket this role cannot reach. Pin that to exactly one object so a future
+    # rollup read cannot slip back in unnoticed.
+    hot = [ln for ln in sql.splitlines() if "dt-exchange-venue-data/hot/" in ln]
+    check("exactly one hot/ read remains", len(hot) == 1, hot)
+    check("and it is the Paradigm block tape",
+          hot and "hot__paradigm_trade_tape_30d.parquet" in hot[0], hot)
+    # No credential material in the printed plan, ever.
+    check("credentials elided from the plan",
+          "s3_secret_access_key" not in sql and "s3_session_token" not in sql)
+
+
+def test_plan_loads_each_glob_in_its_own_statement():
+    # A glob matching zero objects is a DuckDB error, and the first minutes of a
+    # UTC day/hour legitimately have none. One statement per glob confines that
+    # to the missing slice; a single read over all globs would lose the run.
+    sql = plan_sql("btc", "24h")           # widest window → two day globs
+    agg = [ln for ln in sql.splitlines() if ln.startswith("INSERT INTO agg")]
+    check("one aggregate INSERT per UTC day", len(agg) == 2, len(agg))
+    check("each aggregate glob is day-scoped, not hour-scoped",
+          all(_re.search(r"market_aggregates_5m__\d{8}\*\.parquet", ln) for ln in agg), agg[:1])
+    # Schema drift is live upstream: guard BOTH a dropped and an added column.
+    check("union_by_name across objects in a glob",
+          all("union_by_name=true" in ln for ln in agg), agg[:1])
+    check("zero-row template supplies dropped columns",
+          all("UNION ALL BY NAME SELECT * FROM agg WHERE false" in ln for ln in agg), agg[:1])
+    check("explicit projection discards added columns",
+          all("SELECT row_type, exchange, asset," in ln for ln in agg), agg[:1])
+    osum = [ln for ln in sql.splitlines() if ln.startswith("INSERT INTO osum")]
+    check("one surface INSERT per hour", len(osum) >= 2, len(osum))
+    inst = [ln for ln in sql.splitlines() if ln.startswith("INSERT INTO inst")]
+    check("one spec INSERT per venue", len(inst) == 5, len(inst))
+    check("spec globs name the venue in the key, not a wildcard directory",
+          all("exchange=*" not in ln for ln in inst), inst[:1])
+
+
+def test_plan_stages_once_then_copies_from_tables():
+    # Every COPY re-reading the parquet was free against one rollup object and
+    # is ~300 objects per statement against the partitions.
+    sql = plan_sql("btc", "8h")
+    copies = [ln for ln in sql.splitlines() if ln.startswith("COPY (")]
+    # dvol_spot, volume, venue_blocks, surface_now, surface_open, blocks,
+    # freshness_rec, freshness_vs — one CSV each, recap.py reads all eight.
+    check("every CSV recap.py reads is written", len(copies) == 8, len(copies))
+    for ln in copies:
+        target = ln.rsplit("/", 1)[-1]
+        if "blocks.csv" in target and "venue" not in target:
+            continue                      # the Paradigm tape read, by design
+        check(f"{target} copies from a staging table",
+              "read_parquet" not in ln, ln[:140])
+
+
+def test_plan_applies_contract_specs_with_the_right_failure_mode():
+    sql = plan_sql("btc", "8h")
+    vol = next(ln for ln in sql.splitlines() if "/volume.csv'" in ln)
+    blk = next(ln for ln in sql.splitlines() if "/venue_blocks.csv'" in ln)
+    # volume.csv: every field recap.py reads is safe at contract_size 1.0
+    # (turnover/trade_count need no scaling; volume_sum is summed for Deribit
+    # only), and 1.0 is the true spec for the venues whose metadata publishes
+    # irregularly — so a missing spec must NOT drop the venue's activity.
+    check("volume tolerates a missing spec", "LEFT JOIN spec" in vol, vol[:160])
+    check("volume defaults contract_size to 1.0",
+          "coalesce(s.contract_size, 1.0)" in vol, vol[:160])
+    # venue_blocks.csv: the multiplier IS load-bearing (blocks are priced
+    # volume_coin x spot and ranked against the Paradigm tape), so an unscaled
+    # OKX block reads 100x its size. Drop the venue instead of assuming 1.0.
+    check("venue blocks require a spec",
+          "JOIN spec" in blk and "LEFT JOIN spec" not in blk, blk[:160])
+    check("venue blocks scale by contract_size",
+          "a.volume_sum * s.contract_size" in blk, blk[:160])
 
 
 def test_bad_window_exits_2():

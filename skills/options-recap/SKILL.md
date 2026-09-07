@@ -8,14 +8,17 @@ description: >
   options flow summary, "what happened in BTC options", or "last Xh of flow".
   The output format is fixed — always the same four sections in the same order.
 compatibility: Deribit public API (curl) for the 7d realized-vol closes, and as the
-  live DVOL/spot fallback when the hot source is stale or absent; Paradigm data
-  (DuckDB+S3 via IRSA) for the rest, incl. Biggest Print + Block Flow off the hot
-  paradigm_trade tape, which is now the SOLE block source. Heartbeat
+  live DVOL/spot fallback when the aggregate source is stale or absent; Paradigm data
+  (DuckDB+S3 via IRSA) for the rest, read from the DURABLE partitioned stores
+  (5-min market aggregates, normalized option summaries, instrument specs) rather
+  than the clobbered-in-place `hot/` rollups. Biggest Print + Block Flow come off the
+  paradigm_trade tape, the SOLE block source and the one rollup still read (its
+  upstream is in a bucket this role cannot reach). Heartbeat
   sources are freshness-checked before rendering; one past its limit is
   banner-flagged. S3 reads need the IRSA bootstrap (see paradigm-data-discovery).
 metadata:
   author: tradeparadigm
-  version: "1.15"
+  version: "1.16"
 ---
 
 # Options Recap
@@ -31,17 +34,18 @@ metadata:
 | `options` | the literal word `options` | ignored — a no-op keyword (this skill is always options); `run_recap.sh` strips it |
 
 Any `Nm`/`Nh`/`Nd` window up to 24h works and all render identically: DVOL/spot,
-the `$` Volume line, and the multi-venue activity/P-C all come from one rolling hot
-aggregates file sliced to the window at query time; the surface (and its Δ columns)
-from `v_vol_surface`; and **Biggest Print + Block Flow from the multi-venue Paradigm
-block tape** (the hot `paradigm_trade` rows — the SOLE source; the legacy
+the `$` Volume line, and the multi-venue activity/P-C all come from the 5-min
+market-aggregate partitions sliced to the window at query time; the surface (and
+its Δ columns) from the normalized per-venue option summaries at the same 5-min
+grain; and **Biggest Print + Block Flow from the multi-venue Paradigm
+block tape** (the `paradigm_trade` rows — the SOLE source; the legacy
 `paradigm_trade_tape_slim` csv.gz fallback was removed once its producer was
 decommissioned) — every venue Paradigm brokers (Deribit/Paradex/Bullish/…),
 notional already in USD per leg. There is no fallback: if that read returns
 nothing, Block Flow is MISSING and the output says so — do not report it as a
 quiet market.
 
-**Plus venue-tape blocks** off the hot recap file's option `block` rows. These
+**Plus venue-tape blocks** off the aggregate partitions' option `block` rows. These
 rank in the same pool as Paradigm blocks and render as `<Venue> Block` rows with
 a `(venue tape)` detail note. They are deduped against the Paradigm tape by the
 venue's OWN block id (`VENUE_BLOCK_TRADE_ID`), so a genuinely non-Paradigm
@@ -60,19 +64,18 @@ The Paradigm tape has no IV, so the top blocks' IV is looked up from the vol
 surface (Deribit legs only; venue-tape blocks carry their venue's per-trade IV
 where published; other venues show IV `n/a`). A malformed window exits with a clear error.
 
-**Windows beyond 24h:** the Snapshot flow sources (the rolling hot aggregates file →
-Volume/Activity/P-C/DVOL/spot) retain only ~24h, so `run_recap.sh` caps any longer
+**Windows beyond 24h:** `/recap` is a ≤24h command, so `run_recap.sh` caps any longer
 window (e.g. `2d`) at 24h and prepends a one-line `⚠ window capped at 24h — …` banner
 as the first line of its output — **relay it verbatim** (don't drop or reword it).
-Block Flow itself now comes from the 30-day block tape and isn't the constraint;
-the cap lifts once the Snapshot sources are wired to the cold store.
+This is now a product limit, not a data one: the aggregate partitions retain
+about two months, so lifting the cap is a deliberate follow-up rather than
+something the reader should expect to work today.
 
-**Vol-surface Δ coverage:** the window-open surface comes from `_hot.parquet`
-(~2h rolling buffer) for short windows, else from the cold `v_vol_surface`
-hour-partition at window-start (published ~15min after each hour closes; the
-`_hot` fallback covers windows whose start hour isn't published yet). Δ columns
-read `n/a` only when window-start is outside the available history — deeper than
-the cold backfill, or in a partition gap.
+**Vol-surface Δ coverage:** window-open and `now` come from the same place —
+the 5-min option-summary partition for the hour holding each. Both publish on
+the same ~5-minute cadence, so there is no hot/cold split and no wait for an
+hourly partition to close. Δ columns read `n/a` only when window-start's
+partition is missing outright (a gap, or older than the retained history).
 
 `/recap` alone = BTC options, last 24h. Still pass just `<ASSET> <WINDOW>` to
 `run_recap.sh` — it drops a stray `options`/`option` token, so `/recap btc
@@ -87,9 +90,9 @@ command and relay its stdout **verbatim** as your entire reply:
 bash scripts/run_recap.sh BTC 8h      # <ASSET> <WINDOW>; any Nm/Nh/Nd works; 1d→24h
 ```
 
-That script does everything — STS bootstrap, the single DuckDB session (hot
-surface + the Paradigm block tape), the Deribit 7d-closes fetch (the realized-vol
-input), the vol math, and final formatting — and prints the finished four-section
+That script does everything — STS bootstrap, the single DuckDB session (aggregate
+and surface partitions + the Paradigm block tape), the Deribit 7d-closes fetch
+(the realized-vol input), the vol math, and final formatting — and prints the finished four-section
 recap. **Do not** add commentary, reformat it, re-fetch
 anything, or run extra steps. Its output already is the recap. Your reply must
 BEGIN with the script's first output line (the `⚠ …` banner when present, else
@@ -127,17 +130,21 @@ into a stronger claim:
   Deribit`. If it fails, the stale figures are retained and the banner says
   `could NOT be re-sourced`. **Never tell a user the figures are live unless
   the banner says re-sourced.** `$ Volume`, Activity, P/C and venue Block Flow
-  come from the same file and are windowed, so they cover only up to the freeze
+  come from the same store and are windowed, so they cover only up to the freeze
   and understate the window — the banner says this too.
 - **`vol_surface` stale** — banner only; a stale surface does not itself
   trigger a refetch. ATM/RR/Fly, skew, term and the Δ columns come from that
   data unless the Deribit ticker surface happens to be fetched for another
-  reason (a stale `recap_aggregates`, or no hot surface at all).
+  reason (a stale `recap_aggregates`, or no surface at all).
 
 This exists because the recap aggregates froze on 2026-07-10 and rendered July
-10 DVOL/spot as current for ~3.5 weeks. The file's mtime kept changing while its
-contents did not, so every "is it running?" check passed. Only comparing a data
-timestamp against the clock catches that.
+10 DVOL/spot as current for ~3.5 weeks. A single rolling object was being
+clobbered in place, so its mtime kept changing while its contents did not and
+every "is it running?" check passed. Both sources are now read from their
+partitioned stores, where a stalled producer stops creating objects and the gap
+is visible in the key space — but the gate stays, because comparing a data
+timestamp against the clock is the only check that catches this class of failure
+however the data is laid out.
 
 Only heartbeat sources are checked. Event-driven ones (the block tape) are not
 and must not be: their newest row depends on whether anyone traded, so a quiet
