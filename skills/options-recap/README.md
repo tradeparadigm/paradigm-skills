@@ -24,8 +24,9 @@ The live path is **one command** the agent runs, then it relays stdout verbatim:
 bash scripts/run_recap.sh <ASSET> <WINDOW>
         │
         ├── STS bootstrap (IRSA → temporary S3 creds)
-        ├── writes $WORK/recap.sql (one DuckDB session, COPY statements → CSVs:
-        │     dvol_spot, volume, surface_now/open, AND blocks from the tape)
+        ├── writes $WORK/recap.sql (one DuckDB session: ONE scan of the 5-min
+        │     market_aggregates layer into a temp table, then COPY statements →
+        │     CSVs: dvol_spot, volume, venue_blocks, surface_now/open, blocks)
         └── uv run scripts/recap.py --duckdb-sql $WORK/recap.sql --csv-dir $WORK --render
                     │
                     ├── runs DuckDB in a thread  ─┐  (concurrent — both are
@@ -52,9 +53,10 @@ bash scripts/run_recap.sh <ASSET> <WINDOW>
 
 `run_recap.sh` parses the window generically into seconds (`Nm`/`Nh`/`Nd`), so
 **any** window renders — there is a single data path. DVOL/spot OHLC and the
-volume/`trade_count` rows come from ONE rolling file, `hot__recap_aggregates_5m_24h.parquet`
-(5-min buckets over the trailing 24h), windowed at query time by `WHERE bucket_at
->= now - window` + aggregation; the vol surface + ΔATM/ΔRR/ΔFly come from
+volume/`trade_count` rows come from the pipeline's 5-minute aggregation layer,
+`s3://dt-exchange-venue-data/market_aggregates_5m/` (5-min buckets, `bucket_at`
+in Unix ms), windowed at query time by `WHERE bucket_at >= now - window` +
+aggregation; the vol surface + ΔATM/ΔRR/ΔFly come from
 `v_vol_surface`; and Biggest Print / Block Flow come from the multi-venue Paradigm
 block tape (the hot `paradigm_trade` rows), scanned in the same DuckDB session. The
 Deribit public API adds only the 7d realized-vol closes (and a live DVOL/spot
@@ -62,7 +64,7 @@ fallback when the S3 read fails **or its data is stale** — see Data freshness)
 
 Notes / non-obvious bits:
 - **`PRESET` is just a label now.** The canonical windows (`5m 10m 20m 1h 4h 8h
-  24h`) set `PRESET=1`, but since every window reads the same rolling file this no
+  24h`) set `PRESET=1`, but since every window reads the same layer this no
   longer gates the data path — it's retained for the plan/test hook and as an
   observability signal (canonical vs ad-hoc window).
 - **Dollar Volume and Activity/P-C span all venues.** See "Data sources" below —
@@ -74,14 +76,14 @@ Notes / non-obvious bits:
 - **The old bug:** a preset `case` mapped unknown windows to a silent 8h default,
   so surface deltas were computed against an 8h-old open. Fixed by parsing the
   window into seconds instead of enumerating presets.
-- **~24h Snapshot horizon.** The *Snapshot* flow sources reach back only ~24h:
-  Volume / Activity / P-C / DVOL / spot come from the rolling recap-aggregates file
-  (trailing 24h). Block Flow + Biggest Print now come from the 30-day Paradigm
-  block tape, and the vol surface (`v_vol_surface`) retains far longer — so those are
-  no longer the constraint. For windows >24h, `build()` sets a `hot_horizon` field and
-  `render_md` prepends a one-line banner scoped to the hot Snapshot sections (Block
-  Flow + surface span the full window). `run_recap.sh` still caps at 24h until the
-  Snapshot sources are wired to the cold store — the follow-up that retires the banner.
+- **~24h Snapshot horizon — now a policy, not a data limit.** The cap dates from
+  the retired hot rollup, which held only ~24h. `market_aggregates_5m/` retains
+  history, so the data constraint is gone, but two things still assume 24h and
+  must move together: `run_recap.sh`'s cap (+ disclosure banner) and `build()`'s
+  >24h handling (`hot_horizon` banner, Deribit-preferred DVOL/spot). Lift them
+  once a >24h window has been verified live against the layer (retention and
+  read cost over the wider glob). Block Flow (30-day tape) and the surface
+  (`v_vol_surface`) already span longer windows.
 - **Bad windows** (`3x`, `0h`, …) exit `2` with a clear message before any network.
 - The raw per-venue tapes under `external/tardis/` are **not** a source here —
   they don't replicate into the pod's bucket and are stale; Deribit's public API
@@ -95,32 +97,97 @@ script (agent types one short line) and pre-rendering the markdown in `recap.py`
 
 ## Data sources
 
-Three S3 sources in one DuckDB session: the recap aggregates file (DVOL/spot,
-volume, activity/P-C), the `v_vol_surface` store (surface + Δ), and the Paradigm
-block tape (Biggest Print + Block Flow). The Deribit public API adds the 7d
-realized-vol closes, and serves as the live DVOL/spot fallback when the recap
-aggregates are unreadable or stale (see §Data freshness — do not treat
-`_fetch_market_fallback` as dead code). `recap.py` reads the `dvol_spot` + `volume` rows from the
-recap file. The `row_type` map in `hot__recap_aggregates_5m_24h.parquet` (a single
-rolling file of 5-min buckets over the trailing 24h; windowed at query time via
-`WHERE bucket_at >= now - window` + aggregation):
+Three S3 sources in one DuckDB session: the 5-min market aggregates layer
+(DVOL/spot, volume, activity/P-C, venue blocks), the `v_vol_surface` store
+(surface + Δ), and the Paradigm block tape (Biggest Print + Block Flow). The
+Deribit public API adds the 7d realized-vol closes, and serves as the live
+DVOL/spot fallback when the aggregates are unreadable or stale (see §Data
+freshness — do not treat `_fetch_market_fallback` as dead code).
+
+**Market aggregates (`s3://dt-exchange-venue-data/market_aggregates_5m/`).**
+This is the pipeline's own aggregation layer — the data the hot
+`hot__recap_aggregates_5m_24h.parquet` rollup was generated FROM. That lineage
+was established by row-level comparison (2026-09-07): for a given 5-min bucket
+the hot file and the layer hold the same rows with identical `volume_sum` and
+`trade_count`; the only difference is that the hot copy carried a
+USD-converted `notional_usd` (coin-denominated `notional` × `underlying_price`
+on `deribit` and `okex-options`; `bybit-options` and `deribit-usdc` already in
+USD) where the layer carries the raw `notional`. The recap renders neither
+column — $ Volume is `turnover_usd`, block notional is `volume_coin × spot` —
+so `run_recap.sh` does not reproduce the conversion; it emits the raw premium
+as `notional_native` / `premium_native` (unit-explicit, never a dollar sum).
+
+Reading the layer instead of the rollup removes a derived artifact from the
+path — the one whose mtime kept moving while its contents froze for 3.5 weeks
+(§Data freshness) — and drops the 24h retention limit at the source. What it
+does NOT change: the `row_type` schema below, the window-at-query-time pattern,
+or the freshness gate (the layer is still a continuously-written feed).
+
+*Layout.* The layer is a prefix of parquet files; `run_recap.sh` reads it
+through **one glob**, defaulting to the recursive
+`market_aggregates_5m/**/*.parquet` with `hive_partitioning=true`
+(`key=value` directories, if any, surface as columns) and
+`union_by_name=true` (files written before a column existed — e.g.
+`turnover_usd` — read NULL for it instead of failing the bind). The recursive
+default is layout-agnostic but pays to list the prefix and open every file's
+footer for `bucket_at` pruning, so once the partition layout is confirmed,
+narrow it — the two seams are `RECAP_MA_ROOT` (the prefix) and
+`RECAP_MA_GLOB` (the full glob, taken verbatim). Probe the layout with:
+
+```sql
+INSTALL httpfs; LOAD httpfs; INSTALL aws; LOAD aws;
+CREATE OR REPLACE SECRET s3_irsa (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1');
+SELECT file FROM glob('s3://dt-exchange-venue-data/market_aggregates_5m/**')
+ORDER BY file DESC LIMIT 20;                       -- newest keys → the layout
+DESCRIBE SELECT * FROM read_parquet('s3://dt-exchange-venue-data/market_aggregates_5m/**/*.parquet',
+                                    hive_partitioning=true, union_by_name=true);  -- columns
+```
+
+A glob that matches nothing fails at bind, which fails every dependent COPY
+toward the Deribit fallback plus a `market_aggregates: freshness could not be
+verified` banner — loud, never a silent all-clear. Note DuckDB rejects a glob
+*list* if any single pattern matches no files, which is why the script does
+not build per-day globs: right after 00:00 UTC the day's first bucket is not
+yet published and such a list would fail for ~15 minutes every day.
+
+*One scan.* The SQL session materialises the asset's rows from the floored
+window-open onward into a temp table (`ma`) and the `dvol_spot` / `volume` /
+`venue_blocks` COPYs read that table, so the prefix is listed and pruned once
+per recap rather than once per statement. The freshness probe reads the glob
+directly (it must not be window-filtered) but is bounded to a 7-day lookback
+for cost; see §Data freshness.
+
+The `row_type` map (5-min buckets; windowed at query time via `WHERE bucket_at
+>= now - window` + aggregation):
 
 | Section | `row_type` | Key columns |
 |---|---|---|
 | Snapshot DVOL/spot | `dvol_spot` | `metric`, `open`, `close`, `high`, `low` (OHLC: `arg_min(open,bucket_at)` / `arg_max(close,bucket_at)` / `max(high)` / `min(low)`) |
-| Snapshot volume/P-C/$Volume | `volume` | `exchange`, `optionType`, `volume_sum`, `turnover_usd`, `notional_usd`, `trade_count` |
-| Block Flow (non-Paradigm venues) | `block` | `exchange`, `block_id`, `volume_sum`, `notional_usd` (**premium**, not underlying — see below), `leg_count`, `iv_sum`/`iv_count` |
+| Snapshot volume/P-C/$Volume | `volume` | `exchange`, `optionType`, `volume_sum`, `turnover_usd`, `notional` (native quote unit — not read), `trade_count` |
+| Block Flow (non-Paradigm venues) | `block` | `exchange`, `block_id`, `volume_sum`, `notional` (**premium** in the native unit, not underlying — see below), `leg_count`, `iv_sum`/`iv_count` |
 
 There is **no `surface` `row_type`** — the vol surface lives in `v_vol_surface`.
 Biggest Print / Block Flow are primarily the block tape (below), plus the
-`block` rows for venues the tape doesn't broker. `notional` is `notional_usd`.
+`block` rows for venues the tape doesn't broker.
 
 **Block tape (Biggest Print + Block Flow).**
 `s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet`
 (`row_type='paradigm_trade'`) — the Snowflake-free tape, built by the
-`exchange-venue-data` paradigm-trade CronJob from the Airbyte→S3 UM landing. Leg
-grain, **trailing 30 days**, read fresh per recap and windowed by `traded_at` in
-`run_recap.sh`.
+`exchange-venue-data` paradigm-trade CronJob from the Airbyte→S3 UM landing on
+`s3://dt-paradigm-data`. Leg grain, **trailing 30 days**, read fresh per recap
+and windowed by `traded_at` in `run_recap.sh`.
+
+This is the **one read still on the `hot/` prefix**, deliberately. Its lineage
+is traced only to the bucket: the Airbyte landing's key layout and column names
+are not catalogued anywhere in this repo, and the legacy
+`paradigm_trade_tape_slim.csv.gz` that once stood in for it froze on 2026-08-10.
+Repointing blind would replace a working read with a guessed one. The seam is
+`RECAP_PARADIGM_TAPE` — point it at the landing (or a view over it) once its
+shape is known; the `blocks.csv` COPY needs the same columns the hot tape
+exposes (`traded_at`/`traded_at_iso`, `product`, `description`, `quantity`,
+`trade_price`, `mark_price`, `taker_side`, `asset`, `instrument_name`,
+`instrument_kind`, `notional_volume_usd`, `rfq_id`, `trade_id`,
+`block_trade_id`, `venue_block_trade_id`, `row_type`).
 
 It REPLACED `s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz`
 (a flat csv.gz spanning all dates). That read was removed in this PR: data#712
@@ -148,14 +215,14 @@ skill for the tape schema and the `paradigm-block-analyst` skill for the
 `DESCRIPTION` grammar.
 
 **Venue-tape blocks (`venue_blocks.csv`) — full-market block coverage.** The
-recap file's `block` rows carry every block/OTC print off the exchanges' own
-feeds (Deribit `block_trade_id`, OKX `blockTdId`, Bullish `otcTradeId`);
+aggregates layer's `block` rows carry every block/OTC print off the exchanges'
+own feeds (Deribit `block_trade_id`, OKX `blockTdId`, Bullish `otcTradeId`);
 `run_recap.sh` groups the **option-kind** rows per `(exchange, block_id)` into
 `venue_blocks.csv` (`instrument_kind='option'` in the COPY — a perp/spot OTC
 block must never compete in an options recap) with **unit-explicit columns**:
-`volume_coin` (Σ leg amounts, coin) and `premium_usd` (Σ premium — kept for
-debuggability, **never displayed as notional**: it's ~50–100× below the
-underlying-USD basis the block sections use). `recap.py` then:
+`volume_coin` (Σ leg amounts, coin) and `premium_native` (Σ premium in the
+venue's own quote unit — kept for debuggability, **never displayed as
+notional**: it is a premium, and its unit differs by venue). `recap.py` then:
 
 - **Exact id dedupe where the venue has proved it.** A venue-tape block whose
   `block_id` matches a `VENUE_BLOCK_TRADE_ID` on the Paradigm tape is the same
@@ -198,16 +265,15 @@ venues. The "all venues" label is **gated on per-venue completeness**: if any
 venue that traded carries only null turnover cells (a partial upstream rollout),
 the line falls back to the Deribit-scoped `volume_sum × spot` calc with the
 "Deribit only" label rather than present a partial sum as a market total. Same
-fallback on a recap file that predates `turnover_usd` entirely (the upgraded
-volume.csv COPY fails at bind and the legacy shape stands). Remaining caveat the
-gate can't see: for ~24h after the upstream deploy, a venue's EARLY buckets carry
-null turnover while its later ones don't, so a technically-complete sum still
-under-counts until the retained series turns over — upstream cannot backfill
-those values (they only exist from ingestion onward). **No venue contract
+fallback if NO file in the glob carries `turnover_usd` (the upgraded volume.csv
+COPY fails at bind and the legacy shape stands); files that merely predate the
+column read NULL for it under `union_by_name`, so a window that straddles the
+column's introduction under-counts for those early buckets — upstream cannot
+backfill values that only exist from ingestion onward. **No venue contract
 multipliers are hardcoded anywhere.**
 
 The "now" values (latest DVOL/spot close, current surface) come from the newest
-`bucket_at` in the recap file and the latest `v_vol_surface/_hot` snapshot.
+`bucket_at` in the aggregates layer and the latest `v_vol_surface/_hot` snapshot.
 (`hot__market_signals_1m.parquet` is the live signals heartbeat used by
 `paradigm-block-analyst`; `/recap` no longer reads it.)
 S3 access (IRSA STS bootstrap) is documented in the `paradigm-data-discovery` skill.
@@ -230,11 +296,11 @@ the displayed level also comes from this `now` snapshot. Missing/empty either CS
 and `recap.py` falls back to the hot `surface.csv` for the displayed values. The
 table is capped to the front `MAX_SURFACE_ROWS` expiries.
 
-## Known hot-data quirk (important)
+## Known aggregates-data quirk (important)
 
-`hot__recap_aggregates_5m_24h.parquet` `volume` rows have **inconsistent units**
-and **aggregate rows** that, summed naively, produced an absurd Volume (~$9.8T)
-in early versions:
+The `volume` rows (in the layer, and identically in the hot rollup it fed) have
+**inconsistent units** and **aggregate rows** that, summed naively, produced an
+absurd Volume (~$9.8T) in early versions:
 
 - `volume` carries a per-exchange **aggregate row** (blank `optionType`) whose
   `notional` double-counts, and `volume_sum` units differ by venue
@@ -253,23 +319,31 @@ On a hot miss (DuckDB fails / CSVs absent) it degrades: affected sections read
 
 ## Data freshness
 
-A hot **miss** was always handled. A hot source that is present but **stale** was
-not, and that is a different failure: the recap aggregates froze on 2026-07-10 and
+A source **miss** was always handled. A source that is present but **stale** was
+not, and that is a different failure: the hot recap rollup froze on 2026-07-10 and
 kept rendering July 10 DVOL/spot as current until the 2026-08-04 deploy — about
 3.5 weeks. The object's mtime kept changing while its contents did not, so every
 "is it still running?" check passed. Only comparing a data timestamp against the
-clock catches it.
+clock catches it. Reading `market_aggregates_5m/` directly removes that
+particular derived artifact, but the layer is still a continuously-written feed
+that can stop, so the gate is unchanged in kind.
 
-`run_recap.sh` writes one probe CSV **per source** (`freshness_rec.csv`,
+`run_recap.sh` writes one probe CSV **per source** (`freshness_ma.csv`,
 `freshness_vs.csv`) — the newest timestamp that source carries, deliberately
 **not** window-filtered (a source frozen before window-start returns zero
 windowed rows, which is indistinguishable from a quiet market). One file per
 source, not one `UNION ALL`: a single COPY spanning both means either read
 failing writes zero bytes and silently disables the gate for *both*.
 
-For `recap_aggregates` the probe takes the **min over per-(exchange, metric)
-maxima**, not a flat max. `row_type='dvol_spot'` is two series; a flat max
-reports the freshest, so a dead DVOL scraper hides behind a live spot ticker.
+The `market_aggregates` probe is bounded to a **7-day lookback** — not the
+window — because an unbounded `max(bucket_at)` over the layer would scan every
+file in it on every recap. A freeze inside 7 days reports its exact lag; one
+older than that returns no row, which `recap.py` classifies as `unknown`
+(banner + divert), never as fresh. Both outcomes fail safe.
+
+For `market_aggregates` the probe takes the **min over per-metric maxima**,
+not a flat max. `row_type='dvol_spot'` is two series; a flat max reports the
+freshest, so a dead DVOL scraper hides behind a live spot ticker.
 
 `recap.py` classifies each source into one of three states:
 
@@ -286,7 +360,7 @@ all-clear. Limits, against lags measured on a healthy pipeline (2026-08-09):
 
 | source | healthy lag | limit |
 |---|---|---|
-| `recap_aggregates` | 13m15s — 5-min buckets, open bucket unpublished | 45m |
+| `market_aggregates` | 13m15s — measured on the hot rollup this layer fed; the layer can only be as fresh or fresher | 45m |
 | `vol_surface` | 8m30s | 45m |
 
 The banner leads the output because it is the only warning that says the numbers
@@ -294,7 +368,7 @@ may be *wrong* rather than missing — `No data` is self-evident to a reader,
 stale DVOL is not. **What follows the banner differs by source**, and the
 consequence is spelled out per source rather than left generic:
 
-- **`recap_aggregates`** — DVOL/spot divert to the live Deribit fallback. If
+- **`market_aggregates`** — DVOL/spot divert to the live Deribit fallback. If
   that fetch fails the stale figures are retained rather than blanked (figures
   plus a banner beat no figures) and the banner says `could NOT be re-sourced`
   instead of `re-sourced live from Deribit`, so the two outcomes are
@@ -303,7 +377,7 @@ consequence is spelled out per source rather than left generic:
   truncates them: they cover only up to the freeze while the header claims the
   full window. The Snapshot divert does not help them, so the banner discloses
   the truncation explicitly.
-- **`vol_surface`** — banner only. `_SNAPSHOT_SOURCES` covers `recap_aggregates`
+- **`vol_surface`** — banner only. `_SNAPSHOT_SOURCES` covers `market_aggregates`
   alone, so a stale surface triggers no fetch of its own (the Deribit ticker
   surface can still backfill it when the fallback runs for another reason); ATM/RR/Fly,
   skew, term and the Δ columns all come from the frozen snapshot (with the Δs
@@ -339,15 +413,17 @@ python3 tests/test_vol_math.py    # 166 checks — the math formulas + tape pars
                                     #   (parse_tape_description) and block ranking/
                                     #   rollup (build_tape_blocks: Σ-per-block
                                     #   notional, RFQ clip rollup, IV lookup)
-python3 tests/test_recap.py       # 327 checks — orchestrator: window parsing,
-python3 tests/test_recap.py       # 293 checks — orchestrator: window parsing,
+python3 tests/test_recap.py       # 392 checks — orchestrator: window parsing,
                                     #   hot-CSV ingest, the volume-corruption guard,
                                     #   block tape → Biggest Print/Block Flow (multi-
-                                    #   venue, venue column, freshness stamp),
-                                    #   assembly, vol-surface deltas, rendering
-python3 tests/test_run_recap.py   # 39 checks — run_recap.sh arg normalization
-                                    #   (asset/window resolution, "options" keyword
-                                    #   strip) via the RECAP_PRINT_ARGS hook
+                                    #   venue, venue column, freshness gate),
+                                    #   assembly, vol-surface deltas, rendering, and
+                                    #   the run_recap.sh SQL contract (layer read,
+                                    #   one-scan temp table, probe bounds)
+python3 tests/test_run_recap.py   # 46 checks — run_recap.sh arg normalization,
+                                    #   window parsing, surface-open resolution and
+                                    #   aggregates-source resolution via the
+                                    #   RECAP_PRINT_* hooks (no creds needed)
 ```
 
 LLM output-format evals live in `evals/evals.json` and run via `run_evals.py`
@@ -365,4 +441,8 @@ open-surface read were the minor bump to `1.4`; relocating the output template t
 Flow off the Deribit public API onto the multi-venue Paradigm block tape (S3-only,
 adds `via Paradigm/<venue>` + surface-IV lookup, Volume goes
 hot-only) is the **minor** bump to `1.12` — same four sections and trigger, no
-removed fields. (See the repo `CLAUDE.md` for the minor/major rules.)
+removed fields. Repointing the Snapshot sources off the derived
+`hot__recap_aggregates_5m_24h.parquet` rollup onto the `market_aggregates_5m/`
+layer it was generated from (same `row_type` schema, one-scan temp table,
+`recap_aggregates` → `market_aggregates` in the freshness banner) is the
+**minor** bump to `1.16`. (See the repo `CLAUDE.md` for the minor/major rules.)

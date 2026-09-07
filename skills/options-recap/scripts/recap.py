@@ -75,19 +75,20 @@ MAX_SURFACE_ROWS = 5
 #
 # The limits are the publish cadence plus generous slack, sized so normal
 # operation never trips them and a dead feed always does. Measured against a
-# healthy pipeline on 2026-08-09: recap aggregates ran ~13-15 min behind (they
-# are 5-min buckets and the open bucket is not yet published), the vol surface
-# 8m30s. The failure this exists to catch was ~3.5 WEEKS, so precision here
+# healthy pipeline on 2026-08-09: the (since retired) hot recap rollup ran
+# ~13-15 min behind (5-min buckets, open bucket not yet published), the vol
+# surface 8m30s. market_aggregates_5m is the layer that rollup was built FROM,
+# so it can only be as fresh or fresher — the same limit holds. The failure this exists to catch was ~3.5 WEEKS, so precision here
 # buys nothing — a wide margin that never cries wolf is worth far more than a
 # tight one that trains people to ignore the banner.
 STALENESS_LIMIT_S = {
-    "recap_aggregates": 45 * 60,
+    "market_aggregates": 45 * 60,
     "vol_surface": 45 * 60,
 }
 # Sources whose staleness invalidates the Snapshot's DVOL/spot specifically, and
 # so should divert those fields to the live Deribit fallback rather than merely
 # annotate them.
-_SNAPSHOT_SOURCES = ("recap_aggregates",)
+_SNAPSHOT_SOURCES = ("market_aggregates",)
 
 
 def warn(msg: str) -> None:
@@ -216,7 +217,7 @@ def _num(row: dict, *keys):
 
 
 # One CSV per source, written by separate COPY statements — see run_recap.sh.
-_FRESHNESS_FILES = {"recap_aggregates": "freshness_rec.csv",
+_FRESHNESS_FILES = {"market_aggregates": "freshness_ma.csv",
                     "vol_surface": "freshness_vs.csv"}
 
 
@@ -512,15 +513,16 @@ def load_blocks(csv_dir: str) -> list[dict]:
 
 def load_venue_blocks(csv_dir: str, asset: str) -> list[dict]:
     """Read venue_blocks.csv — OPTION block/OTC prints off the EXCHANGES' own
-    tapes (the hot recap file's `block` rows, grouped per block id in DuckDB,
+    tapes (the 5-min market aggregates' `block` rows, grouped per block id in DuckDB,
     `instrument_kind='option'` — a perp/spot OTC block must never compete in
     an options recap). Missing file → [] (the Paradigm tape still renders
     alone). Dedup against the Paradigm tape happens in _dedupe_venue_blocks.
 
     Columns are unit-explicit: `volume_coin` (Σ leg amounts, coin units) and
-    `premium_usd` (Σ premium — carried for debuggability, NEVER displayed as
-    notional: it is ~50-100x smaller than the underlying-USD basis the block
-    sections use). Underlying notional is derived later as volume_coin × spot.
+    `premium_native` (Σ premium in the venue's own quote unit — carried for
+    debuggability, NEVER displayed as notional: it is a premium, not an
+    underlying figure, and its unit differs by venue). Underlying notional is
+    derived later as volume_coin × spot.
     """
     rows = _own_asset_rows(_read_csv(csv_dir, "venue_blocks.csv"), asset,
                            "venue_blocks.csv")
@@ -807,12 +809,13 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     mkt = deri.get("market")
     window_h = (end_ms - start_ms) / 3600_000
 
-    # DVOL / spot: hot authoritative for windows the rolling aggregates file
-    # actually spans (~24h); fall back to Deribit market if hot is absent.
-    # PAST ~24h the hot OHLC silently covers only the file's retention — a 2d
-    # recap once quoted a 24h-scoped low under a banner claiming full-window
-    # spot — so for >24h windows the Deribit market fetch (full history) is
-    # authoritative instead, with hot as the fallback.
+    # DVOL / spot: the 5-min aggregates (hot CSVs) are authoritative for
+    # windows up to 24h; fall back to Deribit market if absent. PAST 24h the
+    # retired hot rollup silently covered only its retention — a 2d recap once
+    # quoted a 24h-scoped low under a banner claiming full-window spot — so for
+    # >24h windows the Deribit market fetch (full history) is authoritative
+    # instead, with the CSVs as the fallback. Kept until the layer's retention
+    # is verified over a long window (run_recap.sh caps at 24h meanwhile).
     prefer_mkt = window_h > 24
     dvol_close = hot.get("dvol"); dvol_open = hot.get("dvol_open")
     dvol_low, dvol_high = hot.get("dvol_low"), hot.get("dvol_high")
@@ -1045,7 +1048,7 @@ def render_md(r: dict) -> str:
         # Name the CONSEQUENCE per source, not one generic line. "figures
         # sourced from it are NOT live" left the reader unable to tell which
         # figures, whether the divert worked, or that the window was truncated.
-        if st["source"] == "recap_aggregates":
+        if st["source"] == "market_aggregates":
             kept = st.get("retained_groups") or []
             if kept:
                 got = [g for g in ("dvol", "spot") if g not in kept]
@@ -1066,7 +1069,7 @@ def render_md(r: dict) -> str:
         elif st["source"] == "vol_surface":
             L.append("   Vol Surface (ATM/RR/Fly, skew, term) and its Δ columns "
                      "are from that data. A stale surface does not itself "
-                     "trigger a refetch — only recap_aggregates does — so the "
+                     "trigger a refetch — only market_aggregates does — so the "
                      "Deribit ticker surface backfills these only when that "
                      "fallback runs for another reason.")
     if r.get("stale_sources"):
@@ -1262,11 +1265,11 @@ def main() -> None:
         hot = load_hot(args.csv_dir, ASSET)
         block_rows = load_blocks(args.csv_dir)
         venue_block_rows = load_venue_blocks(args.csv_dir, ASSET)
-        # No hot dvol_spot row: the DuckDB read of the rolling recap-aggregates file
+        # No hot dvol_spot row: the DuckDB read of the 5-min aggregates layer
         # failed or returned nothing for this window. Either way DVOL/spot must come
-        # from Deribit. Also fetch for any >24h window — the rolling file only
-        # retains ~24h, so its OHLC silently under-covers longer windows (build()
-        # then prefers the full-span Deribit series). Only pull the expensive
+        # from Deribit. Also fetch for any >24h window — the Snapshot horizon is
+        # still treated as ~24h (see build()), so its OHLC may under-cover longer
+        # windows (build() then prefers the full-span Deribit series). Only pull the expensive
         # per-strike ticker surface when v_vol_surface also gave us nothing — for
         # a normal dynamic window vs_now is populated, so we skip ~50 serial
         # ticker calls (the bulk of the cost).
