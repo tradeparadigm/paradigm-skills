@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Offline contract checks for the direct-data RFQ collector."""
+
+import importlib.util
+import os
+import subprocess
+import sys
+import types
+import io
+import json
+from contextlib import redirect_stdout
+from unittest.mock import patch
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPT = os.path.join(ROOT, "scripts", "analyze.sh")
+COLLECTOR = os.path.join(ROOT, "scripts", "collect_analysis.py")
+# collect_analysis imports duckdb at module top. Stub it ONLY when it is
+# genuinely absent (the stdlib-only workflow). Under the dependency-equipped
+# pytest lane the real module must win: a module-level setdefault here leaked
+# this connect=None stub into every sibling collected later in the same
+# session — order-dependent, and it broke test_evidence_queries whenever this
+# file was collected first.
+if importlib.util.find_spec("duckdb") is None:
+    sys.modules["duckdb"] = types.SimpleNamespace(Error=Exception, connect=None)
+spec = importlib.util.spec_from_file_location("collect_analysis", COLLECTOR)
+collector = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = collector
+spec.loader.exec_module(collector)
+
+
+def test_wrapper_contract():
+    env = dict(os.environ, ANALYZE_PRINT_ID="1")
+    result = subprocess.run(["bash", SCRIPT, "DRFQv2-r_test-1"], capture_output=True, text=True, env=env)
+    assert result.returncode == 0
+    assert result.stdout.strip() == "r_test-1"
+    with open(SCRIPT) as handle:
+        source = handle.read()
+    assert "collect_analysis.py" in source
+    assert "/hot/" not in source and "hot__" not in source and "--render" in source
+
+
+def test_invalid_id_fails_before_data_access():
+    result = subprocess.run(["bash", SCRIPT, "r_bad'id"], capture_output=True, text=True)
+    assert result.returncode == 2
+
+
+def test_rfq_predicate_is_id_only():
+    predicate = collector.rfq_predicate("RFQ_ID", "r_test-1")
+    assert "RFQ_ID" in predicate and "r_test-1" in predicate
+    assert "DESCRIPTION" not in predicate and "PRODUCT" not in predicate
+
+
+def test_raw_lookup_is_bounded_to_event_hours():
+    paths = collector.raw_deribit_paths({
+        "DATE": "2026-08-30", "TIME": "00:30:00",
+        "PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Call",
+    })
+    assert len(paths) == 3
+    assert all("/raw/" in path and "level=5m" in path and "hour=*" not in path for path in paths)
+    assert any("day=29/hour=23" in path for path in paths)
+    assert any("day=30/hour=01" in path for path in paths)
+
+
+def test_unresolved_anchor_does_not_scan_bucket():
+    assert collector.raw_deribit_paths({"DESCRIPTION": "user supplied guess"}) == []
+    assert collector.raw_deribit_paths({
+        "DATE": "2026-08-30", "TIME": "00:30:00",
+        "PRODUCT": "BTC OPTION - PRDX", "DESCRIPTION": "Call",
+    }) == []
+
+
+def test_current_execution_resolves_without_request_or_venue_rows():
+    legs = [{"trade_id": f"leg-{i}", "rfq_id": "DRFQv2-r_test", "product": "BTC OPTION - PRDX"}
+            for i in range(150)]
+    helper = types.SimpleNamespace(AmbiguousRfqError=type('AmbiguousRfqError', (RuntimeError,), {}), read_executions=lambda *a, **kw: {
+        "rows": legs, "sources": [], "build_window_end_ms": 1, "units": {}})
+    output = io.StringIO()
+    with patch.dict(sys.modules, {"execution_tape": helper}), \
+         patch.object(sys, "argv", ["collect_analysis.py", "--rfq-id", "DRFQv2-r_test"]), \
+         patch.object(collector, "run_sql", return_value=([], None)), redirect_stdout(output):
+        assert collector.main() == 0
+    document = json.loads(output.getvalue())
+    assert document["resolution"]["status"] == "execution_resolved_by_paradigm_rfq_id"
+    assert len(document["execution_candidates"]["paradigm_tape"]) == 150
+
+
+def test_partition_discovery_failure_is_not_an_empty_market():
+    with patch.object(collector, "run_sql", return_value=([], "AccessDenied")):
+        try:
+            collector.existing_paths(["s3://bucket/bounded/*"])
+        except RuntimeError as exc:
+            assert "AccessDenied" in str(exc)
+        else:
+            raise AssertionError("access failure was swallowed")
+
+
+def test_proven_venue_block_id_is_used_without_leg_limit():
+    legs = [{'rfq_id': 'DRFQv2-r_AbC', 'product': 'BTC OPTION - DBT',
+             'traded_at_iso': '2026-09-08T07:30:00Z', 'venue_block_trade_id': 'BLOCK-123'}]
+    helper = types.SimpleNamespace(AmbiguousRfqError=type('AmbiguousRfqError', (RuntimeError,), {}),
+                                   read_executions=lambda *a, **kw: {'rows': legs})
+    queries = []
+
+    def run(sql):
+        queries.append(sql)
+        return [], None
+
+    with patch.dict(sys.modules, {'execution_tape': helper}), \
+         patch.object(sys, 'argv', ['collector', '--rfq-id', 'DRFQv2-r_AbC']), \
+         patch.object(collector, 'run_sql', side_effect=run), \
+         patch.object(collector, 'existing_paths', side_effect=lambda paths: paths), \
+         redirect_stdout(io.StringIO()):
+        assert collector.main() == 0
+    raw = next(sql for sql in queries if 'read_parquet' in sql)
+    assert "block_trade_id AS VARCHAR) IN ('BLOCK-123')" in raw
+    assert 'block_rfq_id' not in raw and 'LIMIT' not in raw
+    assert all('LIKE' not in sql and 'upper(' not in sql for sql in queries)
+
+
+def test_ambiguous_execution_cannot_fall_through_to_other_sources():
+    error_type = type('AmbiguousRfqError', (RuntimeError,), {})
+
+    def read(*args, **kwargs):
+        raise error_type('ambiguous')
+
+    helper = types.SimpleNamespace(AmbiguousRfqError=error_type, read_executions=read)
+    with patch.dict(sys.modules, {'execution_tape': helper}), \
+         patch.object(sys, 'argv', ['collector', '--rfq-id', 'r_AbC']), \
+         patch.object(collector, 'run_sql') as query:
+        try:
+            collector.main()
+        except error_type:
+            pass
+        else:
+            raise AssertionError('ambiguity was swallowed')
+        query.assert_not_called()
+
+
+def test_incomplete_execution_coverage_is_reported_as_a_gap():
+    """An uncovered tail is missing evidence and must surface in `gaps`, not only in `sources`."""
+    def gaps_for(complete):
+        helper = types.SimpleNamespace(
+            AmbiguousRfqError=type('AmbiguousRfqError', (RuntimeError,), {}),
+            read_executions=lambda *a, **kw: {
+                "rows": [], "sources": [], "build_window_end_ms": 1, "units": {},
+                "coverage_complete": complete,
+                "coverage_note": "coverage ends 40 min before the requested end"})
+        output = io.StringIO()
+        with patch.dict(sys.modules, {"execution_tape": helper}), \
+             patch.object(sys, "argv", ["collect_analysis.py", "--rfq-id", "DRFQv2-r_test"]), \
+             patch.object(collector, "run_sql", return_value=([], None)), redirect_stdout(output):
+            assert collector.main() == 0
+        return [g for g in json.loads(output.getvalue())["gaps"]
+                if g.get("source") == "partitioned_paradigm_executions"]
+
+    incomplete = gaps_for(False)
+    assert incomplete and "40 min" in incomplete[0]["reason"]
+    # Complete coverage with no matching legs is a genuine negative, not a gap.
+    assert gaps_for(True) == []
+
+
+if __name__ == "__main__":
+    tests = [value for name, value in sorted(globals().items())
+             if name.startswith("test_") and callable(value)]
+    for test in tests:
+        test()
+    print(f"{len(tests)} tests passed")

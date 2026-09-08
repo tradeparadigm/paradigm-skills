@@ -1,262 +1,45 @@
 #!/usr/bin/env bash
-# run_recap.sh — the entire live recap in one command, so the agent types one
-# short line instead of regenerating a ~50-line bootstrap+SQL block (that
-# generation was ~12s of the old run). Does: STS bootstrap, one DuckDB session
-# into CSVs, then recap.py --render. Its stdout IS the final four-section recap.
-#
-# Usage: bash scripts/run_recap.sh <ASSET> <WINDOW>     e.g. run_recap.sh BTC 8h
-set -uo pipefail
+# Render the established recap from bounded non-hot source data.
+set -euo pipefail
 
-# Some users type the no-op keyword "options" (/recap btc options 8h). This skill
-# is always options, so drop any "options"/"option" token before assigning
-# asset/window — otherwise a stray token lands in the window slot and breaks
-# parsing (hot__recap_options.parquet doesn't exist; parse_window_ms raises).
-ARGS=""
-for a in "$@"; do
-  case "$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]')" in
-    options|option) ;;                       # no-op keyword — drop
-    *) ARGS="$ARGS $a" ;;
+ASSET=BTC
+WINDOW=24h
+ASSET_SET=
+WINDOW_SET=
+for arg in "$@"; do
+  token=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
+  case "$token" in
+    option|options) ;;
+    *)
+      if [[ "$token" =~ ^[1-9][0-9]*[mhd]$ ]]; then
+        [ -z "$WINDOW_SET" ] || { echo "recap: specify one window" >&2; exit 2; }
+        WINDOW=$token
+        WINDOW_SET=1
+      elif [[ "$token" =~ ^[a-z][a-z0-9]*$ ]] && [ -z "$ASSET_SET" ]; then
+        ASSET=$(printf '%s' "$token" | tr '[:lower:]' '[:upper:]')
+        ASSET_SET=1
+      else
+        echo "recap: invalid argument '$arg' — use an asset and Nm/Nh/Nd window" >&2
+        exit 2
+      fi ;;
   esac
 done
-set -- $ARGS
 
-ASSET=$(printf '%s' "${1:-BTC}" | tr '[:lower:]' '[:upper:]')
-WIN="${2:-8h}"
-[ "$WIN" = "1d" ] && WIN=24h                 # exact match — the old substring
-                                             # substitution turned 31d into 324h
-
-# Window → seconds, parsed GENERICALLY (Nm/Nh/Nd) so any window works. The rolling
-# recap-aggregates file is windowed by bucket_at at query time, so there are no
-# per-window files to enumerate. An earlier preset-only `case` silently defaulted
-# unknown windows (e.g. 3h) to 8h, so surface deltas were computed against the
-# wrong window-open. Parse instead of enumerate.
-WL=$(printf '%s' "$WIN" | tr '[:upper:]' '[:lower:]')
-WN=${WL%[mhd]}; WU=${WL##*[0-9]}             # magnitude / unit
-case "$WU" in
-  m) SECS=$((WN * 60));; h) SECS=$((WN * 3600));; d) SECS=$((WN * 86400));;
-  *) SECS=0;;
+[ "$WINDOW" = "1d" ] && WINDOW=24h
+case "$ASSET" in *[!A-Z0-9]*) echo "recap: invalid asset '$ASSET'" >&2; exit 2;; esac
+[[ "$WINDOW" =~ ^[1-9][0-9]*[mhd]$ ]] || {
+  echo "recap: bad window '$WINDOW' — use e.g. 30m, 8h, 2d" >&2; exit 2;
+}
+MAGNITUDE=${WINDOW%[mhd]}
+UNIT=${WINDOW##*[0-9]}
+case "$UNIT" in
+  m) SECONDS=$((MAGNITUDE * 60));;
+  h) SECONDS=$((MAGNITUDE * 3600));;
+  d) SECONDS=$((MAGNITUDE * 86400));;
+  *) echo "recap: bad window '$WINDOW' — use e.g. 30m, 8h, 2d" >&2; exit 2;;
 esac
-if ! [ "$WN" -gt 0 ] 2>/dev/null || [ "$SECS" -le 0 ]; then
-  echo "recap: bad window '$WIN' — use e.g. 30m, 3h, 8h, 24h" >&2; exit 2
-fi
-# Cap at 24h. The Snapshot flow sources (rolling recap-aggregates file →
-# Volume/Activity/P-C/DVOL/spot) hold only ~24h, so a longer window rendered
-# partially-covered Snapshot flow under a full-window header. Block Flow itself
-# now comes from the 30-day Paradigm tape and is not the constraint, but the
-# Snapshot still is — until those are wired to the cold store, clamp and DISCLOSE
-# (the banner line below is part of the recap output).
-CAP_NOTE=""
-if [ "$SECS" -gt 86400 ]; then
-  CAP_NOTE="⚠ window capped at 24h — $WIN exceeds the ~24h Snapshot-data horizon."
-  WIN=24h; SECS=86400
-fi
-# PRESET flags the canonical windows. Since the migration to the single rolling
-# recap-aggregates file every window reads the same source (bucket_at-windowed), so
-# PRESET no longer gates the data path — it's retained for the plan hook below and
-# as an observability signal (canonical vs ad-hoc window).
-case "$WIN" in
-  5m|10m|20m|1h|4h|8h|24h) PRESET=1;; *) PRESET=0;;
-esac
+[ -n "${RECAP_PRINT_ARGS:-}" ] && { echo "$ASSET $WINDOW"; exit 0; }
+[ -n "${RECAP_PRINT_PLAN:-}" ] && { echo "$ASSET $WINDOW $SECONDS direct"; exit 0; }
 
-# Vol-surface deltas (ΔATM/ΔRR/ΔFly) need a window-OPEN surface, which the recap
-# aggregates file doesn't carry (it has no surface rows). Read the consolidated
-# per-strike store v_vol_surface: its rolling _hot.parquet holds ~2h of 1-min
-# snapshots, and older opens come from the cold hour-partition containing
-# window-start (hourly files, published ~15min after each hour closes). "Now" is
-# always _hot.parquet's latest snapshot, so open+close share one pipeline.
-# Resolved here, before the STS bootstrap: it's pure date math, which lets the
-# RECAP_PRINT_SOURCES test hook exercise it with no creds. RECAP_NOW_S pins the
-# clock so tests can assert exact partition paths.
-NOW_S=${RECAP_NOW_S:-$(date -u +%s)}; START_S=$((NOW_S - SECS)); START_MS=$((START_S * 1000))
-# Venue-tape `block` rows are bucketed to 5 minutes while the Paradigm tape
-# carries exact-ms traded_at. Windowing both on START_MS drops any venue block
-# in the first PARTIAL bucket, so a Paradigm print in that bucket has no
-# counterpart, full-coverage proof fails, and the whole venue falls back to
-# structural — measured to leave the id merge inactive about half the time from
-# the bucket edge alone. Flooring the venue window to the containing bucket
-# removes that term. It can only ADD venue rows that were already in-window at
-# 5-minute resolution, so it cannot create a double count.
-START_MS_5M=$(( (START_S - START_S % 300) * 1000 ))
-VS_HOT=s3://dt-paradigm-data/paradigm_data/v_vol_surface/_hot.parquet
-VS_COLD=""
-if [ "$SECS" -gt 3600 ]; then               # window-start may predate _hot's buffer
-  SY=$(date -u -d "@$START_S" +%Y 2>/dev/null || date -u -r "$START_S" +%Y)
-  SM=$(date -u -d "@$START_S" +%m 2>/dev/null || date -u -r "$START_S" +%m)
-  SD=$(date -u -d "@$START_S" +%d 2>/dev/null || date -u -r "$START_S" +%d)
-  SH=$(date -u -d "@$START_S" +%H 2>/dev/null || date -u -r "$START_S" +%H)
-  VS_COLD=s3://dt-paradigm-data/paradigm_data/v_vol_surface/base=${ASSET}/year=${SY}/month=${SM}/day=${SD}/hour=${SH}/v_vol_surface.parquet
-fi
-
-# Testability hooks: echo resolved state and exit before any STS/DuckDB work (no
-# creds/network needed). Used by tests/test_run_recap.py.
-#   RECAP_PRINT_ARGS → "ASSET WIN"          (arg normalization)
-#   RECAP_PRINT_PLAN → "ASSET WIN SECS PRESET"  (window parsing + preset flag)
-#   RECAP_PRINT_SOURCES → "ASSET WIN START_MS VS_COLD|-"  (surface-open resolution)
-[ -n "${RECAP_PRINT_ARGS:-}" ] && { echo "$ASSET $WIN"; exit 0; }
-[ -n "${RECAP_PRINT_PLAN:-}" ] && { echo "$ASSET $WIN $SECS $PRESET"; exit 0; }
-[ -n "${RECAP_PRINT_SOURCES:-}" ] && { echo "$ASSET $WIN $START_MS ${VS_COLD:--}"; exit 0; }
-DIR="$(cd "$(dirname "$0")/.." && pwd)"      # skill dir (scripts/..)
-# Per-invocation workdir. The old fixed /tmp/recap + /tmp/recap.sql were shared
-# state: two concurrent recaps (e.g. BTC and ETH fired from separate sessions)
-# raced on the SQL file and CSVs, and one recap silently rendered the other's
-# asset/window slice (exit 0, no warning). A fresh mktemp dir per run isolates
-# them completely; it also supersedes the old stale-CSV wipe — nothing stale can
-# exist in a directory this run just created.
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/recap.XXXXXX") || { echo "recap: mktemp failed" >&2; exit 1; }
-trap 'rm -rf "$WORK"' EXIT
-
-# STS bootstrap (IRSA → temporary creds; see paradigm-data-discovery skill).
-TOKEN=$(cat "$AWS_WEB_IDENTITY_TOKEN_FILE")
-CREDS=$(curl -s "https://sts.ap-northeast-1.amazonaws.com/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=${AWS_ROLE_ARN}&RoleSessionName=duckdb&WebIdentityToken=${TOKEN}")
-AK=$(printf '%s' "$CREDS" | grep -o '<AccessKeyId>[^<]*'     | cut -d'>' -f2)
-SK=$(printf '%s' "$CREDS" | grep -o '<SecretAccessKey>[^<]*' | cut -d'>' -f2)
-ST=$(printf '%s' "$CREDS" | grep -o '<SessionToken>[^<]*'    | cut -d'>' -f2)
-
-# Single rolling file of 5-min aggregates over trailing 24h (replaces the old
-# per-window hot__recap_<window> files). The window is applied at query time via
-# a bucket_at filter + aggregation, not by picking a per-window file. recap.py
-# reads only the dvol_spot + volume rows here (block flow comes from the Deribit
-# tape; the surface from v_vol_surface below).
-REC=s3://dt-exchange-venue-data/hot/hot__recap_aggregates_5m_24h.parquet
-
-# Multi-venue Paradigm block tape — the SOLE source for Biggest Print + Block
-# Flow. hot__paradigm_trade_tape_30d.parquet (row_type='paradigm_trade', leg
-# grain, trailing 30d), built by the exchange-venue-data paradigm-trade CronJob
-# from the Airbyte→S3 UM landing. Spans every venue Paradigm brokers
-# (Deribit/Paradex/Bullish/…) with USD notional PER LEG and the structure named
-# in DESCRIPTION, so recap.py needs no cross-venue $ normalization and no
-# instrument-name inference. It also carries VENUE_BLOCK_TRADE_ID — the venue's
-# own block id — which is what unlocks exact block dedupe against the venue
-# tapes.
-#
-# The Snowflake-egressed paradigm_trade_tape_slim.csv.gz that used to be read
-# first and overwritten is GONE. Its producer was decommissioned in data#712 on
-# 2026-08-10, so it froze that day and returns zero rows for any recent window:
-# it could no longer serve as a fallback, only mask a failure of this read. With
-# it removed there is nothing to fall back TO, so an empty result is Block Flow
-# MISSING rather than stale — recap.py renders that distinction explicitly.
-PT=s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet
-
-# One DuckDB session → CSVs. One statement per line; `at` is reserved → alias it.
-# dvol_spot + volume come from the rolling recap-aggregates file, windowed at query
-# time by bucket_at (>= START_MS) — one file serves every window, preset or not.
-# Each COPY echoes `asset` through so recap.py can assert the slice is for THIS
-# asset (defense in depth against any future shared-state/wrong-file regression).
-cat > "$WORK/recap.sql" <<SQL
-INSTALL httpfs; LOAD httpfs;
-SET s3_region='ap-northeast-1';
-SET s3_access_key_id='${AK}';
-SET s3_secret_access_key='${SK}';
-SET s3_session_token='${ST}';
-COPY (SELECT asset, exchange, metric, arg_min(open, bucket_at) AS open, arg_max(close, bucket_at) AS close, max(high) AS high, min(low) AS low FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, metric) TO '${WORK}/dvol_spot.csv' (HEADER, DELIMITER ',');
-COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
-COPY (SELECT asset, exchange, block_id, min(bucket_at) AS bucket_at, sum(volume_sum) AS volume_coin, sum(notional_usd) AS premium_usd, sum(leg_count) AS leg_count, sum(iv_sum) AS iv_sum, sum(iv_count) AS iv_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='block' AND instrument_kind='option' AND bucket_at >= ${START_MS_5M} GROUP BY asset, exchange, block_id) TO '${WORK}/venue_blocks.csv' (HEADER, DELIMITER ',');
-COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '${WORK}/surface_now.csv' (HEADER, DELIMITER ',');
-COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h WHERE abs("at"-${START_MS})<=900000 ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '${WORK}/surface_open.csv' (HEADER, DELIMITER ',');
-COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(turnover_usd) AS turnover_usd, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
-COPY (SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS "DATE", strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS "TIME", product AS PRODUCT, description AS DESCRIPTION, quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE, taker_side AS SIDE, CASE WHEN upper(trim(split_part(coalesce(product,''), ' - ', 2))) = 'DBT' AND upper(coalesce(asset,'')) IN ('BTC','ETH') AND instrument_name IS NOT NULL AND upper(instrument_name) NOT LIKE '%USDC%' THEN upper(asset) ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD, rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID, venue_block_trade_id AS VENUE_BLOCK_TRADE_ID FROM read_parquet('${PT}') WHERE row_type='paradigm_trade' AND asset='${ASSET}' AND instrument_kind='OPTION' AND traded_at >= ${START_MS}) TO '${WORK}/blocks.csv' (HEADER, DELIMITER ',');
-COPY (SELECT 'recap_aggregates' AS source, min(mx) AS max_at FROM (SELECT metric, max(bucket_at) AS mx FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot' GROUP BY metric) AS g) TO '${WORK}/freshness_rec.csv' (HEADER, DELIMITER ',');
-COPY (SELECT 'vol_surface' AS source, max("at") AS max_at FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) TO '${WORK}/freshness_vs.csv' (HEADER, DELIMITER ',');
-SQL
-
-
-# blocks.csv upgrade (the statement just above): OVERWRITES the legacy
-# csv.gz-sourced shape with the same columns off the Snowflake-free hot
-# paradigm_trade tape, PLUS VENUE_BLOCK_TRADE_ID (recap.py's exact block
-# dedupe key — absent column means structural dedupe, today's behavior).
-# Same fallback-then-overwrite pattern as volume.csv: while the hot file
-# did not exist (the paradigm-trade CronJob deployed 2026-08-04) the bind fails,
-# the legacy blocks.csv stands, and nothing changes.
-#
-# The bind-failure fallback does NOT cover a zero-row result: a COPY that
-# binds cleanly but matches nothing still truncates the target to a bare
-# header, destroying good legacy data. So the overwrite is staged through a
-# temp file and only promoted when it actually carries rows — a predicate
-# that silently matches nothing now leaves the legacy tape intact instead of
-# emptying Block Flow. Once the egress
-# decommission (data#712) merges, the legacy TAPE read above gets deleted.
-
-
-# freshness_*.csv (the two statements just above): the newest timestamp each
-# continuously-written source carries, NOT windowed. The window filter is
-# deliberately omitted — a source frozen before START_MS returns zero windowed
-# rows, which is indistinguishable from "quiet market" and tells you nothing
-# about the feed. The absolute max is the pipeline's heartbeat, so it answers
-# the only question that matters: is anything still writing this file?
-#
-# ONE FILE PER SOURCE, not one UNION ALL. A single COPY spanning both reads
-# means either read failing writes ZERO bytes, silently disabling the gate for
-# BOTH sources — and a disabled gate is indistinguishable in the output from
-# "everything fresh", which is the original bug wearing a different hat. Split,
-# a ${VS_HOT} outage costs only the vol_surface probe and recap_aggregates is
-# still checked. recap.py treats a source it cannot read as UNKNOWN and says so
-# rather than assuming fresh; see load_freshness / check_freshness.
-#
-# MIN OVER THE PER-METRIC MAXIMA for recap_aggregates, not a flat max.
-# `row_type='dvol_spot'` is two series (metric='dvol' and metric='spot') read as
-# separate fields by load_hot. A flat max reports the FRESHEST constituent, so a
-# dead DVOL scraper hides behind a live spot ticker and the recap renders frozen
-# DVOL with no banner.
-#
-# GROUP BY metric ONLY — deliberately NOT `exchange, metric`. load_hot collapses
-# every exchange to one dvol and one spot, sorting so Deribit wins, so the recap
-# renders DERIBIT's numbers. Grouping by exchange made the probe measure a
-# superset of what is rendered: any other venue emitting sparse dvol_spot rows
-# (deribit-usdc, Paradex) and lagging past the limit would fire the banner,
-# discard a perfectly live Deribit snapshot and force a serial refetch on every
-# run — the cry-wolf outcome the limits are explicitly sized to avoid.
-#
-# Note the reading is the laggiest PRESENT constituent: `min` cannot see a group
-# that does not exist, so a metric absent entirely does not register here. That
-# case is caught downstream by `hot['dvol'] is None`, which already diverts.
-#
-# WHY THIS EXISTS. hot__market_signals_1m / the recap aggregates went stale on
-# 2026-07-10 and kept rendering July 10 numbers as if live until 2026-08-04 —
-# ~3.5 weeks — because the object's mtime kept changing while its CONTENTS did
-# not, and nothing anywhere compared a timestamp to the clock. recap.py's Deribit
-# fallback already existed but triggers only on ABSENT data (`hot['dvol'] is
-# None`) or a >24h window; stale-but-present sailed straight through it.
-#
-# ONLY heartbeat sources are probed. dvol_spot rows are emitted every 5 min and
-# vol-surface snapshots every minute regardless of trading activity, so a gap in
-# them is unambiguously a pipeline fault. Event-driven sources are NOT probed and
-# must not be: the block tape's newest trade is a function of whether anyone
-# traded, so gating on it would fire on any quiet hour. (Measured: venue `block`
-# rows legitimately sat 1h13m behind with the pipeline perfectly healthy, because
-# only 29 blocks printed in 24h.) Once the tape carries a pipeline-stamped
-# `generated_at` — it does under the hot paradigm_trade tape — that column, not
-# the trade time, is the right thing to add here.
-
-# volume.csv upgrade (the statement just above): OVERWRITES the legacy shape# with one that adds turnover_usd — the pipeline's per-trade USD premium,
-# summable across ALL venues (drives the cross-venue $ Volume line). Same
-# fallback-then-overwrite pattern as the VS_COLD surface read: on a recap file
-# that predates the column this bind fails, the legacy volume.csv
-# (Activity/P-C intact) stands, and recap.py labels the Volume line
-# Deribit-scoped. Placed BEFORE the VS_COLD append so neither may-fail
-# statement can shadow the other's output even if the DuckDB CLI ever bails on
-# error (its -bail default is off — statements continue past a failure — but
-# nothing here depends on that). Once the upstream column is everywhere, fold
-# turnover_usd into the main volume COPY.
-
-# surface_open: the statement above is a SAFE fallback from _hot (always exists),
-# tolerance-guarded to 15min so a window-start outside _hot's ~2h buffer writes a
-# header-only CSV (→ n/a) instead of a wrong open. For >1h windows the
-# authoritative open is the cold hour-partition — appended as the session's LAST
-# statement so it OVERWRITES the fallback when it succeeds. If the partition
-# object is missing (start hour's file not yet published, or older than the cold
-# history), read_parquet fails at bind before the COPY sink opens, the fallback
-# file stands, and only this final statement is lost: nothing depends on the
-# DuckDB CLI continuing past the error. This closes the just-over-1h gap (cold
-# partition unpublished, but _hot still covers the start) and keeps clean n/a
-# otherwise.
-if [ -n "$VS_COLD" ]; then
-  cat >> "$WORK/recap.sql" <<SQL
-COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_COLD}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '${WORK}/surface_open.csv' (HEADER, DELIMITER ',');
-SQL
-fi
-
-# recap.py runs this DuckDB session in a thread concurrent with the Deribit fetch.
-# No exec — the EXIT trap must fire to clean up $WORK.
-[ -n "$CAP_NOTE" ] && { echo "$CAP_NOTE"; echo; }
-cd "$DIR" && uv run scripts/recap.py \
-  --asset "$ASSET" --window "$WIN" --csv-dir "$WORK" --duckdb-sql "$WORK/recap.sql" --render
+DIR="$(cd "$(dirname "$0")/.." && pwd)"
+exec uv run "$DIR/scripts/collect_recap.py" --asset "$ASSET" --window "$WINDOW" --render

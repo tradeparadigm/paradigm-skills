@@ -1,9 +1,9 @@
 # Output Format — FIXED
 
-This is the exact rendering contract for the recap. **In the live path you do
-not need this file** — `run_recap.sh` already emits this shape and you relay its
-stdout verbatim. Read this only in the **injected-data** and **simulate** modes,
-where you render the four sections yourself.
+This is the existing rendering contract, now backed by non-hot inputs. The live
+script renders it; consult it directly only for supplied/injected evidence.
+Never fabricate a value to fill the template; state a specific field or section
+as unavailable when the selected data cannot establish it.
 
 Four sections, this exact order, every recap. Never reorder, add, or drop
 sections. **Do not emit Themes, Dealer positioning, or a Bottom Line.** Work
@@ -29,9 +29,9 @@ Volume    $[X]M       all venues
 P/C       [X.Xx]      [descriptor] (all venues, by trades)
 ```
 
-The Volume note reads `all venues` when the cross-venue `turnover_usd` sum
-drove the number; on a pre-upgrade recap file it falls back to the old
-Deribit-scoped calc and the note reads `Deribit only`.
+The Volume note names the venues whose normalized `turnover_usd` observations
+drove the number. Do not write `all venues` when any venue trade source is a
+gap, and do not combine `amount_native` across venues.
 
 **Biggest Print**
 
@@ -39,24 +39,16 @@ Deribit-scoped calc and the note reads `Deribit only`.
 [DDMMMYY] [structure]   [Nx]   $[X]M   [HH:MM] UTC   via Paradigm/[Venue] ([Buy/Sell, ][IV]v avg)
 ```
 
-The single largest **block** in the window, by summed per-leg USD notional,
-from two sources ranked together: the Paradigm block tape (one
-`BLOCK_TRADE_ID` = one block; every venue Paradigm brokers —
-Deribit/Paradex/Bullish/…) and the exchanges' own venue tapes for venues
-Paradigm does NOT broker (OKX today, via the hot recap file's option `block`
-rows) — the only venues with zero Paradigm-tape overlap, so nothing
-double-counts. (Widening to every venue via exact id-dedupe is deferred to the
-Snowflake-off migration; see the maintainer README.)
-The `via …` tag names the source and scopes the line: `via Paradigm/[Venue]`
-for a Paradigm-brokered block, `via venue tape` for a venue-tape one. A
-venue-tape winner has no leg geometry, so it renders as
+The single largest **proven block** in the window, ranked by underlying USD
+notional, as in Block Flow. Snapshot Volume is USD premium turnover: never
+substitute one measure for the other. Group legs only on a real venue block/OTC id. The
+`via …` tag names the source and venue. A raw venue block without provable leg
+geometry renders as
 `[Venue] Block   [Nx]   $[X]M   ~[HH:MM] UTC   via venue tape`
 (`~` = 5-min bucket resolution; `[Nx]` is its total coin size). The side word appears only when
 the whole block is one-directional (Buy/Sell); mixed-direction structures (any
 spread) carry no side tag — never write "two-way" here. The `[IV]v avg` appears
-only for Deribit blocks (IV is looked up from the vol surface, which is
-Deribit-scoped); venue-tape blocks carry per-trade IV where their venue
-publishes it (OKX does); other venues show no IV tag.
+only when the direct venue rows publish or support the IV calculation.
 
 `[Nx]` is the structure UNIT size — the base (ratio-1) leg count of the
 package, e.g. a 4×63-lot iron fly is `63x`, a 600-per-leg calendar is `600x`.
@@ -81,10 +73,9 @@ the Detail column.
 …
 ```
 
-Venue-tape rows (venues Paradigm never brokers — OKX today) rank in the same
-pool and count toward the header totals. Their tape has no leg geometry, so
-the structure label is `[Venue] Block`, the detail carries a `(venue tape)`
-note, and they count as one block each.
+Raw venue blocks rank in the same pool and count toward the header totals. When
+their rows do not prove leg geometry, use `[Venue] Block`, carry a
+`(venue tape)` note, and count the real venue block id once.
 
 The Structure column has a 27-char floor but stretches to the longest label in
 the window (a typed cross-expiry label like `24JUL26/31JUL26 Call Diagonal`

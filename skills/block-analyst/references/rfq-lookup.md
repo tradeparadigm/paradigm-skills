@@ -1,168 +1,75 @@
-# Resolve an RFQ by `rfq_id` — Paradigm trade tape via data-discovery
+# Resolve an RFQ without hot files
 
-The block analyst's input is `/analyze <rfq_id> <rfq description>`. The `rfq_id`
-is the authoritative key. **Resolve it by searching the Paradigm trade tape** —
-this file is the complete, self-contained recipe (credentials need no bootstrap:
-DuckDB resolves the pod's IRSA identity itself, see the preamble below) for
-turning the `rfq_id` into the full trade record the analysis needs (the same
-fields that used to be pasted as JSON).
+The first token after `/analyze` is the authoritative RFQ id. Accept only
+`[A-Za-z0-9_-]` before using it in a query. Preserve case and the supplied
+`DRFQv2-` or `GRFQ-` namespace in both exact comparisons and the response;
+never use SQL LIKE, arbitrary suffix matching or case folding for opaque IDs.
 
----
+For current executions, read the daily partitioned tape described in
+[the execution contract](../../data-discovery/references/datasets.md#current-partitioned-executions).
+The collector reads at most 31 exact keys and returns every matching leg without
+a LIMIT. A supplied namespace is matched exactly; an unprefixed ID is checked
+against explicit bare, DRFQv2 and GRFQ candidates. More than one matching identity
+fails loudly and requires a fully qualified ID. Missing or stale
+objects are explicit gaps, not proof that the RFQ never executed.
 
-## How to resolve it
+## Available sources
 
-### 1. ONE combined tape read — fill row **and** 30d recurrence in a single scan (primary)
+1. **Injected trade context** — if Dime supplies the cleared trade rows, use
+   them directly. This is the strongest source because the id-to-fill mapping
+   is already resolved.
+2. **Current Paradigm RFQ tape** —
+   `s3://dt-paradigm-data/paradigm_data/paradigm_rfq_tape_slim.csv.gz` carries
+   `RFQ_ID`, product, structure description, quantity, quote currency, quote
+   count, block count, status, and lifespan. It does **not** carry execution
+   price, mark, taker side, trade id, or block id.
+3. **Raw exchange trades** — use the layout and fields in
+   `../../data-discovery/references/exchange-raw.md`. Deribit option trades
+   carry `block_rfq_id` and `block_trade_id`; OKX carries `block_trade_id`;
+   Bybit has only `is_block_trade`; Bullish carries OTC ids. The collector
+   joins proven tape `venue_block_trade_id` values to exact venue block IDs;
+   a Paradigm RFQ suffix is not proof of a venue RFQ identity.
+4. **Historical executed tape** —
+   `s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz`
+   contains fill price, reference mark, side, trade id, and block id, but it is
+   frozen at 2026-08-10. Use it only for RFQs at or before that date and label
+   it historical.
+5. **Venue public APIs** — use current tickers and recent venue trades to
+   complete or corroborate a raw-file result. They cannot by themselves prove
+   a Paradigm RFQ id that the venue does not publish.
 
-The trade tape is a parquet on S3 (trailing 30 days). The read is the dominant cost, so
-**scan it exactly once**: materialize the relevant rows into a temp table, then
-read both the fill row (Step 0) and the 30d structure recurrence (Step 3a) out of
-that temp table. **Do not run a second tape query later** — this one covers both.
+## Model-selected lookup
 
-This recipe is **self-contained**: credentials resolve inside DuckDB, so you
-do **not** need to open `paradigm-data-discovery`'s `SKILL.md` or `s3-access.md`
-first. The **only** token is `<CORE_ID>` (the `r_…` id with any `DRFQv2-`/`GRFQ-` prefix
-stripped) — **nothing from the `<rfq description>`**. The `<rfq_id>` is the sole authoritative
-input; the description text is user reference only and must not seed the asset, instrument, or
-filter. HIST recurrence self-derives from the FILL row's own `PRODUCT` + normalized
-`DESCRIPTION`, so the query needs no strike/expiry/asset tokens.
+Choose the smallest combination that can prove the requested trade:
 
-> **Sanitize `<CORE_ID>` before substituting it** — it lands inside a SQL string
-> literal on a session holding live S3 credentials. Accept only `[A-Za-z0-9_-]`
-> (reject anything else outright), and backslash-escape `_` (a `LIKE` wildcard)
-> as the `ESCAPE '\'` clauses below expect, so `r_3Fvz…` matches literally.
+- Query the current RFQ tape by exact id or the explicit namespace candidates.
+- Read `execution_candidates.paradigm_tape` for the current id-linked execution;
+  group its complete leg set by `block_trade_id`, retaining `venue_block_trade_id`.
+- Use its authoritative `PRODUCT`, `DESCRIPTION`, `QTY`, and time to select
+  narrow raw exchange partitions.
+- Match a published `block_rfq_id` or real block id when possible.
+- Otherwise compare time, venue, instrument/structure, size, side, and price,
+  but describe the result as a candidate unless the identity is unique.
+- Cluster multi-leg trades only on a real shared block id. Never reconstruct a
+  package from proximity alone.
 
-Run it as one `exec`:
+The inline description after the id is user reference, not authoritative
+identity. It may help explain a mismatch after resolution, but it must not
+seed an asset, instrument, fill, or block when the data did not resolve them.
 
-```bash
-# One process, no shell state: the whole thing is a single duckdb -c call.
-# DuckDB's aws extension resolves the pod's IRSA credentials in-process — do
-# NOT read the token file or call STS in shell (see data-discovery's
-# references/s3-access.md for why that fails through exec).
-duckdb -c "
-INSTALL httpfs; LOAD httpfs;
-INSTALL aws;    LOAD aws;
-CREATE OR REPLACE SECRET s3_irsa (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1');
--- single scan → temp table holding the target RFQ + 30d matching structures.
--- Source is the Snowflake-free hot paradigm_trade tape (trailing 30 days,
--- leg grain — exactly the HIST horizon), aliased to the legacy tape column
--- names so everything downstream is unchanged.
-CREATE TEMP TABLE tape AS
-SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS DATE,
-       strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS TIME,
-       auction AS AUCTION, product AS PRODUCT, description AS DESCRIPTION,
-       quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE,
-       taker_side AS SIDE,
-       CASE WHEN upper(trim(split_part(coalesce(product,''), ' - ', 2))) = 'DBT' AND upper(coalesce(asset,'')) IN ('BTC','ETH') AND instrument_name IS NOT NULL AND upper(instrument_name) NOT LIKE '%USDC%' THEN upper(asset) ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
-       rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID,
-       UPPER(REPLACE(description,' ','')) AS DESC_N
-FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet')
-WHERE row_type='paradigm_trade';
--- (a) the cleared block — authoritative for every field. Asset ← PRODUCT (never assume BTC),
--- structure ← DESCRIPTION. Offsets precomputed: OFFSET_BPS (×10000) for COIN-quoted premiums
--- (BTC/ETH); OFFSET_PCT (% of mark) for USD/USDC-quoted premiums (SOL/alts — dollar prices,
--- where ×10000 bps is meaningless). Pick by QUOTE_CURRENCY. Never hand-compute the offset.
--- Per-row OFFSET_BPS/OFFSET_PCT is a SINGLE-LEG value. For a MULTI-ROW (multi-leg) RFQ do NOT
--- paste a leg's OFFSET_BPS into the package header — net first: net_fill = Σ(±PRICE) over the OPTION
--- legs (+ for BUY, − for SELL; perp/hedge rows excluded), net_mark = same on REF_PRICE, then package
--- offset = (|net_fill| − |net_mark|) × 10000 in the displayed Paid/Recd orientation (SKILL Step 7
--- "Net package offset"). Single-leg reduces to the per-row OFFSET_BPS (unchanged).
-SELECT 'FILL' tag, *,
-       ROUND(PRICE - REF_PRICE, 6) AS MARK_OFFSET,
-       ROUND((PRICE - REF_PRICE) * 10000, 1) AS OFFSET_BPS,
-       ROUND((PRICE - REF_PRICE) / NULLIF(REF_PRICE,0) * 100, 1) AS OFFSET_PCT
-FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%' ESCAPE '\';
--- (b) 30d recurrence (Step 3a): same structure = same PRODUCT + same normalized DESCRIPTION as
--- the FILL, self-derived from the FILL row (no user text). Same-coin match blocks cross-asset leaks.
-SELECT 'HIST' tag, DATE, TIME, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, BLOCK_TRADE_ID
-FROM tape
-WHERE PRODUCT IN (SELECT PRODUCT FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%' ESCAPE '\')
-  AND DESC_N  IN (SELECT DESC_N  FROM tape WHERE RFQ_ID LIKE '%<CORE_ID>%' ESCAPE '\')
-ORDER BY DATE DESC, TIME DESC;
-"
+## Failure behavior
+
+If the RFQ request resolves but the execution does not, state that distinction:
+
+```text
+RFQ <id> found, but its executed fill could not be resolved from current raw exchange data.
 ```
 
-> **The tape prefixes ids with a routing tag (e.g. `DRFQv2-`). The `LIKE '%<CORE_ID>%' ESCAPE '\'`
-> match is prefix-tolerant by construction — the `r_…` core is the stable key. Never
-> conclude "not on tape" from a miss without having run this suffix-tolerant match.**
+If even the RFQ request does not resolve, state:
 
-Notes:
-- A whole structure sits on the matched row(s) — `DESCRIPTION` encodes the full
-  strategy (e.g. `Straddle 19 Nov 25 3050`, `RRCall 30 Jan 26 70000/108000`,
-  `Cstm +1.00 Call 24 Apr 26 78000 -2.00 Call 24 Apr 26 85000`). Rows sharing a
-  `BLOCK_TRADE_ID` are one block — keep them together.
-- The `HIST` rows ARE the Step 3a Paradigm-recurrence answer (count, sizes, sides,
-  most-recent). Cluster them by `BLOCK_TRADE_ID` and match the full leg set —
-  count only rows whose `DESCRIPTION` is the *same structure* as the recurrence;
-  note the rest as strike-level context, not prints.
-- The tape is the **executed** tape. For RFQ-level context (fill rate, unfilled,
-  lifespan) the sibling dataset is `paradigm_rfq_tape_slim` (same `RFQ_ID` key).
-- **Auth:** the STS block above assumes the IRSA role directly; no external file
-  read needed. If the credentials / DuckDB tool are unavailable, fall back below.
+```text
+RFQ <id> not resolved — no authoritative asset, structure, or fill available.
+```
 
-**Self-test (regression guard — bare id must resolve a prefixed row):** given a
-tape row whose `RFQ_ID` is `DRFQv2-r_01H8XQ…`, the canonical query above invoked
-with the **bare** id `r_01H8XQ…` must return that row (the substring
-`LIKE '%<CORE_ID>%' ESCAPE '\'` match is prefix-tolerant). If a bare-id lookup
-comes back empty on a tape known to carry the prefixed form, the prefix handling
-has regressed — fix the match before reporting "not on tape".
-
-### 2. Fallbacks (when the tape can't be queried)
-
-| Source | When | How |
-|---|---|---|
-| Injected block-trade context | running inside the Dime/terminal session | the terminal attaches the cleared block (e.g. a `set_block_trade_context` feed) — read it directly |
-| Deribit public tape | last resort, no Paradigm tape access | reconstruct the block from `block_trade_id` clusters (SKILL Step 3b) |
-
-**If the id cannot be resolved on any source, do NOT fabricate the record — and
-do NOT fall back to the inline `<rfq description>` to build a structure.** With
-no resolved row the asset isn't known, so live instruments can't be built either.
-Emit only the SKILL.md Step 7 unresolved line (fill, mark, spot, size, side,
-structure all *unavailable*) and stop.
-
----
-
-## Field mapping — trade-tape row → analysis fields
-
-The Paradigm trade tape (hot `paradigm_trade` rows, formerly the
-`paradigm_trade_tape_slim` csv.gz — same columns) carries the information that
-used to arrive as pasted JSON. Map by the tape's actual columns:
-
-| Analysis field (SKILL Step 1) | Trade-tape column |
-|---|---|
-| `description` / legs | `DESCRIPTION` (structure name + expiry + strikes; parse per the examples above) |
-| `action` / taker side | `SIDE` (`BUY` / `SELL`) |
-| `quantity` | `QTY` (contracts) |
-| `price` (fill) | `PRICE` (execution price, in `QUOTE_CURRENCY`) |
-| `mark_price` | `REF_PRICE` (reference/mark at trade time) |
-| `displayValues.markOffset` | single-leg: `PRICE − REF_PRICE`; multi-leg: the package net offset (SKILL Step 7 "Net package offset"), not a per-leg value |
-| `venue` | from `PRODUCT` suffix — the token after ` - ` (e.g. `DBT` Deribit, `PRDX` Paradex, `BYB` Bybit, `OKX` OKX; **non-exhaustive** — new venues appear over time. Surface an unrecognized suffix verbatim; never fail or guess on one) |
-| `product_codes` / asset + kind | from `PRODUCT` — e.g. `BTC OPTION - DBT`, `ETH PERPETUAL - DBT`, `BTC OPTION - PRDX` |
-| `quote_currency` | `QUOTE_CURRENCY` (`BTC` / `ETH` / `USD` …) |
-| USD notional | `NOTIONAL_VOLUME_USD` |
-| `rfqType` (`RFQ`/`OB`) | `AUCTION` |
-| ids | `RFQ_ID`, `TRADE_ID`, `BLOCK_TRADE_ID` |
-
-**Not in the tape — pull live or infer (never fabricate):**
-- `index_price` / **spot**: not a tape column — pull the live underlying
-  (`BTC-PERPETUAL` / `ETH-PERPETUAL`) mark in Step 2, or use the description.
-- `strategy_code`: not stored — infer the structure from `DESCRIPTION`
-  (see `references/strategy-codes.md`).
-- per-leg greeks/IV: not in the tape — fetched live in Step 2 (or via Bullish
-  chain snapshots / exchange market data through `paradigm-data-discovery` for historical).
-
----
-
-## The role of the inline `<rfq description>`
-
-The `<rfq description>` after the `rfq_id` is **user reference only — not an input to the
-analysis**. Do not use it to choose the asset, build instrument names, filter the tape, or
-decide the structure; every one of those comes from the resolved `FILL` row (`PRODUCT` +
-`DESCRIPTION`). It may omit the asset or be outright wrong.
-
-- **The only allowed use:** if the resolved row materially disagrees with what the description
-  implied, add a one-line note that the id resolved to a *different* trade — but the resolved
-  row still governs every field.
-- **Never** let the description seed a live fetch before the tape resolves, and **never**
-  fall back to "parse the structure from the description" — if the id doesn't resolve and the
-  asset therefore isn't known, report the RFQ unresolved (Step 7); do not fabricate an
-  asset/strike/structure or default to BTC.
+Do not use the hot 30-day Paradigm tape, default to BTC, reuse the inline
+description as the fill, or fabricate missing price/mark/side fields.

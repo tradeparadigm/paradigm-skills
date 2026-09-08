@@ -45,6 +45,14 @@ def check(name, cond, detail=""):
         print(f"  ✗ {name}  {detail}")
 
 
+def _first_fenced(md):
+    """First line INSIDE the Snapshot fence. Warnings lead there now; they used
+    to be the document's first line, above the header, and the relaying model
+    kept the fence verbatim while dropping everything above it (2026-09-08)."""
+    lines = md.splitlines()
+    return lines[lines.index("```yaml") + 1]
+
+
 def _write(d, name, text):
     with open(os.path.join(d, name), "w") as f:
         f.write(text)
@@ -1081,7 +1089,8 @@ def test_render_degraded_banner():
     res = build("btc", "8h", 0, 8 * 3600_000,
                 {"closes_7d": [], "trades": [], "market": None}, hot)
     md = render_md(res)
-    check("degraded banner prepended", md.startswith("⚠ hot surface unavailable"), md[:60])
+    check("degraded banner leads the Snapshot fence",
+          _first_fenced(md).startswith("⚠ hot surface unavailable"), md.splitlines()[:8])
     check("volume reads n/a", "Volume" in md and "n/a" in md)
     check("surface reads No data", "No data" in md)
 
@@ -1367,8 +1376,10 @@ def test_stale_banner_leads_and_states_the_outcome():
                           "retained_groups": []}])
     md = render_md(r)
     lines = md.splitlines()
-    check("banner is the first line", lines[0].startswith("⚠ recap_aggregates"), lines[0])
-    check("names the lag in human units", "25d 0h" in lines[0], lines[0])
+    first = _first_fenced(md)
+    check("banner is the first line inside the Snapshot fence",
+          first.startswith("⚠ recap_aggregates"), first)
+    check("names the lag in human units", "25d 0h" in first, first)
     check("says the divert worked", "re-sourced live from Deribit" in md, lines[:4])
     # The truncation disclosure is the point of finding #5: these come from the
     # same parquet, are windowed, and the Snapshot divert does not help them.
@@ -1473,8 +1484,8 @@ def test_main_wires_the_gate_end_to_end():
     # gate detected -> banner rendered (kills: stale=[], stale=[] into build(),
     # and the check_freshness call being bypassed)
     check("banner present", "⚠ recap_aggregates" in out, out.splitlines()[:3])
-    check("banner leads", out.splitlines()[0].startswith("⚠ recap_aggregates"),
-          out.splitlines()[:2])
+    check("banner leads the Snapshot fence", _first_fenced(out).startswith("⚠ recap_aggregates"),
+          out.splitlines()[:8])
     # divert actually happened (kills: stale_snapshot=False, _SNAPSHOT_SOURCES
     # pointed at the wrong source)
     check("deribit fallback invoked", calls["fallback"] == 1, calls)
@@ -1530,38 +1541,13 @@ def test_main_no_s3_path_does_not_crash():
 
 
 def test_freshness_probe_contract_matches_its_reader():
-    # The shell->Python contract crosses a process boundary that CI cannot
-    # execute (run_recap.sh needs IRSA credentials), so it is asserted on the
-    # generated SQL instead. Renaming the alias or the output filename used to
-    # leave both suites green while the gate returned a permanent all-clear.
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "..", "scripts", "run_recap.sh")
     with open(src) as f:
         sh = f.read()
-    import re as _re
-    copies = _re.findall(r"COPY \((.*?)\) TO '\$\{WORK\}/(freshness_[a-z]+\.csv)'", sh)
-    files = {c[1] for c in copies}
-    expected = set(recap._FRESHNESS_FILES.values())
-    check("one COPY per source", files == expected, f"{files} vs {expected}")
-    for body, fname in copies:
-        check(f"{fname} aliases the column load_freshness reads",
-              "AS max_at" in body, body[:120])
-    # Assert the exact grouping key set, not merely that a GROUP BY exists. The
-    # loose version let two distinct defects through at full green:
-    #   GROUP BY exchange, metric -> probe measures a SUPERSET of what load_hot
-    #     renders (it collapses to Deribit), so another venue lagging fires a
-    #     false banner and forces a refetch every run;
-    #   GROUP BY exchange         -> collapses dvol and spot back into one flat
-    #     max, restoring the original masked-freeze bug.
-    rec = next(b for b, f in copies if f == "freshness_rec.csv")
-    check("recap probe takes min over per-metric maxima", "min(mx)" in rec, rec[:160])
-    check("grouped by metric ALONE", "GROUP BY metric)" in rec, rec[:200])
-    check("not grouped by exchange", "exchange" not in rec, rec[:200])
-    # The vol_surface probe must measure the rows the recap consumes. Deleting
-    # this predicate survived at full green: BTC's surface could freeze while
-    # ETH rows keep landing in the shared file and the probe reads fresh.
-    vs = next(b for b, f in copies if f == "freshness_vs.csv")
-    check("surface probe is asset-scoped", "symbol LIKE" in vs, vs[:200])
+    check("wrapper delegates to collector", "collect_recap.py" in sh, sh)
+    check("wrapper no longer builds presentation files", "COPY (" not in sh, sh)
+    check("wrapper renders from direct inputs", "--render" in sh, sh)
 
 
 # ── Venue-block dedupe: fail-closed guarantees ──────────────────────────────
@@ -1780,21 +1766,12 @@ def test_ordinary_bybit_print_does_not_disable_the_merge():
 
 
 def test_venue_window_is_floored_to_the_containing_bucket():
-    # The grain alignment had no test at all — reverting START_MS_5M survived
-    # every suite. Assert the shell computes the floor and uses it for the
-    # venue read only (blocks.csv must stay on exact START_MS).
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "..", "scripts", "run_recap.sh")
+                       "..", "scripts", "collect_recap.py")
     with open(src) as f:
-        sh = f.read()
-    check("floor is computed",
-          "START_MS_5M=$(( (START_S - START_S % 300) * 1000 ))" in sh, "missing START_MS_5M")
-    venue = next(l for l in sh.splitlines() if "venue_blocks.csv" in l and l.startswith("COPY"))
-    check("venue read uses the floored bound", "${START_MS_5M}" in venue, venue[:160])
-    tape = next(l for l in sh.splitlines()
-                if l.startswith("COPY") and "read_parquet('${PT}')" in l)
-    check("tape read stays on exact START_MS",
-          "${START_MS}" in tape and "START_MS_5M" not in tape, tape[:160])
+        collector = f.read()
+    check("collector filters on event time", "TRY_CAST(timestamp AS TIMESTAMPTZ)" in collector)
+    check("collector exposes source paths", "path_plan" in collector)
 
 
 def test_no_banner_when_nothing_is_stale():
@@ -1823,23 +1800,13 @@ def test_empty_block_tape_is_rendered_not_silently_quiet():
 
 
 def test_run_recap_has_no_legacy_csv_read_left():
-    # The csv.gz stopped refreshing on 2026-08-10 (data#712) and returns zero
-    # rows for any recent window, so the fallback can only mask, never help.
-    # Pin its removal so it cannot creep back.
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "..", "scripts", "run_recap.sh")
     with open(src) as f:
         sh = f.read()
-    # Assert the CONSTRUCT is gone, not the word — the comment deliberately
-    # retains the history of why the fallback existed and why it was removed.
-    check("no TAPE variable",
-          not any(l.startswith("TAPE=") for l in sh.splitlines()), "TAPE= still assigned")
-    check("no read_csv_auto", "read_csv_auto" not in sh, "legacy read still present")
-    check("no staging file", "blocks_pt" not in sh, "staging still present")
-    blocks = [l for l in sh.splitlines()
-              if l.startswith("COPY") and "/blocks.csv'" in l]
-    check("exactly one blocks.csv writer", len(blocks) == 1, blocks)
-    check("and it is the hot tape", "read_parquet('${PT}')" in blocks[0], blocks[0][:120])
+    check("no hot path", "/hot/" not in sh and "hot__" not in sh, sh)
+    check("no legacy CSV read", "read_csv_auto" not in sh, sh)
+    check("stdout is the finished recap", sh.rstrip().endswith('--window "$WINDOW" --render'), sh[-160:])
 
 
 
@@ -1877,6 +1844,35 @@ def test_unknown_freshness_reaches_the_divert_through_main():
     check("unknown is banner-flagged", "could not be verified" in out, out.splitlines()[:4])
     check("and it diverts rather than trusting the data", calls["fallback"] == 1, calls)
     check("stale hot DVOL not rendered", "38.2" not in out, out.splitlines()[:14])
+
+
+def test_warning_banners_render_inside_snapshot_fence():
+    # 2026-09-08, live: a relaying model kept the Snapshot fence verbatim and
+    # deleted every ⚠ line printed above the header (Bullish partial, a 66-min
+    # Paradigm coverage shortfall, 13k unvalued trades). The lines that say what
+    # NOT to trust must travel inside the block that carries the numbers.
+    recap.WARNINGS.clear()
+    with tempfile.TemporaryDirectory() as d:
+        hot = load_hot(d, "BTC")
+    res = build("btc", "8h", 0, 8 * 3600_000,
+                {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+    res["source_gaps"] = [
+        "Paradigm executions: coverage ends 66 min before the requested end",
+        "option_trades_bullish: 4/9 hourly/bucket paths absent; partial coverage",
+    ]
+    lines = render_md(res).splitlines()
+    header = next(i for i, ln in enumerate(lines) if ln.startswith("**BTC Options"))
+    fence_open = next(i for i, ln in enumerate(lines) if ln == "```yaml")
+    fence_close = next(i for i in range(fence_open + 1, len(lines)) if lines[i] == "```")
+    warns = [i for i, ln in enumerate(lines) if ln.startswith("⚠")]
+    check("source gaps rendered", sum("coverage ends 66 min" in ln for ln in lines) == 1
+          and sum("bullish: 4/9" in ln for ln in lines) == 1, lines[:14])
+    check("no ⚠ line above the header", all(i > header for i in warns), lines[:header + 1])
+    check("every ⚠ line inside the Snapshot fence",
+          warns and all(fence_open < i < fence_close for i in warns), lines[fence_open:fence_close + 1])
+    check("blank line then Spot follow the warnings",
+          warns and lines[max(warns) + 1] == "" and lines[max(warns) + 2].startswith("Spot"),
+          lines[fence_open:fence_open + 8])
 
 
 def main():

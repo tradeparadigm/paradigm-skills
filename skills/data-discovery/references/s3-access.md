@@ -48,10 +48,9 @@ Do **not** read `$AWS_WEB_IDENTITY_TOKEN_FILE`, call STS with `curl`, scrape
 None of these exist when the credential step is a SQL statement inside the same
 `duckdb -c "…"` call as the query.
 
-(The same STS logic *is* fine inside a committed `.sh` file — e.g.
-`options-recap/scripts/run_recap.sh` — because `bash script.sh` is one process
-with normal shell state and a known interpreter. The rule here is about inline
-shell an agent assembles across `exec` calls.)
+(The same STS logic can be valid inside a committed `.sh` file because the
+script is one process with normal shell state and a known interpreter. The rule
+here is about inline shell an agent assembles across `exec` calls.)
 
 ## Token lifecycle
 
@@ -62,15 +61,15 @@ a read starts returning HTTP 400 `InvalidToken`.
 
 ## Verifying access
 
-The cheapest reachability check is a read of a known stable key — the hot
-surface, which is clobbered every 60 s and always present:
+Use a small non-hot source object to verify the credential and network path:
 
 ```sql
 INSTALL httpfs; LOAD httpfs;
 INSTALL aws;    LOAD aws;
 CREATE OR REPLACE SECRET s3_irsa (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1');
 
-SELECT COUNT(*) FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet');
+SELECT COUNT(*)
+FROM read_csv_auto('s3://dt-paradigm-data/paradigm_data/paradigm_rfq_tape_slim.csv.gz');
 ```
 
 A non-zero count confirms credentials and network path are good.
@@ -82,12 +81,14 @@ mechanics.
 
 ## Coverage probe pattern
 
-The catalog's verified date ranges are point-in-time; the tapes grow forward.
-Confirm current coverage by reading the date column directly:
+The catalog's verified date ranges are point-in-time. Confirm coverage by
+reading the source's event-time column directly:
 
 ```sql
 SELECT min(DATE) AS earliest, max(DATE) AS latest
-FROM read_csv_auto('s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz');
+FROM read_csv_auto('s3://dt-paradigm-data/paradigm_data/paradigm_rfq_tape_slim.csv.gz');
 ```
 
-Use this before concluding "no data" for a recent date.
+For exchange landing data, inspect `max(CAST(timestamp AS TIMESTAMP))` in the
+narrow raw partition selected for the request. Use this before concluding
+"no data" for a recent date.

@@ -4,16 +4,17 @@
 # dependencies = []
 # ///
 """
-recap.py — single-call orchestrator for the options recap.
+Deterministic recap calculations and rendering. The live entrypoint supplies
+non-hot partitioned inputs through direct_inputs.py; CSV inputs are retained
+for offline fixtures.
+
+recap.py — single-call orchestrator for the prior options recap implementation.
 
 ONE invocation does the entire recap: it fetches the Deribit 7d closes (the
 realized-vol input), ingests the DuckDB-written CSVs (hot surface + the
 multi-venue block tape), runs the vol math (realized-vs-implied, block
 ranking/rollup, vol-surface skew/term), and prints ONE JSON object whose fields
 map 1:1 to the four output sections.
-
-The agent runs this once and renders the four sections from the JSON. It must
-not paginate, merge, cluster, or hand-assemble a snapshot — all of that is here.
 
 Pipeline (concurrent where independent):
   • Deribit 7d hourly closes        → realized vol (no non-Deribit source)
@@ -853,7 +854,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         volume_scope = "deribit"
     # Activity + P/C use trade_count — unit-free, so they span ALL venues truthfully.
     pt, ct = hot.get("put_trades"), hot.get("call_trades")
-    pc = round(pt / ct, 2) if pt and ct else None
+    pc = round(pt / ct, 2) if pt is not None and ct else None
     tt = hot.get("trades_total")
     activity_split = None
     if tt:
@@ -1029,6 +1030,10 @@ def render_md(r: dict) -> str:
     h, s, bp, bf, vs = (r["header"], r["snapshot"], r["biggest_print"],
                         r["block_flow"], r["vol_surface"])
     L: list[str] = []
+    for gap in r.get("source_gaps", []):
+        L.append(f"⚠ {gap}")
+    if r.get("source_gaps"):
+        L.append("")
 
     # STALENESS FIRST. This banner outranks the others because it is the only
     # one that says the numbers below may be WRONG rather than missing — a
@@ -1097,9 +1102,22 @@ def render_md(r: dict) -> str:
                  f"horizon); Block Flow and surface span the full {hh}h.")
         L.append("")
 
+    # Everything appended so far is a warning banner. It used to sit ABOVE the
+    # header, outside any fence — and the relaying model demonstrably copies
+    # fenced blocks verbatim and drops the prose around them: on 2026-09-08 a
+    # /recap relay kept every Snapshot figure and deleted all three ⚠ lines
+    # (Bullish partial, a 66-minute Paradigm coverage shortfall, 13k unvalued
+    # trades). The lines that say what NOT to trust must travel with the
+    # numbers they qualify, so they are emitted as the first lines INSIDE the
+    # Snapshot fence, where they cannot be dropped without dropping Snapshot.
+    banner, L = L, []
+    while banner and banner[-1] == "":
+        banner.pop()
     L.append(f"**{h['asset']} Options · {h['window']} Recap · "
              f"{h['start_utc']}–{h['end_utc']} UTC**")
     L += ["", "**Snapshot**", "", "```yaml"]
+    if banner:
+        L += banner + [""]
 
     spot = f"${s['spot']:,}" if s.get("spot") else "n/a"
     chg = s.get("spot_change_pct")
@@ -1118,7 +1136,7 @@ def render_md(r: dict) -> str:
     L.append(f"{'DVOL':<9} {dvol:<11} {s.get('dvol_label') or ''}{dv}")
 
     vrp = s.get("vrp")
-    rich = ("CHEAP" if vrp is not None and vrp < -1 else
+    rich = ("unavailable" if vrp is None else "CHEAP" if vrp is not None and vrp < -1 else
             "RICH" if vrp is not None and vrp > 1 else "IN LINE")
     rv = f"{s['rv_7d']}v" if s.get("rv_7d") is not None else "n/a"
     L.append(f"{'RV 7d':<9} {rv:<11} implied {rich} vs realized")
@@ -1126,7 +1144,7 @@ def render_md(r: dict) -> str:
     vrp_txt = f"{vrp:+}v" if vrp is not None else "n/a"
     # Same ±1v dead-band as the RV line above — otherwise a VRP in (0,1] prints
     # "IN LINE" and "overpriced" on adjacent lines.
-    upo = ("underpriced" if vrp is not None and vrp < -1 else
+    upo = ("unavailable" if vrp is None else "underpriced" if vrp is not None and vrp < -1 else
            "overpriced" if vrp is not None and vrp > 1 else "roughly fair")
     L.append(f"{'VRP':<9} {vrp_txt:<11} vol {upo} vs delivered")
 
@@ -1144,11 +1162,12 @@ def render_md(r: dict) -> str:
     vol = f"${s['volume_usd_m']}M" if s.get("volume_usd_m") else "n/a"
     # "all venues" when the cross-venue turnover_usd sum drove the number;
     # the Deribit-scoped label survives only on the pre-upgrade fallback.
-    vol_note = "all venues" if s.get("volume_scope") == "all" else "Deribit only"
+    vol_note = ("all venues" if s.get("volume_scope") == "all" else
+                "Deribit only" if s.get("volume_scope") == "deribit" else s.get("volume_scope", "unavailable"))
     L.append(f"{'Volume':<9} {vol:<11} {vol_note}")
     pc = f"{s['pc_ratio']}x" if s.get("pc_ratio") is not None else "n/a"
     pc_desc = f"{s['pc_descriptor']} " if s.get("pc_descriptor") else ""
-    L.append(f"{'P/C':<9} {pc:<11} {pc_desc}(all venues, by trades)")
+    L.append(f"{'P/C':<9} {pc:<11} {pc_desc}({s.get('activity_scope', 'all venues, by trades')})")
     L += ["```", "", "**Biggest Print**", "", "```yaml"]
 
     if bp:

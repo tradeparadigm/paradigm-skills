@@ -4,18 +4,15 @@
 # dependencies = []
 # ///
 """
-analyze.py — single-call orchestrator for the block analyst.
+Deterministic block calculations and rendering. The live entrypoint supplies
+resolved partitioned execution rows; CSV inputs remain available for fixtures.
+
+analyze.py — orchestrator for the prior block analyst implementation.
 
 ONE invocation does everything after the tape resolve: it reads the FILL/HIST
 CSVs the DuckDB step wrote (from analyze.sh), parses the structure, fetches every
 leg's Deribit ticker + 30d trade buckets CONCURRENTLY, computes net greeks /
 direction / fill-offset / recurrence, and prints the finished block (--render).
-
-The agent runs `bash scripts/analyze.sh <rfq_id>` and relays stdout. The only
-piece it may finalise itself is the [Greeks] net line when the structure's signs
-aren't reliably derivable from the tape (risk reversals, calendars, exotics) —
-those rows are printed as per-leg greeks with a `⚠ net: confirm signs` marker and
-all the numbers it needs are right there.
 
 Deterministic + no per-turn tool orchestration ⇒ fast and run-to-run stable.
 """
@@ -80,13 +77,15 @@ def fetch_trades_bucket(sym, now_ms):
         r = _get("get_last_trades_by_instrument",
                  {"instrument_name": sym, "count": 1000, "start_timestamp": start,
                   "end_timestamp": now_ms, "sorting": "desc"})
+        if r.get("has_more"):
+            warn(f"trades {sym}: incomplete 30d history (API result truncated)")
+            return sym, None
         t = r.get("trades") or []
         if not t:
             return sym, {"24h": (0, 0, 0.0), "7d": (0, 0, 0.0), "30d": (0, 0, 0.0)}
-        latest = max(x.get("timestamp") or 0 for x in t)
 
         def bucket(days):
-            c = latest - days * 86400_000
+            c = now_ms - days * 86400_000
             w = [x for x in t if (x.get("timestamp") or 0) >= c]
             b = [x for x in w if x.get("block_trade_id")]
             return len(w), len(b), round(sum(float(x.get("amount") or 0) for x in w), 1)
@@ -132,17 +131,29 @@ def _run(args):
               "no asset/structure/fill available.")
         return
 
+    result = analyze_rows(fill, hist, now_ms)
+    print(render(result) if args.render else json.dumps(result, default=str))
+
+
+def analyze_rows(fill, hist, now_ms):
+    """Use the same calculation/render contract regardless of tape storage."""
+    WARN.clear()
+
     prod = ac.parse_product(fill[0].get("PRODUCT", ""))
     asset = prod["asset"]
     desc = fill[0].get("DESCRIPTION", "")
     quote = (fill[0].get("QUOTE_CURRENCY") or "").upper()
-    qty = ac._f(fill[0].get("QTY")) or 1.0
+    option_quantities = [float(r["QTY"]) for r in fill
+                         if ac.parse_product(r["PRODUCT"])["kind"] == "OPTION"]
+    qty = min(option_quantities) if option_quantities else float(fill[0]["QTY"])
     # Two tape shapes: (a) one combined-DESCRIPTION block (ICondor/Cstm/single) →
     # parse fill[0]; (b) one row PER LEG, each a single-leg desc or a perp/future →
     # build legs from the rows, sign straight from each row's SIDE (most reliable).
     unmapped = False
     legs = ac.legs_from_rows(fill)
     if legs is not None:
+        for leg in legs:
+            leg["ratio"] = float(leg["_row"]["QTY"]) / qty
         side = "Buyer" if ac.net_cash(fill) > 0 else "Seller"
         # per-leg option signs are exact; a perp leg needs delta sizing we don't do
         # here, so defer the net to the model (⚠) when a future/perp leg is present.
@@ -178,8 +189,12 @@ def _run(args):
     # fetch everything concurrently: tickers (legs+perp) + per-leg 30d trades.
     # Submit all up front so they run in parallel, then collect into typed maps.
     tickers, buckets = {}, {}
+    # A non-Deribit execution must not silently acquire a Deribit live screen.
+    if prod["venue"] != "DBT":
+        syms, perp = [], None
+        warn(f"live market data unavailable for {prod['venue']}")
     with ThreadPoolExecutor(max_workers=min(12, 2 * len(syms) + 2)) as ex:
-        tfuts = [ex.submit(fetch_ticker, s) for s in syms + [perp]]
+        tfuts = [ex.submit(fetch_ticker, s) for s in syms + ([perp] if perp else [])]
         bfuts = [ex.submit(fetch_trades_bucket, s, now_ms) for s in syms]
         for f in tfuts:
             s, v = f.result()
@@ -205,7 +220,11 @@ def _run(args):
         tt = tickers.get(l.get("_sym"))
         if tt:
             greek_by_key[ac.leg_key(l)] = tt
-    ng = ac.net_greeks(legs, greek_by_key, qty) if reliable else {}
+    complete_greeks = all(
+        ac.leg_key(l) in greek_by_key and all(greek_by_key[ac.leg_key(l)].get(k) is not None
+                                             for k in ("delta", "vega", "gamma", "theta"))
+        for l in legs)
+    ng = ac.net_greeks(legs, greek_by_key, qty) if reliable and complete_greeks else {}
 
     # Net package offset (SKILL Step 7, the ONE convention) — per structure unit, unit by quote.
     # struct_net weights each option leg by its QTY relative to the structure's base unit, so a
@@ -249,10 +268,7 @@ def _run(args):
         "net_greeks": ng, "recurrence_blocks": recurrence, "warnings": WARN,
     }
 
-    if args.render:
-        print(render(result))
-    else:
-        print(json.dumps(result, default=str))
+    return result
 
 
 def _sk(strike):
@@ -271,6 +287,15 @@ def _leg_lbl(l, multi_exp):
     (calendars/diagonals) so same-strike legs are distinguishable — else stays clean."""
     base = f"{_sk(l['strike'])}{l['cp']}"
     return f"{base}·{_exp_short(l.get('expiry'))}" if multi_exp and l.get("expiry") else base
+
+
+def _leg_expiry(l):
+    """Expiry code of a leg under either key. analyze_core legs carry
+    `expiry_c`; the result legs render() builds carry `expiry` (line
+    `"expiry": l.get("expiry_c")`). Reading only `expiry_c` here made every
+    result-leg comparison None == None, so a 79k 11SEP/12SEP call calendar
+    was labelled "Combo"."""
+    return l.get("expiry") or l.get("expiry_c")
 
 
 def _struct_name(code, legs):
@@ -299,7 +324,7 @@ def _struct_name(code, legs):
             a, b = sorted(opt, key=lambda l: l["strike"])
             cps = {a["cp"], b["cp"]}
             same_k = a["strike"] == b["strike"]
-            same_e = a.get("expiry_c") == b.get("expiry_c")
+            same_e = _leg_expiry(a) == _leg_expiry(b)
             opp = (a["sign"] or 0) * (b["sign"] or 0) < 0
             if cps == {"C", "P"} and same_e:
                 base = (("Combo" if opp else "Straddle") if same_k
@@ -358,7 +383,11 @@ def render(r) -> str:
             L.append(f"<!-- warnings: {'; '.join(r['warnings'])} -->")
         return "\n".join(L)
 
-    exp = legs[0]["expiry"] if legs else "?"
+    # A calendar/diagonal spans two expiries; naming only the first leg's made
+    # "11SEP26 79k/79k Call Calendar" read as a single-expiry trade.
+    expiries = list(dict.fromkeys(l.get("expiry") for l in legs
+                                  if l["cp"] != "FUT" and l.get("expiry")))
+    exp = "/".join(expiries) if expiries else (legs[0]["expiry"] if legs else "?")
     strikes = "/".join(_sk(l["strike"]) for l in legs if l["cp"] != "FUT")
     struct = _struct_name(r["structure"], legs)
     L = []
@@ -383,19 +412,20 @@ def render(r) -> str:
         per = " · ".join(
             f"{_leg_lbl(l, multi_exp)} Δ{(l['tkr'] or {}).get('delta')}"
             for l in legs if l["cp"] != "FUT" and l.get("tkr"))
-        L.append(f"[Greeks]   ⚠ net: confirm signs — per-leg: {per}")
+        L.append(f"[Greeks]   Unavailable — incomplete live greeks or unresolved signs{': ' + per if per else ''}")
     # [Fair]
     ivs = " / ".join(f"{_leg_lbl(l, multi_exp)} {(l['tkr'] or {}).get('iv')}v"
                      for l in legs if l["cp"] != "FUT" and l.get("tkr"))
     L.append(f"[Fair]     {_offset_txt(r['offset'])} · {ivs}")
     # [History]
-    d30 = sum((l["trades"] or {}).get("30d", (0, 0, 0))[1] for l in legs if l.get("trades"))
+    d30 = (sum(l["trades"]["30d"][1] for l in legs)
+           if all(l.get("trades") for l in legs) else "n/a (incomplete)")
     L.append(f"[History]  {r['recurrence_blocks']} same-structure block(s) on Paradigm 30d · "
              f"Deribit leg blocks 30d: {d30}")
     # [Live]
     live = " · ".join(f"{_leg_lbl(l, multi_exp)} {(l['tkr'] or {}).get('bid')}/{(l['tkr'] or {}).get('ask')}"
                       for l in legs if l["cp"] != "FUT" and l.get("tkr"))
-    L.append(f"[Live]     {live}")
+    L.append(f"[Live]     {live or 'Unavailable — no applicable venue quotes'}")
     L.append("```")
     if r["warnings"]:
         L.append(f"<!-- warnings: {'; '.join(r['warnings'])} -->")

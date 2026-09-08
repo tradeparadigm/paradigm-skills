@@ -1,192 +1,160 @@
 #!/usr/bin/env python3
-"""
-Tests for run_recap.sh argument normalization — no creds, no network.
+"""Offline checks for the direct-data recap command and collector plan."""
 
-run_recap.sh resolves `<asset> <window>` from positional args and drops a stray
-"options"/"option" keyword that some users include (`/recap btc options 8h`).
-Left in, that token would land in the window slot and break the run
-(hot__recap_options.parquet doesn't exist; parse_window_ms raises). We invoke the
-REAL script with RECAP_PRINT_ARGS=1, which echoes the resolved "ASSET WIN" and
-exits 0 before any STS/DuckDB work — so this exercises the actual parsing in CI
-with no AWS creds and no S3.
-
-Run: python3 tests/test_run_recap.py
-"""
-
+import datetime as dt
+import importlib.util
 import os
 import subprocess
 import sys
-import time
+import types
 
-SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "run_recap.sh")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPT = os.path.join(ROOT, "scripts", "run_recap.sh")
+COLLECTOR = os.path.join(ROOT, "scripts", "collect_recap.py")
 
-_passed = 0
-_failed = 0
+# collect_recap imports duckdb at module top. Stub it ONLY when it is genuinely
+# absent (the stdlib-only workflow); if this file is ever collected into a
+# pytest session alongside modules that need the real duckdb, a module-level
+# setdefault would leak this connect=None stub into them (see
+# test_collect_analysis for the incident).
+if importlib.util.find_spec("duckdb") is None:
+    sys.modules["duckdb"] = types.SimpleNamespace(Error=Exception, connect=None)
+
+spec = importlib.util.spec_from_file_location("collect_recap", COLLECTOR)
+collector = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = collector
+spec.loader.exec_module(collector)
+
+passed = failed = 0
 
 
-def check(name, cond, detail=""):
-    global _passed, _failed
-    if cond:
-        _passed += 1
+def check(name, condition, detail=""):
+    global passed, failed
+    if condition:
+        passed += 1
     else:
-        _failed += 1
+        failed += 1
         print(f"  ✗ {name}  {detail}")
 
 
-def resolve(*args):
-    """Run run_recap.sh with the print-args hook; return (stdout.strip(), rc)."""
-    env = dict(os.environ, RECAP_PRINT_ARGS="1")
-    r = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True,
-                       env=env, timeout=20)
-    return r.stdout.strip(), r.returncode
+def hook(name, *args):
+    env = dict(os.environ, **{name: "1"})
+    result = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True, env=env)
+    return (result.stdout.strip() or result.stderr.strip()), result.returncode
 
 
-def plan(*args):
-    """Run with the print-plan hook; return ("ASSET WIN SECS PRESET", rc). Also
-    surfaces stderr on non-zero rc so bad-window guards are checkable."""
-    env = dict(os.environ, RECAP_PRINT_PLAN="1")
-    r = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True,
-                       env=env, timeout=20)
-    return (r.stdout.strip() or r.stderr.strip()), r.returncode
+def test_arguments():
+    check("default is BTC 24h", hook("RECAP_PRINT_ARGS")[0] == "BTC 24h")
+    check("options token is ignored", hook("RECAP_PRINT_ARGS", "eth", "options", "8h")[0] == "ETH 8h")
+    check("1d normalizes to 24h", hook("RECAP_PRINT_ARGS", "btc", "1d")[0] == "BTC 24h")
+    check("window-first invocation", hook("RECAP_PRINT_ARGS", "8h", "options", "eth")[0] == "ETH 8h")
+    check("window-only invocation", hook("RECAP_PRINT_ARGS", "8h")[0] == "BTC 8h")
 
 
-def sources(now_s, *args):
-    """Run with the print-sources hook and a pinned clock; return
-    "ASSET WIN START_MS VS_COLD|-". Exercises the real surface-open source
-    resolution (window-start date math → cold partition path) with no creds."""
-    env = dict(os.environ, RECAP_PRINT_SOURCES="1", RECAP_NOW_S=str(now_s))
-    r = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True,
-                       env=env, timeout=20)
-    return r.stdout.strip()
+def test_windows_are_not_capped():
+    check("2d remains 2d", hook("RECAP_PRINT_PLAN", "eth", "2d") == ("ETH 2d 172800 direct", 0))
+    check("31d remains 31d", hook("RECAP_PRINT_PLAN", "btc", "31d") == ("BTC 31d 2678400 direct", 0))
 
 
-def test_plain_args():
-    out, rc = resolve("BTC", "8h")
-    check("BTC 8h passes through", out == "BTC 8h", out)
-    check("exit 0", rc == 0, rc)
+def test_bad_arguments_fail_before_data_access():
+    for value in ("0h", "3x", "-2h", "foo"):
+        output, code = hook("RECAP_PRINT_PLAN", "btc", value)
+        check(f"{value} exits 2", code == 2, output)
+    check("unsafe asset exits 2", hook("RECAP_PRINT_PLAN", "BTC';", "8h")[1] == 2)
 
 
-def test_asset_uppercased():
-    out, _ = resolve("btc", "4h")
-    check("lowercase asset uppercased", out == "BTC 4h", out)
+def test_partition_plan_is_explicit_and_hot_free():
+    start = dt.datetime(2026, 8, 30, 10, 30, tzinfo=dt.timezone.utc)
+    end = dt.datetime(2026, 8, 30, 12, 0, tzinfo=dt.timezone.utc)
+    queries = collector.build_queries("BTC", start, end)
+    paths = [path for query in queries for path in query.paths]
+    check("collector exposes venue-isolated evidence groups", len(queries) == 19, [q.name for q in queries])
+    check("every path is direct", all("/raw/" in p or "/normalized/" in p or "/meta/" in p for p in paths))
+    check("no hot path", all("/hot/" not in p and "hot__" not in p for p in paths))
+    check("hours are explicit", all("hour=*" not in p for p in paths))
+    check("exclusive end covers two UTC hours", len(queries[0].paths) == 2, len(queries[0].paths))
+    surface_sql = next(query.sql for query in queries if query.name == "option_surface_deribit")
+    check("surface samples every expiry and type independently", "PARTITION BY observation, expirationDate, optionType, target_delta" in surface_sql)
 
 
-def test_strips_options_keyword():
-    out, rc = resolve("btc", "options", "8h")
-    check("'options' dropped → BTC 8h", out == "BTC 8h", out)
-    check("exit 0 (not the break path)", rc == 0, rc)
+def test_evidence_contract_names_provenance_and_freshness():
+    source = collector.Query("x", ["s3://direct"], "SELECT 1", {"price": "USD"}, True)
+    original = collector.duckdb.connect
+
+    collector.duckdb.connect = fake_connection(["s3://direct/a.parquet"])
+    try:
+        metadata, rows = collector.run_query(source)
+    finally:
+        collector.duckdb.connect = original
+    check("source plan retained", metadata["path_plan"] == {
+        "pattern_count": 1, "first_pattern": "s3://direct", "last_pattern": "s3://direct",
+        "resolved_file_count": 1, "missing_pattern_count": 0})
+    check("units retained", metadata["units"] == {"price": "USD"})
+    check("event freshness retained", metadata["max_event_at"] == "2026-08-30T12:00:00Z")
+    check("observations are not rendered", rows[0]["price"] == 1)
 
 
-def test_strips_options_case_insensitive():
-    check("OPTIONS dropped", resolve("BTC", "OPTIONS", "8h")[0] == "BTC 8h")
-    check("singular 'option' dropped", resolve("eth", "option", "4h")[0] == "ETH 4h")
+def fake_connection(glob_files):
+    """A duckdb.connect stand-in whose glob() returns exactly `glob_files`."""
+
+    class Connection:
+        description = [("max_event_at",), ("price",)]
+
+        def execute(self, sql):
+            self._glob = sql.lstrip().startswith("SELECT file FROM glob(")
+            self.description = [("file",)] if self._glob else [("max_event_at",), ("price",)]
+            return self
+
+        def fetchall(self):
+            if self._glob:
+                return [(name,) for name in glob_files]
+            return [("2026-08-30T12:00:00Z", 1)]
+
+        def close(self):
+            pass
+
+    return Connection
 
 
-def test_options_with_1d_window():
-    # 1d→24h normalization still applies after the keyword is stripped.
-    out, _ = resolve("eth", "options", "1d")
-    check("eth options 1d → ETH 24h", out == "ETH 24h", out)
+def test_absent_partition_does_not_erase_the_rest_of_the_window():
+    """One unwritten hour must not take the whole window's evidence down."""
+    patterns = [f"s3://bucket/hour={hour:02d}/**/*.parquet" for hour in (17, 18, 19)]
+    source = collector.Query("trades", patterns, "SELECT * FROM read_parquet(__PATHS__)", {}, True)
+    original = collector.duckdb.connect
+
+    # Hours 17 and 18 landed; the current hour 19 has not been written yet.
+    collector.duckdb.connect = fake_connection(
+        ["s3://bucket/hour=17/a.parquet", "s3://bucket/hour=18/b.parquet"])
+    try:
+        metadata, rows = collector.run_query(source)
+    finally:
+        collector.duckdb.connect = original
+    check("partial window still reads", metadata["status"] == "ok" and rows)
+    check("resolved only the present partitions", metadata["path_plan"]["resolved_file_count"] == 2)
+    check("absent partition counted", metadata["path_plan"]["missing_pattern_count"] == 1)
+    check("absent partition named", metadata["path_plan"]["missing_patterns"] == [patterns[2]])
 
 
-def test_defaults():
-    check("no args → BTC 8h", resolve()[0] == "BTC 8h")
-    check("asset only → BTC 8h", resolve("btc")[0] == "BTC 8h")
-
-
-# ── Dynamic-window parsing + preset gating (RECAP_PRINT_PLAN) ────────────────
-# The old preset `case` silently defaulted any non-preset window (e.g. 3h) to
-# 8h, so surface deltas were computed against the wrong window-open and the
-# hot__recap_<win>.parquet read missed. Windows are now parsed generically.
-
-def test_preset_window_plan():
-    # Preset: SECS from the window, PRESET=1 (label only — same rolling-file path).
-    check("8h → 28800s, preset", plan("btc", "8h") == ("BTC 8h 28800 1", 0))
-    check("1h → 3600s, preset", plan("btc", "1h") == ("BTC 1h 3600 1", 0))
-
-
-def test_dynamic_window_resolves_correctly():
-    # The bug: 3h must resolve to 10800s (not the old 8h/28800 default), PRESET=0.
-    check("3h → 10800s, non-preset", plan("btc", "3h") == ("BTC 3h 10800 0", 0))
-    check("90m → 5400s, non-preset", plan("btc", "90m") == ("BTC 90m 5400 0", 0))
-    check("6h → 21600s, non-preset", plan("btc", "6h") == ("BTC 6h 21600 0", 0))
-
-
-def test_1d_normalizes_to_preset():
-    # 1d → 24h happens before parsing, so it stays on the fast preset path.
-    check("1d → 24h, 86400s, preset", plan("btc", "1d") == ("BTC 24h 86400 1", 0))
-
-
-def test_windows_beyond_24h_cap():
-    # Every flow source retains only ~24h, so longer windows clamp to 24h (the
-    # live path also prepends a disclosure banner). 24h itself is NOT capped.
-    check("2d caps to 24h", plan("eth", "2d") == ("ETH 24h 86400 1", 0))
-    check("48h caps to 24h", plan("btc", "48h") == ("BTC 24h 86400 1", 0))
-    check("25h caps to 24h", plan("btc", "25h") == ("BTC 24h 86400 1", 0))
-    check("24h itself not capped", plan("btc", "24h") == ("BTC 24h 86400 1", 0))
-    check("1440m (=24h) not capped", plan("btc", "1440m") == ("BTC 1440m 86400 0", 0))
-    # Regression: the old substring 1d→24h substitution turned 31d into "324h"
-    # (13.5 days); exact-match normalization + the cap now yield a plain 24h.
-    check("31d caps to 24h (not 324h)", plan("btc", "31d") == ("BTC 24h 86400 1", 0))
-
-
-# ── Surface-open source resolution (RECAP_PRINT_SOURCES) ────────────────────
-# ΔATM/ΔRR/ΔFly need a window-open surface. Windows ≤1h read it from _hot only
-# (VS_COLD "-"); >1h windows also target the cold hour-partition containing
-# window-start. The bash date math must be UTC and zero-padded on both GNU and
-# BSD date — a wrong partition path silently degrades every Δ column to n/a,
-# which is exactly the bug that shipped when the cold store was empty.
-
-COLD_FMT = ("s3://dt-paradigm-data/paradigm_data/v_vol_surface/"
-            "base={a}/year={t.tm_year:04d}/month={t.tm_mon:02d}/day={t.tm_mday:02d}/"
-            "hour={t.tm_hour:02d}/v_vol_surface.parquet")
-
-
-def expect(asset, win, now_s, secs, cold):
-    start = now_s - secs
-    c = COLD_FMT.format(a=asset, t=time.gmtime(start)) if cold else "-"
-    return f"{asset} {win} {start * 1000} {c}"
-
-
-def test_sources_hot_only_up_to_1h():
-    now = 1_784_536_200  # 2026-07-20 08:30:00 UTC
-    check("30m stays on _hot", sources(now, "btc", "30m") == expect("BTC", "30m", now, 1800, False))
-    check("1h stays on _hot", sources(now, "btc", "1h") == expect("BTC", "1h", now, 3600, False))
-
-
-def test_sources_cold_partition_over_1h():
-    now = 1_784_536_200  # 2026-07-20 08:30:00 UTC
-    out = sources(now, "btc", "8h")
-    check("8h resolves cold partition", out == expect("BTC", "8h", now, 28800, True), out)
-    check("8h cold path zero-padded/UTC",
-          "base=BTC/year=2026/month=07/day=20/hour=00/" in out, out)
-    out = sources(now, "eth", "90m")
-    check("90m (61–120min) also targets cold", out == expect("ETH", "90m", now, 5400, True), out)
-
-
-def test_sources_day_boundary():
-    # Window-start crosses midnight UTC: day/hour must roll back correctly.
-    now = 1_784_514_600  # 2026-07-20 02:30:00 UTC
-    out = sources(now, "btc", "8h")
-    check("8h across midnight → day=19 hour=18",
-          "year=2026/month=07/day=19/hour=18/" in out, out)
-    check("8h across midnight full line", out == expect("BTC", "8h", now, 28800, True), out)
-
-
-def test_bad_window_exits_2():
-    for w in ("3x", "foo", "0h", "h", "-2h"):
-        out, rc = plan("btc", w)
-        check(f"bad window '{w}' exits 2", rc == 2, f"rc={rc}")
-        check(f"bad window '{w}' names it", "bad window" in out, out)
+def test_fully_absent_window_reports_unavailable_not_a_quiet_market():
+    patterns = ["s3://bucket/hour=17/**/*.parquet", "s3://bucket/hour=18/**/*.parquet"]
+    source = collector.Query("trades", patterns, "SELECT * FROM read_parquet(__PATHS__)", {}, True)
+    original = collector.duckdb.connect
+    collector.duckdb.connect = fake_connection([])
+    try:
+        metadata, rows = collector.run_query(source)
+    finally:
+        collector.duckdb.connect = original
+    check("no objects means unavailable", metadata["status"] == "unavailable")
+    check("no rows fabricated", rows == [] and metadata["row_count"] == 0)
+    check("error names the pattern span", "2 partition patterns" in metadata["error"])
 
 
 def main():
-    tests = [v for k, v in sorted(globals().items())
-             if k.startswith("test_") and callable(v)]
-    print(f"Running {len(tests)} test functions...")
-    for t in tests:
-        t()
-    print(f"\n{_passed} checks passed, {_failed} failed")
-    sys.exit(1 if _failed else 0)
+    for name, function in sorted(globals().items()):
+        if name.startswith("test_") and callable(function):
+            function()
+    print(f"{passed} checks passed, {failed} failed")
+    raise SystemExit(1 if failed else 0)
 
 
 if __name__ == "__main__":
