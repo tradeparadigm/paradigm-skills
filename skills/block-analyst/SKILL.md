@@ -123,8 +123,7 @@ net_greek = sum(position_sign * leg_ratio * instrument_greek) * quantity
 ```
 
 - Delta is in underlying coin; vega is USD per vol point; theta is USD per
-  day; gamma is coin per USD move. Deribit does not publish vanna, so omit it
-  or mark an estimate with `~`.
+  day; gamma is coin per USD move. Deribit does not publish vanna; omit it.
 - For multi-leg option packages, calculate fill and mark on the same signed,
   ratio-weighted legs. Exclude perp hedge legs from option-premium offset.
 - When resolved tape evidence supplies one row per leg, use the smallest
@@ -171,6 +170,9 @@ Spot <price> · <moneyness/exposure> · <key risk level> · <rfq type/venue>
 [Live]    <per-leg bid/ask> · <screen level> · <fill vs screen>
 ```
 
-Use real numbers only. Drop a bracket row only when all of its data is
-unavailable. Do not show working, tool narration, a data trace, or follow-up
-commentary.
+Use only numbers the script or a tool call in this turn actually produced. A
+field with no such source is written `unavailable` — never an estimate, a
+range, an "est." or a `~` value; supplied tape rows carry fill, mark, size and
+side, not greeks, IV, bid/ask or history. Drop a bracket row only when all of
+its data is unavailable. Do not show working, tool narration, a data trace, or
+follow-up commentary.
