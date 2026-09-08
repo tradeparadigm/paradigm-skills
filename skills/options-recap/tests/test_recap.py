@@ -1792,7 +1792,7 @@ def test_venue_window_is_floored_to_the_containing_bucket():
     venue = next(l for l in sh.splitlines() if "venue_blocks.csv" in l and l.startswith("COPY"))
     check("venue read uses the floored bound", "${START_MS_5M}" in venue, venue[:160])
     tape = next(l for l in sh.splitlines()
-                if l.startswith("COPY") and "read_parquet('${PT}')" in l)
+                if l.startswith("COPY") and " FROM ${PT} " in l)
     check("tape read stays on exact START_MS",
           "${START_MS}" in tape and "START_MS_5M" not in tape, tape[:160])
 
@@ -1839,7 +1839,17 @@ def test_run_recap_has_no_legacy_csv_read_left():
     blocks = [l for l in sh.splitlines()
               if l.startswith("COPY") and "/blocks.csv'" in l]
     check("exactly one blocks.csv writer", len(blocks) == 1, blocks)
-    check("and it is the hot tape", "read_parquet('${PT}')" in blocks[0], blocks[0][:120])
+    check("and it is the tape store", " FROM ${PT} " in blocks[0], blocks[0][:120])
+    # The hot 30d rollup is gone too: the store it was cut from is read directly.
+    code = [l for l in sh.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    check("no hot tape rollup read left in code",
+          not any("hot__paradigm_trade_tape" in l for l in code),
+          [l[:80] for l in code if "hot__paradigm_trade_tape" in l])
+    pt = next(l for l in sh.splitlines() if l.startswith("PT="))
+    check("tape read tolerates columns added mid-history", "union_by_name=true" in pt, pt)
+    check("tape read exposes partition keys", "hive_partitioning=true" in pt, pt)
+    check("no row_type discriminator on the dedicated store",
+          "row_type" not in blocks[0], blocks[0][:200])
 
 
 
@@ -1917,10 +1927,13 @@ def test_run_recap_reads_the_aggregation_layer_not_the_hot_rollup():
     check("probe reads the layer", "${MA}" in probe, probe[:120])
     check("probe bounded by the lookback, not the window",
           "${PROBE_FROM_MS}" in probe and "${START_MS}" not in probe, probe[:200])
-    # The Paradigm tape stays on the hot prefix (its landing is uncatalogued),
-    # but through an override seam so it can be repointed without a code change.
-    pt = next(l for l in lines if l.startswith("PT="))
-    check("tape path is overridable", "RECAP_PARADIGM_TAPE" in pt, pt)
+    # The Paradigm tape store has the same seams, so it can be narrowed
+    # without a code change once its layout is verified.
+    pt_root = next(l for l in lines if l.startswith("PT_ROOT="))
+    check("default tape root is the persisted store", "paradigm_trade_tape" in pt_root
+          and "hot" not in pt_root, pt_root)
+    pt_glob = next(l for l in lines if l.startswith("PT_GLOB="))
+    check("tape glob is overridable", "RECAP_PARADIGM_TAPE" in pt_glob, pt_glob)
 
 
 def main():

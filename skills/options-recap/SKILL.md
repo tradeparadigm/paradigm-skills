@@ -38,7 +38,7 @@ the `$` Volume line, and the multi-venue activity/P-C all come from the pipeline
 hot recap rollup was generated from), sliced to the window at query time; the
 surface (and its Δ columns)
 from `v_vol_surface`; and **Biggest Print + Block Flow from the multi-venue Paradigm
-block tape** (the hot `paradigm_trade` rows — the SOLE source; the legacy
+block tape** (the `paradigm_trade_tape/` store — the SOLE source; the legacy
 `paradigm_trade_tape_slim` csv.gz fallback was removed once its producer was
 decommissioned) — every venue Paradigm brokers (Deribit/Paradex/Bullish/…),
 notional already in USD per leg. There is no fallback: if that read returns

@@ -10,7 +10,8 @@
 #   RECAP_MA_ROOT        s3://dt-exchange-venue-data/market_aggregates_5m
 #   RECAP_MA_GLOB        ${RECAP_MA_ROOT}/**/*.parquet   (narrow it once the
 #                        partition layout is known — see README "Data sources")
-#   RECAP_PARADIGM_TAPE  s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet
+#   RECAP_PT_ROOT        s3://dt-exchange-venue-data/paradigm_trade_tape
+#   RECAP_PARADIGM_TAPE  ${RECAP_PT_ROOT}/**/*.parquet   (full glob, verbatim)
 set -uo pipefail
 
 # Some users type the no-op keyword "options" (/recap btc options 8h). This skill
@@ -123,6 +124,11 @@ MA="read_parquet('${MA_GLOB}', hive_partitioning=true, union_by_name=true)"
 # which recap.py reports as `unknown` (freshness unverifiable → banner + divert),
 # never as fresh. Both outcomes fail safe; only the wording differs.
 PROBE_FROM_MS=$(( (NOW_S - 7 * 86400) * 1000 ))
+# Block-tape source (documented with its read below, resolved here so the
+# RECAP_PRINT_PT hook can exercise it with no creds).
+PT_ROOT=${RECAP_PT_ROOT:-s3://dt-exchange-venue-data/paradigm_trade_tape}
+PT_GLOB=${RECAP_PARADIGM_TAPE:-${PT_ROOT}/**/*.parquet}
+PT="read_parquet('${PT_GLOB}', hive_partitioning=true, union_by_name=true)"
 
 # Testability hooks: echo resolved state and exit before any STS/DuckDB work (no
 # creds/network needed). Used by tests/test_run_recap.py.
@@ -130,10 +136,12 @@ PROBE_FROM_MS=$(( (NOW_S - 7 * 86400) * 1000 ))
 #   RECAP_PRINT_PLAN → "ASSET WIN SECS PRESET"  (window parsing + preset flag)
 #   RECAP_PRINT_SOURCES → "ASSET WIN START_MS VS_COLD|-"  (surface-open resolution)
 #   RECAP_PRINT_MA → "MA_GLOB PROBE_FROM_MS"  (aggregates source resolution)
+#   RECAP_PRINT_PT → "PT_GLOB"                (block-tape source resolution)
 [ -n "${RECAP_PRINT_ARGS:-}" ] && { echo "$ASSET $WIN"; exit 0; }
 [ -n "${RECAP_PRINT_PLAN:-}" ] && { echo "$ASSET $WIN $SECS $PRESET"; exit 0; }
 [ -n "${RECAP_PRINT_SOURCES:-}" ] && { echo "$ASSET $WIN $START_MS ${VS_COLD:--}"; exit 0; }
 [ -n "${RECAP_PRINT_MA:-}" ] && { echo "$MA_GLOB $PROBE_FROM_MS"; exit 0; }
+[ -n "${RECAP_PRINT_PT:-}" ] && { echo "$PT_GLOB"; exit 0; }
 DIR="$(cd "$(dirname "$0")/.." && pwd)"      # skill dir (scripts/..)
 # Per-invocation workdir. The old fixed /tmp/recap + /tmp/recap.sql were shared
 # state: two concurrent recaps (e.g. BTC and ETH fired from separate sessions)
@@ -152,27 +160,35 @@ SK=$(printf '%s' "$CREDS" | grep -o '<SecretAccessKey>[^<]*' | cut -d'>' -f2)
 ST=$(printf '%s' "$CREDS" | grep -o '<SessionToken>[^<]*'    | cut -d'>' -f2)
 
 # Multi-venue Paradigm block tape — the SOLE source for Biggest Print + Block
-# Flow. hot__paradigm_trade_tape_30d.parquet (row_type='paradigm_trade', leg
-# grain, trailing 30d), built by the exchange-venue-data paradigm-trade CronJob
-# from the Airbyte→S3 UM landing on s3://dt-paradigm-data. Spans every venue
-# Paradigm brokers (Deribit/Paradex/Bullish/…) with USD notional PER LEG and the
+# Flow. s3://dt-exchange-venue-data/paradigm_trade_tape/ is the persisted
+# store of the exchange-venue-data paradigm-trade pipeline (leg grain, built
+# from the Airbyte→S3 UM landing on s3://dt-paradigm-data); the
+# hot__paradigm_trade_tape_30d.parquet rollup this replaced was that pipeline's
+# trailing-30d single-file copy of the same rows. It spans every venue Paradigm
+# brokers (Deribit/Paradex/Bullish/…) with USD notional PER LEG and the
 # structure named in DESCRIPTION, so recap.py needs no cross-venue $
 # normalization and no instrument-name inference. It also carries
-# VENUE_BLOCK_TRADE_ID — the venue's own block id — which is what unlocks exact
+# venue_block_trade_id — the venue's own block id — which is what unlocks exact
 # block dedupe against the venue tapes.
 #
-# STILL A HOT-PREFIX READ, deliberately. Its lineage is traced only to the
-# bucket (the Airbyte landing under dt-paradigm-data); the landing's key
-# layout and column names are not catalogued, and the legacy
-# paradigm_trade_tape_slim.csv.gz that once stood in for it froze on
-# 2026-08-10 (data#712) so it cannot serve either. Repointing blind would trade
-# a working read for a guessed one. RECAP_PARADIGM_TAPE is the seam: set it to
-# the landing (or a view over it) once its shape is known — the COPY below
-# needs the same columns the hot tape exposes.
+# Same read shape as the aggregates layer above: ONE recursive glob by default
+# (hive_partitioning picks up key=value directories, union_by_name tolerates
+# columns added mid-history), narrowed via RECAP_PT_ROOT / RECAP_PARADIGM_TAPE
+# once the partition layout is verified (README "Data sources" has the probe).
+# The COPY below expects the columns the hot rollup exposed (traded_at ms +
+# traded_at_iso, product, description, quantity, trade_price, mark_price,
+# taker_side, asset, instrument_name, instrument_kind, notional_volume_usd,
+# rfq_id, trade_id, block_trade_id, venue_block_trade_id); a store without one
+# of them fails the COPY at bind, which recap.py renders as Block Flow MISSING.
+# The hot rollup's row_type='paradigm_trade' discriminator is NOT applied: a
+# dedicated tape store is single-kind, and a predicate on a column it may not
+# carry would fail every recap for nothing. asset / instrument_kind are
+# compared case-insensitively for the same reason.
 #
 # There is no fallback: an empty result is Block Flow MISSING rather than
-# stale — recap.py renders that distinction explicitly.
-PT=${RECAP_PARADIGM_TAPE:-s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet}
+# stale — recap.py renders that distinction explicitly. Not freshness-probed,
+# and must not be: it is event-driven (its newest row is whenever anyone last
+# traded), so a quiet hour would fire a false alarm.
 
 # One DuckDB session → CSVs. One statement per line; `at` is reserved → alias it.
 # Each COPY echoes `asset` through so recap.py can assert the slice is for THIS
@@ -201,7 +217,7 @@ COPY (SELECT asset, exchange, block_id, min(bucket_at) AS bucket_at, sum(volume_
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT max("at") FROM h)) TO '${WORK}/surface_now.csv' (HEADER, DELIMITER ',');
 COPY (WITH h AS (SELECT symbol, mark_iv, delta, "at" FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) SELECT symbol, mark_iv, delta FROM h WHERE "at"=(SELECT "at" FROM h WHERE abs("at"-${START_MS})<=900000 ORDER BY abs("at"-${START_MS}) LIMIT 1)) TO '${WORK}/surface_open.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional) AS notional_native, sum(turnover_usd) AS turnover_usd, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM ma WHERE row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
-COPY (SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS "DATE", strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS "TIME", product AS PRODUCT, description AS DESCRIPTION, quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE, taker_side AS SIDE, CASE WHEN upper(trim(split_part(coalesce(product,''), ' - ', 2))) = 'DBT' AND upper(coalesce(asset,'')) IN ('BTC','ETH') AND instrument_name IS NOT NULL AND upper(instrument_name) NOT LIKE '%USDC%' THEN upper(asset) ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD, rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID, venue_block_trade_id AS VENUE_BLOCK_TRADE_ID FROM read_parquet('${PT}') WHERE row_type='paradigm_trade' AND asset='${ASSET}' AND instrument_kind='OPTION' AND traded_at >= ${START_MS}) TO '${WORK}/blocks.csv' (HEADER, DELIMITER ',');
+COPY (SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS "DATE", strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS "TIME", product AS PRODUCT, description AS DESCRIPTION, quantity AS QTY, trade_price AS PRICE, mark_price AS REF_PRICE, taker_side AS SIDE, CASE WHEN upper(trim(split_part(coalesce(product,''), ' - ', 2))) = 'DBT' AND upper(coalesce(asset,'')) IN ('BTC','ETH') AND instrument_name IS NOT NULL AND upper(instrument_name) NOT LIKE '%USDC%' THEN upper(asset) ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD, rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID, venue_block_trade_id AS VENUE_BLOCK_TRADE_ID FROM ${PT} WHERE upper(asset)='${ASSET}' AND upper(instrument_kind)='OPTION' AND traded_at >= ${START_MS}) TO '${WORK}/blocks.csv' (HEADER, DELIMITER ',');
 COPY (SELECT 'market_aggregates' AS source, min(mx) AS max_at FROM (SELECT metric, max(bucket_at) AS mx FROM ${MA} WHERE asset='${ASSET}' AND row_type='dvol_spot' AND bucket_at >= ${PROBE_FROM_MS} GROUP BY metric) AS g) TO '${WORK}/freshness_ma.csv' (HEADER, DELIMITER ',');
 COPY (SELECT 'vol_surface' AS source, max("at") AS max_at FROM read_parquet('${VS_HOT}') WHERE base='${ASSET}' AND symbol LIKE '${ASSET}-%' AND mark_iv IS NOT NULL) TO '${WORK}/freshness_vs.csv' (HEADER, DELIMITER ',');
 SQL

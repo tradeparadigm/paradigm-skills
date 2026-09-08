@@ -171,23 +171,31 @@ Biggest Print / Block Flow are primarily the block tape (below), plus the
 `block` rows for venues the tape doesn't broker.
 
 **Block tape (Biggest Print + Block Flow).**
-`s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet`
-(`row_type='paradigm_trade'`) — the Snowflake-free tape, built by the
-`exchange-venue-data` paradigm-trade CronJob from the Airbyte→S3 UM landing on
-`s3://dt-paradigm-data`. Leg grain, **trailing 30 days**, read fresh per recap
-and windowed by `traded_at` in `run_recap.sh`.
+`s3://dt-exchange-venue-data/paradigm_trade_tape/` — the persisted store of the
+`exchange-venue-data` paradigm-trade pipeline (Snowflake-free, built from the
+Airbyte→S3 UM landing on `s3://dt-paradigm-data`). Leg grain, read fresh per
+recap and windowed by `traded_at` in `run_recap.sh`. It replaced
+`hot/hot__paradigm_trade_tape_30d.parquet`, that pipeline's trailing-30-day
+single-file rollup of the same rows, so **no `hot/` read remains** in the recap.
 
-This is the **one read still on the `hot/` prefix**, deliberately. Its lineage
-is traced only to the bucket: the Airbyte landing's key layout and column names
-are not catalogued anywhere in this repo, and the legacy
-`paradigm_trade_tape_slim.csv.gz` that once stood in for it froze on 2026-08-10.
-Repointing blind would replace a working read with a guessed one. The seam is
-`RECAP_PARADIGM_TAPE` — point it at the landing (or a view over it) once its
-shape is known; the `blocks.csv` COPY needs the same columns the hot tape
-exposes (`traded_at`/`traded_at_iso`, `product`, `description`, `quantity`,
-`trade_price`, `mark_price`, `taker_side`, `asset`, `instrument_name`,
-`instrument_kind`, `notional_volume_usd`, `rfq_id`, `trade_id`,
-`block_trade_id`, `venue_block_trade_id`, `row_type`).
+Read shape mirrors the aggregates layer: one recursive glob by default
+(`paradigm_trade_tape/**/*.parquet`, `hive_partitioning=true`,
+`union_by_name=true`), narrowed via `RECAP_PT_ROOT` (the prefix) or
+`RECAP_PARADIGM_TAPE` (the full glob, verbatim) once the layout is confirmed —
+same probe as above with the prefix swapped. The `blocks.csv` COPY expects the
+columns the hot rollup exposed (`traded_at` ms + `traded_at_iso`, `product`,
+`description`, `quantity`, `trade_price`, `mark_price`, `taker_side`, `asset`,
+`instrument_name`, `instrument_kind`, `notional_volume_usd`, `rfq_id`,
+`trade_id`, `block_trade_id`, `venue_block_trade_id`); a store missing one
+fails the COPY at bind and the recap renders `Block Flow unavailable`, never a
+quiet market. Two predicates were loosened relative to the hot read: the
+`row_type='paradigm_trade'` discriminator is dropped (a dedicated tape store is
+single-kind, and a filter on a column it may not carry would fail every recap
+for nothing) and `asset` / `instrument_kind` compare case-insensitively.
+
+**Not yet verified live** (this sandbox had no S3 access): the store's
+partition layout and that its column set matches the hot rollup's. Both fail
+loudly rather than silently if wrong.
 
 It REPLACED `s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz`
 (a flat csv.gz spanning all dates). That read was removed in this PR: data#712
@@ -413,16 +421,16 @@ python3 tests/test_vol_math.py    # 166 checks — the math formulas + tape pars
                                     #   (parse_tape_description) and block ranking/
                                     #   rollup (build_tape_blocks: Σ-per-block
                                     #   notional, RFQ clip rollup, IV lookup)
-python3 tests/test_recap.py       # 392 checks — orchestrator: window parsing,
+python3 tests/test_recap.py       # 397 checks — orchestrator: window parsing,
                                     #   hot-CSV ingest, the volume-corruption guard,
                                     #   block tape → Biggest Print/Block Flow (multi-
                                     #   venue, venue column, freshness gate),
                                     #   assembly, vol-surface deltas, rendering, and
                                     #   the run_recap.sh SQL contract (layer read,
                                     #   one-scan temp table, probe bounds)
-python3 tests/test_run_recap.py   # 46 checks — run_recap.sh arg normalization,
-                                    #   window parsing, surface-open resolution and
-                                    #   aggregates-source resolution via the
+python3 tests/test_run_recap.py   # 51 checks — run_recap.sh arg normalization,
+                                    #   window parsing, surface-open, aggregates-
+                                    #   and tape-source resolution via the
                                     #   RECAP_PRINT_* hooks (no creds needed)
 ```
 
@@ -444,5 +452,6 @@ hot-only) is the **minor** bump to `1.12` — same four sections and trigger, no
 removed fields. Repointing the Snapshot sources off the derived
 `hot__recap_aggregates_5m_24h.parquet` rollup onto the `market_aggregates_5m/`
 layer it was generated from (same `row_type` schema, one-scan temp table,
-`recap_aggregates` → `market_aggregates` in the freshness banner) is the
-**minor** bump to `1.16`. (See the repo `CLAUDE.md` for the minor/major rules.)
+`recap_aggregates` → `market_aggregates` in the freshness banner), together
+with moving Block Flow off the hot 30d tape rollup onto the persisted
+`paradigm_trade_tape/` store, is the **minor** bump to `1.16`. (See the repo `CLAUDE.md` for the minor/major rules.)

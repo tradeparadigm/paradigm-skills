@@ -39,7 +39,13 @@ Paradigm across Deribit, Paradex, and Bybit.
 
 - **Path:** `s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz`
 - **Last verified coverage:** 2025-11-09 → 2026-05-09
-- **Layout:** Single flat CSV — all dates in one file. Coverage likely extends forward.
+- **Layout:** Single flat CSV — all dates in one file.
+- **Status:** its producer was decommissioned on 2026-08-10, so this file is
+  frozen at that date. For current Paradigm block flow read the persisted
+  parquet store `s3://dt-exchange-venue-data/paradigm_trade_tape/` (leg grain,
+  lowercase column names — `product`, `description`, `notional_volume_usd`,
+  `rfq_id`, `block_trade_id`, `venue_block_trade_id`, `traded_at` in Unix ms;
+  see Dataset 3c) or its trailing-30d rollup `hot/hot__paradigm_trade_tape_30d.parquet`.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -374,9 +380,12 @@ DESCRIBE SELECT * FROM read_parquet(
   (`markIV_close` → `mark_iv`, `delta_close` → `greek_delta`,
   `openInterest_close` → `open_interest`, `underlyingPrice_close` →
   `underlying_price`), `perp_summary/` (funding, OI) and `spot_trade/` (spot);
-  `hot__paradigm_trade_tape_30d` is built from the Airbyte landing on
-  `s3://dt-paradigm-data` (path not catalogued). `raw/` is the exchange-native
-  ingest layer and does not feed the hot files directly.
+  `hot__paradigm_trade_tape_30d` is the trailing-30d rollup of the persisted
+  Paradigm tape store `s3://dt-exchange-venue-data/paradigm_trade_tape/`
+  (itself built from the Airbyte landing on `s3://dt-paradigm-data`, path not
+  catalogued); `/recap` reads that store directly (layout to be probed, same
+  columns as the rollup). `raw/` is the exchange-native ingest layer and does
+  not feed the hot files directly.
 
 ---
 

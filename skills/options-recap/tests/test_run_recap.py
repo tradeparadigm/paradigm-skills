@@ -213,6 +213,34 @@ def test_ma_probe_lookback_is_independent_of_the_window():
           ma(now, "btc", "30m")[1] == ma(now, "eth", "24h")[1] == (now - 7 * 86400) * 1000)
 
 
+PT_DEFAULT = "s3://dt-exchange-venue-data/paradigm_trade_tape/**/*.parquet"
+
+
+def pt(now_s, *args, **env_extra):
+    env = dict(os.environ, RECAP_PRINT_PT="1", RECAP_NOW_S=str(now_s), **env_extra)
+    r = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True,
+                       env=env, timeout=20)
+    return r.stdout.strip()
+
+
+def test_pt_default_is_the_store_not_the_hot_rollup():
+    now = 1_784_536_200
+    glob_ = pt(now, "btc", "8h")
+    check("default tape glob is the persisted store", glob_ == PT_DEFAULT, glob_)
+    check("no hot file in the tape path", "hot__" not in glob_, glob_)
+
+
+def test_pt_overrides():
+    now = 1_784_536_200
+    check("root override rebuilds the recursive glob",
+          pt(now, "btc", "8h", RECAP_PT_ROOT="s3://bkt/tape") == "s3://bkt/tape/**/*.parquet")
+    narrowed = "s3://bkt/tape/year=2026/**/*.parquet"
+    check("glob override is taken verbatim",
+          pt(now, "btc", "8h", RECAP_PARADIGM_TAPE=narrowed) == narrowed)
+    check("glob override wins over root",
+          pt(now, "btc", "8h", RECAP_PT_ROOT="s3://ignored", RECAP_PARADIGM_TAPE=narrowed) == narrowed)
+
+
 def test_ma_overrides():
     now = 1_784_536_200
     glob_, _ = ma(now, "btc", "8h", RECAP_MA_ROOT="s3://bkt/agg")
