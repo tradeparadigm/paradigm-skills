@@ -7,7 +7,7 @@ description: >
   selects the raw evidence and never uses Dime hot files.
 metadata:
   author: tradeparadigm
-  version: "2.1"
+  version: "2.0"
 ---
 
 # Paradigm Block Trade Analyst
@@ -124,6 +124,12 @@ net_greek = sum(position_sign * leg_ratio * instrument_greek) * quantity
 - Keep the resolved tape `REF_PRICE` as the execution benchmark. A newer live
   mark belongs in `[Live]`; it must not replace or contradict the tape-based
   fill-versus-mark calculation.
+- Before rendering, compute the signed fill, signed reference and offset in
+  code from the actual leg rows; check the header against those results.
+  Row `SIDE` controls cash flow even when DESCRIPTION has opposite signs.
+  Never reverse authoritative BUY/SELL sides to fit a strategy label.
+  Multiplying a BTC premium difference by 10,000 expresses it in units of
+  0.0001 BTC, not a relative percentage of the reference premium.
 - Attribute a vol-surface move only when raw trade IV and later summary IV,
   timing, and size support it.
 

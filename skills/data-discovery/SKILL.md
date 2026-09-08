@@ -9,7 +9,7 @@ description: >
   Does not cover account state, positions, vaults, or order placement.
 metadata:
   author: tradeparadigm
-  version: "2.1"
+  version: "2.0"
 ---
 
 # Paradigm Data Discovery
