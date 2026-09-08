@@ -44,6 +44,9 @@ follow-up lookup plan. Available evidence includes:
 
 - injected cleared-trade context;
 - the current Paradigm RFQ tape for request metadata;
+- the daily partitioned Paradigm execution tape for all id-linked legs in the
+  trailing 30 days (`execution_candidates.paradigm_tape`); see the linked
+  execution contract for publication lag, native units and deployment gates;
 - raw venue `option_trade`/perp rows and their real block/RFQ/OTC ids;
 - the frozen non-hot executed Paradigm tape for trades at or before
   2026-08-10 only;
@@ -72,7 +75,8 @@ After the trade resolves, use any bounded combination the model judges useful:
 - raw `option_trade` rows for 24h/7d/30d prior prints, real block clusters,
   traded IV, and flow impact;
 - raw `perp_summary` or spot/perp trades for spot, hedge legs, and funding;
-- newest instrument metadata for contract, IV, OI, and premium units;
+- event-time-applicable instrument metadata for contract, IV, OI, and premium
+  units; follow the catalog's 30-day metadata-history limit and report gaps;
 - direct Deribit/OKX/Bybit/Bullish APIs for fresher or missing current marks.
 
 Read only the relevant venues, symbols, and event-time partitions. Query legs

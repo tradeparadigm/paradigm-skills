@@ -1,18 +1,22 @@
 # Exchange venue files
 
 Use these files when a question needs exchange market data. They are the
-per-message landing data, not an LLM-shaped read surface.
+per-period source data, not an LLM-shaped read surface: event rows and
+existing per-instrument aggregates are both available.
 
 ## Read policy
 
 - Do not read `s3://dt-exchange-venue-data/hot/`.
-- Prefer `raw/` when venue-native fields matter. Use `normalized/` only when a
-  common cross-venue schema materially simplifies the question; it is still
-  per-message data, not a hot aggregate.
+- Prefer `raw/` when venue-native fields matter. `normalized/` provides common
+  column names, with both `rows` and `agg` files; normalization of names does
+  not establish comparable units across venues.
 - Read only the requested venues, data types, currencies, dates, and levels.
   Do not list or scan the whole bucket to discover data for each request.
 - Use `rows` files for event-level questions. `rows` exist at `1m` and `5m`;
-  `1h` contains aggregates only.
+  `1h` contains aggregates only. Existing `1m`/`5m` aggregates can avoid scanning
+  every ticker update when the question only needs a per-period observation.
+  Choose one level for each interval: overlapping `1m`, `5m`, and `1h` files
+  represent the same source events and must not be added together.
 - Check freshness from the maximum `timestamp` in the selected data. S3 object
   modification time is not evidence that the records are current.
 - Raw schemas and units differ by venue. Never union raw venues and then sum a
@@ -43,9 +47,52 @@ s3://dt-exchange-venue-data/meta/instruments/
   exchange=<venue>/currency=<currency>/instruments__*.parquet
 ```
 
-Take the newest `captured_at` row per `(exchange, currency, symbol)`. It carries
+For current questions, take the newest `captured_at` row per
+`(exchange, currency, symbol)`. It carries
 `instType`, `contract_size`, `contract_ccy`, `base_ccy`, `quote_ccy`, `iv_unit`,
 `oi_unit`, `price_unit`, and `tick_size`.
+
+For historical conversion, require metadata applicable at the event time:
+use an at-or-before snapshot and check intervening changes, or establish that
+the instrument's relevant attributes were unchanged. Do not apply today's
+contract size or units to older events merely because it is the latest row.
+Metadata snapshots have 30-day current-object retention while raw history can
+extend further. The default skill does not support harmonized historical
+analysis beyond 30 days; report older results in native units by venue unless
+an independently verified historical metadata source establishes the conversion.
+Even inside 30 days, retention is not a coverage guarantee: absent or ambiguous
+applicable metadata means an explicit conversion gap, never a multiplier of 1.
+
+## Inputs behind the hot files
+
+Use the layout above with these selectors; the hot names below identify the
+capability being replaced, not an allowed read path. All exchange inputs also
+need `meta/instruments/` when converting venue-native units.
+
+| Former output | Direct inputs | Agent responsibility |
+|---|---|---|
+| `hot__market_signals_1m` | Normalized `option_summary`, `option_trade`, and Deribit `perp_trade` aggregates at `1m`; raw Deribit `dvol` rows; normalized `perp_summary` rows; raw venue block-trade rows | Compute ATM IV, volume, DVOL, funding and block measures; report coverage separately per stream. The old spot signal uses a Deribit perpetual-price proxy, not the index price. |
+| `hot__vol_surface` | Normalized `option_summary` aggregates at `5m`, or summary rows for exact event-time snapshots | Select per-symbol observations, harmonize IV/OI, then derive ATM, skew, term structure or max pain as needed. Do not sum repeated OI snapshots. |
+| `hot__recap_aggregates_5m_24h` and all seven `hot__recap_<window>` presets | Normalized `option_trade` rows/aggregates, Deribit `perp_trade` aggregates, raw Deribit `dvol` rows, Bullish `perp_trade` and `spot_trade` rows, plus normalized `option_summary` aggregates for underlying prices | Filter the requested event window; compute volume, flow and real block groups with period-appropriate prices. No new consolidated recap dataset is required. |
+| `hot__paradigm_trade_tape_30d` | Daily `paradigm_trade_tape/year=YYYY/month=MM/day=DD/paradigm_trade_tape__YYYYMMDD.parquet`; see [the execution contract](datasets.md#current-partitioned-executions). | Keep every matching leg and its real IDs; check per-object publication metadata. Deployment and Dime-role verification are required before cutover. |
+
+The market-signal producer compares against its previous successfully published
+snapshot. A new event-time delta computed from source partitions is useful, but
+is not necessarily identical after a missed publication; label the actual times.
+Likewise, empty trade partitions alone do not prove a healthy quiet market:
+check a continuous companion feed and distinguish missing access from no events.
+
+The Paradigm execution producer reads private, append-versioned Unified Markets
+Airbyte streams (DRFQ/GRFQ legs, blocks, RFQs, orders and instrument metadata).
+Do not point agents at that entire private namespace. The required replacement
+is a scoped, current execution dataset retaining RFQ, trade, block and venue-block
+IDs, execution time, price, mark, side, quantity and instrument dimensions.
+Its notional USD measure is not option premium turnover.
+
+Before declaring migration complete, verify bounded reads of every required
+prefix with the **Dime runtime identity**, including metadata and current
+execution partitions. Source-bucket existence or a replication configuration
+does not prove that the consumer can read the destination objects.
 
 ## Available feeds
 

@@ -4,9 +4,12 @@ The first token after `/analyze` is the authoritative RFQ id. Accept only
 `[A-Za-z0-9_-]` before using it in a query. Strip a leading `DRFQv2-` or
 `GRFQ-` when comparing suffixes, but preserve the supplied id in the response.
 
-There is no single current raw file that guarantees a complete executed fill
-for every Paradigm RFQ. Use the available sources as evidence and stop when the
-identity cannot be proved.
+For current executions, read the daily partitioned tape described in
+[the execution contract](../../data-discovery/references/datasets.md#current-partitioned-executions).
+The collector reads at most 31 exact keys and returns every matching leg without
+a LIMIT. A supplied namespace is matched exactly; an unprefixed ID is checked
+against DRFQv2 and GRFQ. Keep different namespaced RFQs separate. Missing or stale
+objects are explicit gaps, not proof that the RFQ never executed.
 
 ## Available sources
 
@@ -38,6 +41,8 @@ identity cannot be proved.
 Choose the smallest combination that can prove the requested trade:
 
 - Query the current RFQ tape by exact id and suffix-tolerant core id.
+- Read `execution_candidates.paradigm_tape` for the current id-linked execution;
+  group its complete leg set by `block_trade_id`, retaining `venue_block_trade_id`.
 - Use its authoritative `PRODUCT`, `DESCRIPTION`, `QTY`, and time to select
   narrow raw exchange partitions.
 - Match a published `block_rfq_id` or real block id when possible.

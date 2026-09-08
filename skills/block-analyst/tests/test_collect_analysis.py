@@ -6,6 +6,10 @@ import os
 import subprocess
 import sys
 import types
+import io
+import json
+from contextlib import redirect_stdout
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "scripts", "analyze.sh")
@@ -56,6 +60,31 @@ def test_unresolved_anchor_does_not_scan_bucket():
         "DATE": "2026-08-30", "TIME": "00:30:00",
         "PRODUCT": "BTC OPTION - PRDX", "DESCRIPTION": "Call",
     }) == []
+
+
+def test_current_execution_resolves_without_request_or_venue_rows():
+    legs = [{"trade_id": f"leg-{i}", "rfq_id": "DRFQv2-r_test", "product": "BTC OPTION - PRDX"}
+            for i in range(150)]
+    helper = types.SimpleNamespace(read_executions=lambda *a, **kw: {
+        "rows": legs, "sources": [], "coverage_end_ms": 1, "units": {}})
+    output = io.StringIO()
+    with patch.dict(sys.modules, {"execution_tape": helper}), \
+         patch.object(sys, "argv", ["collect_analysis.py", "--rfq-id", "DRFQv2-r_test"]), \
+         patch.object(collector, "run_sql", return_value=([], None)), redirect_stdout(output):
+        assert collector.main() == 0
+    document = json.loads(output.getvalue())
+    assert document["resolution"]["status"] == "execution_resolved_by_paradigm_rfq_id"
+    assert len(document["execution_candidates"]["paradigm_tape"]) == 150
+
+
+def test_partition_discovery_failure_is_not_an_empty_market():
+    with patch.object(collector, "run_sql", return_value=([], "AccessDenied")):
+        try:
+            collector.existing_paths(["s3://bucket/bounded/*"])
+        except RuntimeError as exc:
+            assert "AccessDenied" in str(exc)
+        else:
+            raise AssertionError("access failure was swallowed")
 
 
 if __name__ == "__main__":

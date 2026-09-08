@@ -73,28 +73,72 @@ def test_evidence_contract_names_provenance_and_freshness():
     source = collector.Query("x", ["s3://direct"], "SELECT 1", {"price": "USD"}, True)
     original = collector.duckdb.connect
 
-    class Connection:
-        description = [("max_event_at",), ("price",)]
-
-        def execute(self, _sql):
-            return self
-
-        def fetchall(self):
-            return [("2026-08-30T12:00:00Z", 1)]
-
-        def close(self):
-            pass
-
-    collector.duckdb.connect = Connection
+    collector.duckdb.connect = fake_connection(["s3://direct/a.parquet"])
     try:
         metadata, rows = collector.run_query(source)
     finally:
         collector.duckdb.connect = original
     check("source plan retained", metadata["path_plan"] == {
-        "pattern_count": 1, "first_pattern": "s3://direct", "last_pattern": "s3://direct"})
+        "pattern_count": 1, "first_pattern": "s3://direct", "last_pattern": "s3://direct",
+        "resolved_file_count": 1, "missing_pattern_count": 0})
     check("units retained", metadata["units"] == {"price": "USD"})
     check("event freshness retained", metadata["max_event_at"] == "2026-08-30T12:00:00Z")
     check("observations are not rendered", rows[0]["price"] == 1)
+
+
+def fake_connection(glob_files):
+    """A duckdb.connect stand-in whose glob() returns exactly `glob_files`."""
+
+    class Connection:
+        description = [("max_event_at",), ("price",)]
+
+        def execute(self, sql):
+            self._glob = sql.lstrip().startswith("SELECT file FROM glob(")
+            self.description = [("file",)] if self._glob else [("max_event_at",), ("price",)]
+            return self
+
+        def fetchall(self):
+            if self._glob:
+                return [(name,) for name in glob_files]
+            return [("2026-08-30T12:00:00Z", 1)]
+
+        def close(self):
+            pass
+
+    return Connection
+
+
+def test_absent_partition_does_not_erase_the_rest_of_the_window():
+    """One unwritten hour must not take the whole window's evidence down."""
+    patterns = [f"s3://bucket/hour={hour:02d}/**/*.parquet" for hour in (17, 18, 19)]
+    source = collector.Query("trades", patterns, "SELECT * FROM read_parquet(__PATHS__)", {}, True)
+    original = collector.duckdb.connect
+
+    # Hours 17 and 18 landed; the current hour 19 has not been written yet.
+    collector.duckdb.connect = fake_connection(
+        ["s3://bucket/hour=17/a.parquet", "s3://bucket/hour=18/b.parquet"])
+    try:
+        metadata, rows = collector.run_query(source)
+    finally:
+        collector.duckdb.connect = original
+    check("partial window still reads", metadata["status"] == "ok" and rows)
+    check("resolved only the present partitions", metadata["path_plan"]["resolved_file_count"] == 2)
+    check("absent partition counted", metadata["path_plan"]["missing_pattern_count"] == 1)
+    check("absent partition named", metadata["path_plan"]["missing_patterns"] == [patterns[2]])
+
+
+def test_fully_absent_window_reports_unavailable_not_a_quiet_market():
+    patterns = ["s3://bucket/hour=17/**/*.parquet", "s3://bucket/hour=18/**/*.parquet"]
+    source = collector.Query("trades", patterns, "SELECT * FROM read_parquet(__PATHS__)", {}, True)
+    original = collector.duckdb.connect
+    collector.duckdb.connect = fake_connection([])
+    try:
+        metadata, rows = collector.run_query(source)
+    finally:
+        collector.duckdb.connect = original
+    check("no objects means unavailable", metadata["status"] == "unavailable")
+    check("no rows fabricated", rows == [] and metadata["row_count"] == 0)
+    check("error names the pattern span", "2 partition patterns" in metadata["error"])
 
 
 def main():

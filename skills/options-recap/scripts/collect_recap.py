@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["duckdb>=1.3"]
+# dependencies = ["duckdb>=1.3", "polars>=1.0", "boto3>=1.35"]
 # ///
 """Collect bounded direct exchange evidence without deciding the recap narrative."""
 
@@ -15,6 +15,7 @@ import re
 import sys
 from dataclasses import dataclass
 from typing import Any
+from pathlib import Path
 
 import duckdb
 
@@ -83,6 +84,25 @@ class Query:
     required: bool = False
 
 
+def resolve_paths(connection: duckdb.DuckDBPyConnection,
+                  patterns: list[str]) -> tuple[list[str], list[str]]:
+    """Split the partition patterns into the ones S3 actually has, and the rest.
+
+    read_parquet() fails the entire list when any single pattern matches no
+    object, so the current hour — which producers only write ~10 minutes in —
+    would otherwise erase every other hour in the window. glob() tolerates a
+    miss, so the read is scoped to partitions that exist and the absent ones
+    are reported rather than silently taking the whole source down with them.
+    """
+    files = [row[0] for row in
+             connection.execute(f"SELECT file FROM glob({sql_list(patterns)}) ORDER BY file").fetchall()]
+    present, missing = [], []
+    for pattern in patterns:
+        prefix = pattern.split("*", 1)[0]
+        (present if any(f.startswith(prefix) for f in files) else missing).append(pattern)
+    return files, missing
+
+
 def run_query(query: Query) -> tuple[dict[str, Any], list[Any]]:
     source: dict[str, Any] = {
         "name": query.name,
@@ -93,7 +113,17 @@ def run_query(query: Query) -> tuple[dict[str, Any], list[Any]]:
     try:
         connection = duckdb.connect()
         connection.execute(DUCKDB_PREFIX)
-        result = connection.execute(query.sql)
+        files, missing = resolve_paths(connection, query.paths)
+        source["path_plan"].update(resolved_file_count=len(files),
+                                   missing_pattern_count=len(missing))
+        if missing:
+            source["path_plan"]["missing_patterns"] = missing[:10]
+        if not files:
+            source.update(status="unavailable", row_count=0,
+                          error=f"no objects matched any of {len(query.paths)} partition "
+                                f"patterns between {query.paths[0]} and {query.paths[-1]}")
+            return source, []
+        result = connection.execute(query.sql.replace("__PATHS__", sql_list(files)))
         columns = [column[0] for column in result.description]
         rows = [dict(zip(columns, row)) for row in result.fetchall()]
     except duckdb.Error as exc:
@@ -118,7 +148,7 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime) -> list[Quer
         trade_paths = hour_patterns("normalized", venue, "option_trade", currency, start, end)
         queries.append(Query(f"option_trades_{venue}", trade_paths, f"""
           WITH trades AS MATERIALIZED (
-            SELECT * FROM read_parquet({sql_list(trade_paths)}, union_by_name=true,
+            SELECT * FROM read_parquet(__PATHS__, union_by_name=true,
                                        hive_partitioning=true, filename=true)
             WHERE {between}
           ), largest AS (
@@ -142,7 +172,7 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime) -> list[Quer
           WITH observations AS (
             SELECT *, row_number() OVER (PARTITION BY symbol ORDER BY timestamp) AS open_rank,
                       row_number() OVER (PARTITION BY symbol ORDER BY timestamp DESC) AS latest_rank
-            FROM read_parquet({sql_list(summary_paths)}, union_by_name=true, hive_partitioning=true)
+            FROM read_parquet(__PATHS__, union_by_name=true, hive_partitioning=true)
             WHERE {between}
           )
           SELECT * EXCLUDE(evidence_rank) FROM (
@@ -170,7 +200,7 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime) -> list[Quer
         }
         queries.append(Query(f"venue_blocks_{venue}", block_paths, f"""
           SELECT *, filename AS source_path, max(timestamp) OVER () AS max_event_at
-          FROM read_parquet({sql_list(block_paths)}, union_by_name=true,
+          FROM read_parquet(__PATHS__, union_by_name=true,
                             hive_partitioning=true, filename=true)
           WHERE {between} AND ({native_predicates[venue]})
           ORDER BY timestamp DESC LIMIT 50
@@ -181,7 +211,7 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime) -> list[Quer
       SELECT asset, index_name, arg_min(volatility, timestamp) AS open,
              arg_max(volatility, timestamp) AS close, min(volatility) AS low,
              max(volatility) AS high, max(timestamp) AS max_event_at
-      FROM read_parquet({sql_list(dvol_paths)}, union_by_name=true, hive_partitioning=true)
+      FROM read_parquet(__PATHS__, union_by_name=true, hive_partitioning=true)
       WHERE {between} GROUP BY asset, index_name
     """, {"open": "vol points", "close": "vol points", "low": "vol points", "high": "vol points"}))
 
@@ -191,7 +221,7 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime) -> list[Quer
           SELECT exchange, timestamp, symbol, funding_rate, funding_interval_hours,
                  index_price, mark_price, open_interest_coin, open_interest_usd,
                  max(timestamp) OVER () AS max_event_at
-          FROM read_parquet({sql_list(perp_paths)}, union_by_name=true, hive_partitioning=true)
+          FROM read_parquet(__PATHS__, union_by_name=true, hive_partitioning=true)
           WHERE {between}
           QUALIFY row_number() OVER (PARTITION BY symbol ORDER BY timestamp DESC)=1
         """, {"funding_rate": "published rate per funding_interval_hours", "index_price": "USD"}))
@@ -220,6 +250,24 @@ def main() -> int:
     evidence = {query.name: rows for query, (_, rows) in zip(queries, results)}
     gaps = [{"source": source["name"], "reason": source.get("error", "no rows")}
             for source in sources if source["status"] != "ok" or source["row_count"] == 0]
+    gaps += [{"source": source["name"],
+              "reason": f"partial coverage: {source['path_plan']['missing_pattern_count']} of "
+                        f"{source['path_plan']['pattern_count']} partitions absent",
+              "missing_patterns": source["path_plan"].get("missing_patterns", [])}
+             for source in sources
+             if source["status"] == "ok" and source["row_count"] > 0
+             and source["path_plan"].get("missing_pattern_count")]
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "data-discovery" / "scripts"))
+    from execution_tape import read_executions
+    try:
+        executions = read_executions(start, end, asset=args.asset)
+        evidence["paradigm_executions"] = executions.pop("rows")
+        sources.append({"name": "partitioned_paradigm_executions", "status": "ok",
+                        "row_count": len(evidence["paradigm_executions"]), **executions})
+    except Exception as exc:
+        evidence["paradigm_executions"] = []
+        sources.append({"name": "partitioned_paradigm_executions", "status": "unavailable", "error": str(exc)})
+        gaps.append({"source": "partitioned_paradigm_executions", "reason": str(exc)})
     document = {
         "schema_version": "dime.recap.evidence.v1",
         "request": {"asset": args.asset.upper(), "window": args.window,

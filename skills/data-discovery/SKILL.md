@@ -29,6 +29,8 @@ constraints, not a fixed workflow.
 4. **Respect native schemas and units.** Read instrument metadata before
    combining venue-native volume, premium, IV, or OI; otherwise keep results
    separated and label their units.
+   Historical conversions require event-time-applicable metadata; the default
+   harmonized-history support is at most 30 days, not the full raw retention.
 5. **Check record timestamps for freshness.** Never infer freshness from S3
    modification time.
 6. **Fail visibly.** Do not invent values, simulate a plausible answer, silently
@@ -49,15 +51,13 @@ volume, OI, spot, or perps. It documents:
 - the non-hot Paradigm RFQ/trade tapes and Paradex trade tape.
 
 Read [references/datasets.md](references/datasets.md) for the detailed Paradigm
-RFQ and executed-trade tape schemas and the Paradex DEX trade schema. Treat its
-exchange hot-surface section as historical documentation only; the hard rule
-above wins.
+RFQ and executed-trade tape schemas and the Paradex DEX trade schema.
 
 The three buckets are all in `ap-northeast-1`:
 
 | Bucket | What to use |
 |---|---|
-| `s3://dt-exchange-venue-data` | `raw/`, optional per-message `normalized/`, and `meta/instruments/` |
+| `s3://dt-exchange-venue-data` | `raw/`, `normalized/` rows and per-period aggregates, and `meta/instruments/` |
 | `s3://dt-paradigm-data` | Paradigm RFQ and executed-trade source tapes |
 | `s3://dt-paradex-data` | Paradex historical trade tape and Parquet parts |
 
@@ -76,13 +76,16 @@ smallest raw inputs that can support it:
   that venue is relevant.
 - **Cross-venue comparison:** read each venue separately, harmonise with the
   newest instrument metadata, then combine only comparable units.
-- **Paradigm RFQ lookup:** current RFQ tape for request metadata; raw exchange
-  trades for execution evidence. The non-hot executed tape is frozen at
+- **Paradigm RFQ lookup:** current RFQ tape for request metadata; daily
+  `paradigm_trade_tape/` partitions for executed legs and raw exchange trades
+  for corroboration. The legacy executed CSV is frozen at
   2026-08-10 and must be labelled historical if used.
 - **Paradex history:** the Paradex tape, excluding busted trades.
 
-The model may choose raw S3, normalized per-message S3, or direct venue APIs
+The model may choose raw S3, normalized rows/per-period aggregates, or direct venue APIs
 based on which gives the clearest answer. It must not choose the hot surface.
+Use the catalog's **Inputs behind the hot files** map to check source coverage;
+the current non-hot Paradigm execution dataset remains a cutover dependency.
 
 ## Query execution
 

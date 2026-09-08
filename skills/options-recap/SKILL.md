@@ -30,9 +30,11 @@ the actual interval queried rather than silently capping or changing it.
    before choosing sources. The model owns the query plan.
 4. Bound reads to the requested window, asset, venues, data types, and
    partitions. Check `max(timestamp)` in each continuous source used.
-5. Normalise IV, amount, premium turnover, and OI with the newest instrument
+5. Normalise IV, amount, premium turnover, and OI with event-time-applicable instrument
    metadata before combining venues. If a conversion cannot be proved, keep
    the result venue-local and label the native unit.
+   Follow the catalog's 30-day metadata-history limit; raw availability alone
+   does not establish that a historical conversion is supported.
 6. A missing or unreadable source is not a quiet market. Name the missing
    section or field; do not estimate, simulate, or fill it from a stale object.
 7. When the prompt supplies fixture or injected evidence, treat those values as
@@ -48,10 +50,15 @@ support it. Typical choices are:
   for volume, put/call activity, screen flow, IV at trade, and venue blocks;
 - raw `option_summary` rows for current/window-open mark IV, bid/ask, greeks,
   OI, underlying price, skew, and term structure;
+- existing normalized `option_summary` per-period aggregates when a period-end
+  observation suffices; use rows for exact event-time selection and apply the
+  same metadata-driven unit conversions;
 - Deribit raw `dvol` for DVOL open/close/high/low;
 - raw `perp_summary` or relevant raw spot/perp trades for spot and funding;
 - `meta/instruments/` for contract size and IV/OI/premium units;
-- the current Paradigm RFQ tape for request activity and the frozen non-hot
+- the daily partitioned Paradigm execution tape for brokered option legs
+  (`evidence.paradigm_executions`), the current RFQ tape for request activity,
+  and the frozen non-hot
   executed tape only for historical trades at or before 2026-08-10;
 - public venue APIs when they provide a clearer current observation than the
   latest raw partition.
@@ -63,9 +70,12 @@ and explicit gaps. Inspect that evidence and decide which facts answer the
 question. The JSON is evidence, not a response template and not a command to
 populate every field.
 
-The model may make additional bounded reads from raw S3, normalized per-message
-S3, source tapes, or venue APIs when the returned evidence identifies a real
+The model may make additional bounded reads from raw S3, normalized rows or
+per-period aggregates, source tapes, or venue APIs when the returned evidence identifies a real
 gap. It must not use a hot or pre-shaped recap file.
+The source map in the raw exchange catalog covers all former hot-file inputs.
+Check `partitioned_paradigm_executions` source status and publication coverage;
+do not present exchange-only block flow as complete Paradigm execution coverage.
 
 ## Computation constraints
 

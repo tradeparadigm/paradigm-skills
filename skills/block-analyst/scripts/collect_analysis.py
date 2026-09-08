@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["duckdb>=1.3"]
+# dependencies = ["duckdb>=1.3", "polars>=1.0", "boto3>=1.35"]
 # ///
 """Collect authoritative RFQ and raw venue evidence without rendering analysis."""
 
@@ -13,6 +13,7 @@ import json
 import re
 import sys
 from typing import Any
+from pathlib import Path
 
 import duckdb
 
@@ -43,6 +44,23 @@ def run_sql(sql: str) -> tuple[list[dict[str, Any]], str | None]:
             connection.close()
 
 
+def existing_paths(patterns: list[str]) -> list[str]:
+    """Keep only the partition patterns S3 actually has.
+
+    read_parquet() fails the whole list on a single unmatched pattern, so the
+    forward hour around a recent trade — which producers have not written yet —
+    would drop the venue read entirely and silently downgrade the analysis
+    confidence from authoritative to request-only. glob() tolerates a miss.
+    """
+    quoted = "[" + ",".join("'" + path + "'" for path in patterns) + "]"
+    files, error = run_sql(f"SELECT file FROM glob({quoted}) ORDER BY file")
+    if error:
+        raise RuntimeError(error)
+    matched = [row["file"] for row in files]
+    return [pattern for pattern in patterns
+            if any(f.startswith(pattern.split("*", 1)[0]) for f in matched)]
+
+
 def suffix_predicate(column: str, core: str) -> str:
     escaped = core.replace("'", "''")
     return f"upper(CAST({column} AS VARCHAR)) = upper('{escaped}') OR upper(CAST({column} AS VARCHAR)) LIKE upper('%{escaped}')"
@@ -69,7 +87,7 @@ def raw_deribit_paths(row: dict[str, Any]) -> list[str]:
     if not re.search(r"(?:^|\s|-)DBT(?:$|\s|-)", product):
         return []
     asset_match = re.search(r"\b(BTC|ETH|SOL|XRP)\b", product + " " + description)
-    date_text = value(row, "DATE", "CREATED_AT", "REQUESTED_AT", "RFQ_CREATED_AT", "TIMESTAMP")
+    date_text = value(row, "traded_at_iso", "DATE", "CREATED_AT", "REQUESTED_AT", "RFQ_CREATED_AT", "TIMESTAMP")
     time_text = value(row, "TIME")
     if not asset_match or not date_text:
         return []
@@ -104,6 +122,16 @@ def main() -> int:
     if not re.fullmatch(r"[A-Za-z0-9_-]+", core):
         parser.error("invalid RFQ id")
 
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "data-discovery" / "scripts"))
+    from execution_tape import read_executions
+    now = dt.datetime.now(dt.timezone.utc)
+    execution, execution_error = None, None
+    try:
+        execution = read_executions(now - dt.timedelta(days=30), now, rfq_id=args.rfq_id, now=now)
+    except Exception as exc:
+        execution_error = str(exc)
+    execution_rows = execution["rows"] if execution else []
+
     request_rows, request_error = run_sql(
         f"SELECT * FROM read_csv_auto('{RFQ_TAPE}', union_by_name=true) "
         f"WHERE {suffix_predicate('RFQ_ID', core)} LIMIT 20"
@@ -118,10 +146,15 @@ def main() -> int:
     else:
         historical_rows, historical_error = [], None
 
-    anchor = request_rows[0] if request_rows else (historical_rows[0] if historical_rows else {})
+    anchor = execution_rows[0] if execution_rows else (request_rows[0] if request_rows else (historical_rows[0] if historical_rows else {}))
     venue_paths = raw_deribit_paths(anchor)
     venue_rows: list[dict[str, Any]] = []
     venue_error: str | None = None
+    try:
+        venue_paths = existing_paths(venue_paths) if venue_paths else venue_paths
+    except RuntimeError as exc:
+        venue_error = str(exc)
+        venue_paths = []
     if venue_paths:
         quoted = "[" + ",".join("'" + path + "'" for path in venue_paths) + "]"
         venue_rows, venue_error = run_sql(
@@ -130,7 +163,9 @@ def main() -> int:
             f"WHERE {suffix_predicate('block_rfq_id', core)} ORDER BY timestamp LIMIT 100"
         )
 
-    if venue_rows:
+    if execution_rows:
+        status, confidence = "execution_resolved_by_paradigm_rfq_id", "authoritative"
+    elif venue_rows:
         status, confidence = "execution_resolved_by_venue_rfq_id", "authoritative"
     elif historical_rows:
         status, confidence = "historical_execution_resolved", "authoritative_historical"
@@ -159,6 +194,13 @@ def main() -> int:
                         "units": {"amount": "coin", "price": "coin", "iv": "vol points"},
                         **({"error": venue_error} if venue_error else {})})
     gaps = []
+    sources.append({"name": "partitioned_paradigm_executions",
+                    "status": "unavailable" if execution_error else "ok",
+                    "row_count": len(execution_rows),
+                    **({k: v for k, v in execution.items() if k != "rows"} if execution else {}),
+                    **({"error": execution_error} if execution_error else {})})
+    if execution_error:
+        gaps.append({"source": "partitioned_paradigm_executions", "reason": execution_error})
     if request_error:
         gaps.append({"source": "current_paradigm_rfq_tape", "reason": request_error})
     if venue_error:
@@ -174,11 +216,11 @@ def main() -> int:
         "request": {"rfq_id": args.rfq_id, "core_id": core},
         "resolution": {"status": status, "confidence": confidence},
         "rfq_requests": request_rows,
-        "execution_candidates": {"raw_venue": venue_rows, "historical_tape": historical_rows},
+        "execution_candidates": {"paradigm_tape": execution_rows, "raw_venue": venue_rows, "historical_tape": historical_rows},
         "sources": sources,
         "gaps": gaps,
     }, separators=(",", ":"), default=str))
-    if request_error and historical_error:
+    if request_error and historical_error and not execution_rows:
         print("analyze: no authoritative source could be read", file=sys.stderr)
         return 1
     return 0
