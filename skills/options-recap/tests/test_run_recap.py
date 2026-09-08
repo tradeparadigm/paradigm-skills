@@ -12,7 +12,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "scripts", "run_recap.sh")
 COLLECTOR = os.path.join(ROOT, "scripts", "collect_recap.py")
 
-sys.modules.setdefault("duckdb", types.SimpleNamespace(Error=Exception, connect=None))
+# collect_recap imports duckdb at module top. Stub it ONLY when it is genuinely
+# absent (the stdlib-only workflow); if this file is ever collected into a
+# pytest session alongside modules that need the real duckdb, a module-level
+# setdefault would leak this connect=None stub into them (see
+# test_collect_analysis for the incident).
+if importlib.util.find_spec("duckdb") is None:
+    sys.modules["duckdb"] = types.SimpleNamespace(Error=Exception, connect=None)
 
 spec = importlib.util.spec_from_file_location("collect_recap", COLLECTOR)
 collector = importlib.util.module_from_spec(spec)

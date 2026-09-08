@@ -14,7 +14,14 @@ from unittest.mock import patch
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "scripts", "analyze.sh")
 COLLECTOR = os.path.join(ROOT, "scripts", "collect_analysis.py")
-sys.modules.setdefault("duckdb", types.SimpleNamespace(Error=Exception, connect=None))
+# collect_analysis imports duckdb at module top. Stub it ONLY when it is
+# genuinely absent (the stdlib-only workflow). Under the dependency-equipped
+# pytest lane the real module must win: a module-level setdefault here leaked
+# this connect=None stub into every sibling collected later in the same
+# session — order-dependent, and it broke test_evidence_queries whenever this
+# file was collected first.
+if importlib.util.find_spec("duckdb") is None:
+    sys.modules["duckdb"] = types.SimpleNamespace(Error=Exception, connect=None)
 spec = importlib.util.spec_from_file_location("collect_analysis", COLLECTOR)
 collector = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = collector
@@ -127,6 +134,29 @@ def test_ambiguous_execution_cannot_fall_through_to_other_sources():
         else:
             raise AssertionError('ambiguity was swallowed')
         query.assert_not_called()
+
+
+def test_incomplete_execution_coverage_is_reported_as_a_gap():
+    """An uncovered tail is missing evidence and must surface in `gaps`, not only in `sources`."""
+    def gaps_for(complete):
+        helper = types.SimpleNamespace(
+            AmbiguousRfqError=type('AmbiguousRfqError', (RuntimeError,), {}),
+            read_executions=lambda *a, **kw: {
+                "rows": [], "sources": [], "build_window_end_ms": 1, "units": {},
+                "coverage_complete": complete,
+                "coverage_note": "coverage ends 40 min before the requested end"})
+        output = io.StringIO()
+        with patch.dict(sys.modules, {"execution_tape": helper}), \
+             patch.object(sys, "argv", ["collect_analysis.py", "--rfq-id", "DRFQv2-r_test"]), \
+             patch.object(collector, "run_sql", return_value=([], None)), redirect_stdout(output):
+            assert collector.main() == 0
+        return [g for g in json.loads(output.getvalue())["gaps"]
+                if g.get("source") == "partitioned_paradigm_executions"]
+
+    incomplete = gaps_for(False)
+    assert incomplete and "40 min" in incomplete[0]["reason"]
+    # Complete coverage with no matching legs is a genuine negative, not a gap.
+    assert gaps_for(True) == []
 
 
 if __name__ == "__main__":

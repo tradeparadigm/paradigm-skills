@@ -217,6 +217,11 @@ def main() -> int:
                     **({"error": execution_error} if execution_error else {})})
     if execution_error:
         gaps.append({"source": "partitioned_paradigm_executions", "reason": execution_error})
+    # Incomplete coverage is not an error, so it must be reported as a gap in
+    # its own right: an uncovered tail is missing evidence, never no trading.
+    if execution and not execution.get("coverage_complete", False):
+        gaps.append({"source": "partitioned_paradigm_executions",
+                     "reason": execution.get("coverage_note", "execution coverage incomplete")})
     if request_error:
         gaps.append({"source": "current_paradigm_rfq_tape", "reason": request_error})
     if venue_error:
@@ -261,6 +266,15 @@ def render_current_analysis(rfq_id):
     if len({row["rfq_id"] for row in selected}) > 1:
         raise AmbiguousRfqError("ambiguous RFQ ID; specify the exact namespace")
     if not selected:
+        # Distinguish "searched complete data, not there" from "searched data
+        # that stops short of now" — the second is not a negative result.
+        if not tape.get("coverage_complete", False):
+            print(
+                f"RFQ {rfq_id} not resolved — and execution coverage is incomplete: "
+                f"{tape.get('coverage_note', 'coverage unknown')} "
+                "This is missing evidence, not proof the RFQ did not trade."
+            )
+            return 1
         print(f"RFQ {rfq_id} not resolved — no authoritative asset, structure, or fill available.")
         return 0
     for row in selected:

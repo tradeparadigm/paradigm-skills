@@ -121,7 +121,11 @@ def run(asset, window, start, end):
     with ThreadPoolExecutor(max_workers=8) as pool:
         reads = [(q, pool.submit(run_query, q)) for q in queries]
         meta = {v: pool.submit(metadata, v, asset, start, end) for v in VENUES}
-        tape = pool.submit(read_executions, start, end, asset=asset, now=end)
+        # Publication age is a WALL-CLOCK question, so the reader's `now` must
+        # not be the window end: collect_recap accepts --now for replays, and
+        # passing that historical instant here made every replayed read fail
+        # the publication gate as "future-dated" (published > now).
+        tape = pool.submit(read_executions, start, end, asset=asset)
         closes = pool.submit(recap.fetch_7d_closes, asset, end_ms)
         # Same Deribit perpetual-price proxy and realized-vol definition as before.
         market = pool.submit(recap._fetch_market_fallback, asset, start_ms, end_ms, want_surface=False)
@@ -147,7 +151,14 @@ def run(asset, window, start, end):
             except Exception as exc:
                 gaps.append(f"{venue}: unit metadata unavailable — {exc}")
         try:
-            executions = calculation_rows(tape.result()["rows"])
+            tape_result = tape.result()
+            executions = calculation_rows(tape_result["rows"])
+            # An uncovered tail is missing evidence, not a quiet tape.
+            if not tape_result.get("coverage_complete", False):
+                gaps.append(
+                    "Paradigm executions: "
+                    + tape_result.get("coverage_note", "coverage incomplete")
+                )
         except Exception as exc:
             executions = []
             gaps.append(f"Paradigm executions unavailable — {exc}")

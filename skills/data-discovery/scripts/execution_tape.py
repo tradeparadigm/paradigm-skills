@@ -9,6 +9,15 @@ import polars as pl
 BUCKET = "dt-exchange-venue-data"
 PREFIX = "paradigm_trade_tape"
 
+# Dead-writer detection ONLY. The producer runs every 15 minutes with an
+# activeDeadlineSeconds of 10 minutes, so a healthy publication can legitimately
+# be ~25 minutes old after one slow or skipped tick; 45 tolerates two. This
+# threshold says nothing about how current the DATA is -- that is the watermark
+# below. The previous 20-minute rule conflated the two, which both rejected
+# healthy partitions and, when it passed, let a lagging landing read as a
+# quiet market.
+MAX_PUBLICATION_AGE = timedelta(minutes=45)
+
 
 class AmbiguousRfqError(RuntimeError):
     """A bare RFQ ID resolved to more than one source namespace."""
@@ -44,7 +53,21 @@ def read_executions(start, end, *, rfq_id=None, asset=None, s3=None, now=None):
     """Read exact UTC daily objects, returning every matching execution leg.
 
     A missing, unreadable or stale day raises; it is never silently skipped.
-    Publication can lag the requested end: report observed coverage explicitly.
+
+    Two independent checks, deliberately not merged:
+
+    - PUBLICATION age (`generated_at_ms`) proves the writer is alive. A
+      stale or future-dated build raises -- that is a broken producer.
+    - COVERAGE (`source_watermark_ms`) bounds how far the data reaches.
+      The UM landing syncs hourly, so a request ending after the watermark
+      is the NORMAL case and must not raise; it returns
+      `coverage_complete=False` plus the shortfall, so the caller reports a
+      gap instead of presenting the uncovered tail as zero activity.
+
+    The watermark is the newest event the producer saw, so it cannot separate
+    an unsynced landing from a genuinely quiet market. It is therefore a
+    lower bound: safe against inventing quiet, occasionally withholding real
+    quiet as unknown.
     """
     now = now or datetime.now(timezone.utc)
     if start.tzinfo is None or end.tzinfo is None or not start < end:
@@ -66,11 +89,19 @@ def read_executions(start, end, *, rfq_id=None, asset=None, s3=None, now=None):
         published = datetime.fromtimestamp(
             int(metadata["generated_at_ms"]) / 1000, timezone.utc
         )
-        coverage_start = int(metadata["build_window_start_ms"])
-        coverage_end = int(metadata["build_window_end_ms"])
-        if not timedelta(0) <= now - published <= timedelta(minutes=20):
-            raise RuntimeError(f"stale or future-dated execution partition: {key}")
-        if coverage_start > int(start.timestamp() * 1000):
+        build_start = int(metadata["build_window_start_ms"])
+        build_end = int(metadata["build_window_end_ms"])
+        # Objects published before the watermark field exists report coverage
+        # as UNKNOWN. Never fall back to the build clock: that is the
+        # overstatement this field was added to remove.
+        raw_watermark = metadata.get("source_watermark_ms")
+        watermark = int(raw_watermark) if raw_watermark else None
+        if not timedelta(0) <= now - published <= MAX_PUBLICATION_AGE:
+            raise RuntimeError(
+                "execution partition publication stale or future-dated "
+                f"(generated_at {published.isoformat()}, now {now.isoformat()}): {key}"
+            )
+        if build_start > int(start.timestamp() * 1000):
             raise RuntimeError(
                 f"execution partition does not cover requested start: {key}"
             )
@@ -96,7 +127,8 @@ def read_executions(start, end, *, rfq_id=None, asset=None, s3=None, now=None):
             {
                 "path": f"s3://{BUCKET}/{key}",
                 "generated_at": published.isoformat(),
-                "build_window_end_ms": coverage_end,
+                "build_window_end_ms": build_end,
+                "source_watermark_ms": watermark,
             }
         )
         day += timedelta(days=1)
@@ -110,10 +142,39 @@ def read_executions(start, end, *, rfq_id=None, asset=None, s3=None, now=None):
         raise RuntimeError(
             "execution read has duplicate/null trade IDs; retry after publication completes"
         )
+    # Coverage is bounded by the WEAKEST watermark in the read set, and a
+    # single unknown makes the whole read's coverage unknown -- an unknown
+    # must never average away against a known-good sibling day.
+    end_ms = int(end.timestamp() * 1000)
+    watermarks = [item["source_watermark_ms"] for item in sources]
+    watermark = None if any(w is None for w in watermarks) else min(watermarks)
+    coverage_end_ms = None if watermark is None else min(end_ms, watermark)
+    coverage_complete = coverage_end_ms is not None and coverage_end_ms >= end_ms
+    shortfall_seconds = (
+        None if coverage_end_ms is None else max(0, (end_ms - coverage_end_ms) / 1000)
+    )
+    if coverage_complete:
+        coverage_note = "observed executions cover the full requested window"
+    elif coverage_end_ms is None:
+        coverage_note = (
+            "coverage UNKNOWN: partitions predate the source watermark field. "
+            "Absence of executions is not evidence of no trading."
+        )
+    else:
+        coverage_note = (
+            f"coverage ends {shortfall_seconds / 60:.0f} min before the requested end "
+            "(hourly upstream sync). Report the uncovered tail as missing evidence, "
+            "NOT as zero activity."
+        )
     return {
         "rows": result.to_dicts(),
         "sources": sources,
         "build_window_end_ms": min(item["build_window_end_ms"] for item in sources),
+        "source_watermark_ms": watermark,
+        "coverage_end_ms": coverage_end_ms,
+        "coverage_complete": coverage_complete,
+        "coverage_shortfall_seconds": shortfall_seconds,
+        "coverage_note": coverage_note,
         "units": {
             "quantity": "product-native",
             "trade_price": "instrument-native premium price",

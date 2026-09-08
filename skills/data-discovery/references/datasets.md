@@ -46,18 +46,38 @@ unbounded or infer a historical retention guarantee from old keys remaining.
 | `row_type`, `auction`, `trade_source`, `product`, `description` | Trade classification and display fields |
 | `generated_at` | Publication time in epoch milliseconds, not source ingestion freshness |
 
-Object metadata `build_window_start_ms`, `build_window_end_ms`, `generated_at_ms`
-is present even on empty days. The build bounds describe the whole rebuild,
-not the contents of a single object: intersect them with that key's UTC day.
-A closed day is temporally covered when build start is at/before its midnight
-and build end is at/after the next midnight. The publisher refuses closed-day
-row-count shrink; a legitimate downward correction needs operator review.
-The shared reader in `scripts/execution_tape.py`
-requires each object to have been published within 20 minutes, returns its
-build-window end, and fails on missing access, keys or duplicate IDs. Publication
-is atomic per object, not across days; replication may expose mixed generations.
-The upstream Airbyte sync is hourly: a fresh publication does **not** prove that
-an execution from the last few minutes has landed. Report the coverage and gap.
+Object metadata is present even on empty days, and carries **two clocks that
+must not be conflated**:
+
+| Metadata | Answers | Do not use it for |
+|---|---|---|
+| `generated_at_ms`, `build_window_start_ms`, `build_window_end_ms` | "did the writer run, and what window did it attempt?" | how current the data is |
+| `source_watermark_ms` | "how far does the observed data actually reach?" (newest `traded_at` seen) | proving the writer is alive |
+
+The build bounds describe the whole rebuild, not one object's contents:
+intersect them with that key's UTC day. A closed day is temporally covered when
+build start is at/before its midnight **and** `min(build_window_end_ms,
+source_watermark_ms)` is at/after the next midnight. The publisher refuses
+closed-day row-count shrink; a legitimate downward correction needs operator
+review.
+
+The shared reader in `scripts/execution_tape.py` raises when a publication is
+older than `MAX_PUBLICATION_AGE` (45 minutes — the producer's 15-minute cadence
+plus its 10-minute deadline, twice over) or future-dated, and fails on missing
+access, keys or duplicate IDs. It does **not** raise when the requested window
+extends past the watermark, because the hourly upstream sync makes that the
+normal case; it returns `coverage_complete`, `coverage_end_ms`,
+`coverage_shortfall_seconds` and a `coverage_note`. Report the shortfall as
+missing evidence. **Never present an uncovered tail as zero activity.**
+
+`source_watermark_ms` is the newest event observed, so it cannot separate an
+unsynced landing from a quiet market — treat it as a lower bound on coverage.
+An object published before this field existed reports coverage as unknown,
+which is also not evidence of no trading.
+
+Publication is atomic per object, not across days; replication may expose mixed
+generations, so a single unknown or lagging day makes the whole read's coverage
+incomplete rather than averaging against healthier days.
 
 The `/analyze` collector returns all matching legs in
 `execution_candidates.paradigm_tape`; `/recap` returns the requested asset's
