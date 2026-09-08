@@ -1,5 +1,11 @@
 name: execution-tape tests
 
+# The dependency-equipped lane: every pytest module under skills/*/tests runs
+# here, in one session, with pytest / polars / boto3 / duckdb installed. The
+# sibling stdlib-only workflows (block-analyst-tests, options-recap-tests)
+# deliberately skip any test file that imports pytest and point at this one,
+# so a pytest module that is not listed in PYTEST_TARGETS would run nowhere —
+# the first step below fails loudly if that ever happens.
 on:
   push:
     paths:
@@ -17,6 +23,20 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # Single source of truth for what this lane runs — the completeness
+      # check and the run step both read it. test_collect_analysis.py is
+      # FIRST on purpose: it once stubbed duckdb at module level with
+      # sys.modules.setdefault, which leaked a connect=None stub into every
+      # sibling collected after it (test_evidence_queries needs the real
+      # module). The stub is now guarded on find_spec; leading with the file
+      # keeps that regression visible instead of hidden behind collection
+      # order, which is what made this lane pass by luck before.
+      PYTEST_TARGETS: >-
+        skills/block-analyst/tests/test_collect_analysis.py
+        skills/data-discovery/tests
+        skills/block-analyst/tests/test_direct_analysis.py
+        skills/options-recap/tests/test_direct_inputs.py
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,9 +44,20 @@ jobs:
           python-version: '3.11'
       - name: Install test dependencies
         run: python -m pip install pytest polars boto3 duckdb
+
+      - name: Every pytest module must be selected by this lane
+        run: |
+          status=0
+          for f in $(grep -lE '^(import|from) pytest\b' skills/*/tests/test_*.py); do
+            case " $PYTEST_TARGETS " in
+              *" $f "*|*" $(dirname "$f") "*) ;;
+              *)
+                echo "::error file=$f::imports pytest but is not in PYTEST_TARGETS — the stdlib-only workflows skip it, so it would run nowhere"
+                status=1
+                ;;
+            esac
+          done
+          exit $status
+
       - name: Test bounded execution reads without AWS access
-        run: >-
-          python -m pytest skills/data-discovery/tests
-          skills/block-analyst/tests/test_collect_analysis.py
-          skills/block-analyst/tests/test_direct_analysis.py
-          skills/options-recap/tests/test_direct_inputs.py -q
+        run: python -m pytest $PYTEST_TARGETS -q

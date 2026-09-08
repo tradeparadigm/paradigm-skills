@@ -1,8 +1,19 @@
 name: block-analyst tests
 
-# Runs the block-analyst unit tests whenever anything in the skill folder
-# changes (any branch on push, and on PRs that touch it). Stdlib-only tests —
-# no network, no S3, no deps — so this is fast and needs no setup.
+# Runs the block-analyst SELF-RUNNING test scripts whenever anything in the
+# skill folder changes (any branch on push, and on PRs that touch it).
+# Stdlib-only — no network, no S3, no deps — so this is fast and needs no setup.
+#
+# tests/ holds two test contracts side by side:
+#   * self-running scripts (stdlib-only): `python3 test_x.py` executes every
+#     check and exits non-zero on failure — this workflow's job.
+#   * pytest modules (need pytest / polars / boto3 / duckdb): collected by
+#     execution-tape-tests.yml, which installs those.
+# Running a pytest module with bare python3 either dies on its first
+# third-party import, or — worse — defines its functions and exits 0 having
+# executed nothing. So this loop skips anything that imports pytest, and
+# requires every file it DOES run to report what it passed: exit 0 with no
+# "passed" line is a false green, not a pass.
 on:
   push:
     paths:
@@ -21,14 +32,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run block-analyst unit tests
+      - name: Run block-analyst self-running test scripts
         run: |
           shopt -s nullglob
-          tests=(skills/block-analyst/tests/test_*.py)
-          if [ ${#tests[@]} -eq 0 ]; then
-            echo "No tests found under skills/block-analyst/tests/"; exit 1
-          fi
-          for t in "${tests[@]}"; do
+          ran=0
+          for t in skills/block-analyst/tests/test_*.py; do
+            if grep -qE '^(import|from) pytest\b' "$t"; then
+              echo "=== $t: pytest module — run by execution-tape-tests.yml, skipped here ==="
+              continue
+            fi
             echo "=== $t ==="
-            python3 "$t"
+            # Capture stdout so the summary line survives a failing exit;
+            # tracebacks go to stderr and still stream live.
+            if ! out="$(python3 "$t")"; then
+              printf '%s\n' "$out"
+              echo "::error file=$t::test script failed"
+              exit 1
+            fi
+            printf '%s\n' "$out"
+            if ! grep -q "passed" <<<"$out"; then
+              echo "::error file=$t::exited 0 without reporting passed checks — not a self-running test script; either give it a runner or move it to execution-tape-tests.yml"
+              exit 1
+            fi
+            ran=$((ran + 1))
           done
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::no self-running test scripts executed under skills/block-analyst/tests/"
+            exit 1
+          fi
+          echo "ran $ran self-running test script(s)"
