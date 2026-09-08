@@ -111,6 +111,10 @@ instrument naming and venue-specific limitations.
   against debit/credit.
 - A prior print means the whole structure matched: same real block group and
   full leg set/ratios. Loose matching legs are context, not recurrence.
+- One RFQ id can resolve to several blocks with opposite taker sides: a GRFQ is
+  a broadcast, and whoever crosses is the taker on that block. The script groups
+  blocks by signed structure and prints one analysis per direction. Relay every
+  analysis it prints; never net them into one package, one size, or one edge.
 - Convert raw native units with instrument metadata before comparing venues.
 - Net greeks over proven legs and ratios, scaled to the full position:
 

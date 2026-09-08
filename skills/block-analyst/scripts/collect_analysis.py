@@ -290,21 +290,61 @@ def render_current_analysis(rfq_id):
         base = min(quantities.values())
         return tuple(sorted((*key, qty / base) for key, qty in quantities.items()))
 
+    # One rfq_id is NOT one party's order. A GRFQ is a broadcast: whoever
+    # crosses is the taker on THAT block, so one RFQ's blocks can carry
+    # opposite taker sides (2026-09-08, GRFQ-50128348: desk 1184 took the
+    # 79k call calendar SHORT in one block, desk 4671 took it LONG in two).
+    # combine_fills assumes every clip points the same way; merging those
+    # blocks produced a four-"leg" Combo at the smallest clip's size with a
+    # meaningless edge. So: group blocks by SIGNED signature, merge clips
+    # only within a group (the legitimate same-direction case), and analyse
+    # each direction on its own.
+    by_block = defaultdict(list)
+    for row in selected:
+        by_block[row["block_trade_id"]].append(row)
+    by_direction = defaultdict(list)
+    for rows in by_block.values():
+        by_direction[signature(rows)].extend(rows)
+    # Dominant direction first, so a single-direction RFQ renders exactly as
+    # before and a mixed one leads with the side that did most of the size.
+    directions = sorted(by_direction.items(),
+                        key=lambda item: -sum(r["quantity"] for r in item[1]))
+
     groups = defaultdict(list)
     for row in tape["rows"]:
         if row["block_trade_id"] and row["rfq_id"] not in candidates:
             groups[(row["venue"], row["block_trade_id"])].append(row)
-    wanted = signature(selected)
-    history = [row for group in groups.values()
-               if all(r["quantity"] is not None and r["quantity"] > 0 for r in group)
-               and signature(group) == wanted for row in group]
-    result = analyze_rows(combine_fills(calculation_rows(selected)), calculation_rows(history), int(now.timestamp() * 1000))
-    print(render(result))
+
+    mixed = len(directions) > 1
+    if mixed:
+        # Bold, because the relaying model has been observed to keep bold
+        # headers and fenced blocks verbatim while dropping plain ⚠ prose.
+        print(f"**⚠ {rfq_id} filled as {len(by_block)} blocks in {len(directions)} "
+              "directions — analysed per direction below. Do not net them into one "
+              "package or one edge.**")
+        print()
+    for wanted, rows in directions:
+        history = [row for group in groups.values()
+                   if all(r["quantity"] is not None and r["quantity"] > 0 for r in group)
+                   and signature(group) == wanted for row in group]
+        result = analyze_rows(combine_fills(calculation_rows(rows)), calculation_rows(history),
+                              int(now.timestamp() * 1000))
+        if mixed:
+            blocks = sorted({r["block_trade_id"] for r in rows})
+            print(f"**{len(blocks)} block(s): {', '.join(blocks)}**")
+            print()
+        print(render(result))
+        if mixed:
+            print()
     return 0
 
 
 def combine_fills(rows):
-    """Multiple clips of one RFQ: total size and quantity-weighted leg prices."""
+    """Multiple clips of one RFQ: total size and quantity-weighted leg prices.
+
+    Precondition: every clip points the same way per instrument. The caller
+    (render_current_analysis) groups blocks by signed signature first; feeding
+    opposite-direction blocks here yields a spurious multi-leg structure."""
     import polars as pl
     keys = ["PRODUCT", "DESCRIPTION", "SIDE", "QUOTE_CURRENCY"]
     preserved = [key for key in rows[0] if key not in keys + ["QTY", "PRICE", "REF_PRICE", "NOTIONAL_VOLUME_USD"]]

@@ -289,6 +289,15 @@ def _leg_lbl(l, multi_exp):
     return f"{base}·{_exp_short(l.get('expiry'))}" if multi_exp and l.get("expiry") else base
 
 
+def _leg_expiry(l):
+    """Expiry code of a leg under either key. analyze_core legs carry
+    `expiry_c`; the result legs render() builds carry `expiry` (line
+    `"expiry": l.get("expiry_c")`). Reading only `expiry_c` here made every
+    result-leg comparison None == None, so a 79k 11SEP/12SEP call calendar
+    was labelled "Combo"."""
+    return l.get("expiry") or l.get("expiry_c")
+
+
 def _struct_name(code, legs):
     """Human structure name in the DRFQ StrategyCodeEnum vocabulary (rfq-trader
     references/instruments.md): Butterfly family (never "Fly"), typed calendars.
@@ -315,7 +324,7 @@ def _struct_name(code, legs):
             a, b = sorted(opt, key=lambda l: l["strike"])
             cps = {a["cp"], b["cp"]}
             same_k = a["strike"] == b["strike"]
-            same_e = a.get("expiry_c") == b.get("expiry_c")
+            same_e = _leg_expiry(a) == _leg_expiry(b)
             opp = (a["sign"] or 0) * (b["sign"] or 0) < 0
             if cps == {"C", "P"} and same_e:
                 base = (("Combo" if opp else "Straddle") if same_k
@@ -374,7 +383,11 @@ def render(r) -> str:
             L.append(f"<!-- warnings: {'; '.join(r['warnings'])} -->")
         return "\n".join(L)
 
-    exp = legs[0]["expiry"] if legs else "?"
+    # A calendar/diagonal spans two expiries; naming only the first leg's made
+    # "11SEP26 79k/79k Call Calendar" read as a single-expiry trade.
+    expiries = list(dict.fromkeys(l.get("expiry") for l in legs
+                                  if l["cp"] != "FUT" and l.get("expiry")))
+    exp = "/".join(expiries) if expiries else (legs[0]["expiry"] if legs else "?")
     strikes = "/".join(_sk(l["strike"]) for l in legs if l["cp"] != "FUT")
     struct = _struct_name(r["structure"], legs)
     L = []
