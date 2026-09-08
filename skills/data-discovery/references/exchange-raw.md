@@ -209,6 +209,12 @@ globs rather than widening to the bucket root.
 
 These non-hot files are also available:
 
+- `s3://dt-exchange-venue-data/paradigm_trade_tape/`:
+  current mutable UTC-day execution-leg Parquet, with lowercase columns and
+  the case-sensitive options filter `instrument_kind == "OPTION"`.
+  Use the current schema and exact daily filenames in
+  [datasets.md](datasets.md), under Current partitioned executions; verify deployment,
+  access and coverage before reading. The frozen CSV below is a separate dataset.
 - `s3://dt-paradigm-data/paradigm_data/paradigm_rfq_tape_slim.csv.gz`:
   RFQ requests, including `RFQ_ID`, product, description, quantity, quote
   currency, quote count, block count, status, and lifespan. It does not carry

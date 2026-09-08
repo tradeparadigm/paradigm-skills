@@ -57,8 +57,8 @@ The three buckets are all in `ap-northeast-1`:
 
 | Bucket | What to use |
 |---|---|
-| `s3://dt-exchange-venue-data` | `raw/`, `normalized/` rows and per-period aggregates, and `meta/instruments/` |
-| `s3://dt-paradigm-data` | Paradigm RFQ and executed-trade source tapes |
+| `s3://dt-exchange-venue-data` | `raw/`, `normalized/`, `meta/instruments/`, and current daily `paradigm_trade_tape/` executions |
+| `s3://dt-paradigm-data` | Current Paradigm RFQ CSV and frozen legacy execution CSV |
 | `s3://dt-paradex-data` | Paradex historical trade tape and Parquet parts |
 
 ## Choose the reads
@@ -114,7 +114,12 @@ timestamps, or records and present them as query output.
 ## Output
 
 For inventory or schema questions, answer concisely with the relevant paths,
-coverage, fields, and unit caveats. For analysis, include:
+coverage, fields, and unit caveats. An unqualified "Paradigm trade tape" schema
+question means the current partitioned execution tape: show its lowercase
+columns and options filter from `datasets.md`, with the frozen CSV as a
+separately labelled historical alternative. Use the uppercase CSV schema only
+when the user specifically asks about that CSV or historical source.
+For analysis, include:
 
 1. the answer;
 2. the source paths and exact event-time window;

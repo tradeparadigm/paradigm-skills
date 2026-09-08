@@ -83,7 +83,7 @@ alongside independently available market evidence; neither falls back to hot.
 This tape does not contain execution price, reference mark, taker side,
 `TRADE_ID`, or `BLOCK_TRADE_ID`.
 
-### Executed trade tape
+### Legacy executed CSV tape (frozen)
 
 - **Path:** `s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz`
 - **Grain:** executed RFQ trade leg
@@ -153,7 +153,8 @@ For exchange landing data, select the narrow recent partition and inspect
 
 - Raw order-book depth or book deltas
 - Live Paradex positions, balances, vaults, margin, or order placement
-- A current non-hot Paradigm executed-trade tape after 2026-08-10
+- Guaranteed execution coverage outside the partitioned tape's supported window
+  or the frozen legacy CSV's observed coverage
 - A guaranteed cross-venue mapping between every Paradigm RFQ and venue block
 
 Do not turn an unavailable field into a default or simulated value. State the
