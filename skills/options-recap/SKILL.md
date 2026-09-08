@@ -2,13 +2,13 @@
 name: paradigm-options-recap
 description: >
   Build an options market recap for /recap or a user-specified asset/window
-  from raw exchange venue files and source tapes. Use for options flow,
-  volatility, biggest-print, and market-window questions. The model chooses
+  from raw exchange venue files and source tapes. Use for full options-market
+  recaps; focused flow, volatility or biggest-print questions stay in data-discovery. The model chooses
   the bounded raw reads needed for the request and renders Snapshot, Biggest
   Print, Block Flow, and Vol Surface without using Dime hot files.
 metadata:
   author: tradeparadigm
-  version: "2.0"
+  version: "2.1"
 ---
 
 # Options Recap
@@ -20,6 +20,18 @@ metadata:
 the actual interval queried rather than silently capping or changing it.
 
 ## Hard rules
+
+The collector's trade examples and surface nodes are samples, not the full
+market. Read aggregate field coverage and missing partitions before claiming
+totals or rankings: null `premium_turnover_usd` means incomplete valuation;
+`known_premium_turnover_usd` is only the valued subset. Surface nodes are
+nearest available absolute 25/50 delta per expiry/type, with actual deltas;
+the same instrument can occupy both nodes. Never sum their OI or describe
+them as a full chain. For OI/max-pain, read all instruments once per snapshot.
+Opening observations are the first event within the requested opening 5m
+bucket, not an exact as-of quote; latest observations use the explicitly
+reported stable bucket. Missing opening evidence cannot establish a change.
+Exclude expired instruments at the comparison anchor and report observed time.
 
 1. **Do not use `s3://dt-exchange-venue-data/hot/` or any `hot__*` object.**
 2. Run `bash scripts/run_recap.sh <ASSET> <WINDOW>` once. It reads bounded

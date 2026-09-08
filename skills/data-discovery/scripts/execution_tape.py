@@ -10,6 +10,10 @@ BUCKET = "dt-exchange-venue-data"
 PREFIX = "paradigm_trade_tape"
 
 
+class AmbiguousRfqError(RuntimeError):
+    """A bare RFQ ID resolved to more than one source namespace."""
+
+
 def read_executions(start, end, *, rfq_id=None, asset=None, s3=None, now=None):
     """Read exact UTC daily objects, returning every matching execution leg.
 
@@ -71,6 +75,8 @@ def read_executions(start, end, *, rfq_id=None, asset=None, s3=None, now=None):
         )
         day += timedelta(days=1)
     result = pl.concat(frames).sort(["traded_at", "trade_id"])
+    if rfq_id and result["rfq_id"].n_unique() > 1:
+        raise AmbiguousRfqError("ambiguous RFQ ID; specify the exact DRFQv2- or GRFQ- namespace")
     if (
         result["trade_id"].null_count()
         or result["trade_id"].n_unique() != result.height

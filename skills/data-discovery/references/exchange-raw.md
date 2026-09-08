@@ -157,6 +157,41 @@ snapshots.
 
 ## Units
 
+`normalized/` standardizes column names, **not all units**: option-trade `iv`
+and option-summary `markIV`, bid/ask IV and `openInterest` remain venue-native.
+In contrast, non-null option-trade `turnover_usd` is already producer-converted
+USD premium turnover: do not scale it again. Count nulls before summing; SQL
+`sum` silently ignores them. Publish a partial known-value sum separately from
+a complete total, and do not rank venues on incomplete valuations. Historical
+nulls (including Bybit symbols missing from old discovery snapshots) are not
+repaired by a later metadata snapshot or collector update.
+
+### Shared read contract
+
+- Preserve requested asset, venue and instrument-kind filters and the exact
+  half-open UTC interval `[start, end)`, independent of partition boundaries.
+- Execution grain is `trade_id`; exchange trade identity is
+  `(exchange, symbol, id)`, not `id` alone. IDs are opaque and case-sensitive;
+  match exact known namespaces, never SQL suffix/LIKE or case-folded strings.
+  Multiple RFQ namespaces matching a bare ID are ambiguous, not one RFQ.
+- Group legs only by a proven venue-scoped block identity; preserve every leg.
+  A window edge can cut a block: verify declared leg count or read bounded
+  adjacent evidence before asserting the complete structure. Bybit has flags,
+  not group IDs. RFQ IDs are not inferred venue block IDs.
+- Snapshot grain is one `(exchange, symbol)` per observation anchor. Select
+  at/before the requested as-of time; if using an opening observation after
+  that time, label its actual time and offset. Never sum repeated ticker updates.
+- State source paths, observed event bounds, missing partitions, required-field
+  null counts and whether rows are exhaustive or sampled (with denominator).
+  A valid aggregate covers only readable partitions; missing objects are not
+  proof of zero activity, and access errors are not empty datasets.
+- Full-chain OI and max-pain require every active instrument at the anchor;
+  sampled delta nodes cannot establish them. Label nearest-delta nodes with
+  actual delta, expiry and time; missing opening snapshots cannot establish moves.
+- For conversions, join one event-applicable metadata record per
+  `(exchange, currency, symbol)` before aggregation, without multiplying rows.
+  Keep native values and an explicit gap if that record is unavailable.
+
 Use instrument metadata rather than hardcoded multipliers when it is available.
 
 | Venue | IV | Option amount / OI | Option premium price |
@@ -227,6 +262,6 @@ These non-hot files are also available:
   Parquet parts: Paradex perp trades; always exclude `IS_TRADEBUST=true`.
 
 There is no guaranteed cross-venue key from a Paradigm `RFQ_ID` to every raw
-exchange trade. Deribit publishes `block_rfq_id`; try an exact/suffix match only
-when the values support it. Otherwise use time, product, structure, size, and
+exchange trade. Deribit publishes `block_rfq_id`; only a proven exact mapping
+is authoritative, never an arbitrary matching suffix. Otherwise use time, product, structure, size, and
 real block ids as evidence and state when an execution cannot be resolved.

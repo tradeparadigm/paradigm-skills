@@ -9,7 +9,7 @@ description: >
   Does not cover account state, positions, vaults, or order placement.
 metadata:
   author: tradeparadigm
-  version: "2.0"
+  version: "2.1"
 ---
 
 # Paradigm Data Discovery
@@ -139,5 +139,6 @@ Do not dump the full catalog unless the user asks for it.
 - The non-hot executed Paradigm CSV stopped updating on 2026-08-10.
 - A raw venue block id is not automatically a Paradigm RFQ id.
 - Paradex historical trades must filter `NOT IS_TRADEBUST`.
-- For single-trade analysis, route to `paradigm-block-analyst`; for an options
-  market window, route to `paradigm-options-recap`.
+- For single-trade analysis, route to `paradigm-block-analyst`; for an explicitly
+  requested full recap, route to `paradigm-options-recap`. Focused questions
+  remain here: choose only the datasets, fields and time range needed.

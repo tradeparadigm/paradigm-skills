@@ -37,8 +37,8 @@ def test_invalid_id_fails_before_data_access():
     assert result.returncode == 2
 
 
-def test_suffix_predicate_is_id_only():
-    predicate = collector.suffix_predicate("RFQ_ID", "r_test-1")
+def test_rfq_predicate_is_id_only():
+    predicate = collector.rfq_predicate("RFQ_ID", "r_test-1")
     assert "RFQ_ID" in predicate and "r_test-1" in predicate
     assert "DESCRIPTION" not in predicate and "PRODUCT" not in predicate
 
@@ -65,7 +65,7 @@ def test_unresolved_anchor_does_not_scan_bucket():
 def test_current_execution_resolves_without_request_or_venue_rows():
     legs = [{"trade_id": f"leg-{i}", "rfq_id": "DRFQv2-r_test", "product": "BTC OPTION - PRDX"}
             for i in range(150)]
-    helper = types.SimpleNamespace(read_executions=lambda *a, **kw: {
+    helper = types.SimpleNamespace(AmbiguousRfqError=type('AmbiguousRfqError', (RuntimeError,), {}), read_executions=lambda *a, **kw: {
         "rows": legs, "sources": [], "build_window_end_ms": 1, "units": {}})
     output = io.StringIO()
     with patch.dict(sys.modules, {"execution_tape": helper}), \
@@ -85,6 +85,48 @@ def test_partition_discovery_failure_is_not_an_empty_market():
             assert "AccessDenied" in str(exc)
         else:
             raise AssertionError("access failure was swallowed")
+
+
+def test_proven_venue_block_id_is_used_without_leg_limit():
+    legs = [{'rfq_id': 'DRFQv2-r_AbC', 'product': 'BTC OPTION - DBT',
+             'traded_at_iso': '2026-09-08T07:30:00Z', 'venue_block_trade_id': 'BLOCK-123'}]
+    helper = types.SimpleNamespace(AmbiguousRfqError=type('AmbiguousRfqError', (RuntimeError,), {}),
+                                   read_executions=lambda *a, **kw: {'rows': legs})
+    queries = []
+
+    def run(sql):
+        queries.append(sql)
+        return [], None
+
+    with patch.dict(sys.modules, {'execution_tape': helper}), \
+         patch.object(sys, 'argv', ['collector', '--rfq-id', 'DRFQv2-r_AbC']), \
+         patch.object(collector, 'run_sql', side_effect=run), \
+         patch.object(collector, 'existing_paths', side_effect=lambda paths: paths), \
+         redirect_stdout(io.StringIO()):
+        assert collector.main() == 0
+    raw = next(sql for sql in queries if 'read_parquet' in sql)
+    assert "block_trade_id AS VARCHAR) IN ('BLOCK-123')" in raw
+    assert 'block_rfq_id' not in raw and 'LIMIT' not in raw
+    assert all('LIKE' not in sql and 'upper(' not in sql for sql in queries)
+
+
+def test_ambiguous_execution_cannot_fall_through_to_other_sources():
+    error_type = type('AmbiguousRfqError', (RuntimeError,), {})
+
+    def read(*args, **kwargs):
+        raise error_type('ambiguous')
+
+    helper = types.SimpleNamespace(AmbiguousRfqError=error_type, read_executions=read)
+    with patch.dict(sys.modules, {'execution_tape': helper}), \
+         patch.object(sys, 'argv', ['collector', '--rfq-id', 'r_AbC']), \
+         patch.object(collector, 'run_sql') as query:
+        try:
+            collector.main()
+        except error_type:
+            pass
+        else:
+            raise AssertionError('ambiguity was swallowed')
+        query.assert_not_called()
 
 
 if __name__ == "__main__":

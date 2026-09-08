@@ -64,9 +64,9 @@ def test_partition_plan_is_explicit_and_hot_free():
     check("every path is direct", all("/raw/" in p or "/normalized/" in p or "/meta/" in p for p in paths))
     check("no hot path", all("/hot/" not in p and "hot__" not in p for p in paths))
     check("hours are explicit", all("hour=*" not in p for p in paths))
-    check("window covers three UTC hours", len(queries[0].paths) == 3, len(queries[0].paths))
+    check("exclusive end covers two UTC hours", len(queries[0].paths) == 2, len(queries[0].paths))
     surface_sql = next(query.sql for query in queries if query.name == "option_surface_deribit")
-    check("surface caps open and latest independently", "PARTITION BY CASE WHEN open_rank=1" in surface_sql)
+    check("surface samples every expiry and type independently", "PARTITION BY observation, expirationDate, optionType, target_delta" in surface_sql)
 
 
 def test_evidence_contract_names_provenance_and_freshness():

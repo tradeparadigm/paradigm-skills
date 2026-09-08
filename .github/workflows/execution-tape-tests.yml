@@ -23,6 +23,6 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install test dependencies
-        run: python -m pip install pytest polars boto3
+        run: python -m pip install pytest polars boto3 duckdb
       - name: Test bounded execution reads without AWS access
-        run: python -m pytest skills/data-discovery/tests/test_execution_tape.py -q
+        run: python -m pytest skills/data-discovery/tests -q

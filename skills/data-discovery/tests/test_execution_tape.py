@@ -89,3 +89,24 @@ def test_old_metadata_contract_is_rejected():
 
     with pytest.raises(KeyError, match="build_window_start_ms"):
         reader.read_executions(NOW - timedelta(hours=2), NOW, s3=OldMetadata(), now=NOW)
+
+
+def test_ambiguous_bare_id_fails_but_qualified_id_preserves_legs():
+    class Namespaces(S3):
+        def get_object(self, **kwargs):
+            obj = super().get_object(**kwargs)
+            buf = io.BytesIO()
+            pl.DataFrame({
+                'trade_id': ['a', 'b'],
+                'rfq_id': ['DRFQv2-r_AbC', 'GRFQ-r_AbC'],
+                'traded_at': [int((NOW - timedelta(hours=1)).timestamp() * 1000)] * 2,
+            }).write_parquet(buf)
+            obj['Body'] = io.BytesIO(buf.getvalue())
+            return obj
+
+    with pytest.raises(reader.AmbiguousRfqError):
+        reader.read_executions(NOW - timedelta(hours=2), NOW, rfq_id='r_AbC',
+                               s3=Namespaces(), now=NOW)
+    result = reader.read_executions(NOW - timedelta(hours=2), NOW,
+                                    rfq_id='DRFQv2-r_AbC', s3=Namespaces(), now=NOW)
+    assert [row['trade_id'] for row in result['rows']] == ['a']

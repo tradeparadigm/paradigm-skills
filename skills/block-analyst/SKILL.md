@@ -7,7 +7,7 @@ description: >
   selects the raw evidence and never uses Dime hot files.
 metadata:
   author: tradeparadigm
-  version: "2.0"
+  version: "2.1"
 ---
 
 # Paradigm Block Trade Analyst
@@ -68,6 +68,11 @@ RFQ <id> not resolved — no authoritative asset, structure, or fill available.
 
 ## Choose market evidence
 
+Answer the requested question first: fill-versus-mark needs the proven legs
+and their execution-time benchmark, not an automatic 7/30-day history or live
+surface scan. Fetch history, greeks or current marks only when requested or
+necessary to support the answer; optional unavailable fields must not stall it.
+
 After the trade resolves, use any bounded combination the model judges useful:
 
 - latest raw `option_summary` rows for each leg's mark, bid/ask, IV, greeks,
@@ -124,7 +129,9 @@ net_greek = sum(position_sign * leg_ratio * instrument_greek) * quantity
 
 ## Output
 
-The entire successful response is two plain-text lines followed by one YAML
+For a focused natural-language question, answer it directly with units and
+material coverage gaps. For the full `/analyze` command, the successful
+response is two plain-text lines followed by one YAML
 code block. Keep it terse and omit unestablished fields rather than padding:
 
 ```text

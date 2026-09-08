@@ -35,7 +35,7 @@ def hour_patterns(source: str, venue: str, data_type: str, currency: str,
                   start: dt.datetime, end: dt.datetime) -> list[str]:
     cursor = start.replace(minute=0, second=0, microsecond=0)
     patterns: list[str] = []
-    while cursor <= end:
+    while cursor < end:
         patterns.append(
             f"{BUCKET}/{source}/exchange={venue}/data_type={data_type}/currency={currency}/"
             f"level=5m/year={cursor:%Y}/month={cursor:%m}/day={cursor:%d}/hour={cursor:%H}/"
@@ -133,6 +133,14 @@ def run_query(query: Query) -> tuple[dict[str, Any], list[Any]]:
         if "connection" in locals():
             connection.close()
     source.update(status="ok", row_count=len(rows))
+    source["partition_coverage"] = "partial" if missing else "all_planned_patterns_present"
+    if query.name.startswith("option_surface_"):
+        source["missing_observations"] = sorted(
+            {"window_open", "latest"} - {row["observation"] for row in rows})
+    if query.name.startswith("venue_blocks_"):
+        source["selection"] = "all_matching_rows_in_window; boundary groups may be incomplete"
+    if query.name.startswith("option_trades_"):
+        source["selection"] = "all-row aggregates plus top 25 known-turnover-first sample; not a complete trade list"
     timestamps = [row.get("max_event_at") for row in rows if isinstance(row, dict) and row.get("max_event_at")]
     if timestamps:
         source["max_event_at"] = max(timestamps)
@@ -157,7 +165,12 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime) -> list[Quer
             FROM trades ORDER BY turnover_usd DESC NULLS LAST, amount DESC NULLS LAST LIMIT 25
           )
           SELECT 'aggregate' AS record_type, exchange, count(*) AS trade_count,
-                 sum(amount) AS amount_native, sum(turnover_usd) AS premium_turnover_usd,
+                 sum(amount) AS amount_native,
+                 CASE WHEN count(turnover_usd)=count(*) THEN sum(turnover_usd) END AS premium_turnover_usd,
+                 sum(turnover_usd) AS known_premium_turnover_usd,
+                 count(*) - count(turnover_usd) AS missing_turnover_count,
+                 count(iv) AS iv_count,
+                 least(count(*), 25) AS sampled_trade_count,
                  count(*) FILTER (WHERE lower(side)='buy') AS buy_count,
                  count(*) FILTER (WHERE lower(side)='sell') AS sell_count,
                  max(timestamp) AS max_event_at
@@ -165,30 +178,50 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime) -> list[Quer
           UNION ALL BY NAME
           SELECT 'trade' AS record_type, *, max(timestamp) OVER () AS max_event_at FROM largest
         """, {"amount_native": "venue-native; do not combine without metadata",
-               "premium_turnover_usd": "USD", "iv": "normalized vol points"}, True))
+               "premium_turnover_usd": "USD; null unless every matching row has turnover",
+               "known_premium_turnover_usd": "USD partial sum, not a complete total",
+               "iv": "venue-native; normalized column names do not harmonize units"}, True))
 
         summary_paths = snapshot_patterns(venue, currency, start, end)
+        open_point = start.replace(minute=start.minute - start.minute % 5, second=0, microsecond=0)
+        latest_point = max(open_point, end.replace(minute=end.minute - end.minute % 5,
+                                                 second=0, microsecond=0) - dt.timedelta(minutes=10))
         queries.append(Query(f"option_surface_{venue}", summary_paths, f"""
-          WITH observations AS (
-            SELECT *, row_number() OVER (PARTITION BY symbol ORDER BY timestamp) AS open_rank,
-                      row_number() OVER (PARTITION BY symbol ORDER BY timestamp DESC) AS latest_rank
-            FROM read_parquet(__PATHS__, union_by_name=true, hive_partitioning=true)
+          WITH anchors(observation, bucket_start, anchor_at) AS (
+            VALUES ('window_open', TIMESTAMPTZ '{open_point.isoformat()}', TIMESTAMPTZ '{start_iso}'),
+                   ('latest', TIMESTAMPTZ '{latest_point.isoformat()}', TIMESTAMPTZ '{end_iso}')
+          ), observations AS (
+            SELECT *, row_number() OVER (
+                PARTITION BY observation, exchange, symbol
+                ORDER BY CASE WHEN observation='window_open' THEN timestamp END ASC,
+                         timestamp DESC) AS snapshot_rank
+            FROM read_parquet(__PATHS__, union_by_name=true, hive_partitioning=true), anchors
             WHERE {between}
-          )
-          SELECT * EXCLUDE(evidence_rank) FROM (
-            SELECT CASE WHEN open_rank=1 THEN 'window_open' ELSE 'latest' END AS observation,
+              AND TRY_CAST(timestamp AS TIMESTAMPTZ) >= bucket_start
+              AND TRY_CAST(timestamp AS TIMESTAMPTZ) < bucket_start + INTERVAL 5 MINUTE
+              AND TRY_CAST(expirationDate AS TIMESTAMPTZ) > anchor_at
+          ), snapshots AS (
+            SELECT *, count(*) OVER (PARTITION BY observation) AS snapshot_symbol_count
+            FROM observations WHERE snapshot_rank=1
+          ), nodes AS (
+            SELECT observation, CAST(anchor_at AS VARCHAR) AS anchor_at,
+                   CAST(bucket_start AS VARCHAR) AS bucket_start, snapshot_symbol_count,
                    exchange, timestamp, symbol, expirationDate, strikePrice, optionType,
                    markIV, bestBidIV, bestAskIV, markPrice, bestBidPrice, bestAskPrice,
                    delta, gamma, vega, theta, openInterest, underlyingPrice,
-                   max(timestamp) OVER () AS max_event_at,
+                   target_delta, 'nearest_delta_per_expiry_and_type' AS selection,
+                   max(timestamp) OVER (PARTITION BY observation) AS max_event_at,
                    row_number() OVER (
-                     PARTITION BY CASE WHEN open_rank=1 THEN 'window_open' ELSE 'latest' END
-                     ORDER BY expirationDate, abs(delta)
+                     PARTITION BY observation, expirationDate, optionType, target_delta
+                     ORDER BY abs(abs(delta)-target_delta) NULLS LAST, symbol
                    ) AS evidence_rank
-            FROM observations WHERE open_rank=1 OR latest_rank=1
-          ) WHERE evidence_rank <= 30
-          ORDER BY observation, expirationDate, abs(delta)
-        """, {"markIV": "vol points", "openInterest": "coin where normalized metadata supports it"}, True))
+            FROM snapshots CROSS JOIN (VALUES (0.25), (0.50)) AS targets(target_delta)
+          )
+          SELECT * EXCLUDE(evidence_rank), count(*) OVER (PARTITION BY observation) AS selected_node_count
+          FROM nodes WHERE evidence_rank=1
+          ORDER BY observation, expirationDate, optionType, target_delta
+        """, {"markIV": "venue-native; convert using event-applicable instrument metadata",
+               "openInterest": "venue-native snapshot sample, not full-chain OI"}, True))
 
         block_paths = hour_patterns("raw", venue, "option_trade", currency, start, end)
         native_predicates = {
@@ -203,7 +236,7 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime) -> list[Quer
           FROM read_parquet(__PATHS__, union_by_name=true,
                             hive_partitioning=true, filename=true)
           WHERE {between} AND ({native_predicates[venue]})
-          ORDER BY timestamp DESC LIMIT 50
+          ORDER BY timestamp DESC
         """, {"numeric_fields": "venue-native; consult instrument metadata"}))
 
     dvol_paths = hour_patterns("raw", "deribit", "dvol", currency, start, end)

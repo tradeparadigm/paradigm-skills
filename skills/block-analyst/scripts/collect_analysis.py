@@ -61,9 +61,11 @@ def existing_paths(patterns: list[str]) -> list[str]:
             if any(f.startswith(pattern.split("*", 1)[0]) for f in matched)]
 
 
-def suffix_predicate(column: str, core: str) -> str:
-    escaped = core.replace("'", "''")
-    return f"upper(CAST({column} AS VARCHAR)) = upper('{escaped}') OR upper(CAST({column} AS VARCHAR)) LIKE upper('%{escaped}')"
+def rfq_predicate(column: str, core: str) -> str:
+    """Exact opaque IDs; only explicitly known RFQ namespaces are candidates."""
+    ids = [core] if core.startswith(("DRFQv2-", "GRFQ-")) else [core, f"DRFQv2-{core}", f"GRFQ-{core}"]
+    quoted = ",".join("'" + item.replace("'", "''") + "'" for item in ids)
+    return f"CAST({column} AS VARCHAR) IN ({quoted})"
 
 
 def value(row: dict[str, Any], *names: str) -> Any:
@@ -123,31 +125,40 @@ def main() -> int:
         parser.error("invalid RFQ id")
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "data-discovery" / "scripts"))
-    from execution_tape import read_executions
+    from execution_tape import AmbiguousRfqError, read_executions
     now = dt.datetime.now(dt.timezone.utc)
     execution, execution_error = None, None
     try:
         execution = read_executions(now - dt.timedelta(days=30), now, rfq_id=args.rfq_id, now=now)
+    except AmbiguousRfqError:
+        raise
     except Exception as exc:
         execution_error = str(exc)
     execution_rows = execution["rows"] if execution else []
 
     request_rows, request_error = run_sql(
         f"SELECT * FROM read_csv_auto('{RFQ_TAPE}', union_by_name=true) "
-        f"WHERE {suffix_predicate('RFQ_ID', core)} LIMIT 20"
+        f"WHERE {rfq_predicate('RFQ_ID', args.rfq_id)}"
     )
     request_date = str(value(request_rows[0], "DATE") or "")[:10] if request_rows else ""
     historical_applicable = not request_rows or not request_date or request_date <= FREEZE_DATE
     if historical_applicable:
         historical_rows, historical_error = run_sql(
             f"SELECT * FROM read_csv_auto('{TRADE_TAPE}', union_by_name=true) "
-            f"WHERE {suffix_predicate('RFQ_ID', core)} LIMIT 100"
+            f"WHERE {rfq_predicate('RFQ_ID', args.rfq_id)}"
         )
     else:
         historical_rows, historical_error = [], None
 
+    identities = {str(value(row, "rfq_id")) for row in execution_rows + request_rows + historical_rows
+                  if value(row, "rfq_id") is not None}
+    if len(identities) > 1:
+        raise AmbiguousRfqError(f"Ambiguous RFQ ID; specify the exact namespace: {sorted(identities)}")
+
     anchor = execution_rows[0] if execution_rows else (request_rows[0] if request_rows else (historical_rows[0] if historical_rows else {}))
-    venue_paths = raw_deribit_paths(anchor)
+    venue_ids = sorted({str(row["venue_block_trade_id"]) for row in execution_rows
+                        if row.get("venue_block_trade_id")})
+    venue_paths = raw_deribit_paths(anchor) if venue_ids else []
     venue_rows: list[dict[str, Any]] = []
     venue_error: str | None = None
     try:
@@ -157,10 +168,11 @@ def main() -> int:
         venue_paths = []
     if venue_paths:
         quoted = "[" + ",".join("'" + path + "'" for path in venue_paths) + "]"
+        block_ids = ",".join("'" + item.replace("'", "''") + "'" for item in venue_ids)
         venue_rows, venue_error = run_sql(
             "SELECT *, filename AS source_path FROM read_parquet("
             f"{quoted}, union_by_name=true, hive_partitioning=true, filename=true) "
-            f"WHERE {suffix_predicate('block_rfq_id', core)} ORDER BY timestamp LIMIT 100"
+            f"WHERE CAST(block_trade_id AS VARCHAR) IN ({block_ids}) ORDER BY timestamp"
         )
 
     if execution_rows:
@@ -209,7 +221,7 @@ def main() -> int:
         gaps.append({"field": "execution", "reason": "No authoritative id-linked execution was available."})
     anchor_product = str(value(anchor, "PRODUCT", "product") or "").upper()
     if not venue_paths and anchor and "DBT" in anchor_product:
-        gaps.append({"source": "raw_exchange_trades", "reason": "RFQ evidence did not establish both asset and event date for a bounded partition read."})
+        gaps.append({"source": "raw_exchange_trades", "reason": "No proven venue block ID and bounded asset/event date lookup was available; RFQ suffixes are not venue identities."})
 
     print(json.dumps({
         "schema_version": "dime.analysis.evidence.v1",
