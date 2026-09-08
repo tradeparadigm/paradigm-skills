@@ -125,9 +125,10 @@ Do not dump the full catalog unless the user asks for it.
 
 ## Fixed source facts
 
-- Paradigm tapes join on `RFQ_ID`; executed rows also carry
-  `BLOCK_TRADE_ID`.
-- Filter the Paradigm tapes to options with `PRODUCT LIKE '%OPTION%'`.
+- The partitioned execution tape uses `rfq_id`, `block_trade_id` and
+  `venue_block_trade_id`; CSV tapes use uppercase `RFQ_ID` / `BLOCK_TRADE_ID`.
+- Filter partitioned executions to options with `instrument_kind == "OPTION"`
+  (case-sensitive). Only the CSV tapes use `PRODUCT LIKE '%OPTION%'`.
 - The current RFQ tape does not contain execution price, mark, side, trade id,
   or block id.
 - The non-hot executed Paradigm CSV stopped updating on 2026-08-10.

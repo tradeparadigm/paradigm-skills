@@ -5,10 +5,10 @@
     {
       "id": 1,
       "prompt": "what data do we have available to query?",
-      "expected_output": "An inventory-style response listing the three market-data families: raw/normalized per-venue exchange files plus instrument metadata under s3://dt-exchange-venue-data, the Paradigm RFQ and historical executed tapes under s3://dt-paradigm-data/paradigm_data/, and the Paradex DEX trade tape under s3://dt-paradex-data/paradex_data/. Mentions ap-northeast-1 and DuckDB IRSA credential-chain access. Does not use the hot prefix.",
+      "expected_output": "An inventory-style response listing raw/normalized per-venue exchange files, instrument metadata and the current partitioned Paradigm execution tape under s3://dt-exchange-venue-data; the Paradigm RFQ and legacy historical executed CSV tapes under s3://dt-paradigm-data/paradigm_data/; and the Paradex DEX trade tape under s3://dt-paradex-data/paradex_data/. Mentions ap-northeast-1 and credential-chain access. Does not use the hot prefix.",
       "assertions": [
         "Response names the S3 buckets (s3://dt-paradigm-data, s3://dt-exchange-venue-data, s3://dt-paradex-data)",
-        "Response lists raw exchange venue files and metadata, Paradigm RFQ/executed tapes, and the Paradex DEX trade tape",
+        "Response lists raw exchange venue files and metadata, the current partitioned Paradigm execution tape, Paradigm RFQ and legacy executed CSV tapes, and the Paradex DEX trade tape",
         "Response does not recommend s3://dt-exchange-venue-data/hot/ or any hot__ object",
         "Response is structured as a catalog summary, not a query — it does not attempt to run SQL"
       ]
@@ -26,12 +26,13 @@
     {
       "id": 3,
       "prompt": "what columns does the Paradigm trade tape have and where does it live?",
-      "expected_output": "Response gives s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz and lists DATE, TIME, AUCTION, PRODUCT, DESCRIPTION, QTY, PRICE, REF_PRICE, SIDE, QUOTE_CURRENCY, NOTIONAL_VOLUME_USD, RFQ_ID, TRADE_ID, BLOCK_TRADE_ID. It states that the non-hot object is frozen at 2026-08-10 and is historical only, and that RFQ_ID links to the current RFQ tape.",
+      "expected_output": "Response leads with current daily Parquet at s3://dt-exchange-venue-data/paradigm_trade_tape/year=YYYY/month=MM/day=DD/paradigm_trade_tape__YYYYMMDD.parquet, lists its lowercase leg-level columns, and gives the case-sensitive options filter instrument_kind == \"OPTION\". It distinguishes the legacy s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz frozen at 2026-08-10, whose uppercase columns are not the Parquet schema. Current objects are mutable, support trailing 30-day reads plus the full oldest UTC day, and require metadata freshness/coverage checks.",
       "assertions": [
-        "Response returns the correct S3 path: s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz",
-        "Response lists the schema columns including DATE, PRODUCT, DESCRIPTION, PRICE, NOTIONAL_VOLUME_USD, RFQ_ID, BLOCK_TRADE_ID",
-        "Response mentions or implies how to filter for options only (e.g. PRODUCT LIKE '%OPTION%')",
-        "Response notes the dataset is a single flat CSV.gz frozen at 2026-08-10 and is not current"
+        "Response identifies the current tape at s3://dt-exchange-venue-data/paradigm_trade_tape/ with year/month/day partitions and paradigm_trade_tape__YYYYMMDD.parquet filenames",
+        "Response lists current Parquet columns including traded_at, trade_id, rfq_id, block_trade_id, venue_block_trade_id, instrument_kind, trade_price, notional_volume_usd",
+        "Response gives the case-sensitive options-only filter instrument_kind == \"OPTION\" (or equivalent SQL equality with uppercase OPTION), not merely the legacy PRODUCT filter",
+        "Response distinguishes current partitioned Parquet from the legacy paradigm_trade_tape_slim.csv.gz frozen at 2026-08-10, without presenting the frozen CSV as the only execution dataset",
+        "Response explains bounded recent coverage and checking freshness or coverage metadata rather than treating all historical days as available"
       ]
     },
     {

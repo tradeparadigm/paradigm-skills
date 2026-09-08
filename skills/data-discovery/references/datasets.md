@@ -40,7 +40,7 @@ unbounded or infer a historical retention guarantee from old keys remaining.
 | `traded_at`, `traded_at_iso` | Execution time, epoch milliseconds and UTC ISO text |
 | `rfq_id`, `trade_id`, `block_trade_id` | Namespaced Paradigm identity (`DRFQv2-` or `GRFQ-`); keep all legs and group on block ID |
 | `venue_block_trade_id` | Nullable venue-native ID for corroboration/deduplication, not a Paradigm RFQ ID |
-| `venue`, `asset`, `instrument_kind`, `option_kind`, `instrument_name`, `strike_price`, `expiry_date` | Routing and instrument dimensions; `asset` is the underlying, not premium currency |
+| `venue`, `asset`, `instrument_kind`, `option_kind`, `instrument_name`, `strike_price`, `expiry_date` | Routing and instrument dimensions; `asset` is the underlying, not premium currency; options-only filter: `instrument_kind == "OPTION"` (case-sensitive) |
 | `quantity`, `trade_price`, `mark_price`, `taker_side` | Native leg size, fill price, execution-time reference mark, BUY/SELL; infer conversion only from instrument metadata |
 | `notional_volume_usd` | Contract notional in USD, **not premium turnover**; nullable when index price is unavailable |
 | `row_type`, `auction`, `trade_source`, `product`, `description` | Trade classification and display fields |

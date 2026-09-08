@@ -92,6 +92,12 @@ do not present exchange-only block flow as complete Paradigm execution coverage.
   snapshot; show `n/a` when either side is unavailable.
 - Derive DVOL open/close from the first/last event-time observations in the
   requested window. Do not substitute a different point from the range.
+  Raw S3 `dvol` rows contain point observations (`timestamp`, `volatility`);
+  fixture/API candles instead contain `[timestamp_ms, open, high, low, close]`.
+  For a supplied candle series, sort by timestamp and use the earliest
+  candle's open and latest candle's close, not the earliest candle's close.
+  Candle coverage may straddle the requested boundaries; label that coverage
+  rather than claiming exact sub-candle endpoints.
 - For a mixed-direction biggest block, state each proven leg side (for example,
   `buy put / sell call`); "two-way" alone does not establish the structure.
 - Deduplicate a Paradigm and venue block only when a real shared identifier or
