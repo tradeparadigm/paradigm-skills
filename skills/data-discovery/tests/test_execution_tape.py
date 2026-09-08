@@ -40,10 +40,10 @@ class S3:
                 "generated_at_ms": str(
                     int((NOW - timedelta(minutes=self.age)).timestamp() * 1000)
                 ),
-                "coverage_start_ms": str(
+                "build_window_start_ms": str(
                     int((NOW - timedelta(days=31)).timestamp() * 1000)
                 ),
-                "coverage_end_ms": str(int(NOW.timestamp() * 1000)),
+                "build_window_end_ms": str(int(NOW.timestamp() * 1000)),
             },
         }
 
@@ -54,6 +54,7 @@ def test_all_legs_exact_path_and_id():
         NOW - timedelta(hours=2), NOW, rfq_id="r_test", s3=s3, now=NOW
     )
     assert len(result["rows"]) == 150
+    assert result["build_window_end_ms"] == int(NOW.timestamp() * 1000)
     assert s3.calls == [
         "paradigm_trade_tape/year=2026/month=09/day=08/paradigm_trade_tape__20260908.parquet"
     ]
@@ -76,3 +77,15 @@ def test_outside_retention_fails_before_read():
     with pytest.raises(ValueError):
         reader.read_executions(NOW - timedelta(days=32), NOW, s3=s3, now=NOW)
     assert s3.calls == []
+
+
+def test_old_metadata_contract_is_rejected():
+    class OldMetadata(S3):
+        def get_object(self, **kwargs):
+            obj = super().get_object(**kwargs)
+            obj["Metadata"]["coverage_start_ms"] = obj["Metadata"].pop("build_window_start_ms")
+            obj["Metadata"]["coverage_end_ms"] = obj["Metadata"].pop("build_window_end_ms")
+            return obj
+
+    with pytest.raises(KeyError, match="build_window_start_ms"):
+        reader.read_executions(NOW - timedelta(hours=2), NOW, s3=OldMetadata(), now=NOW)

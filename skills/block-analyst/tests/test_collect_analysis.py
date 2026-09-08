@@ -66,7 +66,7 @@ def test_current_execution_resolves_without_request_or_venue_rows():
     legs = [{"trade_id": f"leg-{i}", "rfq_id": "DRFQv2-r_test", "product": "BTC OPTION - PRDX"}
             for i in range(150)]
     helper = types.SimpleNamespace(read_executions=lambda *a, **kw: {
-        "rows": legs, "sources": [], "coverage_end_ms": 1, "units": {}})
+        "rows": legs, "sources": [], "build_window_end_ms": 1, "units": {}})
     output = io.StringIO()
     with patch.dict(sys.modules, {"execution_tape": helper}), \
          patch.object(sys, "argv", ["collect_analysis.py", "--rfq-id", "DRFQv2-r_test"]), \

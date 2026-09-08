@@ -46,10 +46,15 @@ unbounded or infer a historical retention guarantee from old keys remaining.
 | `row_type`, `auction`, `trade_source`, `product`, `description` | Trade classification and display fields |
 | `generated_at` | Publication time in epoch milliseconds, not source ingestion freshness |
 
-Object metadata `coverage_start_ms`, `coverage_end_ms`, `generated_at_ms` is
-present even on empty days. The shared reader in `scripts/execution_tape.py`
+Object metadata `build_window_start_ms`, `build_window_end_ms`, `generated_at_ms`
+is present even on empty days. The build bounds describe the whole rebuild,
+not the contents of a single object: intersect them with that key's UTC day.
+A closed day is temporally covered when build start is at/before its midnight
+and build end is at/after the next midnight. The publisher refuses closed-day
+row-count shrink; a legitimate downward correction needs operator review.
+The shared reader in `scripts/execution_tape.py`
 requires each object to have been published within 20 minutes, returns its
-coverage end, and fails on missing access, keys or duplicate IDs. Publication
+build-window end, and fails on missing access, keys or duplicate IDs. Publication
 is atomic per object, not across days; replication may expose mixed generations.
 The upstream Airbyte sync is hourly: a fresh publication does **not** prove that
 an execution from the last few minutes has landed. Report the coverage and gap.

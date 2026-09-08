@@ -36,8 +36,8 @@ def read_executions(start, end, *, rfq_id=None, asset=None, s3=None, now=None):
         published = datetime.fromtimestamp(
             int(metadata["generated_at_ms"]) / 1000, timezone.utc
         )
-        coverage_start = int(metadata["coverage_start_ms"])
-        coverage_end = int(metadata["coverage_end_ms"])
+        coverage_start = int(metadata["build_window_start_ms"])
+        coverage_end = int(metadata["build_window_end_ms"])
         if not timedelta(0) <= now - published <= timedelta(minutes=20):
             raise RuntimeError(f"stale or future-dated execution partition: {key}")
         if coverage_start > int(start.timestamp() * 1000):
@@ -66,7 +66,7 @@ def read_executions(start, end, *, rfq_id=None, asset=None, s3=None, now=None):
             {
                 "path": f"s3://{BUCKET}/{key}",
                 "generated_at": published.isoformat(),
-                "coverage_end_ms": coverage_end,
+                "build_window_end_ms": coverage_end,
             }
         )
         day += timedelta(days=1)
@@ -81,7 +81,7 @@ def read_executions(start, end, *, rfq_id=None, asset=None, s3=None, now=None):
     return {
         "rows": result.to_dicts(),
         "sources": sources,
-        "coverage_end_ms": min(item["coverage_end_ms"] for item in sources),
+        "build_window_end_ms": min(item["build_window_end_ms"] for item in sources),
         "units": {
             "quantity": "product-native",
             "trade_price": "instrument-native premium price",
