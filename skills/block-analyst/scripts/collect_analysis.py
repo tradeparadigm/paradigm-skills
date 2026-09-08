@@ -184,7 +184,7 @@ def main() -> int:
          "status": "not_applicable" if not historical_applicable else ("unavailable" if historical_error else "ok"),
          "row_count": len(historical_rows),
          "event_time_bounds": event_bounds(historical_rows),
-         "units": {"PRICE": "QUOTE_CURRENCY", "REF_PRICE": "QUOTE_CURRENCY", "NOTIONAL_VOLUME_USD": "USD"},
+         "units": {"PRICE": "instrument-native", "REF_PRICE": "instrument-native", "NOTIONAL_VOLUME_USD": "USD notional, not premium turnover"},
          "valid_through": FREEZE_DATE, **({"error": historical_error} if historical_error else {})},
     ]
     if venue_paths:

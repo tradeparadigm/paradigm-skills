@@ -72,7 +72,7 @@ alongside independently available market evidence; neither falls back to hot.
 | `PRODUCT` | Asset, instrument kind, and venue suffix |
 | `DESCRIPTION` | Strategy description |
 | `QTY` | Requested quantity |
-| `QUOTE_CURRENCY` | Premium currency |
+| `QUOTE_CURRENCY` | Source currency label; not sufficient to establish premium units |
 | `NOTIONAL_VOLUME_USD` | RFQ notional |
 | `NUMBER_OF_QUOTES` | Maker responses |
 | `NUMBER_OF_BLOCK_TRADES` | Executions; zero means unfilled |
@@ -99,7 +99,7 @@ This tape does not contain execution price, reference mark, taker side,
 | `PRICE` | Execution price |
 | `REF_PRICE` | Reference mark at execution |
 | `SIDE` | Taker side |
-| `QUOTE_CURRENCY` | Premium currency |
+| `QUOTE_CURRENCY` | Underlying asset/routing currency, not necessarily premium denomination |
 | `NOTIONAL_VOLUME_USD` | USD notional |
 | `RFQ_ID` | Join to the RFQ tape |
 | `TRADE_ID` | Trade identifier |
