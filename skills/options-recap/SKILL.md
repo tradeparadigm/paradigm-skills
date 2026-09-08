@@ -3,8 +3,8 @@ name: paradigm-options-recap
 description: >
   Build an options market recap for /recap or a user-specified asset/window
   from raw exchange venue files and source tapes. Use for full options-market
-  recaps; focused flow, volatility or biggest-print questions stay in data-discovery. The model chooses
-  the bounded raw reads needed for the request and renders Snapshot, Biggest
+  recaps; focused flow, volatility or biggest-print questions stay in data-discovery. The script reads
+  bounded raw inputs and renders Snapshot, Biggest
   Print, Block Flow, and Vol Surface without using Dime hot files.
 metadata:
   author: tradeparadigm
@@ -18,6 +18,23 @@ metadata:
 `/recap [asset] [options] [window]` is order-independent. Default to BTC and
 24h; `options` is a no-op token. Accept `Nm`, `Nh`, and `Nd` windows, and state
 the actual interval queried rather than silently capping or changing it.
+
+## Live execution
+
+Run one command from this skill's directory:
+
+```bash
+bash scripts/run_recap.sh BTC 24h
+```
+
+Pass the parsed asset and window. The script reads non-hot partitions, applies
+event-time instrument metadata, computes the established metrics, and prints
+the finished four-section recap. Relay stdout verbatim as the entire answer,
+including coverage warnings. Do not recalculate, reformat, inspect its intermediate
+JSON, or make additional reads to fill optional fields. If it fails, report the
+error and stop; never retry with a different window or bypass a freshness gate.
+The following calculation and output rules describe what the script implements
+and how to handle supplied/injected evidence when no live execution is needed.
 
 ## Hard rules
 
@@ -34,12 +51,12 @@ reported stable bucket. Missing opening evidence cannot establish a change.
 Exclude expired instruments at the comparison anchor and report observed time.
 
 1. **Do not use `s3://dt-exchange-venue-data/hot/` or any `hot__*` object.**
-2. Run `bash scripts/run_recap.sh <ASSET> <WINDOW>` once. It reads bounded
-   direct partitions and returns a `dime.recap.evidence.v1` JSON document; it
-   does not render or choose the answer.
+2. Run `bash scripts/run_recap.sh <ASSET> <WINDOW>` once and relay the finished
+   recap, not the intermediate collector evidence.
 3. Read
    [the raw exchange catalog](../data-discovery/references/exchange-raw.md)
-   before choosing sources. The model owns the query plan.
+   when explaining the source contract or working with injected evidence;
+   the live script already implements the bounded query plan.
 4. Bound reads to the requested window, asset, venues, data types, and
    partitions. Check `max(timestamp)` in each continuous source used.
 5. Normalise IV, amount, premium turnover, and OI with event-time-applicable instrument
@@ -75,16 +92,15 @@ support it. Typical choices are:
 - public venue APIs when they provide a clearer current observation than the
   latest raw partition.
 
-The collector supplies a general evidence bundle: source-local aggregates,
+Internally the collector supplies source-local aggregates,
 largest trade observations, window-open/latest surface observations, DVOL,
 perpetual snapshots, venue-native block rows, provenance, units, freshness,
-and explicit gaps. Inspect that evidence and decide which facts answer the
-question. The JSON is evidence, not a response template and not a command to
-populate every field.
+and explicit gaps to the existing calculator and renderer. This intermediate
+data is not a second model-driven rendering workflow.
 
-The model may make additional bounded reads from raw S3, normalized rows or
-per-period aggregates, source tapes, or venue APIs when the returned evidence identifies a real
-gap. It must not use a hot or pre-shaped recap file.
+For separate follow-up questions, use bounded raw S3, normalized rows or
+per-period aggregates, source tapes, or venue APIs. Do not add those queries to
+the live recap command or use a hot/pre-shaped recap file.
 The source map in the raw exchange catalog covers all former hot-file inputs.
 Check `partitioned_paradigm_executions` source status and publication coverage;
 do not present exchange-only block flow as complete Paradigm execution coverage.

@@ -1,7 +1,7 @@
 # Output Format — FIXED
 
-This is the rendering contract for the model-directed raw-data workflow. Use it
-after selecting and querying the necessary raw exchange files and source tapes.
+This is the existing rendering contract, now backed by non-hot inputs. The live
+script renders it; consult it directly only for supplied/injected evidence.
 Never fabricate a value to fill the template; state a specific field or section
 as unavailable when the selected data cannot establish it.
 
@@ -39,8 +39,9 @@ gap, and do not combine `amount_native` across venues.
 [DDMMMYY] [structure]   [Nx]   $[X]M   [HH:MM] UTC   via Paradigm/[Venue] ([Buy/Sell, ][IV]v avg)
 ```
 
-The single largest **proven block** in the window, ranked by USD premium
-turnover when available. Group legs only on a real venue block/OTC id. The
+The single largest **proven block** in the window, ranked by underlying USD
+notional, as in Block Flow. Snapshot Volume is USD premium turnover: never
+substitute one measure for the other. Group legs only on a real venue block/OTC id. The
 `via …` tag names the source and venue. A raw venue block without provable leg
 geometry renders as
 `[Venue] Block   [Nx]   $[X]M   ~[HH:MM] UTC   via venue tape`

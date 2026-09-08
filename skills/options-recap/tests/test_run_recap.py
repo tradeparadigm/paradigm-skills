@@ -41,6 +41,8 @@ def test_arguments():
     check("default is BTC 24h", hook("RECAP_PRINT_ARGS")[0] == "BTC 24h")
     check("options token is ignored", hook("RECAP_PRINT_ARGS", "eth", "options", "8h")[0] == "ETH 8h")
     check("1d normalizes to 24h", hook("RECAP_PRINT_ARGS", "btc", "1d")[0] == "BTC 24h")
+    check("window-first invocation", hook("RECAP_PRINT_ARGS", "8h", "options", "eth")[0] == "ETH 8h")
+    check("window-only invocation", hook("RECAP_PRINT_ARGS", "8h")[0] == "BTC 8h")
 
 
 def test_windows_are_not_capped():

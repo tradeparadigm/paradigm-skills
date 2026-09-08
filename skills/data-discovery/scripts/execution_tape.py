@@ -14,6 +14,32 @@ class AmbiguousRfqError(RuntimeError):
     """A bare RFQ ID resolved to more than one source namespace."""
 
 
+def calculation_rows(rows):
+    """Map published leg fields to the existing calculators' tape interface.
+
+    Geometry comes from the typed instrument columns, not the RFQ's shorthand
+    description, which can describe the entire package on every leg.
+    """
+    result = []
+    for row in rows:
+        event = datetime.fromtimestamp(row["traded_at"] / 1000, timezone.utc)
+        description = row["description"]
+        if row["instrument_kind"] == "OPTION":
+            expiry = datetime.fromisoformat(row["expiry_date"])
+            description = (f"{row['option_kind'].title()} {expiry:%d %b %y} "
+                           f"{row['strike_price']:g}")
+        result.append({
+            "RFQ_ID": row["rfq_id"], "BLOCK_TRADE_ID": row["block_trade_id"],
+            "VENUE_BLOCK_TRADE_ID": row["venue_block_trade_id"],
+            "PRODUCT": row["product"], "DESCRIPTION": description,
+            "QUOTE_CURRENCY": row["asset"], "QTY": row["quantity"],
+            "PRICE": row["trade_price"], "REF_PRICE": row["mark_price"],
+            "SIDE": row["taker_side"], "NOTIONAL_VOLUME_USD": row["notional_volume_usd"],
+            "DATE": event.strftime("%Y-%m-%d"), "TIME": event.strftime("%H:%M:%S"),
+        })
+    return result
+
+
 def read_executions(start, end, *, rfq_id=None, asset=None, s3=None, now=None):
     """Read exact UTC daily objects, returning every matching execution leg.
 

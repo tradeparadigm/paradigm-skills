@@ -29,7 +29,7 @@ def test_wrapper_contract():
     with open(SCRIPT) as handle:
         source = handle.read()
     assert "collect_analysis.py" in source
-    assert "/hot/" not in source and "hot__" not in source and "--render" not in source
+    assert "/hot/" not in source and "hot__" not in source and "--render" in source
 
 
 def test_invalid_id_fails_before_data_access():

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Collect direct-data evidence for one RFQ. stdout is one JSON document.
+# Resolve direct-data legs and return the established formatted analysis.
 set -euo pipefail
 
 SUPPLIED_ID=${1:-}
@@ -12,4 +12,4 @@ esac
 [ -n "${ANALYZE_PRINT_ID:-}" ] && { echo "$CORE"; exit 0; }
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-exec uv run "$DIR/scripts/collect_analysis.py" --rfq-id "$SUPPLIED_ID"
+exec uv run "$DIR/scripts/collect_analysis.py" --rfq-id "$SUPPLIED_ID" --render

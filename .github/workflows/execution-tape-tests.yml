@@ -4,14 +4,14 @@ on:
   push:
     paths:
       - 'skills/data-discovery/**'
-      - 'skills/block-analyst/scripts/collect_analysis.py'
-      - 'skills/options-recap/scripts/collect_recap.py'
+      - 'skills/block-analyst/**'
+      - 'skills/options-recap/**'
       - '.github/workflows/execution-tape-tests.yml'
   pull_request:
     paths:
       - 'skills/data-discovery/**'
-      - 'skills/block-analyst/scripts/collect_analysis.py'
-      - 'skills/options-recap/scripts/collect_recap.py'
+      - 'skills/block-analyst/**'
+      - 'skills/options-recap/**'
       - '.github/workflows/execution-tape-tests.yml'
 
 jobs:
@@ -25,4 +25,8 @@ jobs:
       - name: Install test dependencies
         run: python -m pip install pytest polars boto3 duckdb
       - name: Test bounded execution reads without AWS access
-        run: python -m pytest skills/data-discovery/tests -q
+        run: >-
+          python -m pytest skills/data-discovery/tests
+          skills/block-analyst/tests/test_collect_analysis.py
+          skills/block-analyst/tests/test_direct_analysis.py
+          skills/options-recap/tests/test_direct_inputs.py -q

@@ -147,7 +147,7 @@ def run_query(query: Query) -> tuple[dict[str, Any], list[Any]]:
     return source, rows
 
 
-def build_queries(asset: str, start: dt.datetime, end: dt.datetime) -> list[Query]:
+def build_queries(asset: str, start: dt.datetime, end: dt.datetime, *, render=False) -> list[Query]:
     currency = asset.lower()
     start_iso, end_iso = start.isoformat(), end.isoformat()
     between = f"TRY_CAST(timestamp AS TIMESTAMPTZ) >= TIMESTAMPTZ '{start_iso}' AND TRY_CAST(timestamp AS TIMESTAMPTZ) < TIMESTAMPTZ '{end_iso}'"
@@ -258,6 +258,15 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime) -> list[Quer
           WHERE {between}
           QUALIFY row_number() OVER (PARTITION BY symbol ORDER BY timestamp DESC)=1
         """, {"funding_rate": "published rate per funding_interval_hours", "index_price": "USD"}))
+    if render:
+        # Calculators need complete trades and a complete Deribit snapshot, not
+        # the bounded examples formerly sent to the language model.
+        queries = [Query(q.name, q.paths,
+                         q.sql.replace(" LIMIT 25", "").replace(
+                             "WHERE evidence_rank=1", "WHERE target_delta=0.50"),
+                         q.units, q.required)
+                   for q in queries if q.name.startswith("option_trades_")
+                   or q.name in ("option_surface_deribit", "dvol_window")]
     return queries
 
 
@@ -266,6 +275,7 @@ def main() -> int:
     parser.add_argument("--asset", required=True)
     parser.add_argument("--window", required=True)
     parser.add_argument("--now", help="UTC ISO-8601 end time; intended for reproducible tests")
+    parser.add_argument("--render", action="store_true")
     args = parser.parse_args()
     try:
         width = parse_window(args.window)
@@ -274,6 +284,10 @@ def main() -> int:
     end = dt.datetime.fromisoformat(args.now.replace("Z", "+00:00")) if args.now else dt.datetime.now(dt.timezone.utc)
     end = end.astimezone(dt.timezone.utc)
     start = end - width
+    if args.render:
+        from direct_inputs import run
+        print(run(args.asset.upper(), args.window, start, end))
+        return 0
     queries = build_queries(args.asset.upper(), start, end)
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(queries))) as pool:
         results = list(pool.map(run_query, queries))

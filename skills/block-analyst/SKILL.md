@@ -2,9 +2,9 @@
 name: paradigm-block-analyst
 description: >
   Analyze a Paradigm RFQ or pasted block trade using raw exchange venue files,
-  source tapes, and live venue data. Use for /analyze RFQ_ID, fill-vs-market
+  source tapes, and live venue data. Use for /analyze RFQ_ID, /analyst RFQ_ID, fill-vs-market
   benchmarking, net greeks, prior block flow, and vol-surface impact. The model
-  selects the raw evidence and never uses Dime hot files.
+  uses the established script to calculate and render without Dime hot files.
 metadata:
   author: tradeparadigm
   version: "2.0"
@@ -16,18 +16,31 @@ metadata:
 
 Use for `/analyze <rfq_id> <reference description>`, a pasted block-trade
 object, or a request to benchmark or explain a specific Paradigm execution.
+`/analyst` is also accepted. For a bare `/analyze`, `/analyst` or
+`/paradigm_block_analyst` without supplied trade context, ask only:
+"Which RFQ ID or block trade would you like me to analyze?" Do not search
+memory, other sessions, or recent trades to choose an input for the user.
+
+## Live execution
+
+Run `bash scripts/analyze.sh <RFQ_ID>` from this skill's directory and relay
+stdout verbatim as the entire answer. The script resolves partitioned legs,
+uses the existing live market reads and calculations, and renders the analysis.
+Do not recompute or reformat the result or launch optional follow-up scans.
+Report a command error and stop; a stale or unreadable execution source must
+not be bypassed by reading its objects directly. The remaining rules document
+the calculation contract and apply to supplied/injected trades as well.
 
 ## Hard rules
 
 1. **Do not use `s3://dt-exchange-venue-data/hot/` or any `hot__*` object.**
-2. For an id lookup, run `bash scripts/analyze.sh <RFQ_ID>` once. It returns a
-   `dime.analysis.evidence.v1` JSON document from direct source tapes and any
-   bounded raw venue lookup the resolved request permits; it does not render
-   the analysis.
+2. For an id lookup, run `bash scripts/analyze.sh <RFQ_ID>` once and return its
+   finished analysis, not the intermediate collector evidence.
 3. For an id lookup, read
    [references/rfq-lookup.md](references/rfq-lookup.md) and the
    [raw exchange catalog](../data-discovery/references/exchange-raw.md), then
-   choose the evidence needed for this RFQ.
+   consult them when explaining sources or handling injected evidence; the live
+   script already performs the lookup.
 4. The RFQ id is authoritative. Text after it is a user label, not permission
    to invent the asset, structure, fill, or instrument.
 5. Never default to BTC, invent a block grouping, pair legs without a real
@@ -39,8 +52,7 @@ object, or a request to benchmark or explain a specific Paradigm execution.
 The collector performs the first authoritative lookup and distinguishes a
 resolved venue execution, a historical execution, a request with unresolved
 execution, and a missing request. Treat its rows, provenance, confidence, and
-gaps as evidence rather than a fixed output schema. The model owns any
-follow-up lookup plan. Available evidence includes:
+gaps as evidence for the established calculations. Available evidence includes:
 
 - injected cleared-trade context;
 - the current Paradigm RFQ tape for request metadata;
@@ -112,8 +124,10 @@ net_greek = sum(position_sign * leg_ratio * instrument_greek) * quantity
 - For multi-leg option packages, calculate fill and mark on the same signed,
   ratio-weighted legs. Exclude perp hedge legs from option-premium offset.
 - When resolved tape evidence supplies one row per leg, use the smallest
-  absolute option-leg `QTY` as the package unit and weight every option row by
-  `abs(QTY) / package_unit`. `BUY` is premium paid and `SELL` is premium
+  absolute option-leg `QTY` as the package count and weight every option row by
+  `abs(QTY) / package_count`. Per-unit cash flow times package count is the
+  full-size cash flow; they are not identical unless the count is one.
+  `BUY` is premium paid and `SELL` is premium
   received; authoritative row sides override shorthand signs in DESCRIPTION.
 - Net the package before reporting it: `signed_price = sum(BUY price * ratio) -
   sum(SELL price * ratio)`, and apply the identical weights/sides to

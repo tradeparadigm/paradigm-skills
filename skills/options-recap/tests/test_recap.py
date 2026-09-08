@@ -1536,7 +1536,7 @@ def test_freshness_probe_contract_matches_its_reader():
         sh = f.read()
     check("wrapper delegates to collector", "collect_recap.py" in sh, sh)
     check("wrapper no longer builds presentation files", "COPY (" not in sh, sh)
-    check("wrapper does not render", "--render" not in sh, sh)
+    check("wrapper renders from direct inputs", "--render" in sh, sh)
 
 
 # ── Venue-block dedupe: fail-closed guarantees ──────────────────────────────
@@ -1795,7 +1795,7 @@ def test_run_recap_has_no_legacy_csv_read_left():
         sh = f.read()
     check("no hot path", "/hot/" not in sh and "hot__" not in sh, sh)
     check("no legacy CSV read", "read_csv_auto" not in sh, sh)
-    check("stdout belongs to collector", sh.rstrip().endswith('--window "$WINDOW"'), sh[-160:])
+    check("stdout is the finished recap", sh.rstrip().endswith('--window "$WINDOW" --render'), sh[-160:])
 
 
 

@@ -119,10 +119,14 @@ def raw_deribit_paths(row: dict[str, Any]) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--rfq-id", required=True)
+    parser.add_argument("--render", action="store_true")
     args = parser.parse_args()
     core = re.sub(r"^(DRFQv2-|GRFQ-)", "", args.rfq_id)
     if not re.fullmatch(r"[A-Za-z0-9_-]+", core):
         parser.error("invalid RFQ id")
+
+    if args.render:
+        return render_current_analysis(args.rfq_id)
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "data-discovery" / "scripts"))
     from execution_tape import AmbiguousRfqError, read_executions
@@ -236,6 +240,68 @@ def main() -> int:
         print("analyze: no authoritative source could be read", file=sys.stderr)
         return 1
     return 0
+
+
+def render_current_analysis(rfq_id):
+    """Resolve once from partitions, then reuse the established analyst."""
+    from collections import defaultdict
+    from analyze import analyze_rows, render
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "data-discovery" / "scripts"))
+    from execution_tape import AmbiguousRfqError, calculation_rows, read_executions
+
+    now = dt.datetime.now(dt.timezone.utc)
+    try:
+        tape = read_executions(now - dt.timedelta(days=30), now, now=now)
+    except Exception as exc:
+        print(f"RFQ {rfq_id} not resolved — partitioned executions unavailable: {exc}")
+        return 1
+    candidates = {rfq_id} if rfq_id.startswith(("DRFQv2-", "GRFQ-")) else {
+        rfq_id, f"DRFQv2-{rfq_id}", f"GRFQ-{rfq_id}"}
+    selected = [row for row in tape["rows"] if row["rfq_id"] in candidates]
+    if len({row["rfq_id"] for row in selected}) > 1:
+        raise AmbiguousRfqError("ambiguous RFQ ID; specify the exact namespace")
+    if not selected:
+        print(f"RFQ {rfq_id} not resolved — no authoritative asset, structure, or fill available.")
+        return 0
+    for row in selected:
+        if (row["quantity"] is None or row["quantity"] <= 0
+                or row["trade_price"] is None or row["mark_price"] is None
+                or row["taker_side"] not in ("BUY", "SELL")):
+            raise ValueError("execution leg is missing required quantity, fill, mark or side")
+
+    def signature(rows):
+        quantities = defaultdict(float)
+        for row in rows:
+            quantities[(row["venue"], row["instrument_name"], row["taker_side"])] += row["quantity"]
+        base = min(quantities.values())
+        return tuple(sorted((*key, qty / base) for key, qty in quantities.items()))
+
+    groups = defaultdict(list)
+    for row in tape["rows"]:
+        if row["block_trade_id"] and row["rfq_id"] not in candidates:
+            groups[(row["venue"], row["block_trade_id"])].append(row)
+    wanted = signature(selected)
+    history = [row for group in groups.values()
+               if all(r["quantity"] is not None and r["quantity"] > 0 for r in group)
+               and signature(group) == wanted for row in group]
+    result = analyze_rows(combine_fills(calculation_rows(selected)), calculation_rows(history), int(now.timestamp() * 1000))
+    print(render(result))
+    return 0
+
+
+def combine_fills(rows):
+    """Multiple clips of one RFQ: total size and quantity-weighted leg prices."""
+    import polars as pl
+    keys = ["PRODUCT", "DESCRIPTION", "SIDE", "QUOTE_CURRENCY"]
+    preserved = [key for key in rows[0] if key not in keys + ["QTY", "PRICE", "REF_PRICE", "NOTIONAL_VOLUME_USD"]]
+    return (pl.from_dicts(rows, infer_schema_length=None).lazy()
+            .group_by(keys, maintain_order=True)
+            .agg(pl.col("QTY").sum(),
+                 ((pl.col("PRICE") * pl.col("QTY")).sum() / pl.col("QTY").sum()).alias("PRICE"),
+                 ((pl.col("REF_PRICE") * pl.col("QTY")).sum() / pl.col("QTY").sum()).alias("REF_PRICE"),
+                 pl.col("NOTIONAL_VOLUME_USD").sum(),
+                 *[pl.col(key).first() for key in preserved])
+            .collect().to_dicts())
 
 
 if __name__ == "__main__":
