@@ -45,6 +45,14 @@ def check(name, cond, detail=""):
         print(f"  ✗ {name}  {detail}")
 
 
+def _first_fenced(md):
+    """First line INSIDE the Snapshot fence. Warnings lead there now; they used
+    to be the document's first line, above the header, and the relaying model
+    kept the fence verbatim while dropping everything above it (2026-09-08)."""
+    lines = md.splitlines()
+    return lines[lines.index("```yaml") + 1]
+
+
 def _write(d, name, text):
     with open(os.path.join(d, name), "w") as f:
         f.write(text)
@@ -1081,7 +1089,8 @@ def test_render_degraded_banner():
     res = build("btc", "8h", 0, 8 * 3600_000,
                 {"closes_7d": [], "trades": [], "market": None}, hot)
     md = render_md(res)
-    check("degraded banner prepended", md.startswith("⚠ hot surface unavailable"), md[:60])
+    check("degraded banner leads the Snapshot fence",
+          _first_fenced(md).startswith("⚠ hot surface unavailable"), md.splitlines()[:8])
     check("volume reads n/a", "Volume" in md and "n/a" in md)
     check("surface reads No data", "No data" in md)
 
@@ -1367,8 +1376,10 @@ def test_stale_banner_leads_and_states_the_outcome():
                           "retained_groups": []}])
     md = render_md(r)
     lines = md.splitlines()
-    check("banner is the first line", lines[0].startswith("⚠ recap_aggregates"), lines[0])
-    check("names the lag in human units", "25d 0h" in lines[0], lines[0])
+    first = _first_fenced(md)
+    check("banner is the first line inside the Snapshot fence",
+          first.startswith("⚠ recap_aggregates"), first)
+    check("names the lag in human units", "25d 0h" in first, first)
     check("says the divert worked", "re-sourced live from Deribit" in md, lines[:4])
     # The truncation disclosure is the point of finding #5: these come from the
     # same parquet, are windowed, and the Snapshot divert does not help them.
@@ -1473,8 +1484,8 @@ def test_main_wires_the_gate_end_to_end():
     # gate detected -> banner rendered (kills: stale=[], stale=[] into build(),
     # and the check_freshness call being bypassed)
     check("banner present", "⚠ recap_aggregates" in out, out.splitlines()[:3])
-    check("banner leads", out.splitlines()[0].startswith("⚠ recap_aggregates"),
-          out.splitlines()[:2])
+    check("banner leads the Snapshot fence", _first_fenced(out).startswith("⚠ recap_aggregates"),
+          out.splitlines()[:8])
     # divert actually happened (kills: stale_snapshot=False, _SNAPSHOT_SOURCES
     # pointed at the wrong source)
     check("deribit fallback invoked", calls["fallback"] == 1, calls)
@@ -1833,6 +1844,35 @@ def test_unknown_freshness_reaches_the_divert_through_main():
     check("unknown is banner-flagged", "could not be verified" in out, out.splitlines()[:4])
     check("and it diverts rather than trusting the data", calls["fallback"] == 1, calls)
     check("stale hot DVOL not rendered", "38.2" not in out, out.splitlines()[:14])
+
+
+def test_warning_banners_render_inside_snapshot_fence():
+    # 2026-09-08, live: a relaying model kept the Snapshot fence verbatim and
+    # deleted every ⚠ line printed above the header (Bullish partial, a 66-min
+    # Paradigm coverage shortfall, 13k unvalued trades). The lines that say what
+    # NOT to trust must travel inside the block that carries the numbers.
+    recap.WARNINGS.clear()
+    with tempfile.TemporaryDirectory() as d:
+        hot = load_hot(d, "BTC")
+    res = build("btc", "8h", 0, 8 * 3600_000,
+                {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+    res["source_gaps"] = [
+        "Paradigm executions: coverage ends 66 min before the requested end",
+        "option_trades_bullish: 4/9 hourly/bucket paths absent; partial coverage",
+    ]
+    lines = render_md(res).splitlines()
+    header = next(i for i, ln in enumerate(lines) if ln.startswith("**BTC Options"))
+    fence_open = next(i for i, ln in enumerate(lines) if ln == "```yaml")
+    fence_close = next(i for i in range(fence_open + 1, len(lines)) if lines[i] == "```")
+    warns = [i for i, ln in enumerate(lines) if ln.startswith("⚠")]
+    check("source gaps rendered", sum("coverage ends 66 min" in ln for ln in lines) == 1
+          and sum("bullish: 4/9" in ln for ln in lines) == 1, lines[:14])
+    check("no ⚠ line above the header", all(i > header for i in warns), lines[:header + 1])
+    check("every ⚠ line inside the Snapshot fence",
+          warns and all(fence_open < i < fence_close for i in warns), lines[fence_open:fence_close + 1])
+    check("blank line then Spot follow the warnings",
+          warns and lines[max(warns) + 1] == "" and lines[max(warns) + 2].startswith("Spot"),
+          lines[fence_open:fence_open + 8])
 
 
 def main():

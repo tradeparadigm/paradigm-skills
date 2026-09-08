@@ -1102,9 +1102,22 @@ def render_md(r: dict) -> str:
                  f"horizon); Block Flow and surface span the full {hh}h.")
         L.append("")
 
+    # Everything appended so far is a warning banner. It used to sit ABOVE the
+    # header, outside any fence — and the relaying model demonstrably copies
+    # fenced blocks verbatim and drops the prose around them: on 2026-09-08 a
+    # /recap relay kept every Snapshot figure and deleted all three ⚠ lines
+    # (Bullish partial, a 66-minute Paradigm coverage shortfall, 13k unvalued
+    # trades). The lines that say what NOT to trust must travel with the
+    # numbers they qualify, so they are emitted as the first lines INSIDE the
+    # Snapshot fence, where they cannot be dropped without dropping Snapshot.
+    banner, L = L, []
+    while banner and banner[-1] == "":
+        banner.pop()
     L.append(f"**{h['asset']} Options · {h['window']} Recap · "
              f"{h['start_utc']}–{h['end_utc']} UTC**")
     L += ["", "**Snapshot**", "", "```yaml"]
+    if banner:
+        L += banner + [""]
 
     spot = f"${s['spot']:,}" if s.get("spot") else "n/a"
     chg = s.get("spot_change_pct")

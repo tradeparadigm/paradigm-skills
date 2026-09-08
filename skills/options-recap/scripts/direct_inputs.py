@@ -175,7 +175,10 @@ def run(asset, window, start, end):
     # Direct inputs cover the requested window, not the retired 24h rollup.
     result["hot_horizon"] = None
     result["snapshot"]["volume_usd_m"] = round(known_turnover / 1e6, 2)
-    result["snapshot"]["volume_scope"] = "observed valued trades; USD premium"
-    result["snapshot"]["activity_scope"] = "observed trades; see coverage"
+    # `·` like every other Snapshot separator. The `;` form was relayed as
+    # `;;` by the model twice in a row on 2026-09-08; the script never emitted
+    # that, but a separator the relay cannot double removes the question.
+    result["snapshot"]["volume_scope"] = "observed valued trades · USD premium"
+    result["snapshot"]["activity_scope"] = "observed trades · see coverage"
     result["source_gaps"] = gaps
     return recap.render_md(result)
