@@ -39,7 +39,13 @@ Paradigm across Deribit, Paradex, and Bybit.
 
 - **Path:** `s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz`
 - **Last verified coverage:** 2025-11-09 → 2026-05-09
-- **Layout:** Single flat CSV — all dates in one file. Coverage likely extends forward.
+- **Layout:** Single flat CSV — all dates in one file.
+- **Status:** its producer was decommissioned on 2026-08-10, so this file is
+  frozen at that date. For current Paradigm block flow read the persisted
+  parquet store `s3://dt-exchange-venue-data/paradigm_trade_tape/` (leg grain,
+  lowercase column names — `product`, `description`, `notional_volume_usd`,
+  `rfq_id`, `block_trade_id`, `venue_block_trade_id`, `traded_at` in Unix ms;
+  see Dataset 3c) or its trailing-30d rollup `hot/hot__paradigm_trade_tape_30d.parquet`.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -256,11 +262,14 @@ replaces several round-trips. (Per-block flow lives in Dataset 3b.)
 ### 3b. Hot Recap Aggregates — 5-min Rolling Window Source
 
 A single rolling file of **5-minute aggregate buckets over the trailing
-24h** — the query-time source for "last `<window>`" recaps of an arbitrary
-length. The per-window `hot__recap_<window>` files (`5m`/`10m`/`20m`/`1h`/
-`4h`/`8h`/`24h`) **also still exist** and are refreshed each cycle (the
-`/recap` skill reads those pre-baked windows directly); use this aggregates
-file when you need a window the pre-baked set doesn't cover.
+24h** — a convenient single-GET source for "last `<window>`" questions of an
+arbitrary length ≤24h. It is a **derived rollup** of the pipeline's
+`market_aggregates_5m/` layer (Dataset 3c) — same rows, same `volume_sum` /
+`trade_count`, plus a USD-converted `notional_usd`. The per-window
+`hot__recap_<window>` files (`5m`/`10m`/`20m`/`1h`/`4h`/`8h`/`24h`) also
+exist. The `/recap` skill reads the upstream layer directly rather than any of
+these rollups; use this file for a quick ad-hoc read, and the layer when you
+need history beyond 24h or want to avoid the derived artifact.
 
 - **Path:** `s3://dt-exchange-venue-data/hot/hot__recap_aggregates_5m_24h.parquet`
 - **Granularity:** one row-set per 5-min bucket (`bucket_at`, Unix ms); ~289 buckets ≈ 24h
@@ -337,7 +346,46 @@ GROUP BY exchange, optionType;
 **When to use:** a "last `<window>`" question (volume / flow / blocks /
 DVOL move over 5m–24h) — one S3 read of this file, filtered + aggregated
 to the window. For the vol surface use `v_vol_surface`; for anything
-beyond 24h, use the historical tapes above (Paradigm, Paradex).
+beyond 24h, read the `market_aggregates_5m/` layer (3c) or the historical
+tapes above (Paradigm, Paradex).
+
+### 3c. `market_aggregates_5m/` — the 5-min aggregation layer (upstream of 3b)
+
+- **Path:** `s3://dt-exchange-venue-data/market_aggregates_5m/` (a prefix of
+  parquet files, not a single object)
+- **Grain / schema:** the same `row_type` rows and columns as 3b — established
+  by row-level comparison on 2026-09-07 (identical buckets, `volume_sum`,
+  `trade_count`). One difference: this layer carries the raw `notional`
+  (option premium in each venue's **native quote unit** — coin on `deribit`
+  and `okex-options`, USD on `bybit-options` and `deribit-usdc`); 3b's
+  `notional_usd` is that value × `underlying_price` for the coin venues.
+- **Retention:** history, not a trailing window — the reason to read it over 3b.
+- **Layout: not yet catalogued.** Probe before assuming a partition scheme:
+
+```sql
+SELECT file FROM glob('s3://dt-exchange-venue-data/market_aggregates_5m/**')
+ORDER BY file DESC LIMIT 20;
+DESCRIBE SELECT * FROM read_parquet(
+  's3://dt-exchange-venue-data/market_aggregates_5m/**/*.parquet',
+  hive_partitioning=true, union_by_name=true);
+```
+
+  Read it with `hive_partitioning=true` (any `key=value` directories become
+  columns) and `union_by_name=true` (columns added mid-history, e.g.
+  `turnover_usd`, read NULL in older files instead of failing the bind), and
+  filter on `bucket_at` — narrow the glob to the partitions you need once the
+  layout is known, since the recursive glob opens every file's footer.
+- **Lineage of the other hot files, for orientation:** `hot__vol_surface` and
+  `hot__market_signals_1m` are computed from `normalized/<exchange>/option_summary/`
+  (`markIV_close` → `mark_iv`, `delta_close` → `greek_delta`,
+  `openInterest_close` → `open_interest`, `underlyingPrice_close` →
+  `underlying_price`), `perp_summary/` (funding, OI) and `spot_trade/` (spot);
+  `hot__paradigm_trade_tape_30d` is the trailing-30d rollup of the persisted
+  Paradigm tape store `s3://dt-exchange-venue-data/paradigm_trade_tape/`
+  (itself built from the Airbyte landing on `s3://dt-paradigm-data`, path not
+  catalogued); `/recap` reads that store directly (layout to be probed, same
+  columns as the rollup). `raw/` is the exchange-native ingest layer and does
+  not feed the hot files directly.
 
 ---
 

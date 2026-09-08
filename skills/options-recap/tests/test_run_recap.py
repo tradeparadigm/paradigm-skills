@@ -5,7 +5,7 @@ Tests for run_recap.sh argument normalization — no creds, no network.
 run_recap.sh resolves `<asset> <window>` from positional args and drops a stray
 "options"/"option" keyword that some users include (`/recap btc options 8h`).
 Left in, that token would land in the window slot and break the run
-(hot__recap_options.parquet doesn't exist; parse_window_ms raises). We invoke the
+(parse_window_ms raises on 'options'). We invoke the
 REAL script with RECAP_PRINT_ARGS=1, which echoes the resolved "ASSET WIN" and
 exits 0 before any STS/DuckDB work — so this exercises the actual parsing in CI
 with no AWS creds and no S3.
@@ -95,8 +95,8 @@ def test_defaults():
 
 # ── Dynamic-window parsing + preset gating (RECAP_PRINT_PLAN) ────────────────
 # The old preset `case` silently defaulted any non-preset window (e.g. 3h) to
-# 8h, so surface deltas were computed against the wrong window-open and the
-# hot__recap_<win>.parquet read missed. Windows are now parsed generically.
+# 8h, so surface deltas were computed against the wrong window-open. Windows
+# are now parsed generically.
 
 def test_preset_window_plan():
     # Preset: SECS from the window, PRESET=1 (label only — same rolling-file path).
@@ -177,6 +177,79 @@ def test_bad_window_exits_2():
         out, rc = plan("btc", w)
         check(f"bad window '{w}' exits 2", rc == 2, f"rc={rc}")
         check(f"bad window '{w}' names it", "bad window" in out, out)
+
+
+# ── Aggregates source resolution (RECAP_PRINT_MA) ───────────────────────────
+# The Snapshot sources read market_aggregates_5m/ (the layer the retired hot
+# rollup was generated from) through ONE glob, overridable once the partition
+# layout is verified, plus a bounded lookback for the freshness probe.
+
+MA_DEFAULT = "s3://dt-exchange-venue-data/market_aggregates_5m/**/*.parquet"
+
+
+def ma(now_s, *args, **env_extra):
+    """Run with the print-MA hook; return (MA_GLOB, PROBE_FROM_MS as int)."""
+    env = dict(os.environ, RECAP_PRINT_MA="1", RECAP_NOW_S=str(now_s), **env_extra)
+    r = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True,
+                       env=env, timeout=20)
+    glob_, probe = r.stdout.strip().split()
+    return glob_, int(probe)
+
+
+def test_ma_default_is_the_layer_not_the_hot_rollup():
+    now = 1_784_536_200
+    glob_, probe = ma(now, "btc", "8h")
+    check("default glob is the recursive layer read", glob_ == MA_DEFAULT, glob_)
+    check("no hot file in the default path", "hot__" not in glob_, glob_)
+    check("probe lookback is 7d before now", probe == (now - 7 * 86400) * 1000, probe)
+
+
+def test_ma_probe_lookback_is_independent_of_the_window():
+    # The probe must not be window-filtered (a frozen source yields zero
+    # windowed rows, indistinguishable from a quiet market), so its bound is
+    # the fixed lookback whatever the window.
+    now = 1_784_536_200
+    check("30m and 24h share one probe bound",
+          ma(now, "btc", "30m")[1] == ma(now, "eth", "24h")[1] == (now - 7 * 86400) * 1000)
+
+
+PT_DEFAULT = "s3://dt-exchange-venue-data/paradigm_trade_tape/**/*.parquet"
+
+
+def pt(now_s, *args, **env_extra):
+    env = dict(os.environ, RECAP_PRINT_PT="1", RECAP_NOW_S=str(now_s), **env_extra)
+    r = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True,
+                       env=env, timeout=20)
+    return r.stdout.strip()
+
+
+def test_pt_default_is_the_store_not_the_hot_rollup():
+    now = 1_784_536_200
+    glob_ = pt(now, "btc", "8h")
+    check("default tape glob is the persisted store", glob_ == PT_DEFAULT, glob_)
+    check("no hot file in the tape path", "hot__" not in glob_, glob_)
+
+
+def test_pt_overrides():
+    now = 1_784_536_200
+    check("root override rebuilds the recursive glob",
+          pt(now, "btc", "8h", RECAP_PT_ROOT="s3://bkt/tape") == "s3://bkt/tape/**/*.parquet")
+    narrowed = "s3://bkt/tape/year=2026/**/*.parquet"
+    check("glob override is taken verbatim",
+          pt(now, "btc", "8h", RECAP_PARADIGM_TAPE=narrowed) == narrowed)
+    check("glob override wins over root",
+          pt(now, "btc", "8h", RECAP_PT_ROOT="s3://ignored", RECAP_PARADIGM_TAPE=narrowed) == narrowed)
+
+
+def test_ma_overrides():
+    now = 1_784_536_200
+    glob_, _ = ma(now, "btc", "8h", RECAP_MA_ROOT="s3://bkt/agg")
+    check("root override rebuilds the recursive glob", glob_ == "s3://bkt/agg/**/*.parquet", glob_)
+    narrowed = "s3://bkt/agg/year=2026/month=07/*.parquet"
+    glob_, _ = ma(now, "btc", "8h", RECAP_MA_GLOB=narrowed)
+    check("glob override is taken verbatim", glob_ == narrowed, glob_)
+    glob_, _ = ma(now, "btc", "8h", RECAP_MA_ROOT="s3://ignored", RECAP_MA_GLOB=narrowed)
+    check("glob override wins over root", glob_ == narrowed, glob_)
 
 
 def main():

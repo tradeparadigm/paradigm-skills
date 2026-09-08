@@ -164,6 +164,9 @@ Pull from `references/datasets.md`. Grouped into:
      Apply the window in-query (`WHERE bucket_at >= now - window`). No
      `surface` rows — the vol surface is in `v_vol_surface` on
      `dt-paradigm-data`. See Dataset 3b for the schema and read pattern.
+   - `market_aggregates_5m/` — the aggregation layer the recap rollup is
+     derived from (same schema, raw native-unit `notional`, full history;
+     layout to be probed). `/recap` reads this directly. See Dataset 3c.
 
 For each, report: S3 path (flat file for the Paradigm and Paradex tapes),
 last verified coverage, schema,

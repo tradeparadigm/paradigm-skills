@@ -150,9 +150,9 @@ BLOCKS_RR = [
     _blk("Call 26 Jun 26 65000", "SELL", 6_000_000, tid="t2"),
 ]
 
-# Venue-tape blocks (venue_blocks.csv) — the hot recap file's OPTION `block`
-# rows, grouped per block id. Unit-explicit columns: volume_coin (Σ leg
-# amounts, coin) and premium_usd (Σ premium — NEVER a display notional;
+# Venue-tape blocks (venue_blocks.csv) — the 5-min market aggregates' OPTION
+# `block` rows, grouped per block id. Unit-explicit columns: volume_coin (Σ leg
+# amounts, coin) and premium_native (Σ premium — NEVER a display notional;
 # underlying notional is volume_coin × spot). Dedupe is STRUCTURAL today
 # (see _dedupe_venue_blocks / _TAPE_BROKERED_VENUES): OKX merges (Paradigm
 # never brokers it); Deribit/Bullish are excluded because a block there could
@@ -162,7 +162,7 @@ BLOCKS_RR = [
 #   OKX-BLK-2  2 BTC ≈ $121k — under the $250k floor, filtered.
 #   BLOCK-280624 (deribit) / OTC-9 (bullish) — brokered venues, excluded today.
 VENUE_BLOCKS_CSV = (
-    "asset,exchange,block_id,bucket_at,volume_coin,premium_usd,"
+    "asset,exchange,block_id,bucket_at,volume_coin,premium_native,"
     "leg_count,iv_sum,iv_count\n"
     "BTC,okex-options,OKX-BLK-1,1780000200000,300,90000,3,187.5,3\n"
     "BTC,okex-options,OKX-BLK-2,1780000500000,2,600,1,,\n"
@@ -1222,7 +1222,7 @@ NOW = 1_754_000_000_000  # fixed clock; all lags below are relative to it
 def _fresh_files(d, rec=None, vs=None, rec_col="max_at", vs_col="max_at"):
     """Write the two per-source probe CSVs run_recap.sh emits."""
     if rec is not None:
-        _write(d, "freshness_rec.csv", f"source,{rec_col}\nrecap_aggregates,{rec}\n")
+        _write(d, "freshness_ma.csv", f"source,{rec_col}\nmarket_aggregates,{rec}\n")
     if vs is not None:
         _write(d, "freshness_vs.csv", f"source,{vs_col}\nvol_surface,{vs}\n")
 
@@ -1231,18 +1231,18 @@ def test_freshness_reports_every_source_even_when_unreadable():
     with tempfile.TemporaryDirectory() as d:
         _fresh_files(d, rec=NOW - 60_000, vs="")   # vs present but NULL
         f = load_freshness(d)
-        check("fresh source parsed", f.get("recap_aggregates") == NOW - 60_000, f)
+        check("fresh source parsed", f.get("market_aggregates") == NOW - 60_000, f)
         # NULL must be None, never 0 and never a missing key. Both of those read
         # downstream as "nothing to report", which is a false all-clear — the
         # original bug with extra steps.
         check("null max_at -> None", f.get("vol_surface", "MISSING") is None, f)
-        check("key always present", set(f) == {"recap_aggregates", "vol_surface"}, f)
+        check("key always present", set(f) == {"market_aggregates", "vol_surface"}, f)
 
 
 def test_freshness_missing_files_are_unknown_not_fresh():
     with tempfile.TemporaryDirectory() as d:
         f = load_freshness(d)            # neither COPY ran
-        check("both keys present", set(f) == {"recap_aggregates", "vol_surface"}, f)
+        check("both keys present", set(f) == {"market_aggregates", "vol_surface"}, f)
         check("both None", all(v is None for v in f.values()), f)
         got = check_freshness(f, NOW)
         check("both reported unknown", len(got) == 2, got)
@@ -1251,14 +1251,14 @@ def test_freshness_missing_files_are_unknown_not_fresh():
 
 def test_freshness_survives_one_probe_failing():
     # The two probes are separate COPY statements precisely so a ${VS_HOT}
-    # outage cannot take the recap_aggregates reading down with it. A single
+    # outage cannot take the market_aggregates reading down with it. A single
     # UNION ALL wrote zero bytes on either failure and disabled the whole gate.
     with tempfile.TemporaryDirectory() as d:
         _fresh_files(d, rec=NOW - 60_000)          # vs file never written
         got = check_freshness(load_freshness(d), NOW)
         by = {g["source"]: g for g in got}
         check("vol_surface unknown", by["vol_surface"]["status"] == "unknown", got)
-        check("recap_aggregates still verified fresh", "recap_aggregates" not in by, got)
+        check("market_aggregates still verified fresh", "market_aggregates" not in by, got)
 
 
 def test_freshness_renamed_column_is_unknown_not_silent_pass():
@@ -1276,30 +1276,30 @@ def test_freshness_unparseable_value_is_unknown():
     with tempfile.TemporaryDirectory() as d:
         _fresh_files(d, rec="2026-08-09 12:34:56", vs=NOW)   # TIMESTAMP, not epoch ms
         got = {g["source"]: g for g in check_freshness(load_freshness(d), NOW)}
-        check("unparseable -> unknown", got["recap_aggregates"]["status"] == "unknown", got)
+        check("unparseable -> unknown", got["market_aggregates"]["status"] == "unknown", got)
 
 
 def test_check_freshness_flags_only_over_limit():
-    lim = STALENESS_LIMIT_S["recap_aggregates"]
-    both_ok = {"recap_aggregates": NOW - (lim - 60) * 1000,
+    lim = STALENESS_LIMIT_S["market_aggregates"]
+    both_ok = {"market_aggregates": NOW - (lim - 60) * 1000,
                "vol_surface": NOW - (lim - 60) * 1000}
     # Just inside the limit must NOT fire: a gate that trips in normal operation
     # trains people to ignore the banner, which is worse than no gate.
     check("within limit is not stale", check_freshness(both_ok, NOW) == [],
           check_freshness(both_ok, NOW))
-    over = dict(both_ok, recap_aggregates=NOW - (lim + 600) * 1000)
+    over = dict(both_ok, market_aggregates=NOW - (lim + 600) * 1000)
     got = check_freshness(over, NOW)
-    check("over limit is stale", len(got) == 1 and got[0]["source"] == "recap_aggregates", got)
+    check("over limit is stale", len(got) == 1 and got[0]["source"] == "market_aggregates", got)
     check("status stale", got[0]["status"] == "stale", got)
     check("lag reported", got[0]["lag_s"] >= lim, got)
 
 
 def test_check_freshness_orders_unknown_first_then_worst_lag():
-    la = STALENESS_LIMIT_S["recap_aggregates"]
-    got = check_freshness({"recap_aggregates": NOW - (la + 100) * 1000,
+    la = STALENESS_LIMIT_S["market_aggregates"]
+    got = check_freshness({"market_aggregates": NOW - (la + 100) * 1000,
                            "vol_surface": None}, NOW)
     # Unverifiable outranks a known lag: "I cannot tell" is the worse state.
-    check("unknown first", [g["source"] for g in got] == ["vol_surface", "recap_aggregates"],
+    check("unknown first", [g["source"] for g in got] == ["vol_surface", "market_aggregates"],
           [(g["source"], g["status"]) for g in got])
 
 
@@ -1362,12 +1362,12 @@ def _minimal_result(stale):
 
 
 def test_stale_banner_leads_and_states_the_outcome():
-    r = _minimal_result([{"source": "recap_aggregates", "status": "stale",
+    r = _minimal_result([{"source": "market_aggregates", "status": "stale",
                           "lag_s": 25 * 86400, "limit_s": 2700, "retained": False,
                           "retained_groups": []}])
     md = render_md(r)
     lines = md.splitlines()
-    check("banner is the first line", lines[0].startswith("⚠ recap_aggregates"), lines[0])
+    check("banner is the first line", lines[0].startswith("⚠ market_aggregates"), lines[0])
     check("names the lag in human units", "25d 0h" in lines[0], lines[0])
     check("says the divert worked", "re-sourced live from Deribit" in md, lines[:4])
     # The truncation disclosure is the point of finding #5: these come from the
@@ -1376,7 +1376,7 @@ def test_stale_banner_leads_and_states_the_outcome():
 
 
 def test_banner_distinguishes_a_failed_divert():
-    r = _minimal_result([{"source": "recap_aggregates", "status": "stale",
+    r = _minimal_result([{"source": "market_aggregates", "status": "stale",
                           "lag_s": 3 * 86400, "limit_s": 2700, "retained": True,
                           "retained_groups": ["dvol", "spot"]}])
     md = render_md(r)
@@ -1390,7 +1390,7 @@ def test_banner_reports_a_PARTIAL_divert():
     # The half-successful fetch: dvol replaced, spot retained. The banner must
     # not claim blanket liveness — this is the exact case where the old single
     # gate destroyed spot and reported success.
-    r = _minimal_result([{"source": "recap_aggregates", "status": "stale",
+    r = _minimal_result([{"source": "market_aggregates", "status": "stale",
                           "lag_s": 3 * 86400, "limit_s": 2700, "retained": True,
                           "retained_groups": ["spot"]}])
     md = render_md(r)
@@ -1472,8 +1472,8 @@ def test_main_wires_the_gate_end_to_end():
         out, calls = _run_main(d, market=_LIVE_MARKET)
     # gate detected -> banner rendered (kills: stale=[], stale=[] into build(),
     # and the check_freshness call being bypassed)
-    check("banner present", "⚠ recap_aggregates" in out, out.splitlines()[:3])
-    check("banner leads", out.splitlines()[0].startswith("⚠ recap_aggregates"),
+    check("banner present", "⚠ market_aggregates" in out, out.splitlines()[:3])
+    check("banner leads", out.splitlines()[0].startswith("⚠ market_aggregates"),
           out.splitlines()[:2])
     # divert actually happened (kills: stale_snapshot=False, _SNAPSHOT_SOURCES
     # pointed at the wrong source)
@@ -1514,7 +1514,7 @@ def test_main_stays_silent_on_a_fresh_feed():
     # "hot surface unavailable" banner does fire here — this fixture has no
     # volume/surface CSVs — so assert on the freshness wording specifically
     # rather than on any "⚠" at all.)
-    check("no freshness banner", "recap_aggregates" not in out and
+    check("no freshness banner", "market_aggregates" not in out and
           "could not be verified" not in out, out.splitlines()[:3])
     check("no needless fallback", calls["fallback"] == 0, calls)
     check("hot figures rendered", "38.2" in out, out.splitlines()[:14])
@@ -1526,7 +1526,7 @@ def test_main_no_s3_path_does_not_crash():
     with tempfile.TemporaryDirectory() as d:
         out, _ = _run_main(d, market=_LIVE_MARKET, extra_argv=("--no-s3",))
     check("renders without crashing", "Options ·" in out, out.splitlines()[:3])
-    check("no stale banner offline", "⚠ recap_aggregates" not in out, out.splitlines()[:3])
+    check("no stale banner offline", "⚠ market_aggregates" not in out, out.splitlines()[:3])
 
 
 def test_freshness_probe_contract_matches_its_reader():
@@ -1553,7 +1553,7 @@ def test_freshness_probe_contract_matches_its_reader():
     #     false banner and forces a refetch every run;
     #   GROUP BY exchange         -> collapses dvol and spot back into one flat
     #     max, restoring the original masked-freeze bug.
-    rec = next(b for b, f in copies if f == "freshness_rec.csv")
+    rec = next(b for b, f in copies if f == "freshness_ma.csv")
     check("recap probe takes min over per-metric maxima", "min(mx)" in rec, rec[:160])
     check("grouped by metric ALONE", "GROUP BY metric)" in rec, rec[:200])
     check("not grouped by exchange", "exchange" not in rec, rec[:200])
@@ -1792,7 +1792,7 @@ def test_venue_window_is_floored_to_the_containing_bucket():
     venue = next(l for l in sh.splitlines() if "venue_blocks.csv" in l and l.startswith("COPY"))
     check("venue read uses the floored bound", "${START_MS_5M}" in venue, venue[:160])
     tape = next(l for l in sh.splitlines()
-                if l.startswith("COPY") and "read_parquet('${PT}')" in l)
+                if l.startswith("COPY") and " FROM ${PT} " in l)
     check("tape read stays on exact START_MS",
           "${START_MS}" in tape and "START_MS_5M" not in tape, tape[:160])
 
@@ -1839,7 +1839,17 @@ def test_run_recap_has_no_legacy_csv_read_left():
     blocks = [l for l in sh.splitlines()
               if l.startswith("COPY") and "/blocks.csv'" in l]
     check("exactly one blocks.csv writer", len(blocks) == 1, blocks)
-    check("and it is the hot tape", "read_parquet('${PT}')" in blocks[0], blocks[0][:120])
+    check("and it is the tape store", " FROM ${PT} " in blocks[0], blocks[0][:120])
+    # The hot 30d rollup is gone too: the store it was cut from is read directly.
+    code = [l for l in sh.splitlines() if l.strip() and not l.lstrip().startswith("#")]
+    check("no hot tape rollup read left in code",
+          not any("hot__paradigm_trade_tape" in l for l in code),
+          [l[:80] for l in code if "hot__paradigm_trade_tape" in l])
+    pt = next(l for l in sh.splitlines() if l.startswith("PT="))
+    check("tape read tolerates columns added mid-history", "union_by_name=true" in pt, pt)
+    check("tape read exposes partition keys", "hive_partitioning=true" in pt, pt)
+    check("no row_type discriminator on the dedicated store",
+          "row_type" not in blocks[0], blocks[0][:200])
 
 
 
@@ -1877,6 +1887,53 @@ def test_unknown_freshness_reaches_the_divert_through_main():
     check("unknown is banner-flagged", "could not be verified" in out, out.splitlines()[:4])
     check("and it diverts rather than trusting the data", calls["fallback"] == 1, calls)
     check("stale hot DVOL not rendered", "38.2" not in out, out.splitlines()[:14])
+
+
+def test_run_recap_reads_the_aggregation_layer_not_the_hot_rollup():
+    # The Snapshot's DVOL/spot, $ Volume, Activity/P-C and the venue blocks
+    # come from market_aggregates_5m/ — the layer the retired
+    # hot__recap_aggregates_5m_24h.parquet rollup was generated from. Pin the
+    # read so the derived file cannot creep back in, and pin the shape of the
+    # read: one scan into a temp table, schema-drift tolerant, partition-aware.
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "..", "scripts", "run_recap.sh")
+    with open(src) as f:
+        lines = f.read().splitlines()
+    code = [l for l in lines if l.strip() and not l.lstrip().startswith("#")]
+    check("no hot recap rollup read left in code",
+          not any("hot__recap_aggregates" in l for l in code),
+          [l[:80] for l in code if "hot__recap_aggregates" in l])
+    check("REC variable gone", not any(l.startswith("REC=") for l in lines))
+    root = next(l for l in lines if l.startswith("MA_ROOT="))
+    check("default root is the aggregation layer", "market_aggregates_5m" in root, root)
+    ma = next(l for l in lines if l.startswith("MA="))
+    check("layer read tolerates columns added mid-history", "union_by_name=true" in ma, ma)
+    check("layer read exposes partition keys", "hive_partitioning=true" in ma, ma)
+    # ONE scan: the temp table is asset-scoped + floored to the venue bucket,
+    # and every Snapshot/venue COPY reads it rather than re-globbing S3.
+    tt = next(l for l in lines if l.startswith("CREATE TEMP TABLE ma"))
+    check("temp table reads the layer", "${MA}" in tt, tt[:120])
+    check("temp table is asset-scoped", "asset='${ASSET}'" in tt, tt[:160])
+    check("temp table floored to the venue bucket", "${START_MS_5M}" in tt, tt[:160])
+    for name in ("dvol_spot.csv", "volume.csv", "venue_blocks.csv"):
+        writers = [l for l in lines if l.startswith("COPY") and f"/{name}'" in l]
+        check(f"{name} has a writer", writers, name)
+        for w in writers:
+            check(f"{name} reads the temp table, not S3",
+                  " FROM ma " in w and "read_parquet" not in w, w[:120])
+    # The probe still goes to the layer directly (it must not be window-
+    # filtered), bounded by the 7d lookback rather than the recap window.
+    probe = next(l for l in lines if l.startswith("COPY") and "freshness_ma.csv" in l)
+    check("probe reads the layer", "${MA}" in probe, probe[:120])
+    check("probe bounded by the lookback, not the window",
+          "${PROBE_FROM_MS}" in probe and "${START_MS}" not in probe, probe[:200])
+    # The Paradigm tape store has the same seams, so it can be narrowed
+    # without a code change once its layout is verified.
+    pt_root = next(l for l in lines if l.startswith("PT_ROOT="))
+    check("default tape root is the persisted store", "paradigm_trade_tape" in pt_root
+          and "hot" not in pt_root, pt_root)
+    pt_glob = next(l for l in lines if l.startswith("PT_GLOB="))
+    check("tape glob is overridable", "RECAP_PARADIGM_TAPE" in pt_glob, pt_glob)
 
 
 def main():

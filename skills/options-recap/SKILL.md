@@ -8,14 +8,16 @@ description: >
   options flow summary, "what happened in BTC options", or "last Xh of flow".
   The output format is fixed — always the same four sections in the same order.
 compatibility: Deribit public API (curl) for the 7d realized-vol closes, and as the
-  live DVOL/spot fallback when the hot source is stale or absent; Paradigm data
-  (DuckDB+S3 via IRSA) for the rest, incl. Biggest Print + Block Flow off the hot
-  paradigm_trade tape, which is now the SOLE block source. Heartbeat
+  live DVOL/spot fallback when the aggregates source is stale or absent; Paradigm
+  data (DuckDB+S3 via IRSA) for the rest — the Snapshot's DVOL/spot, $ Volume,
+  Activity/P-C and venue blocks off the pipeline's 5-min market_aggregates layer
+  (not the derived hot rollup), the surface off v_vol_surface, and Biggest Print
+  + Block Flow off the paradigm_trade tape, the SOLE block source. Heartbeat
   sources are freshness-checked before rendering; one past its limit is
   banner-flagged. S3 reads need the IRSA bootstrap (see paradigm-data-discovery).
 metadata:
   author: tradeparadigm
-  version: "1.15"
+  version: "1.16"
 ---
 
 # Options Recap
@@ -31,17 +33,19 @@ metadata:
 | `options` | the literal word `options` | ignored — a no-op keyword (this skill is always options); `run_recap.sh` strips it |
 
 Any `Nm`/`Nh`/`Nd` window up to 24h works and all render identically: DVOL/spot,
-the `$` Volume line, and the multi-venue activity/P-C all come from one rolling hot
-aggregates file sliced to the window at query time; the surface (and its Δ columns)
+the `$` Volume line, and the multi-venue activity/P-C all come from the pipeline's
+5-minute market aggregates layer (`market_aggregates_5m/` — the data the retired
+hot recap rollup was generated from), sliced to the window at query time; the
+surface (and its Δ columns)
 from `v_vol_surface`; and **Biggest Print + Block Flow from the multi-venue Paradigm
-block tape** (the hot `paradigm_trade` rows — the SOLE source; the legacy
+block tape** (the `paradigm_trade_tape/` store — the SOLE source; the legacy
 `paradigm_trade_tape_slim` csv.gz fallback was removed once its producer was
 decommissioned) — every venue Paradigm brokers (Deribit/Paradex/Bullish/…),
 notional already in USD per leg. There is no fallback: if that read returns
 nothing, Block Flow is MISSING and the output says so — do not report it as a
 quiet market.
 
-**Plus venue-tape blocks** off the hot recap file's option `block` rows. These
+**Plus venue-tape blocks** off the market aggregates' option `block` rows. These
 rank in the same pool as Paradigm blocks and render as `<Venue> Block` rows with
 a `(venue tape)` detail note. They are deduped against the Paradigm tape by the
 venue's OWN block id (`VENUE_BLOCK_TRADE_ID`), so a genuinely non-Paradigm
@@ -60,12 +64,12 @@ The Paradigm tape has no IV, so the top blocks' IV is looked up from the vol
 surface (Deribit legs only; venue-tape blocks carry their venue's per-trade IV
 where published; other venues show IV `n/a`). A malformed window exits with a clear error.
 
-**Windows beyond 24h:** the Snapshot flow sources (the rolling hot aggregates file →
-Volume/Activity/P-C/DVOL/spot) retain only ~24h, so `run_recap.sh` caps any longer
-window (e.g. `2d`) at 24h and prepends a one-line `⚠ window capped at 24h — …` banner
-as the first line of its output — **relay it verbatim** (don't drop or reword it).
-Block Flow itself now comes from the 30-day block tape and isn't the constraint;
-the cap lifts once the Snapshot sources are wired to the cold store.
+**Windows beyond 24h:** `run_recap.sh` caps any longer window (e.g. `2d`) at 24h
+and prepends a one-line `⚠ window capped at 24h — …` banner as the first line of
+its output — **relay it verbatim** (don't drop or reword it). The cap dates from
+the retired ~24h hot rollup; the market aggregates layer retains history, but
+the Snapshot path still assumes a 24h horizon until a longer window has been
+verified live. Block Flow comes from the 30-day block tape and isn't the constraint.
 
 **Vol-surface Δ coverage:** the window-open surface comes from `_hot.parquet`
 (~2h rolling buffer) for short windows, else from the cold `v_vol_surface`
@@ -122,22 +126,24 @@ the only signal that the numbers below may be wrong rather than missing.
 The banner states the consequence per source, and you must not paraphrase it
 into a stronger claim:
 
-- **`recap_aggregates` stale** — DVOL/spot are re-sourced live from Deribit
+- **`market_aggregates` stale** — DVOL/spot are re-sourced live from Deribit
   **when that fetch succeeds**; the banner then says `re-sourced live from
   Deribit`. If it fails, the stale figures are retained and the banner says
   `could NOT be re-sourced`. **Never tell a user the figures are live unless
   the banner says re-sourced.** `$ Volume`, Activity, P/C and venue Block Flow
-  come from the same file and are windowed, so they cover only up to the freeze
+  come from the same source and are windowed, so they cover only up to the freeze
   and understate the window — the banner says this too.
 - **`vol_surface` stale** — banner only; a stale surface does not itself
   trigger a refetch. ATM/RR/Fly, skew, term and the Δ columns come from that
   data unless the Deribit ticker surface happens to be fetched for another
-  reason (a stale `recap_aggregates`, or no hot surface at all).
+  reason (a stale `market_aggregates`, or no hot surface at all).
 
-This exists because the recap aggregates froze on 2026-07-10 and rendered July
+This exists because the hot recap rollup froze on 2026-07-10 and rendered July
 10 DVOL/spot as current for ~3.5 weeks. The file's mtime kept changing while its
 contents did not, so every "is it running?" check passed. Only comparing a data
-timestamp against the clock catches that.
+timestamp against the clock catches that. The recap now reads the layer that
+rollup was built from, which removes that derived artifact — but the layer is
+still a continuously-written feed that can stop, so the gate stays.
 
 Only heartbeat sources are checked. Event-driven ones (the block tape) are not
 and must not be: their newest row depends on whether anyone traded, so a quiet
