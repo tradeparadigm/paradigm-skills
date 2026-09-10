@@ -87,8 +87,9 @@ command and relay its stdout **verbatim** as your entire reply:
 bash scripts/run_recap.sh BTC 8h      # <ASSET> <WINDOW>; any Nm/Nh/Nd works; 1d→24h
 ```
 
-That script does everything — STS bootstrap, the single DuckDB session (hot
-surface + the Paradigm block tape), the Deribit 7d-closes fetch (the realized-vol
+That script does everything — the single DuckDB session (creds via the DuckDB
+credential chain, so it works identically on the IRSA pod and inside the OC
+enclave; hot surface + the Paradigm block tape), the Deribit 7d-closes fetch (the realized-vol
 input), the vol math, and final formatting — and prints the finished four-section
 recap. **Do not** add commentary, reformat it, re-fetch
 anything, or run extra steps. Its output already is the recap. Your reply must
