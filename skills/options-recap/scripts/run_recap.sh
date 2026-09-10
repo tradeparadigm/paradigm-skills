@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # run_recap.sh — the entire live recap in one command, so the agent types one
 # short line instead of regenerating a ~50-line bootstrap+SQL block (that
-# generation was ~12s of the old run). Does: STS bootstrap, one DuckDB session
-# into CSVs, then recap.py --render. Its stdout IS the final four-section recap.
+# generation was ~12s of the old run). Does: one DuckDB session (creds via the
+# DuckDB credential chain) into CSVs, then recap.py --render. Its stdout IS the
+# final four-section recap.
 #
 # Usage: bash scripts/run_recap.sh <ASSET> <WINDOW>     e.g. run_recap.sh BTC 8h
 set -uo pipefail
@@ -64,7 +65,7 @@ esac
 # snapshots, and older opens come from the cold hour-partition containing
 # window-start (hourly files, published ~15min after each hour closes). "Now" is
 # always _hot.parquet's latest snapshot, so open+close share one pipeline.
-# Resolved here, before the STS bootstrap: it's pure date math, which lets the
+# Resolved here, before any DuckDB work: it's pure date math, which lets the
 # RECAP_PRINT_SOURCES test hook exercise it with no creds. RECAP_NOW_S pins the
 # clock so tests can assert exact partition paths.
 NOW_S=${RECAP_NOW_S:-$(date -u +%s)}; START_S=$((NOW_S - SECS)); START_MS=$((START_S * 1000))
@@ -105,12 +106,16 @@ DIR="$(cd "$(dirname "$0")/.." && pwd)"      # skill dir (scripts/..)
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/recap.XXXXXX") || { echo "recap: mktemp failed" >&2; exit 1; }
 trap 'rm -rf "$WORK"' EXIT
 
-# STS bootstrap (IRSA → temporary creds; see paradigm-data-discovery skill).
-TOKEN=$(cat "$AWS_WEB_IDENTITY_TOKEN_FILE")
-CREDS=$(curl -s "https://sts.ap-northeast-1.amazonaws.com/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15&RoleArn=${AWS_ROLE_ARN}&RoleSessionName=duckdb&WebIdentityToken=${TOKEN}")
-AK=$(printf '%s' "$CREDS" | grep -o '<AccessKeyId>[^<]*'     | cut -d'>' -f2)
-SK=$(printf '%s' "$CREDS" | grep -o '<SecretAccessKey>[^<]*' | cut -d'>' -f2)
-ST=$(printf '%s' "$CREDS" | grep -o '<SessionToken>[^<]*'    | cut -d'>' -f2)
+# Creds: DuckDB resolves them itself via the AWS credential chain (see the
+# data-discovery s3-access reference). This is the ONE mechanism that works in
+# BOTH deployments: on the standard IRSA pod the chain reads the projected
+# web-identity token; inside the OC Nitro enclave it resolves the credential_process
+# (oc-creds.sh over vsock) that eif/enclave-entry.sh wires into ~/.aws/config.
+# The old hand-rolled STS bootstrap ($AWS_WEB_IDENTITY_TOKEN_FILE + a curl to
+# sts.<region>.amazonaws.com, keys SET into the session) had neither the token
+# file nor STS reachability inside the enclave, so it silently produced empty
+# creds -> HTTP 403 AccessDenied on every S3 read -> blank CSVs -> "No data".
+# The CREDENTIAL_CHAIN SECRET lives in the SQL preamble below (same session).
 
 # Single rolling file of 5-min aggregates over trailing 24h (replaces the old
 # per-window hot__recap_<window> files). The window is applied at query time via
@@ -144,10 +149,12 @@ PT=s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet
 # asset (defense in depth against any future shared-state/wrong-file regression).
 cat > "$WORK/recap.sql" <<SQL
 INSTALL httpfs; LOAD httpfs;
-SET s3_region='ap-northeast-1';
-SET s3_access_key_id='${AK}';
-SET s3_secret_access_key='${SK}';
-SET s3_session_token='${ST}';
+INSTALL aws; LOAD aws;
+-- CREDENTIAL_CHAIN works in both the IRSA pod (web-identity token) and the OC
+-- enclave (credential_process). ENDPOINT is pinned to the region host so the S3
+-- authority is deterministic (no global s3.amazonaws.com -> region 307 redirect),
+-- which also keeps a re-tightened enclave egress allowlist matchable.
+CREATE OR REPLACE SECRET s3_irsa (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1', ENDPOINT 's3.ap-northeast-1.amazonaws.com');
 COPY (SELECT asset, exchange, metric, arg_min(open, bucket_at) AS open, arg_max(close, bucket_at) AS close, max(high) AS high, min(low) AS low FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='dvol_spot' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, metric) TO '${WORK}/dvol_spot.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, optionType, sum(volume_sum) AS volume_sum, sum(notional_usd) AS notional, sum(buy_volume) AS buy_volume, sum(sell_volume) AS sell_volume, sum(trade_count) AS trade_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='volume' AND bucket_at >= ${START_MS} GROUP BY asset, exchange, optionType) TO '${WORK}/volume.csv' (HEADER, DELIMITER ',');
 COPY (SELECT asset, exchange, block_id, min(bucket_at) AS bucket_at, sum(volume_sum) AS volume_coin, sum(notional_usd) AS premium_usd, sum(leg_count) AS leg_count, sum(iv_sum) AS iv_sum, sum(iv_count) AS iv_count FROM read_parquet('${REC}') WHERE asset='${ASSET}' AND row_type='block' AND instrument_kind='option' AND bucket_at >= ${START_MS_5M} GROUP BY asset, exchange, block_id) TO '${WORK}/venue_blocks.csv' (HEADER, DELIMITER ',');
