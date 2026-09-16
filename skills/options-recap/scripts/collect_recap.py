@@ -37,17 +37,26 @@ def parse_window(value: str) -> dt.timedelta:
 
 
 def hour_patterns(source: str, venue: str, data_type: str, currency: str,
-                  start: dt.datetime, end: dt.datetime) -> list[str]:
+                  start: dt.datetime, end: dt.datetime) -> tuple[list[str], list[str]]:
+    """Day-level globs, plus the hours they are expected to cover.
+
+    One listing per day returns exactly the objects that one listing per hour
+    does, and every returned key carries its own hour — so coverage is read off
+    the result rather than probed for, at 1/24 of the S3 calls. A 30-day window
+    was 10,090 listings, which was most of its seven-minute runtime.
+    """
+    base = (f"{BUCKET}/{source}/exchange={venue}/data_type={data_type}/"
+            f"currency={currency}/level=5m")
     cursor = start.replace(minute=0, second=0, microsecond=0)
-    patterns: list[str] = []
+    hours: list[str] = []
+    days: list[str] = []
     while cursor < end:
-        patterns.append(
-            f"{BUCKET}/{source}/exchange={venue}/data_type={data_type}/currency={currency}/"
-            f"level=5m/year={cursor:%Y}/month={cursor:%m}/day={cursor:%d}/hour={cursor:%H}/"
-            "**/*__rows__*.parquet"
-        )
+        hours.append(f"{cursor:%Y%m%dT%H}")
+        day = f"{base}/year={cursor:%Y}/month={cursor:%m}/day={cursor:%d}/**/*__rows__*.parquet"
+        if day not in days:
+            days.append(day)
         cursor += dt.timedelta(hours=1)
-    return patterns
+    return days, hours
 
 
 def snapshot_patterns(venue: str, currency: str, start: dt.datetime,
@@ -88,11 +97,16 @@ class Query:
     sql: str
     units: dict[str, str]
     required: bool = False
+    # Hours the day-level globs should cover; empty means report per pattern.
+    expected_hours: tuple[str, ...] = ()
 
 
-def resolve_paths(connection: duckdb.DuckDBPyConnection,
-                  patterns: list[str]) -> tuple[list[str], list[str]]:
-    """Split the partition patterns into the ones S3 actually has, and the rest.
+HOUR_IN_KEY = re.compile(r"__rows__(\d{8}T\d{2})")
+
+
+def resolve_paths(connection: duckdb.DuckDBPyConnection, patterns: list[str],
+                  expected_hours: tuple[str, ...] = ()) -> tuple[list[str], list[str]]:
+    """Resolve the globs to real objects, and name what the window is missing.
 
     read_parquet() fails the entire list when any single pattern matches no
     object, so the current hour — which producers only write ~10 minutes in —
@@ -102,24 +116,29 @@ def resolve_paths(connection: duckdb.DuckDBPyConnection,
     """
     files = [row[0] for row in
              connection.execute(f"SELECT file FROM glob({sql_list(patterns)}) ORDER BY file").fetchall()]
-    present, missing = [], []
+    if expected_hours:
+        present = {match.group(1) for path in files
+                   if (match := HOUR_IN_KEY.search(path))}
+        return files, [hour for hour in expected_hours if hour not in present]
+    missing = []
     for pattern in patterns:
         prefix = pattern.split("*", 1)[0]
-        (present if any(f.startswith(prefix) for f in files) else missing).append(pattern)
+        if not any(f.startswith(prefix) for f in files):
+            missing.append(pattern)
     return files, missing
 
 
 def run_query(query: Query) -> tuple[dict[str, Any], list[Any]]:
     source: dict[str, Any] = {
         "name": query.name,
-        "path_plan": {"pattern_count": len(query.paths),
+        "path_plan": {"pattern_count": len(query.expected_hours or query.paths),
                       "first_pattern": query.paths[0], "last_pattern": query.paths[-1]},
         "units": query.units,
     }
     try:
         connection = duckdb.connect()
         connection.execute(DUCKDB_PREFIX)
-        files, missing = resolve_paths(connection, query.paths)
+        files, missing = resolve_paths(connection, query.paths, query.expected_hours)
         source["path_plan"].update(resolved_file_count=len(files),
                                    missing_pattern_count=len(missing))
         if missing:
@@ -159,7 +178,7 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime, *, render=Fa
     between = f"TRY_CAST(timestamp AS TIMESTAMPTZ) >= TIMESTAMPTZ '{start_iso}' AND TRY_CAST(timestamp AS TIMESTAMPTZ) < TIMESTAMPTZ '{end_iso}'"
     queries: list[Query] = []
     for venue in VENUES:
-        trade_paths = hour_patterns("normalized", venue, "option_trade", currency, start, end)
+        trade_paths, trade_hours = hour_patterns("normalized", venue, "option_trade", currency, start, end)
         queries.append(Query(f"option_trades_{venue}", trade_paths, f"""
           WITH trades AS MATERIALIZED (
             SELECT * FROM read_parquet(__PATHS__, union_by_name=true,
@@ -186,7 +205,8 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime, *, render=Fa
         """, {"amount_native": "venue-native; do not combine without metadata",
                "premium_turnover_usd": "USD; null unless every matching row has turnover",
                "known_premium_turnover_usd": "USD partial sum, not a complete total",
-               "iv": "venue-native; normalized column names do not harmonize units"}, True))
+               "iv": "venue-native; normalized column names do not harmonize units"},
+               True, tuple(trade_hours)))
 
         summary_paths = snapshot_patterns(venue, currency, start, end)
         open_point = start.replace(minute=start.minute - start.minute % 5, second=0, microsecond=0)
@@ -229,7 +249,7 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime, *, render=Fa
         """, {"markIV": "venue-native; convert using event-applicable instrument metadata",
                "openInterest": "venue-native snapshot sample, not full-chain OI"}, True))
 
-        block_paths = hour_patterns("raw", venue, "option_trade", currency, start, end)
+        block_paths, block_hours = hour_patterns("raw", venue, "option_trade", currency, start, end)
         native_predicates = {
             "deribit": "block_trade_id IS NOT NULL OR block_rfq_id IS NOT NULL",
             "deribit-usdc": "block_trade_id IS NOT NULL OR block_rfq_id IS NOT NULL",
@@ -243,19 +263,21 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime, *, render=Fa
                             hive_partitioning=true, filename=true)
           WHERE {between} AND ({native_predicates[venue]})
           ORDER BY timestamp DESC
-        """, {"numeric_fields": "venue-native; consult instrument metadata"}))
+        """, {"numeric_fields": "venue-native; consult instrument metadata"},
+               expected_hours=tuple(block_hours)))
 
-    dvol_paths = hour_patterns("raw", "deribit", "dvol", currency, start, end)
+    dvol_paths, dvol_hours = hour_patterns("raw", "deribit", "dvol", currency, start, end)
     queries.append(Query("dvol_window", dvol_paths, f"""
       SELECT asset, index_name, arg_min(volatility, timestamp) AS open,
              arg_max(volatility, timestamp) AS close, min(volatility) AS low,
              max(volatility) AS high, max(timestamp) AS max_event_at
       FROM read_parquet(__PATHS__, union_by_name=true, hive_partitioning=true)
       WHERE {between} GROUP BY asset, index_name
-    """, {"open": "vol points", "close": "vol points", "low": "vol points", "high": "vol points"}))
+    """, {"open": "vol points", "close": "vol points", "low": "vol points", "high": "vol points"},
+           expected_hours=tuple(dvol_hours)))
 
     for venue in ("deribit", "okex-options", "bybit-options"):
-        perp_paths = hour_patterns("normalized", venue, "perp_summary", currency, start, end)
+        perp_paths, perp_hours = hour_patterns("normalized", venue, "perp_summary", currency, start, end)
         queries.append(Query(f"perpetual_snapshot_{venue}", perp_paths, f"""
           SELECT exchange, timestamp, symbol, funding_rate, funding_interval_hours,
                  index_price, mark_price, open_interest_coin, open_interest_usd,
@@ -263,14 +285,15 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime, *, render=Fa
           FROM read_parquet(__PATHS__, union_by_name=true, hive_partitioning=true)
           WHERE {between}
           QUALIFY row_number() OVER (PARTITION BY symbol ORDER BY timestamp DESC)=1
-        """, {"funding_rate": "published rate per funding_interval_hours", "index_price": "USD"}))
+        """, {"funding_rate": "published rate per funding_interval_hours", "index_price": "USD"},
+               expected_hours=tuple(perp_hours)))
     if render:
         # Calculators need complete trades and a complete Deribit snapshot, not
         # the bounded examples formerly sent to the language model.
         queries = [Query(q.name, q.paths,
                          q.sql.replace(" LIMIT 25", "").replace(
                              "WHERE evidence_rank=1", "WHERE target_delta=0.50"),
-                         q.units, q.required)
+                         q.units, q.required, q.expected_hours)
                    for q in queries if q.name.startswith("option_trades_")
                    or q.name in ("option_surface_deribit", "dvol_window")]
     return queries

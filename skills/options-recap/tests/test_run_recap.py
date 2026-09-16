@@ -82,7 +82,10 @@ def test_partition_plan_is_explicit_and_hot_free():
     check("every path is direct", all("/raw/" in p or "/normalized/" in p or "/meta/" in p for p in paths))
     check("no hot path", all("/hot/" not in p and "hot__" not in p for p in paths))
     check("hours are explicit", all("hour=*" not in p for p in paths))
-    check("exclusive end covers two UTC hours", len(queries[0].paths) == 2, len(queries[0].paths))
+    check("exclusive end covers two UTC hours",
+          queries[0].expected_hours == ("20260830T10", "20260830T11"), queries[0].expected_hours)
+    # One listing per day, not per hour: the same objects for 1/24 of the S3 calls.
+    check("one glob per day, not per hour", len(queries[0].paths) == 1, queries[0].paths)
     surface_sql = next(query.sql for query in queries if query.name == "option_surface_deribit")
     check("surface samples every expiry and type independently", "PARTITION BY observation, expirationDate, optionType, target_delta" in surface_sql)
 
@@ -143,6 +146,41 @@ def test_absent_partition_does_not_erase_the_rest_of_the_window():
     check("resolved only the present partitions", metadata["path_plan"]["resolved_file_count"] == 2)
     check("absent partition counted", metadata["path_plan"]["missing_pattern_count"] == 1)
     check("absent partition named", metadata["path_plan"]["missing_patterns"] == [patterns[2]])
+
+
+def test_render_queries_keep_their_coverage_expectations():
+    """The render path rebuilds each Query; dropping a field there silently
+    disabled hour-level coverage on the one path /recap actually runs."""
+    start = dt.datetime(2026, 8, 30, 10, 0, tzinfo=dt.timezone.utc)
+    end = dt.datetime(2026, 8, 30, 13, 0, tzinfo=dt.timezone.utc)
+    plain = {q.name: q for q in collector.build_queries("BTC", start, end)}
+    for rendered in collector.build_queries("BTC", start, end, render=True):
+        check(f"{rendered.name} keeps expected_hours",
+              rendered.expected_hours == plain[rendered.name].expected_hours,
+              rendered.name)
+
+
+def test_missing_hours_are_read_off_the_returned_keys():
+    """Day-level globs cannot probe per hour, so an absent hour is found by its
+    absence from the resolved file names — same warning, 1/24 the listings."""
+    start = dt.datetime(2026, 8, 30, 10, 0, tzinfo=dt.timezone.utc)
+    end = dt.datetime(2026, 8, 30, 13, 0, tzinfo=dt.timezone.utc)
+    queries = collector.build_queries("BTC", start, end)
+    trades = next(q for q in queries if q.name == "option_trades_deribit")
+    check("three hours expected", trades.expected_hours ==
+          ("20260830T10", "20260830T11", "20260830T12"), trades.expected_hours)
+    original = collector.duckdb.connect
+    # Hours 10 and 12 landed; hour 11 never wrote a file.
+    collector.duckdb.connect = fake_connection([
+        "s3://b/year=2026/month=08/day=30/hour=10/x__rows__20260830T100000Z.parquet",
+        "s3://b/year=2026/month=08/day=30/hour=12/x__rows__20260830T121500Z.parquet"])
+    try:
+        metadata, _ = collector.run_query(trades)
+    finally:
+        collector.duckdb.connect = original
+    check("absent hour counted", metadata["path_plan"]["missing_pattern_count"] == 1, metadata["path_plan"])
+    check("absent hour named", metadata["path_plan"]["missing_patterns"] == ["20260830T11"], metadata["path_plan"])
+    check("coverage denominator stays hourly", metadata["path_plan"]["pattern_count"] == 3, metadata["path_plan"])
 
 
 def test_fully_absent_window_reports_unavailable_not_a_quiet_market():
