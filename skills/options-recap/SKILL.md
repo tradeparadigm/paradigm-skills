@@ -1,11 +1,16 @@
 ---
 name: paradigm-options-recap
 description: >
-  Build an options market recap for /recap or a user-specified asset/window
-  from raw exchange venue files and source tapes. Use for full options-market
-  recaps; focused flow, volatility or biggest-print questions stay in data-discovery. The script reads
-  bounded raw inputs and renders Snapshot, Biggest
-  Print, Block Flow, and Vol Surface without using Dime hot files.
+  Options market recap for a requested or default window, invoked via /recap.
+  Parses
+  "/recap [asset] [options] [window]" (e.g. "/recap btc options 8h") and builds
+  the fixed four-section recap — Snapshot, Biggest Print, Block Flow, Vol
+  Surface — from bounded raw exchange venue files and source tapes, never from
+  Dime hot files. Use when the user types /recap or asks for a market recap, an
+  options flow summary, "what happened in BTC options", "last Xh of flow", or
+  what the vol surface looks like. Dataset inventory, schema and historical
+  lookups belong to data-discovery. The output format is fixed — always the
+  same four sections in the same order.
 metadata:
   author: tradeparadigm
   version: "2.0"

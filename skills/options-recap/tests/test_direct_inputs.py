@@ -1,6 +1,7 @@
 """Direct input adapters preserve the established numerical/output contract."""
 
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 import sys
 
@@ -88,3 +89,42 @@ def test_leg_adapter_uses_typed_geometry_not_package_description():
     mapped = calculation_rows([row])[0]
     assert mapped["DESCRIPTION"] == "Put 11 Sep 26 70000"
     assert mapped["SIDE"] == "BUY" and mapped["QTY"] == 40
+
+
+def instrument_object(captured_at):
+    """captured_at rides as a String — metadata() parses it with the .str namespace."""
+    frame = pl.DataFrame({"symbol": ["BTC-11SEP26-70000-P"], "captured_at": [captured_at],
+                          "iv_unit": ["decimal"], "oi_unit": ["contracts"],
+                          "contract_size": [0.1], "price_unit": ["coin"]})
+    buffer = BytesIO()
+    frame.write_parquet(buffer)
+    return {"Body": BytesIO(buffer.getvalue())}
+
+
+def test_one_stray_object_does_not_cost_a_venue_its_units(monkeypatch):
+    """A marker or interrupted write under the metadata prefix used to raise,
+    which the caller turns into 'unit metadata unavailable' for the whole venue
+    — so every trade on it loses its provable USD premium."""
+    base = "meta/instruments/exchange=deribit/currency=btc/"
+    snapshots = {
+        base + "instruments__deribit__btc__20260908T070000Z.parquet": "2026-09-08T07:00:00Z",
+        base + "instruments__deribit__btc__20260908T083000Z.parquet": "2026-09-08T08:30:00Z",
+    }
+    keys = [*snapshots, base + "_SUCCESS", base + "instruments__deribit__btc__partial.tmp"]
+
+    class Paginator:
+        def paginate(self, **_):
+            return [{"Contents": [{"Key": key} for key in keys]}]
+
+    class Client:
+        def get_paginator(self, _):
+            return Paginator()
+
+        def get_object(self, Bucket, Key):
+            return instrument_object(snapshots[Key])
+
+    # Patch the module under test, not the real boto3 every other module shares.
+    monkeypatch.setattr(direct, "boto3", type("Stub", (), {"client": staticmethod(lambda *a, **k: Client())}))
+    specs = direct.metadata("deribit", "BTC", START, END)
+    assert specs.height == 2
+    assert specs["contract_size"].to_list() == [0.1, 0.1]

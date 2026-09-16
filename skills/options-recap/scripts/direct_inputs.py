@@ -24,7 +24,13 @@ def metadata(venue, asset, start, end):
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket="dt-exchange-venue-data", Prefix=prefix):
         for item in page.get("Contents", []):
             key = item["Key"]
-            stamp = datetime.strptime(key.rsplit("__", 1)[1], "%Y%m%dT%H%M%SZ.parquet").replace(tzinfo=timezone.utc)
+            # A marker, manifest or interrupted .tmp write is not a snapshot.
+            # Letting it raise here would cost the venue its unit metadata, and
+            # every one of its trades a provable USD premium.
+            try:
+                stamp = datetime.strptime(key.rsplit("__", 1)[1], "%Y%m%dT%H%M%SZ.parquet").replace(tzinfo=timezone.utc)
+            except (ValueError, IndexError):
+                continue
             if stamp <= end:
                 objects.append((stamp, key))
     before = [item for item in objects if item[0] <= start]
