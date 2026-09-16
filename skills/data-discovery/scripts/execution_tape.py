@@ -7,6 +7,9 @@ import boto3
 import polars as pl
 
 BUCKET = "dt-exchange-venue-data"
+# Pinned for the same reason as the DuckDB secret: AWS_ENDPOINT_URL or a
+# profile endpoint_url would otherwise redirect these reads.
+S3_ENDPOINT = "https://s3.ap-northeast-1.amazonaws.com"
 PREFIX = "paradigm_trade_tape"
 
 # Dead-writer detection ONLY. The producer runs every 15 minutes with an
@@ -76,7 +79,7 @@ def read_executions(start, end, *, rfq_id=None, asset=None, s3=None, now=None):
     oldest = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=30)
     if start < oldest or end > now:
         raise ValueError("execution tape supports the trailing 30 days only")
-    s3 = s3 or boto3.client("s3", region_name="ap-northeast-1")
+    s3 = s3 or boto3.client("s3", region_name="ap-northeast-1", endpoint_url=S3_ENDPOINT)
     day = start.replace(hour=0, minute=0, second=0, microsecond=0)
     frames, sources = [], []
     while day < end:

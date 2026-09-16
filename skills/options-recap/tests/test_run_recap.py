@@ -51,9 +51,16 @@ def test_arguments():
     check("window-only invocation", hook("RECAP_PRINT_ARGS", "8h")[0] == "BTC 8h")
 
 
-def test_windows_are_not_capped():
+def test_windows_are_not_capped_but_are_bounded():
+    """The 24h clamp is gone — partitions serve any window — but not unbounded:
+    beyond 30 days the execution tape has nothing and the glob spans every hour
+    of every venue."""
     check("2d remains 2d", hook("RECAP_PRINT_PLAN", "eth", "2d") == ("ETH 2d 172800 direct", 0))
-    check("31d remains 31d", hook("RECAP_PRINT_PLAN", "btc", "31d") == ("BTC 31d 2678400 direct", 0))
+    check("7d remains 7d", hook("RECAP_PRINT_PLAN", "btc", "7d") == ("BTC 7d 604800 direct", 0))
+    check("30d is allowed", hook("RECAP_PRINT_PLAN", "btc", "30d")[1] == 0)
+    output, code = hook("RECAP_PRINT_PLAN", "btc", "31d")
+    check("31d is refused before any read", code == 2, output)
+    check("refusal names the limit", "30d" in output, output)
 
 
 def test_bad_arguments_fail_before_data_access():
@@ -149,7 +156,7 @@ def test_fully_absent_window_reports_unavailable_not_a_quiet_market():
     check("error names the pattern span", "2 partition patterns" in metadata["error"])
 
 
-def test_credential_secrets_pin_the_regional_endpoint():
+def test_s3_reads_pin_the_regional_endpoint():
     """#37 pinned ENDPOINT so the S3 authority stays deterministic: the global
     host answers cross-region with a 307 that the enclave's exact-match egress
     allowlist cannot follow. Rewriting run_recap.sh dropped it once already."""
@@ -170,7 +177,15 @@ def test_credential_secrets_pin_the_regional_endpoint():
                         r"CREATE (?:OR REPLACE )?(?:PERSISTENT )?SECRET\s+\w+\s*\([^)]*\)", body):
                     if "CREDENTIAL_CHAIN" in statement and "ENDPOINT" not in statement:
                         unpinned.append(os.path.relpath(path, skills))
-    check("every CREDENTIAL_CHAIN secret pins ENDPOINT", not unpinned, unpinned)
+                # boto3 resolves its own endpoint, and AWS_ENDPOINT_URL or a
+                # profile setting overrides that resolution. Match on the
+                # constructor and its first argument, so boto3.resource,
+                # session.client and a bare client() are all covered.
+                for call in re.findall(
+                        r"\b(?:client|resource)\(\s*[\'\"]s3[\'\"][^)]*\)", body):
+                    if "endpoint_url" not in call:
+                        unpinned.append(os.path.relpath(path, skills))
+    check("every S3 read pins the regional endpoint", not unpinned, unpinned)
 
 
 def main():

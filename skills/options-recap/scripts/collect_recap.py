@@ -28,7 +28,12 @@ def parse_window(value: str) -> dt.timedelta:
     if not match:
         raise ValueError("window must be a positive Nm, Nh, or Nd value")
     amount, unit = int(match.group(1)), match.group(2)
-    return dt.timedelta(**{{"m": "minutes", "h": "hours", "d": "days"}[unit]: amount})
+    width = dt.timedelta(**{{"m": "minutes", "h": "hours", "d": "days"}[unit]: amount})
+    # No 24h clamp — partitions serve any window — but the execution tape keeps
+    # only 30 days, and an unbounded window globs every hour of it per venue.
+    if width > dt.timedelta(days=30):
+        raise ValueError("window must be 30d or less; the execution tape keeps 30 days")
+    return width
 
 
 def hour_patterns(source: str, venue: str, data_type: str, currency: str,

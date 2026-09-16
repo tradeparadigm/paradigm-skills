@@ -33,13 +33,19 @@ case "$ASSET" in *[!A-Z0-9]*) echo "recap: invalid asset '$ASSET'" >&2; exit 2;;
 MAGNITUDE=${WINDOW%[mhd]}
 UNIT=${WINDOW##*[0-9]}
 case "$UNIT" in
-  m) SECONDS=$((MAGNITUDE * 60));;
-  h) SECONDS=$((MAGNITUDE * 3600));;
-  d) SECONDS=$((MAGNITUDE * 86400));;
+  m) SPAN=$((MAGNITUDE * 60));;
+  h) SPAN=$((MAGNITUDE * 3600));;
+  d) SPAN=$((MAGNITUDE * 86400));;
   *) echo "recap: bad window '$WINDOW' — use e.g. 30m, 8h, 2d" >&2; exit 2;;
 esac
+# No 24h clamp — partitions serve any window — but the execution tape keeps 30
+# days, and an unbounded window globs every hour of it for every venue.
+# -le 0 catches the multiplication overflowing to a negative span.
+if [ "$SPAN" -le 0 ] || [ "$SPAN" -gt 2592000 ]; then
+  echo "recap: window '$WINDOW' exceeds 30d — the execution tape keeps 30 days" >&2; exit 2
+fi
 [ -n "${RECAP_PRINT_ARGS:-}" ] && { echo "$ASSET $WINDOW"; exit 0; }
-[ -n "${RECAP_PRINT_PLAN:-}" ] && { echo "$ASSET $WINDOW $SECONDS direct"; exit 0; }
+[ -n "${RECAP_PRINT_PLAN:-}" ] && { echo "$ASSET $WINDOW $SPAN direct"; exit 0; }
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
 exec uv run "$DIR/scripts/collect_recap.py" --asset "$ASSET" --window "$WINDOW" --render
