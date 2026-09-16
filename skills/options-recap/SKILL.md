@@ -23,8 +23,10 @@ metadata:
 24h; `options` is a no-op token. Accept `Nm`, `Nh`, and `Nd` windows, and state
 the actual interval queried rather than silently capping or changing it.
 
-Windows longer than 30d are refused, not clamped: the execution tape keeps 30
-days. Relay the refusal and the limit — do not retry with a shorter window.
+Windows longer than 30d are refused: the execution tape keeps 30 days. Report
+the refusal and the limit, then stop and let the user pick the window. Running
+30d instead is the wrong repair — it lists about ten thousand partitions and
+takes minutes, so it spends their time on a window they did not ask for.
 
 ## Live execution
 
