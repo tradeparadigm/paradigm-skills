@@ -61,6 +61,9 @@ def test_windows_are_not_capped_but_are_bounded():
     output, code = hook("RECAP_PRINT_PLAN", "btc", "31d")
     check("31d is refused before any read", code == 2, output)
     check("refusal names the limit", "30d" in output, output)
+    # The relay follows script output more closely than a rule it read earlier;
+    # twice it explained the refusal and then ran 30d anyway.
+    check("refusal tells the relay not to substitute", "Do not re-run at 30d" in output, output)
 
 
 def test_bad_arguments_fail_before_data_access():
