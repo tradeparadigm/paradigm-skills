@@ -23,6 +23,9 @@ metadata:
 24h; `options` is a no-op token. Accept `Nm`, `Nh`, and `Nd` windows, and state
 the actual interval queried rather than silently capping or changing it.
 
+Windows longer than 30d are refused, not clamped: the execution tape keeps 30
+days. Relay the refusal and the limit — do not retry with a shorter window.
+
 ## Live execution
 
 Run one command from this skill's directory:

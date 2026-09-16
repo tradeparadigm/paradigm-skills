@@ -20,18 +20,19 @@ would read as a zero-length window. Intraday windows stay HH:MM-only.
 **Snapshot**
 
 ```yaml
-Spot      $[X]        [up/down X%] (from $[Y], low $[Z])
+Spot      $[X]        [up/down X%, or flat] (from $[Y], low $[Z])
 DVOL      [X]v        [flat/rising/falling] ([open] -> [close])
 RV 7d     [X]v        implied [CHEAP/RICH/IN LINE] vs realized
 VRP       [±X]v       vol [underpriced/overpriced/roughly fair] vs delivered
 Activity  [Nk]        trades — [Venue X% · Venue Y% · ...] (by trade count)
-Volume    $[X]M       all venues
-P/C       [X.Xx]      [descriptor] (all venues, by trades)
+Volume    $[X]M       observed valued trades · USD premium
+P/C       [X.Xx]      [descriptor] (observed trades · see coverage)
 ```
 
-The Volume note names the venues whose normalized `turnover_usd` observations
-drove the number. Do not write `all venues` when any venue trade source is a
-gap, and do not combine `amount_native` across venues.
+Volume is the valued subset, not a market total: trades whose USD premium
+cannot be proven are counted in a gap line instead of being estimated into the
+number. Never write `all venues` — a venue's trade source can be a gap — and
+never combine `amount_native` across venues.
 
 **Biggest Print**
 

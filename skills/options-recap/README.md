@@ -8,8 +8,8 @@ partitions replace the hot-file inputs; `direct_inputs.py` maps them to the
 existing calculations and four-section renderer. The command prints the finished
 recap, which the model relays verbatim without extra scans or arithmetic.
 
-The workflow does not read `s3://dt-exchange-venue-data/hot/`, use `hot__*`
-objects. Snapshot Volume is USD premium turnover; Biggest Print and Block Flow
+The workflow does not read `s3://dt-exchange-venue-data/hot/` or any `hot__*`
+object. Snapshot Volume is USD premium turnover; Biggest Print and Block Flow
 retain their underlying-USD notional ranking. Instrument conversions use
 at-or-before metadata snapshots; unresolved conversions are visible gaps.
 
