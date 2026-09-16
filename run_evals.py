@@ -239,9 +239,17 @@ def resolve_context(case: dict, skill_dir: Path) -> str:
         exactly the figures it would otherwise hallucinate.
       * raw `dvol` / `spot` / `trades` — the tape the agent reads itself to
         extract DVOL open/close, the spot range, and block structures.
+        `dvol` candles are re-keyed from the fixture's positional 5-tuples to
+        named fields at injection time (same numbers): injected bare, the
+        agent has read the FIRST candle's [open … close] as the whole window
+        and called the last candle's close a "spike".
     `tickers` is intentionally omitted: the vol surface already lives in
     `derived`, so injecting raw per-strike IVs would only invite the agent to
     re-derive (and re-hallucinate) the surface.
+
+    A case whose PROMPT already embeds its data (e.g. block-analyst's resolved
+    tape rows) has no fixture to trigger this path; it opts out of simulate
+    mode with `"simulate": false` instead — see _run_one_case.
     """
     ctx = case.get("context", "")
     if not ctx:
@@ -256,6 +264,17 @@ def resolve_context(case: dict, skill_dir: Path) -> str:
         for key in ("dvol", "spot", "spot_price_at_fetch", "trades"):
             if key in raw:
                 tape[key] = raw[key]
+        # The fixture stores `dvol` in the Deribit chart API's candle format:
+        # bare positional [ts_ms, open, high, low, close]. A sentence in
+        # SKILL.md describing that layout did not survive contact with a
+        # minified, unlabelled tuple in front of the model (it reported
+        # 46.34 -> 46.22, the first candle's own open->close). Name the fields
+        # so a position cannot be misread. The fixture file is unchanged.
+        if isinstance(tape.get("dvol"), list) and tape["dvol"] and isinstance(tape["dvol"][0], list):
+            tape["dvol"] = [
+                {"timestamp_ms": ts, "open": o, "high": h, "low": lo, "close": c}
+                for ts, o, h, lo, c in tape["dvol"]
+            ]
 
         # `derived` (the figures the agent must read verbatim) is pretty-printed
         # for legibility; the bulky raw arrays are minified to keep the injected
@@ -272,7 +291,10 @@ def resolve_context(case: dict, skill_dir: Path) -> str:
             "surface). Report those figures directly — do NOT recompute them:\n"
             f"{derived_json}\n\n"
             "Raw tape — read DVOL open/close, the spot range, and block "
-            "structures (cluster trades by block_trade_id) from here:\n"
+            "structures (cluster trades by block_trade_id) from here. `dvol` "
+            "is a time-ordered list of hourly OHLC candles: the window's DVOL "
+            "open is the FIRST candle's `open` and its close is the LAST "
+            "candle's `close` — never one candle's own open→close:\n"
             f"{tape_json}\n"
             "</market_data>\n\n"
         )
@@ -374,7 +396,12 @@ def _run_one_case(client, agent_model: str, grader_model: str,
     prompt = context + case["prompt"] if context else case["prompt"]
     # Fixture cases carry real data, so suppress simulate mode for them — the
     # agent must read the injected values, not fabricate (and not disclaim).
-    effective_simulate = simulate and not context
+    # The same principle applies when the data rides INSIDE the prompt
+    # (block-analyst's resolved tape rows): SIMULATE_SUFFIX says "use
+    # plausible example values", which is a direct instruction to do the very
+    # thing those cases' do-not-invent assertions penalise. Such a case opts
+    # out with "simulate": false in evals.json.
+    effective_simulate = simulate and not context and case.get("simulate", True)
     output, timing = run_agent(client, agent_model, skill_md or "", prompt, effective_simulate)
     assertions = case["assertions"]
     graded: list = [None] * len(assertions)
