@@ -18,12 +18,17 @@ INSTALL aws;    LOAD aws;
 CREATE OR REPLACE SECRET s3_irsa (
   TYPE S3,
   PROVIDER CREDENTIAL_CHAIN,
-  REGION 'ap-northeast-1'
+  REGION 'ap-northeast-1',
+  ENDPOINT 's3.ap-northeast-1.amazonaws.com'
 );
 ```
 
 Both extensions are pre-installed in the terminal image, so `INSTALL` is a
 no-op after the first use and never hits the extension repository.
+
+`ENDPOINT` is pinned to the regional host so the S3 authority is deterministic:
+the global `s3.amazonaws.com` answers a cross-region request with a 307 redirect,
+which an exact-match egress allowlist inside the OC enclave cannot follow.
 
 ## Do not hand-roll the credentials
 
@@ -66,7 +71,7 @@ Use a small non-hot source object to verify the credential and network path:
 ```sql
 INSTALL httpfs; LOAD httpfs;
 INSTALL aws;    LOAD aws;
-CREATE OR REPLACE SECRET s3_irsa (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1');
+CREATE OR REPLACE SECRET s3_irsa (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1', ENDPOINT 's3.ap-northeast-1.amazonaws.com');
 
 SELECT COUNT(*)
 FROM read_csv_auto('s3://dt-paradigm-data/paradigm_data/paradigm_rfq_tape_slim.csv.gz');

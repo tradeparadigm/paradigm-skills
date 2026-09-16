@@ -70,7 +70,8 @@ DUCKDB_PREFIX = """
 INSTALL httpfs; LOAD httpfs;
 INSTALL aws; LOAD aws;
 CREATE OR REPLACE SECRET dime_s3 (
-  TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1'
+  TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1',
+  ENDPOINT 's3.ap-northeast-1.amazonaws.com'
 );
 """
 

@@ -4,6 +4,7 @@
 import datetime as dt
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 import types
@@ -146,6 +147,30 @@ def test_fully_absent_window_reports_unavailable_not_a_quiet_market():
     check("no objects means unavailable", metadata["status"] == "unavailable")
     check("no rows fabricated", rows == [] and metadata["row_count"] == 0)
     check("error names the pattern span", "2 partition patterns" in metadata["error"])
+
+
+def test_credential_secrets_pin_the_regional_endpoint():
+    """#37 pinned ENDPOINT so the S3 authority stays deterministic: the global
+    host answers cross-region with a 307 that the enclave's exact-match egress
+    allowlist cannot follow. Rewriting run_recap.sh dropped it once already."""
+    skills = os.path.dirname(ROOT)
+    unpinned = []
+    for skill in ("data-discovery", "options-recap"):
+        for directory, _, names in os.walk(os.path.join(skills, skill)):
+            for name in names:
+                if not name.endswith((".py", ".sh", ".md")):
+                    continue
+                path = os.path.join(directory, name)
+                with open(path, encoding="utf-8") as handle:
+                    body = handle.read()
+                # Require the argument list: a bare prose mention of the phrase
+                # would otherwise start a match that swallows the next real
+                # statement, hiding an unpinned one.
+                for statement in re.findall(
+                        r"CREATE (?:OR REPLACE )?(?:PERSISTENT )?SECRET\s+\w+\s*\([^)]*\)", body):
+                    if "CREDENTIAL_CHAIN" in statement and "ENDPOINT" not in statement:
+                        unpinned.append(os.path.relpath(path, skills))
+    check("every CREDENTIAL_CHAIN secret pins ENDPOINT", not unpinned, unpinned)
 
 
 def main():

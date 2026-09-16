@@ -222,7 +222,8 @@ reads Deribit BTC option-trade rows for one UTC hour:
 INSTALL httpfs; LOAD httpfs;
 INSTALL aws;    LOAD aws;
 CREATE OR REPLACE SECRET s3_irsa (
-  TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1'
+  TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1',
+  ENDPOINT 's3.ap-northeast-1.amazonaws.com'
 );
 
 SELECT *
