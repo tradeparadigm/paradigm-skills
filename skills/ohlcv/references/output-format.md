@@ -61,7 +61,14 @@ Each begins with `⚠` and names the specific fact:
 ⚠ 2 periods unavailable (13:00, 14:00) — partitions absent
 ⚠ last bar is partial — period ends 11:00, data reaches 10:47
 ⚠ volume in contracts (deribit) — no metadata for coin conversion
+⚠ 3 trades with unreported size — volume is the proven subset
 ```
+
+The last of those is required whenever any trade in the window carried no size.
+A trade with an unknown size still sets the bar's prices, but its quantity is
+not in the volume figure and is never counted as zero — so the volume column is
+a lower bound for that bar, and the line says so. Report the count of such
+trades across the rendered window.
 
 A period with no trades and a period whose source could not be read are
 separate lines with separate reasons. Never merge them, and never render either
