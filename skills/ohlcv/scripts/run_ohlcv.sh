@@ -16,17 +16,21 @@ MAX_BARS=2000
 # Listing bound. One day-level glob per calendar day, each listing every object
 # in that day — 288 rows-objects at the 5m level this reads.
 #
-# Measured against the real bucket (deribit BTC, 1h bars, SSO credentials on a
-# laptop): 6h 4s, 1d 4s, 2d 5s, 7d 6s, 14d 9s, 30d 15s. The window's cost is
-# close to flat because the reader fetches up to 512 objects concurrently, so
-# 30d is comfortable. An earlier 7-day bound was inherited from the recap
-# skill's 7m08s/30d option-chain measurement, which does not describe this read
-# at all — candle partitions are one small object per five minutes, not a chain
-# snapshot per instrument.
+# The bound is MEMORY, not time. On a laptop the window is fast and flat —
+# 6h 4s, 1d 4s, 7d 6s, 30d 15s against the real bucket — which is what made an
+# earlier 30-day default look safe. It is not: the reader holds every object's
+# rows in one Arrow table, and in the openclaw container that table shares a
+# 4Gi limit with the agent process and its model context. A 30-day window
+# OOM-killed the container (exit 137), which does not fail the query — it kills
+# openclaw, drops the user's websocket, and wipes the pod's credentials file.
 #
-# Short intervals are bounded by MAX_BARS rather than by this: 7d at 5m is
-# 2,016 bars and is refused before the day count matters.
-MAX_DAYS="${OHLCV_MAX_DAYS:-30}"
+# 7 days is what has run in-pod without a restart. Raise it only against a
+# measurement taken INSIDE the container, and only once the read streams
+# instead of accumulating.
+#
+# Short intervals hit MAX_BARS first: 7d at 5m is 2,016 bars and is refused
+# before the day count matters.
+MAX_DAYS="${OHLCV_MAX_DAYS:-7}"
 
 ASSET=BTC
 VENUE=deribit
@@ -35,8 +39,20 @@ WINDOW=
 ASSET_SET=
 VENUE_SET=
 
+COMPONENT=
 periods=()
-for arg in "$@"; do
+while [ "$#" -gt 0 ]; do
+  arg=$1
+  # The only flag: the catalog component id the client advertised. Given one,
+  # the collector prints that component's spec instead of the table.
+  if [ "$arg" = "--component" ]; then
+    shift
+    [ "$#" -gt 0 ] || { echo "ohlcv: --component needs an id" >&2; exit 2; }
+    COMPONENT=$1
+    shift
+    continue
+  fi
+  shift
   token=$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')
   # Digits are capped in the pattern rather than checked after conversion:
   # bash truncates an oversized integer literal silently, so a 20-digit period
@@ -130,16 +146,18 @@ fi
 DAYS=$(((SPAN + 86399) / 86400))
 if [ "$DAYS" -gt "$MAX_DAYS" ]; then
   echo "ohlcv: '$WINDOW' spans $DAYS day partitions, over the $MAX_DAYS-day read bound." >&2
-  echo "ohlcv: this is a listing-cost bound — each day lists every object in it —" >&2
-  echo "ohlcv: not a limit on what the data retains. Report it and ask which" >&2
-  echo "ohlcv: window to use; do not re-run at the bound or coarsen the interval." >&2
+  echo "ohlcv: this is a memory bound, not a limit on what the data retains —" >&2
+  echo "ohlcv: a wider window has OOM-killed the agent container. Report it and" >&2
+  echo "ohlcv: ask which window to use; do not re-run at the bound and do not" >&2
+  echo "ohlcv: coarsen the interval to squeeze under it." >&2
   exit 2
 fi
 
-[ -n "${OHLCV_PRINT_ARGS:-}" ] && { echo "$ASSET $VENUE $INTERVAL $WINDOW"; exit 0; }
+[ -n "${OHLCV_PRINT_ARGS:-}" ] && { echo "$ASSET $VENUE $INTERVAL $WINDOW${COMPONENT:+ $COMPONENT}"; exit 0; }
 [ -n "${OHLCV_PRINT_PLAN:-}" ] && { echo "$ASSET $VENUE $INTERVAL $WINDOW $SPAN $BARS $DAYS"; exit 0; }
 
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-exec uv run "$DIR/scripts/collect_ohlcv.py" \
-  --asset "$ASSET" --venue "$VENUE" \
-  --interval "$INTERVAL" --window "$WINDOW" --render
+set -- --asset "$ASSET" --venue "$VENUE" \
+       --interval "$INTERVAL" --window "$WINDOW" --render
+[ -n "$COMPONENT" ] && set -- "$@" --component "$COMPONENT"
+exec uv run "$DIR/scripts/collect_ohlcv.py" "$@"

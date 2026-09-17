@@ -48,29 +48,47 @@ interval for one the user gave, and never quietly cap either.
 Run one command from this skill's directory:
 
 ```bash
-bash scripts/run_ohlcv.sh BTC deribit 1h 24h
+bash scripts/run_ohlcv.sh BTC deribit 1h 24h --component paradex-ohlcv_chart
 ```
 
+`--component paradex-ohlcv_chart` is part of the normal command in Dime
+Terminal, whose browser advertises that component on connect. It makes the
+script print a chart the user can read instead of a table they have to parse.
+Drop it only for a client that advertised no chart component.
+
 Windows are bounded by what the read can serve. Two bounds, and a request over
-either is refused before any listing: 2000 bars, and 30 calendar days of
-partitions. The day bound comes from measurement against the real bucket — 1h
-bars take about 4s over a day, 6s over a week and 15s over a month — and short
-intervals hit the bar bound first, so 7d at 5m is refused as 2,016 bars rather
-than on its day count.
+either is refused before any listing: 2000 bars, and 7 calendar days.
+
+The day bound is about MEMORY, not time. The window is fast — about 4s over a
+day and 6s over a week against the real bucket — but the reader holds every
+object's rows at once, and in the agent container that memory is shared with
+the agent process itself. A 30-day window OOM-killed the container, which does
+not merely fail the query: it takes the agent down and drops the session. Short
+intervals hit the bar bound first, so 7d at 5m is refused as 2,016 bars.
 
 The refusal names which bound was crossed. Report it and let the user choose;
 do not re-run at the limit and do not coarsen the interval to squeeze under it.
 
 The script reads non-hot partitions, builds the bars, and prints the finished
-table. Relay stdout verbatim as the entire answer, including the coverage and
-gap lines. Do not recalculate, reformat, or make additional reads to fill
-fields the script left out. If it fails, report the error and stop.
+output. **Relay its stdout as the entire answer — the whole reply, nothing
+else.** No preamble naming the parsed arguments, no caveats section after it,
+no restating the coverage lines in prose: the script already prints them and
+repeating them makes the answer twice as long as it needs to be.
+
+With `--component`, stdout is a single JSON object. Print exactly that object
+and stop. Wrapping it in a fence, summarising it, or describing the chart in
+words all prevent the terminal from drawing it.
+
+Do not recalculate, reformat, or make extra reads to fill fields the script
+left out. If it fails, report the error and stop.
 
 ## Hard rules
 
 1. **Do not use `s3://dt-exchange-venue-data/hot/` or any `hot__*` object.**
-2. Run `bash scripts/run_ohlcv.sh <ASSET> <VENUE> <INTERVAL> <WINDOW>` once and
-   relay its output. The script owns the bar construction.
+2. Run `bash scripts/run_ohlcv.sh <ASSET> <VENUE> <INTERVAL> <WINDOW>
+   --component paradex-ohlcv_chart` once and relay its output. The script owns
+   the bar construction. Keep `--component` in Dime Terminal: without it the
+   user gets a table to read instead of the chart they asked for.
 3. A period with no trades and a period whose partition could not be read are
    different facts. Neither becomes a zero-volume bar: both are reported as
    gaps, with the reason. An unreadable source is not a quiet market.
@@ -101,20 +119,32 @@ file granularity, not sampling — the catalog is explicit that `1m`, `5m` and
 at `1m` and `5m`, so `5m` is the coarsest level that can build a candle at all.
 Reading it for every interval also keeps the listing cost flat in the interval.
 
-Whether the `1h` aggregate files already carry open/high/low/close is not
-established anywhere in the catalog, so nothing here reads them. If a probe
-confirms that schema, a coarse-interval shortcut becomes available.
+The `__agg__` file beside each `__rows__` file **already carries the candle**:
+`price_open`, `price_high`, `price_low`, `price_close`, `volume_sum`, `vwap`
+and buy/sell splits, one row per period. Nothing here reads it yet, and that is
+now a known gap rather than an unknown: for any interval of 5m or more the
+aggregate is the same four numbers in one row instead of several hundred
+trades, which is both cheaper and the producer's own arithmetic rather than a
+recomputation of it. Rows remain necessary only below the 5m bucket.
 
 ## Output
 
-Follow [references/output-format.md](references/output-format.md). The default
-rendering is a mono table.
+Follow [references/output-format.md](references/output-format.md).
 
-A client that advertises a chart component can have its spec instead, by
-passing the advertised id: `--component <id>` on the collector. The id always
-comes from the caller — the skill never assumes one, and with no id it renders
-the table. Nothing in this repository advertises a component today, so the
-table is what every current invocation produces.
+**Dime Terminal draws a chart, so `--component paradex-ohlcv_chart` belongs on
+every invocation there.** Its browser advertises that component on connect.
+Omitting the flag is not a neutral choice: it prints a table of numbers where
+the user asked to see a chart.
+
+The mono table is the fallback for a client that advertised no chart
+component. The id always comes from the client's catalog and is never invented;
+with no id, the table is what prints.
+
+**In Dime Terminal**, the browser advertises `paradex-ohlcv_chart` on connect,
+so use `--component paradex-ohlcv_chart` and relay the JSON it prints exactly
+as printed. The terminal parses that object out of the reply and draws the
+candles. Do not wrap it in a code fence, describe it, or add prose around it —
+the spec must be the reply.
 
 Work silently while reading. The final response is the script's output, with no
 process narration.

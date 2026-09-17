@@ -154,8 +154,8 @@ def test_rejects_too_many_day_partitions():
     check_that("refuses a long listing even at few bars", code == 2,
                f"code {code}: {output!r}")
     check_that("names the day bound", "90 day partitions" in output, output)
-    check_that("says it is a listing-cost bound, not a data bound",
-               "listing-cost" in output, output)
+    check_that("says it is a memory bound, not a data bound",
+               "memory bound" in output, output)
     check_that("tells the relay not to re-run at the bound",
                "do not re-run" in output.lower(), output)
 
@@ -172,12 +172,20 @@ def test_day_bound_is_overridable():
     check_that("still parses correctly", output == "BTC deribit 1d 45d", output)
 
 
-def test_measured_default_admits_a_month():
-    output, code = run("1h", "30d")
-    check_that("30d at 1h is within the measured bound", code == 0,
-               f"code {code}: {output!r}")
-    check_that("parses as a month of hourly bars",
-               output == "BTC deribit 1h 30d", output)
+def test_default_admits_what_has_run_in_pod():
+    """7d is the widest window observed not to OOM the agent container."""
+    output, code = run("1h", "7d")
+    check_that("7d at 1h is allowed", code == 0, f"code {code}: {output!r}")
+    check_that("parses as a week of hourly bars",
+               output == "BTC deribit 1h 7d", output)
+    # 30d fits on a laptop and killed the container; the bound protects the
+    # runtime, and the runtime is the pod.
+    wider, code = run("1h", "30d")
+    check_that("30d is refused by default", code == 2, f"code {code}")
+    check_that("the refusal says it is about memory", "memory bound" in wider,
+               wider)
+    check_that("and warns what a wider window did",
+               "OOM" in wider, wider)
 
 
 def test_rejects_garbage():

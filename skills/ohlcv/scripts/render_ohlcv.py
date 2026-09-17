@@ -232,6 +232,16 @@ def spec(evidence: dict, component: str) -> dict:
     client advertised — never assumed here. `bars` is required to be non-empty
     by the component's schema, so an empty result has no spec and falls back
     to the table, which can say why it is empty.
+
+    TODO: cap the bar count on this path and downsample above it. The spec
+    reaches the client as message text, measured at ~52 tokens per bar: ~1.4k
+    at a day, ~8.9k at a week, and ~105k at the component's own 2000-bar
+    limit — far past what any model emits, so a wide window would truncate
+    mid-object and never render rather than degrade. Roughly 200 bars bounds
+    it near 10k tokens, and is a legibility fix too: 2000 candles at chat width
+    are sub-pixel. Whatever the cap, say in a coverage line that the series was
+    downsampled — a thinned chart presented as the whole window is the kind of
+    quiet substitution the rest of this skill refuses to make.
     """
     bars = evidence.get("bars") or []
     if not bars:

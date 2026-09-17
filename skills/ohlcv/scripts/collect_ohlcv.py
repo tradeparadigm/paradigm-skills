@@ -43,9 +43,13 @@ LEVEL = "5m"
 DATA_TYPE = "perp_trade"
 COLUMNS = ("timestamp", "price", "amount")
 
-# Latency-bound reads: threads cap DuckDB's in-flight requests, and the
-# container's CPU quota is the wrong number to derive them from.
-MAX_READ_THREADS = 64
+# DuckDB does listing here and nothing else — the parquet is read by
+# s3_async/pyarrow — so it needs concurrency for the LIST calls and almost no
+# memory. Sizing it like a scan costs the container headroom it does not get
+# back: the agent process, the model context and this subprocess share one
+# limit, and going over kills openclaw rather than just failing the query.
+MAX_READ_THREADS = 16
+DUCKDB_MEMORY_MB = 256
 
 DUCKDB_PREFIX = f"""
 INSTALL httpfs; LOAD httpfs;
@@ -77,15 +81,12 @@ def connect() -> duckdb.DuckDBPyConnection:
     """A connection sized for many small remote objects, not for local CPU."""
     connection = duckdb.connect()
     connection.execute(DUCKDB_PREFIX)
-    limit = container_memory_bytes()
-    statements = [
+    connection.execute(" ".join([
         f"SET threads={MAX_READ_THREADS};",
         "SET httpfs_connection_caching=true;",
         f"SET temp_directory='{tempfile.gettempdir()}/duckdb_ohlcv';",
-    ]
-    if limit:
-        statements.append(f"SET memory_limit='{int(limit * 0.25) >> 20}MB';")
-    connection.execute(" ".join(statements))
+        f"SET memory_limit='{DUCKDB_MEMORY_MB}MB';",
+    ]))
     return connection
 
 
@@ -243,6 +244,9 @@ def collect(asset: str, venue: str, interval: str, window: str,
         "asset": asset, "venue": venue, "interval": interval,
         "window": window, "start_ms": start_ms, "end_ms": end_ms,
         "level": LEVEL, "data_type": DATA_TYPE, "source": "normalized",
+        # Recorded because exceeding it kills the agent process, not just this
+        # query — a window that OOMs takes openclaw down with it.
+        "container_memory_bytes": container_memory_bytes(),
     }
 
     patterns, _ = day_patterns(venue, asset.lower(), start, end)
