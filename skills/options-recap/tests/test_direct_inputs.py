@@ -413,3 +413,17 @@ def test_unvalued_trades_name_the_venue_whose_metadata_is_short():
     volume = [g for g in gaps if g.startswith("Volume:")]
     assert volume, gaps
     assert "bybit-options 2 of 2 (100%) across 2 symbols" in volume[0]
+
+
+def test_a_block_dropped_for_missing_units_is_counted_not_just_mentioned():
+    """Every other exclusion states its size; this one removed blocks before
+    build() could see them, so the count has to come from here."""
+    gaps = []
+    frame = trades(trade(block_id="whole", amount=10.0),
+                   trade(block_id="partial", amount=None),
+                   trade(block_id="partial", amount=5.0))
+    direct.aggregate_trades("okex-options", frame, spec(), gaps)
+    dropped = [g for g in gaps if "block(s) excluded" in g]
+    assert dropped, gaps
+    assert "Block Flow: 1 okex-options block(s) excluded" in dropped[0]
+    assert "1 of 2 remain" in dropped[0]

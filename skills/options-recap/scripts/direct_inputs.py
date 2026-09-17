@@ -188,8 +188,15 @@ def aggregate_trades(venue, rows, spec, gaps):
                         complete=pl.col("coin").is_not_null().all()))
         total["blocks"] = [{"exchange": venue, **group}
                            for group in grouped.filter(pl.col("complete")).to_dicts()]
-        if grouped.select((~pl.col("complete")).any()).item():
-            gaps.append(f"{venue}: block notional unavailable for groups lacking event-time unit metadata")
+        # Every other exclusion in this recap states how much it removed; this
+        # one dropped blocks before build() could count them, so it must too.
+        dropped = grouped.filter(~pl.col("complete"))
+        if dropped.height:
+            coin = round(dropped.get_column("volume_coin").sum() or 0, 2)
+            gaps.append(f"Block Flow: {dropped.height} {venue} block(s) excluded "
+                        f"({coin} coin) — no event-time unit metadata, so their notional "
+                        f"cannot be computed; {grouped.height - dropped.height} of "
+                        f"{grouped.height} remain")
         del grouped, identified
     del converted, valued
     gc.collect()
