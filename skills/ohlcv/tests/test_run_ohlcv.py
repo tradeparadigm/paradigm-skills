@@ -161,10 +161,23 @@ def test_rejects_too_many_day_partitions():
 
 
 def test_day_bound_is_overridable():
-    output, code = run("1d", "30d", env={"OHLCV_MAX_DAYS": "40"})
+    # 45d is past the default, so this proves the override rather than
+    # re-testing a window the default already allows.
+    _, refused = run("1d", "45d")
+    check_that("past the default bound it is refused", refused == 2,
+               f"code {refused}")
+    output, code = run("1d", "45d", env={"OHLCV_MAX_DAYS": "60"})
     check_that("raising the bound admits a longer window", code == 0,
                f"code {code}: {output!r}")
-    check_that("still parses correctly", output == "BTC deribit 1d 30d", output)
+    check_that("still parses correctly", output == "BTC deribit 1d 45d", output)
+
+
+def test_measured_default_admits_a_month():
+    output, code = run("1h", "30d")
+    check_that("30d at 1h is within the measured bound", code == 0,
+               f"code {code}: {output!r}")
+    check_that("parses as a month of hourly bars",
+               output == "BTC deribit 1h 30d", output)
 
 
 def test_rejects_garbage():

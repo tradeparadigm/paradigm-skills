@@ -13,14 +13,20 @@ INTERVALS="1m 5m 15m 1h 4h 1d"
 # Render bound: the chart component holds 2000 bars, and a table nobody can
 # read is not a better answer than a refusal.
 MAX_BARS=2000
-# Listing bound, and the one that actually protects the runtime. The collector
-# issues one day-level glob per calendar day, and each lists every object in
-# that day — about 288 at the 5m rows level it reads, so roughly 2,000 keys at
-# seven days. That is under the ~10,000 listings where the recap skill measured
-# 7m08s and was killed twice in the pod, which is where this number comes from:
-# inherited from that measurement, NOT measured for candle partitions. Raise it
-# via the environment once someone profiles a real window.
-MAX_DAYS="${OHLCV_MAX_DAYS:-7}"
+# Listing bound. One day-level glob per calendar day, each listing every object
+# in that day — 288 rows-objects at the 5m level this reads.
+#
+# Measured against the real bucket (deribit BTC, 1h bars, SSO credentials on a
+# laptop): 6h 4s, 1d 4s, 2d 5s, 7d 6s, 14d 9s, 30d 15s. The window's cost is
+# close to flat because the reader fetches up to 512 objects concurrently, so
+# 30d is comfortable. An earlier 7-day bound was inherited from the recap
+# skill's 7m08s/30d option-chain measurement, which does not describe this read
+# at all — candle partitions are one small object per five minutes, not a chain
+# snapshot per instrument.
+#
+# Short intervals are bounded by MAX_BARS rather than by this: 7d at 5m is
+# 2,016 bars and is refused before the day count matters.
+MAX_DAYS="${OHLCV_MAX_DAYS:-30}"
 
 ASSET=BTC
 VENUE=deribit

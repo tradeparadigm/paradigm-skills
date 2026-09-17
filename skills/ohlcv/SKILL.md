@@ -51,13 +51,15 @@ Run one command from this skill's directory:
 bash scripts/run_ohlcv.sh BTC deribit 1h 24h
 ```
 
-Windows are bounded by what the read can actually serve, not by what the data
-retains: a request spanning more days than the read bound allows is refused
-before any listing, because one day-level glob per calendar day lists every
-object in that day and a long window spends minutes enumerating keys before it
-reads a byte. The refusal names the bound. Report it and let the user choose a
-window; do not re-run at the limit and do not fall back to a coarser interval
-to squeeze under it.
+Windows are bounded by what the read can serve. Two bounds, and a request over
+either is refused before any listing: 2000 bars, and 30 calendar days of
+partitions. The day bound comes from measurement against the real bucket — 1h
+bars take about 4s over a day, 6s over a week and 15s over a month — and short
+intervals hit the bar bound first, so 7d at 5m is refused as 2,016 bars rather
+than on its day count.
+
+The refusal names which bound was crossed. Report it and let the user choose;
+do not re-run at the limit and do not coarsen the interval to squeeze under it.
 
 The script reads non-hot partitions, builds the bars, and prints the finished
 table. Relay stdout verbatim as the entire answer, including the coverage and
