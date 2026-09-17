@@ -317,6 +317,10 @@ def run_agent(client, model: str, skill_md: str, prompt: str, simulate: bool) ->
         response = client.messages.create(
             model=model,
             max_tokens=4096,
+            # A gate has to be reproducible: sampling at the default 1.0 made
+            # the same commit score differently run to run. The local client
+            # has always graded at 0.0; the hosted path now matches it.
+            temperature=0.0,
             system=system,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -353,6 +357,9 @@ with nothing before it. You may add reasoning on later lines if helpful."""
             # reason before answering, so the verdict never lands and the result
             # silently defaults to FAIL — a spurious failure, not a real one.
             max_tokens=512,
+            # Grading is classification, not generation. The same response
+            # graded twice must reach the same verdict.
+            temperature=0.0,
             messages=[{"role": "user", "content": grading_prompt}],
         )
     verdict = response.content[0].text.strip()
