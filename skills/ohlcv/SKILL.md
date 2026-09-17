@@ -7,7 +7,8 @@ description: >
   venue partitions — never from Dime hot files. Use when the user types /ohlcv
   or asks to chart a market, for candles, a candlestick chart, price history,
   "what has BTC done today", "show me ETH 15m", or how a perp or spot market
-  has traded over a period. Covers perpetual and spot markets only. Options
+  has traded over a period. Covers perpetual futures only — spot is not wired.
+  Options
   flow, block structure and the vol surface belong to options-recap; dataset
   inventory, schema questions and ad-hoc historical queries belong to
   data-discovery. Periods with no data are reported as gaps, never filled.
@@ -30,10 +31,13 @@ such token is the window, and the interval derives from its width: `1m` up to
 names one below, otherwise the asset. A repeated slot — two windows, two
 intervals, two venues, two assets — is an error, not a silent choice.
 
-Valid venues are the ones that publish trade rows: `deribit` (perps, BTC and
-ETH) and `bullish` (perps and spot). The other venues in the catalog carry
-option and summary feeds only, so they cannot produce candles and are refused
-up front rather than after an empty read.
+Valid venues are the ones that publish perpetual trade rows: `deribit` (BTC and
+ETH) and `bullish`. The other venues in the catalog carry option and summary
+feeds only, so they cannot produce candles and are refused up front rather than
+after an empty read.
+
+Only `perp_trade` is read. Bullish also publishes `spot_trade`, but nothing
+here selects it, so a spot market cannot be charted by this skill today.
 
 State the interval, window and venue actually queried — a derived interval is
 stated, not assumed. Never widen a window, never substitute a different
@@ -102,9 +106,13 @@ confirms that schema, a coarse-interval shortcut becomes available.
 ## Output
 
 Follow [references/output-format.md](references/output-format.md). The default
-rendering is a mono table; when the client has advertised a chart component,
-the script emits that component's spec instead. Both carry the same bars, the
-same summary and the same gap lines.
+rendering is a mono table.
+
+A client that advertises a chart component can have its spec instead, by
+passing the advertised id: `--component <id>` on the collector. The id always
+comes from the caller — the skill never assumes one, and with no id it renders
+the table. Nothing in this repository advertises a component today, so the
+table is what every current invocation produces.
 
 Work silently while reading. The final response is the script's output, with no
 process narration.

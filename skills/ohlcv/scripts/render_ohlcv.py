@@ -190,6 +190,12 @@ def render(evidence: dict) -> str:
     bars = evidence.get("bars") or []
     dates = {_utc(bar["time"]).date() for bar in bars}
     dated_rows = len(dates) > 1
+    # Coverage spans the whole window, not just the periods that produced
+    # bars, so its labels follow the window's dates. A two-day window whose
+    # bars all land on one date would otherwise print both days' missing
+    # periods as the same clock times.
+    dated_gaps = (_utc(evidence["start_ms"]).date()
+                  != _utc(evidence["end_ms"] - 1).date())
     decimals = FALLBACK_DECIMALS
 
     lines = [_header(evidence), ""]
@@ -204,7 +210,7 @@ def render(evidence: dict) -> str:
         else:
             lines.append("No bars — no trades in the window")
         lines.append("")
-        lines.extend(_coverage_lines(evidence, interval_ms, dated_rows,
+        lines.extend(_coverage_lines(evidence, interval_ms, dated_gaps,
                                      rendered=False))
         return "\n".join(lines).rstrip() + "\n"
 
@@ -212,7 +218,7 @@ def render(evidence: dict) -> str:
     lines.extend(_table(bars, decimals, dated_rows, vol_dp))
     lines.append("")
     lines.append(_summary_line(evidence["summary"], decimals, vol_dp))
-    coverage = _coverage_lines(evidence, interval_ms, dated_rows, rendered=True)
+    coverage = _coverage_lines(evidence, interval_ms, dated_gaps, rendered=True)
     if coverage:
         lines.append("")
         lines.extend(coverage)
@@ -222,10 +228,10 @@ def render(evidence: dict) -> str:
 def spec(evidence: dict, component: str) -> dict:
     """The catalog spec for a client that advertised a chart component.
 
-    Nothing advertises one yet, so no caller reaches this; it exists tested so
-    the props cannot drift from the component's schema in the terminal repo
-    while the mechanism is built. `bars` is required to be non-empty there, so
-    an empty result has no spec and must render as the table.
+    Reached via the collector's `--component <id>`, where the id is one a
+    client advertised — never assumed here. `bars` is required to be non-empty
+    by the component's schema, so an empty result has no spec and falls back
+    to the table, which can say why it is empty.
     """
     bars = evidence.get("bars") or []
     if not bars:

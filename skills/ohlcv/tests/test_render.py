@@ -297,6 +297,35 @@ def test_long_gap_runs_are_summarised():
     check_that("stays one readable line", len(line) < 120, f"{len(line)} chars")
 
 
+def test_gap_labels_date_by_the_window_not_the_bars():
+    """A two-day window whose bars land on one date still has two days of gaps.
+
+    Dating gap labels off the rendered bars printed both days' missing periods
+    as the same clock times.
+    """
+    day_before = T10 - 24 * HOUR
+    out = render_ohlcv.render(evidence(
+        [bar(0, 1.0, 2.0, 0.5, 1.5, 10.0)],
+        window="2d", start_ms=day_before, end_ms=T10 + 2 * HOUR,
+        coverage=[
+            {"kind": "gap", "from": day_before, "to": day_before + HOUR,
+             "reason": bar_math.ABSENT},
+            {"kind": "gap", "from": T10 + HOUR, "to": T10 + 2 * HOUR,
+             "reason": bar_math.NO_TRADES}]))
+    gaps = [l for l in out.splitlines() if "unavailable" in l]
+    check_that("both gap lines carry a date",
+               all("Sep" in line for line in gaps), str(gaps))
+    check_that("the two days are distinguishable",
+               gaps[0].split("(")[1] != gaps[1].split("(")[1], str(gaps))
+    same_day = render_ohlcv.render(evidence(
+        [bar(0, 1.0, 2.0, 0.5, 1.5, 10.0)],
+        coverage=[{"kind": "gap", "from": T10 + HOUR, "to": T10 + 2 * HOUR,
+                   "reason": bar_math.NO_TRADES}]))
+    line = next(l for l in same_day.splitlines() if "unavailable" in l)
+    check_that("a single-date window keeps bare clock times",
+               "Sep" not in line, line)
+
+
 def test_small_volumes_never_render_as_zero():
     """A 0.04-size bar at one decimal place is an invented zero-volume bar."""
     out = render_ohlcv.render(evidence(

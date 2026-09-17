@@ -305,6 +305,11 @@ def main() -> int:
     parser.add_argument("--window", required=True)
     parser.add_argument("--now", help="UTC ISO-8601 end time, for reproducible tests")
     parser.add_argument("--render", action="store_true")
+    parser.add_argument(
+        "--component",
+        help="Catalog component id the client advertised. Given one, --render "
+             "prints that component's spec instead of the table. The id comes "
+             "from the caller; it is never assumed.")
     args = parser.parse_args()
 
     now = (dt.datetime.fromisoformat(args.now.replace("Z", "+00:00"))
@@ -319,8 +324,18 @@ def main() -> int:
         return 1
 
     if args.render:
-        from render_ohlcv import render  # noqa: PLC0415
-        print(render(evidence))
+        import render_ohlcv  # noqa: PLC0415
+        # An empty series has no spec — the component's schema requires at
+        # least one bar — so it falls back to the table, which can say why.
+        if args.component and evidence.get("bars"):
+            print(render_ohlcv.spec_json(evidence, args.component))
+        else:
+            if args.component:
+                # A caller that asked for JSON and got a table should be told
+                # why, not left to infer it from the shape of stdout.
+                print("ohlcv: no bars, so no chart spec — rendering the table, "
+                      "which can say why", file=sys.stderr)
+            print(render_ohlcv.render(evidence))
     else:
         print(json.dumps(evidence, indent=2, default=str))
     return 0

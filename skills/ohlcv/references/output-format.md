@@ -60,9 +60,22 @@ Each begins with `⚠` and names the specific fact:
 ```text
 ⚠ 2 periods unavailable (13:00, 14:00) — partitions absent
 ⚠ last bar is partial — period ends 11:00, data reaches 10:47
-⚠ volume in contracts (deribit) — no metadata for coin conversion
 ⚠ 3 trades with unreported size — volume is the proven subset
+⚠ price shown to 1 decimal place — no instrument metadata read, so tick size is unknown
+⚠ volume in the venue's native units (deribit) — no metadata to prove a conversion
 ```
+
+The last two are unconditional whenever a table is rendered, and come last in
+that order. Nothing reads `meta/instruments/`, so neither the tick size nor the
+volume unit is ever established, and both say so rather than letting the
+column imply a precision or a unit that was never proved. They are omitted when
+there is no table for them to describe.
+
+Missing periods carry a date (`16Sep 13:00`) when the requested WINDOW spans
+more than one UTC date — not when the rendered bars do. A two-day window whose
+bars all landed on one date would otherwise print two different days' missing
+periods as the same clock times. Past eight periods a run names its span
+(`00:00–23:00`) instead of listing them, and always states the count.
 
 The last of those is required whenever any trade in the window carried no size.
 A trade with an unknown size still sets the bar's prices, but its quantity is

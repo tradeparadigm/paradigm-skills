@@ -11,11 +11,13 @@ on:
     paths:
       - 'skills/data-discovery/**'
       - 'skills/options-recap/**'
+      - 'skills/ohlcv/**'
       - '.github/workflows/execution-tape-tests.yml'
   pull_request:
     paths:
       - 'skills/data-discovery/**'
       - 'skills/options-recap/**'
+      - 'skills/ohlcv/**'
       - '.github/workflows/execution-tape-tests.yml'
 
 jobs:
