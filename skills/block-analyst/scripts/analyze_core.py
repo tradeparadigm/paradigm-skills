@@ -255,6 +255,12 @@ def legs_from_rows(rows: list[dict]):
     the caller parses the combined DESCRIPTION instead)."""
     if not rows or len(rows) < 2:
         return None
+    # Each row's own QTY is the leg's ratio against the package base, the same
+    # base struct_net nets the premium against. A single-leg DESCRIPTION parses
+    # to ratio 1.0, so without this a 40/20 ratio reaches net_greeks as 20/20 —
+    # the header would claim a base unit the greeks do not honour. Perp/future
+    # hedge rows keep ratio 1.0: their QTY is in a different unit entirely.
+    base = structure_unit(rows)
     out = []
     for r in rows:
         pr = parse_product(r.get("PRODUCT", ""))
@@ -267,6 +273,7 @@ def legs_from_rows(rows: list[dict]):
         if d["classified"] and len(d["legs"]) == 1 and d["code"] in ("CL", "PL"):
             lg = d["legs"][0]
             lg["sign"] = sgn
+            lg["ratio"] = (_f(r.get("QTY")) or base) / base
             lg["_row"] = r
             out.append(lg)
         else:

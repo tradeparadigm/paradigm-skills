@@ -297,5 +297,28 @@ hedged = ratio_rows + [{"PRODUCT": "BTC PERPETUAL - DBT", "DESCRIPTION": "Perpet
                         "QTY": 5, "PRICE": 65000, "REF_PRICE": 64955.57, "SIDE": "SELL"}]
 ok(ac.structure_unit(hedged) == 20.0, "a smaller perp hedge row does not become the structure unit")
 
+# ── per-leg rows carry their QTY into the greeks, not just the premium ─────────
+# A ratio whose legs arrive as separate rows parses each DESCRIPTION to ratio 1.0,
+# so without QTY-derived ratios net_greeks sizes a 40/20 package as 20/20 — the
+# header would claim a base unit the greeks do not honour.
+per_leg = [
+    {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 24 Jul 26 59000",
+     "QTY": 40, "PRICE": 0.0023, "REF_PRICE": 0.0021, "SIDE": "BUY"},
+    {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 24 Jul 26 65000",
+     "QTY": 20, "PRICE": 0.0210, "REF_PRICE": 0.0212, "SIDE": "SELL"},
+]
+pl_legs = ac.legs_from_rows(per_leg)
+ok([l["ratio"] for l in pl_legs] == [2.0, 1.0], "per-leg rows take their ratio from QTY/base")
+_gk = {ac.leg_key(l): {"delta": 0.5, "vega": 1.0, "gamma": 0.0, "theta": 0.0} for l in pl_legs}
+ok(ac.net_greeks(pl_legs, _gk, ac.structure_unit(per_leg))["delta"] == 10.0,
+   "net delta counts 40 long against 20 short, not 20 against 20")
+_equal = [dict(r, QTY=100) for r in per_leg]
+ok([l["ratio"] for l in ac.legs_from_rows(_equal)] == [1.0, 1.0],
+   "equal-size per-leg rows keep ratio 1.0")
+_hedged = per_leg + [{"PRODUCT": "BTC PERPETUAL - DBT", "DESCRIPTION": "Perpetual 65,000",
+                      "QTY": 207000, "PRICE": 65000, "REF_PRICE": 64955.57, "SIDE": "SELL"}]
+ok([l["ratio"] for l in ac.legs_from_rows(_hedged)] == [2.0, 1.0, 1.0],
+   "a perp hedge keeps ratio 1.0 — its QTY is in a different unit")
+
 print(f"\n{_p} passed, {_f} failed")
 sys.exit(1 if _f else 0)
