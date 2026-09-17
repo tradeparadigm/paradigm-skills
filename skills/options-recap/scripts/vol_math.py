@@ -852,8 +852,14 @@ def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
     blocks = [_block_from_rows(bid, brows, iv_lookup)
               for bid, brows in by_block.items()]
     blocks += [dict(b) for b in (extra_blocks or [])]
+    below = [b for b in blocks if b["notional_usd"] < min_notional_usd]
     blocks = [b for b in blocks if b["notional_usd"] >= min_notional_usd]
     blocks.sort(key=lambda b: b["notional_usd"], reverse=True)
+    # The floor keeps Block Flow readable, but it removes real prints from the
+    # header totals; a reader cannot tell a quiet window from a trimmed one.
+    trimmed = ({"blocks": len(below),
+                "notional_usd": round(sum(b["notional_usd"] for b in below))}
+               if below else {})
     n_venue = sum(1 for b in blocks if b.get("source") == "venue")
 
     biggest = None
@@ -890,7 +896,7 @@ def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
         "total_m": round(sum(b["notional_usd"] for b in blocks) / 1e6, 1),
         "n_blocks": len(blocks), "n_structures": len(structures),
         "n_venue_blocks": n_venue,
-        "rows": out_rows, "biggest_print": biggest,
+        "rows": out_rows, "biggest_print": biggest, "trimmed": trimmed,
     }
 
 

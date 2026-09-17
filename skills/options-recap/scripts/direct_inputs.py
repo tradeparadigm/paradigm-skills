@@ -322,6 +322,7 @@ def run(asset, window, start, end):
                 evidence[query.name] = rows
         for venue in list(meta):
             spec_for(venue)
+        tape_available = True
         try:
             tape_result = tape.result()
             executions = calculation_rows(tape_result["rows"])
@@ -333,6 +334,12 @@ def run(asset, window, start, end):
                 )
         except Exception as exc:
             executions = []
+            # read_executions raises only when the partition is missing,
+            # unreadable or stale — a broken producer, not a quiet window. That
+            # is the one case where venue blocks have nothing to be deduped
+            # against, so it must not be confused with a tape that read fine
+            # and simply carried no Paradigm activity.
+            tape_available = False
             gaps.append(f"Paradigm executions unavailable — {exc}")
         deri = {}
         for key, future in (("closes_7d", closes), ("market", market)):
@@ -345,7 +352,27 @@ def run(asset, window, start, end):
     surface_rows = evidence.get("option_surface_deribit")
     if not snapshot["trades_total"] and not (surface_rows is not None and surface_rows.height):
         raise RuntimeError("recap: no usable core direct-data source; " + "; ".join(gaps))
-    result = recap.build(asset, window, start_ms, end_ms, deri, snapshot, executions, blocks)
+    result = recap.build(asset, window, start_ms, end_ms, deri, snapshot, executions,
+                         blocks, tape_available=tape_available)
+    # Blocks removed from the totals are reported, never dropped in silence —
+    # the whole point of the section is how much flow there was.
+    for excluded in result.pop("block_exclusions", []):
+        venues = ", ".join(excluded["venues"])
+        if excluded["reason"] == "paradigm_overlap_unverified":
+            gaps.append(
+                f"Block Flow: {excluded['blocks']} {venues} block(s) included without a "
+                f"Paradigm cross-check — the execution tape is unavailable, so any "
+                f"Paradigm-brokered print among them may be counted twice")
+        else:
+            gaps.append(
+                f"Block Flow: {excluded['blocks']} {venues} block(s) excluded "
+                f"({excluded['coin']} coin) — {excluded['reason'].replace('_', ' ')}; "
+                f"the totals below do not include them")
+    trimmed = result.pop("blocks_below_floor", {})
+    if trimmed:
+        gaps.append(
+            f"Block Flow: {trimmed['blocks']} block(s) below the $250k floor "
+            f"(${trimmed['notional_usd']:,}) are excluded from the totals")
     # Direct inputs cover the requested window, not the retired 24h rollup.
     result["hot_horizon"] = None
     result["snapshot"]["volume_usd_m"] = round(known_turnover / 1e6, 2)

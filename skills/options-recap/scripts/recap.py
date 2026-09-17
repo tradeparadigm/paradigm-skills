@@ -578,7 +578,7 @@ def _tape_block_id(tape_row: dict) -> str:
 
 
 def _dedupe_venue_blocks(venue_rows: list[dict],
-                         tape_rows: list[dict] | None = None) -> list[dict]:
+                         tape_rows: list[dict] | None = None, tape_available: bool = True) -> tuple[list[dict], list[dict]]:
     """Venue-tape blocks minus anything that could be a Paradigm-brokered
     duplicate.
 
@@ -621,8 +621,22 @@ def _dedupe_venue_blocks(venue_rows: list[dict],
             # matched, so that venue's coverage is incomplete.
             unstamped_codes.add(code)
     if not any(ids_by_code.values()):
-        return [r for r in venue_rows
-                if (r.get("exchange") or "").lower() not in _TAPE_BROKERED_VENUES]
+        brokered = [r for r in venue_rows
+                    if (r.get("exchange") or "").lower() in _TAPE_BROKERED_VENUES]
+        others = [r for r in venue_rows
+                  if (r.get("exchange") or "").lower() not in _TAPE_BROKERED_VENUES]
+        if not tape_available:
+            # No tape at all means nothing to double-count against. Excluding
+            # here trades a hypothetical double count for a certain total loss:
+            # the producer stopped on 2026-09-12 and this branch then fired on
+            # every run, silently deleting 109 Deribit blocks and $1.25bn of
+            # underlying notional per day from Block Flow.
+            return venue_rows, [{"reason": "paradigm_overlap_unverified",
+                                 "rows": brokered}] if brokered else []
+        # The tape is readable and simply carries no venue ids — the id space
+        # really is unproven, so the conservative exclusion stands.
+        return others, ([{"reason": "id_space_unproven", "rows": brokered}]
+                        if brokered else [])
 
     # An UNPARSEABLE PRODUCT ('?') must remove trust, not silently grant it.
     # Previously '?' could only ever land in `unstamped_codes`, where it matched
@@ -684,7 +698,7 @@ def _dedupe_venue_blocks(venue_rows: list[dict],
     # PASS 2 — apply. Every branch fails toward EXCLUSION, so the worst case is
     # the pre-PR behaviour (a genuinely non-Paradigm block is missed) rather
     # than an inflated headline.
-    out = []
+    out, dropped = [], {}
     for r in venue_rows:
         exchange = (r.get("exchange") or "").lower()
         code = _TAPE_VENUE_CODE.get(exchange)
@@ -695,11 +709,13 @@ def _dedupe_venue_blocks(venue_rows: list[dict],
         if block_id and block_id in (ids_by_code.get(code) or set()):
             continue               # the same print, already on the Paradigm tape
         if code in unstamped_codes:
+            dropped.setdefault("unstamped_tape_rows", []).append(r)
             continue               # incomplete id coverage -> structural
         if code not in matched_codes:
+            dropped.setdefault("id_space_unproven", []).append(r)
             continue               # id space unproven for this venue -> structural
         out.append(r)
-    return out
+    return out, [{"reason": reason, "rows": rows} for reason, rows in dropped.items()]
 
 
 def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
@@ -803,7 +819,8 @@ def spot_vol_label(spot_open, spot_close, dvol_open, dvol_close):
 def build(asset: str, window: str, start_ms: int, end_ms: int,
           deri: dict, hot: dict, block_rows: list[dict] | None = None,
           venue_block_rows: list[dict] | None = None,
-          stale: list[dict] | None = None) -> dict:
+          stale: list[dict] | None = None,
+          tape_available: bool = True) -> dict:
     asset = asset.upper()
     mkt = deri.get("market")
     window_h = (end_ms - start_ms) / 3600_000
@@ -916,7 +933,8 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     # "Not duplicated" and "in the window" are different claims — the widening
     # is correct for the GATE and wrong for the OUTPUT, so it is re-filtered
     # here rather than narrowed at the source.
-    _deduped = _dedupe_venue_blocks(venue_block_rows or [], own_blocks)
+    _deduped, _excluded = _dedupe_venue_blocks(venue_block_rows or [], own_blocks,
+                                               tape_available=tape_available)
     _in_window = [r for r in _deduped
                   if (_num(r, "bucket_at") or 0) >= start_ms]
     venue_blocks = _venue_tape_blocks(_in_window, spot)
@@ -991,6 +1009,13 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "hot_horizon": hot_horizon,
         "stale_sources": stale or [],
         "warnings": list(WARNINGS),
+        "block_exclusions": [
+            {"reason": e["reason"],
+             "venues": sorted({(r.get("exchange") or "?") for r in e["rows"]}),
+             "blocks": len(e["rows"]),
+             "coin": round(sum(_num(r, "volume_coin") or 0 for r in e["rows"]), 2)}
+            for e in _excluded],
+        "blocks_below_floor": block.get("trimmed", {}),
     }
 
 
