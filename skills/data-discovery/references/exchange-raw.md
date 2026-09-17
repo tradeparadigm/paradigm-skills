@@ -155,6 +155,34 @@ snapshots.
 - Bullish `spot_trade` / `perp_trade`: event-level `price`, `amount`, `side`,
   timestamp, and OTC ids when present.
 
+### Aggregate fields
+
+Aggregates exist under `normalized/` only; `raw/` carries `rows` alone. The
+grain is one row per `(exchange, symbol, period)`.
+
+- `option_trade`: `count`, `volume_sum`, `notional`, `turnover_usd`, `vwap`,
+  `price_open`, `price_high`, `price_low`, `price_close`, and `buy_volume` /
+  `sell_volume` / `buy_count` / `sell_count`.
+- `option_summary`: `count`, `markIV_open` / `_high` / `_low` / `_close` /
+  `_mean`, `markPrice_open` / `_high` / `_low` / `_close`, `lastPrice_open` /
+  `_close`, `bestBid_close`, `bestAsk_close`, `openInterest_close`,
+  `underlyingPrice_close`, and `delta_close` / `gamma_close` / `vega_close` /
+  `theta_close`.
+
+No aggregate carries event identity: no trade id, no per-event direction, no
+per-trade IV, no index price, and none of the venue block ids in the table
+above. Direction survives only as the pre-bucketed `buy_*` / `sell_*` totals.
+Block grouping, biggest-print selection and anything reconciled against an
+execution tape need `rows`.
+
+The Units caveat below binds these files MORE strictly, not less. Its
+remedy — count nulls before summing, publish a partial known-value sum
+separately — is unavailable here: `volume_sum`, `notional` and `turnover_usd`
+have already collapsed whatever was null underneath them. An aggregate cannot
+say whether it is complete, so a period whose rows lacked applicable metadata
+reads as a smaller number rather than a gap. Use `rows` when the answer has to
+state its own coverage.
+
 ## Units
 
 `normalized/` standardizes column names, **not all units**: option-trade `iv`
