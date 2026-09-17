@@ -29,8 +29,10 @@ BUCKET = "dt-exchange-venue-data"
 # global host.
 S3_ENDPOINT = "https://s3.ap-northeast-1.amazonaws.com"
 CONCURRENCY = 512
-# Objects are resolved before they are parsed, so a batch bounds how many raw
-# bodies are alive at once. Memory stays flat as the window grows.
+# CONCURRENCY caps the raw bodies in flight; BATCH caps the parsed tables held
+# before each intermediate concat. Neither bounds the result: _gather keeps
+# every batch's table and concatenates at the end, so peak is the whole window
+# twice over and grows with it.
 BATCH = 2048
 
 

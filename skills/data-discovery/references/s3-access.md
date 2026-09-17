@@ -57,6 +57,28 @@ None of these exist when the credential step is a SQL statement inside the same
 script is one process with normal shell state and a known interpreter. The rule
 here is about inline shell an agent assembles across `exec` calls.)
 
+## The concurrent object reader
+
+`scripts/s3_async.py` lives here, beside `execution_tape.py`, because it is a
+shared reader rather than any one skill's: `read_objects(paths, columns)` signs
+and fetches every object through obstore outside the GIL and returns one Arrow
+table, which DuckDB then reads by replacement scan. Import it the way every
+cross-skill import in this repo works — insert `data-discovery/scripts` on
+`sys.path`, never reach sideways into another skill's `scripts/`.
+
+Two properties bind its callers:
+
+- **It pins the S3 endpoint.** The enclave's egress allowlist is exact-match and
+  cannot follow a 307, so `S3Store(...)` must carry `endpoint=`.
+  `options-recap/tests/test_run_recap.py` is the only thing that checks this,
+  which is why that workflow also watches this file.
+- **Peak memory is the whole window, twice.** `CONCURRENCY` and `BATCH` bound
+  only the raw bodies and the single batch being parsed, so they do not cap it:
+  `_gather` keeps every batch's Arrow table and copies the lot in a final
+  `_concat`. Cost scales with objects read, not with wall time — a 30-day
+  `/recap` peaks near 6 GiB against a 4 GiB production container. Reduce per
+  batch, or read the `__agg__` objects instead.
+
 ## Token lifecycle
 
 Each `duckdb -c` invocation is its own process and resolves fresh credentials
