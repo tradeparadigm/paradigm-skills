@@ -123,6 +123,9 @@ def fake_connection(glob_files):
                 return [(name,) for name in glob_files]
             return [("2026-08-30T12:00:00Z", 1)]
 
+        def cursor(self):
+            return Connection()
+
         def close(self):
             pass
 

@@ -13,6 +13,7 @@ import datetime as dt
 import json
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from typing import Any
 from pathlib import Path
@@ -89,6 +90,71 @@ CREATE OR REPLACE SECRET dime_s3 (
 );
 """
 
+MAX_READ_THREADS = 64
+
+
+def query_workers(width: dt.timedelta) -> int:
+    """How many of these queries can hold their window in memory at once.
+
+    A trade query materialises its whole window — a 30-day venue is ~1.3M rows —
+    so wide windows have to give up concurrency to stay inside the container's
+    memory limit. Exceeding it kills the agent runtime, not just the query.
+    """
+    days = width / dt.timedelta(days=1)
+    return 3 if days <= 2 else 2 if days <= 10 else 1
+
+
+def container_memory_bytes() -> int | None:
+    for path in ("/sys/fs/cgroup/memory.max",
+                 "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            value = Path(path).read_text().strip()
+        except OSError:
+            continue
+        if value.isdigit() and int(value) < (1 << 50):
+            return int(value)
+    return None
+
+
+def tuning_statements(workers: int = 3) -> str:
+    """Size DuckDB for reading many small remote objects, not for local CPU work.
+
+    DuckDB derives `threads` from the CPU quota — 2 in this container — and then
+    uses it to cap in-flight HTTP requests too. These reads are latency-bound,
+    thousands of objects per window, so the threads sit blocked on the network
+    rather than competing for the quota and a far higher count is correct.
+    Connection caching matters for the same reason: without it every object pays
+    a fresh TLS handshake.
+    """
+    limit = container_memory_bytes()
+    # DuckDB is not the only tenant: --render hands every trade row back as
+    # Python dicts, which polars then copies. Half the container is its share.
+    per_query = int(limit * 0.5 / workers) if limit else None
+    statements = [
+        f"SET threads={MAX_READ_THREADS};",
+        "SET httpfs_connection_caching=true;",
+        "SET preserve_insertion_order=false;",
+        f"SET temp_directory='{tempfile.gettempdir()}/duckdb_recap';",
+    ]
+    if per_query:
+        statements.append(f"SET memory_limit='{per_query // (1 << 20)}MB';")
+    return " ".join(statements)
+
+
+TUNING = tuning_statements()
+
+
+def connect() -> duckdb.DuckDBPyConnection:
+    connection = duckdb.connect()
+    connection.execute(DUCKDB_PREFIX)
+    connection.execute(TUNING)
+    return connection
+
+
+def set_budget(workers: int) -> None:
+    global TUNING
+    TUNING = tuning_statements(workers)
+
 
 @dataclass(frozen=True)
 class Query:
@@ -113,9 +179,21 @@ def resolve_paths(connection: duckdb.DuckDBPyConnection, patterns: list[str],
     would otherwise erase every other hour in the window. glob() tolerates a
     miss, so the read is scoped to partitions that exist and the absent ones
     are reported rather than silently taking the whole source down with them.
+
+    One glob() call walks its patterns in sequence, so a 30-day window spends
+    half a minute listing before it reads anything. The patterns are independent
+    LISTs, so issue them concurrently and merge.
     """
-    files = [row[0] for row in
-             connection.execute(f"SELECT file FROM glob({sql_list(patterns)}) ORDER BY file").fetchall()]
+    def listing(pattern: str) -> list[str]:
+        scoped = connection.cursor()
+        try:
+            return [row[0] for row in
+                    scoped.execute(f"SELECT file FROM glob('{pattern}')").fetchall()]
+        finally:
+            scoped.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(patterns))) as pool:
+        files = sorted({path for group in pool.map(listing, patterns) for path in group})
     if expected_hours:
         present = {match.group(1) for path in files
                    if (match := HOUR_IN_KEY.search(path))}
@@ -136,9 +214,12 @@ def run_query(query: Query) -> tuple[dict[str, Any], list[Any]]:
         "units": query.units,
     }
     try:
-        connection = duckdb.connect()
-        connection.execute(DUCKDB_PREFIX)
+        connection = connect()
         files, missing = resolve_paths(connection, query.paths, query.expected_hours)
+        # Threads here overlap network round trips, so they are worth only as
+        # much as there are objects to fetch. A two-file query given 64 of them
+        # buys nothing and runs its window functions out of memory.
+        connection.execute(f"SET threads={min(MAX_READ_THREADS, max(4, len(files)))};")
         source["path_plan"].update(resolved_file_count=len(files),
                                    missing_pattern_count=len(missing))
         if missing:
@@ -181,13 +262,16 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime, *, render=Fa
         trade_paths, trade_hours = hour_patterns("normalized", venue, "option_trade", currency, start, end)
         queries.append(Query(f"option_trades_{venue}", trade_paths, f"""
           WITH trades AS MATERIALIZED (
-            SELECT * FROM read_parquet(__PATHS__, union_by_name=true,
-                                       hive_partitioning=true, filename=true)
-            WHERE {between}
-          ), largest AS (
+            -- Named columns, not *: Parquet only fetches the ones asked for, and
+            -- the whole window is held in memory here.
             SELECT exchange, timestamp, symbol, side, amount, price, iv, index_price,
                    turnover_usd, block_id, id, filename AS source_path
-            FROM trades ORDER BY turnover_usd DESC NULLS LAST, amount DESC NULLS LAST LIMIT 25
+            FROM read_parquet(__PATHS__, union_by_name=true,
+                              hive_partitioning=true, filename=true)
+            WHERE {between}
+          ), largest AS (
+            SELECT * FROM trades
+            ORDER BY turnover_usd DESC NULLS LAST, amount DESC NULLS LAST LIMIT 25
           )
           SELECT 'aggregate' AS record_type, exchange, count(*) AS trade_count,
                  sum(amount) AS amount_native,
@@ -318,7 +402,10 @@ def main() -> int:
         print(run(args.asset.upper(), args.window, start, end))
         return 0
     queries = build_queries(args.asset.upper(), start, end)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(queries))) as pool:
+    workers = query_workers(width)
+    set_budget(workers)
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(workers, len(queries))) as pool:
         results = list(pool.map(run_query, queries))
     sources = [source for source, _ in results]
     for source in sources:
