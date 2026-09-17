@@ -119,13 +119,22 @@ file granularity, not sampling — the catalog is explicit that `1m`, `5m` and
 at `1m` and `5m`, so `5m` is the coarsest level that can build a candle at all.
 Reading it for every interval also keeps the listing cost flat in the interval.
 
-The `__agg__` file beside each `__rows__` file **already carries the candle**:
-`price_open`, `price_high`, `price_low`, `price_close`, `volume_sum`, `vwap`
-and buy/sell splits, one row per period. Nothing here reads it yet, and that is
-now a known gap rather than an unknown: for any interval of 5m or more the
-aggregate is the same four numbers in one row instead of several hundred
-trades, which is both cheaper and the producer's own arithmetic rather than a
-recomputation of it. Rows remain necessary only below the 5m bucket.
+The `__agg__` file beside each `__rows__` file already carries the candle —
+the raw exchange catalog lists its fields under "Aggregate fields" — and one
+row per period instead of several hundred trades would cut this skill's memory
+use sharply.
+
+It is deliberately not used, and the catalog says why: an aggregate has already
+collapsed whatever was null underneath it, so it cannot say whether it is
+complete. A period whose rows lacked applicable metadata reads as a smaller
+number rather than as a gap. This skill's whole contract is the opposite — a
+trade with no reported size is counted and declared, never quietly absorbed
+into a smaller volume. Reading aggregates would buy memory with the one
+guarantee the output makes.
+
+If that trade is ever worth taking, it has to be visible: the aggregate path
+would have to say in a coverage line that its volume cannot be proven
+complete.
 
 ## Output
 

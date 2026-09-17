@@ -26,11 +26,12 @@ from pathlib import Path
 import duckdb
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-# s3_async lives in options-recap and is imported lazily where it is used, so
-# the offline tests never need boto3 or obstore. Same precedent as
-# collect_recap.py importing data-discovery's scripts.
-OPTIONS_RECAP_SCRIPTS = (
-    Path(__file__).resolve().parent.parent.parent / "options-recap" / "scripts")
+# The shared readers live in data-discovery, beside execution_tape.py, and are
+# imported lazily where they are used so the offline tests never need boto3 or
+# obstore. Same direction as collect_recap.py and direct_inputs.py: skills
+# import from data-discovery, never sideways from each other.
+SHARED_SCRIPTS = (
+    Path(__file__).resolve().parents[2] / "data-discovery" / "scripts")
 
 import bars as bar_math  # noqa: E402
 
@@ -177,7 +178,7 @@ def read_columns(files: list[str]) -> tuple[list, list, list]:
     and render as an empty market. Check the names came back before trusting
     them.
     """
-    sys.path.insert(0, str(OPTIONS_RECAP_SCRIPTS))
+    sys.path.insert(0, str(SHARED_SCRIPTS))
     from s3_async import read_objects  # noqa: PLC0415
 
     table = read_objects(files, COLUMNS)

@@ -268,14 +268,24 @@ def test_bars_never_contradict_themselves():
                str(bar_math.check(evidence["bars"])))
 
 
-def test_the_cross_skill_dependency_resolves():
-    """collect_ohlcv imports s3_async from another skill at read time."""
-    check_that("options-recap scripts directory exists",
-               os.path.isdir(collector.OPTIONS_RECAP_SCRIPTS),
-               str(collector.OPTIONS_RECAP_SCRIPTS))
+def test_the_shared_reader_resolves():
+    """collect_ohlcv imports s3_async from data-discovery at read time.
+
+    Shared readers live there beside execution_tape.py, and skills import from
+    data-discovery rather than sideways from each other — a skill-to-skill
+    import would be the only one in the repo.
+    """
+    check_that("data-discovery scripts directory exists",
+               os.path.isdir(collector.SHARED_SCRIPTS),
+               str(collector.SHARED_SCRIPTS))
     check_that("s3_async is there",
-               os.path.isfile(os.path.join(collector.OPTIONS_RECAP_SCRIPTS,
-                                           "s3_async.py")))
+               os.path.isfile(os.path.join(collector.SHARED_SCRIPTS,
+                                           "s3_async.py")),
+               str(collector.SHARED_SCRIPTS))
+    check_that("and is no longer in options-recap",
+               not os.path.isfile(os.path.join(
+                   os.path.dirname(os.path.dirname(collector.SHARED_SCRIPTS)),
+                   "options-recap", "scripts", "s3_async.py")))
 
 
 def main() -> int:
