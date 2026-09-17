@@ -1908,6 +1908,32 @@ def test_absent_paradigm_tape_keeps_the_venues_own_blocks():
           excluded2)
 
 
+def test_coverage_leads_the_snapshot_and_names_unread_venues():
+    """A reader cannot infer from the figures how much of the window was read.
+    The line sits INSIDE the Snapshot fence because on 2026-09-08 the relay kept
+    every Snapshot figure and deleted all three unfenced warning lines."""
+    out = render_md(build(
+        "BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+        {"spot_close": 100000.0, "trades_total": 10,
+         "trades_by_venue": {"deribit": 8, "bullish": 0, "bybit-options": 2},
+         "venue_coverage": {"deribit": ("complete", {}), "bullish": ("quiet", {}),
+                            "bybit-options": ("unreadable", {})}}))
+    lines = out.splitlines()
+    fence = [i for i, l in enumerate(lines) if l.strip().startswith("```")]
+    cov = [i for i, l in enumerate(lines) if l.startswith("Coverage")]
+    check("a Coverage line is rendered", bool(cov), lines[:14])
+    check("it sits inside the Snapshot fence",
+          bool(cov) and bool(fence) and fence[0] < cov[0] < fence[1], lines[:14])
+    check("an unreadable venue is not counted as read",
+          bool(cov) and "2/3 venues" in lines[cov[0]], lines[cov[0]] if cov else None)
+    check("it distinguishes no-trades from a failed read",
+          bool(cov) and "Bullish no trades" in lines[cov[0]]
+          and "READ FAILED" in lines[cov[0]], lines[cov[0]] if cov else None)
+    act = next((l for l in lines if l.startswith("Activity")), "")
+    check("a venue that could not be read is marked on the Activity line",
+          "Bybit 20%+" in act, act)
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     print(f"Running {len(tests)} test functions...")

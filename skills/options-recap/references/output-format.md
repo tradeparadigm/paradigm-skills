@@ -20,6 +20,7 @@ would read as a zero-length window. Intraday windows stay HH:MM-only.
 **Snapshot**
 
 ```yaml
+Coverage  [N]/[M] venues  [per-venue state, or "all venue feeds complete"]
 Spot      $[X]        [up/down X%, or flat] (from $[Y], low $[Z])
 DVOL      [X]v        [flat/rising/falling] ([open] -> [close])
 RV 7d     [X]v        implied [CHEAP/RICH/IN LINE] vs realized
@@ -28,6 +29,14 @@ Activity  [Nk]        trades — [Venue X% · Venue Y% · ...] (by trade count)
 Volume    $[X]M       observed valued trades · USD premium
 P/C       [X.Xx]      [descriptor] (observed trades · see coverage)
 ```
+
+`Coverage` leads the block because every figure under it is a function of how
+much of the window was read, and that cannot be inferred from the figures. `N` is
+venues successfully read, `M` venues attempted. The detail names any venue that
+is not `complete`: `no trades` (feed healthy, nothing traded — measured on the
+venue's continuous `option_summary` feed, never on its intermittent trade tape),
+`feed gap` (hours genuinely lost), `READ FAILED`, `unverified`. A venue whose
+share is a floor rather than a share carries a `+` on the Activity line.
 
 Volume is the valued subset, not a market total: trades whose USD premium
 cannot be proven are counted in a gap line instead of being estimated into the
@@ -116,6 +125,11 @@ Expiry     ATM      ΔATM     25d RR    ΔRR      Fly     ΔFly
 …
 ```
 
+`*` marks a figure reached by extrapolating past the listed chain rather than
+interpolating within it — on the ATM column as well as the wings, since a thin
+chain clamps ATM to an endpoint and that value also drives the term-structure
+label.
+
 Formatting rules: ATM/RR/Fly are current (close) values, `X.Xv` precision. The Δ
 columns are the window-over-window change (current − window-open), signed `+X.Xv`;
 `flat` when the change rounds to zero, `n/a` when no window-open surface was
@@ -127,4 +141,7 @@ extrapolated wings (e.g. `-4.0v*`).
 
 ## Thin Window
 
-(< 2h, no blocks) — output all four sections; mark empty ones `No data`.
+(< 2h, no blocks) — output all four sections. An empty one states a specific
+source and reason — `Unavailable — no block cleared the $250k floor in this
+window` — never a bare `No data`, which reads as a quiet market when it may be a
+missing feed.

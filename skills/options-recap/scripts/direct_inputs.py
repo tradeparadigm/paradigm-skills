@@ -412,6 +412,15 @@ def run(asset, window, start, end):
                 f"Block Flow: {excluded['blocks']} {venues} block(s) excluded "
                 f"({excluded['coin']} coin) — {excluded['reason'].replace('_', ' ')}; "
                 f"the totals below do not include them")
+    # Bybit publishes is_block_trade as a flag with no group id, so its blocks
+    # cannot be reconstructed at all — 43,137 trades yielded 0 blocks in a real
+    # 24h window. The catalog says so; nothing ever said it to the reader, and
+    # its absence from Block Flow reads as "Bybit did no blocks".
+    if totals.get("bybit-options", {}).get("count"):
+        gaps.append(
+            "Block Flow: Bybit blocks cannot be shown — the venue publishes a "
+            "block flag with no group id, so its blocks are absent from the "
+            "totals however active it was")
     trimmed = result.pop("blocks_below_floor", {})
     if trimmed:
         gaps.append(

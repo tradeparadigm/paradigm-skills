@@ -892,7 +892,9 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         unread = set()
         for v, n in (hot.get("trades_by_venue") or {}).items():
             label = _venue_label(v)
-            if states.get(v) in ("unreadable", "feed_gap"):
+            state = states.get(v)
+            state = state[0] if isinstance(state, (list, tuple)) else state
+            if state in ("unreadable", "feed_gap"):
                 unread.add(label)
             by_label[label] += n
         activity_split = [
@@ -959,6 +961,9 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     hot_horizon = round(window_h) if window_h > 24 else None
 
     snapshot = {
+        # Carried through so the Snapshot can lead with how much of the window
+        # was actually read; every figure beside it is a function of that.
+        "venue_coverage": hot.get("venue_coverage") or {},
         "spot": round(spot) if spot else None,
         "spot_from": round(spot_open) if spot_open else None,
         "spot_low": round(spot_low) if spot_low else None,
@@ -1157,6 +1162,26 @@ def render_md(r: dict) -> str:
     if banner:
         L += banner + [""]
 
+    # Coverage leads the Snapshot: every figure below is a function of how much
+    # of the window was actually read, and a reader cannot infer that from the
+    # numbers themselves. Inside the fence for the same reason the warnings are
+    # — on 2026-09-08 the relay kept every Snapshot figure and deleted all three
+    # unfenced ⚠ lines.
+    states = s.get("venue_coverage") or {}
+    if states:
+        _WORDS = {"complete": None, "quiet": "no trades", "feed_gap": "feed gap",
+                  "unreadable": "READ FAILED", "unknown": "unverified"}
+        read = sum(1 for v in states.values()
+                   if (v[0] if isinstance(v, (list, tuple)) else v) != "unreadable")
+        notes = []
+        for venue, state in states.items():
+            state = state[0] if isinstance(state, (list, tuple)) else state
+            word = _WORDS.get(state)
+            if word:
+                notes.append(f"{_venue_label(venue)} {word}")
+        detail = " · ".join(notes) if notes else "all venue feeds complete"
+        L.append(f"{'Coverage':<9} {f'{read}/{len(states)} venues':<11} {detail}")
+
     spot = f"${s['spot']:,}" if s.get("spot") else "n/a"
     chg = s.get("spot_change_pct")
     chg_txt = ("flat" if not chg else f"{'up' if chg > 0 else 'down'} {abs(chg)}%")
@@ -1228,7 +1253,11 @@ def render_md(r: dict) -> str:
                  f"${bp['notional_m']}M   {bp['time_utc']} UTC   "
                  f"{via}{tag_txt}")
     else:
-        L.append("No data")
+        # output-format.md: name the source and reason rather than going blank.
+        # True whichever way the pool emptied — no blocks at all, all excluded by
+        # the Paradigm dedupe, or all below the floor. The gaps above say which.
+        L.append("Unavailable — no qualifying block in this window; any blocks "
+                 "excluded from the totals are listed above.")
     n_struct = bf.get("n_structures", len(bf["rows"]))
     struct_word = "structure" if n_struct == 1 else "structures"
     block_word = "block" if bf["n_blocks"] == 1 else "blocks"
@@ -1272,7 +1301,10 @@ def render_md(r: dict) -> str:
             L.append(f"{e['expiry']:<11}{atm:<9}{datm:<9}{rr:<10}{drr:<9}{fly:<8}{dfly}")
         L.append("```")
     else:
-        L.append("No data")
+        # output-format.md: a section states a specific source and reason rather
+        # than going blank. "No data" reads as a quiet market; it never was one.
+        L.append("Unavailable — no vol surface could be built from the window's "
+                 "option_summary snapshots.")
     return "\n".join(L)
 
 
