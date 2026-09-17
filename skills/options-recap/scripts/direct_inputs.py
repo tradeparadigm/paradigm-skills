@@ -10,10 +10,14 @@ import boto3
 import polars as pl
 
 import recap
-from collect_recap import VENUES, build_queries, run_query
+from collect_recap import VENUES, build_queries, query_workers, run_query, set_budget
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "data-discovery" / "scripts"))
 from execution_tape import S3_ENDPOINT, calculation_rows, read_executions
+
+
+SPEC_COLUMNS = ["symbol", "captured_at", "iv_unit", "oi_unit",
+                "contract_size", "price_unit"]
 
 
 def metadata(venue, asset, start, end):
@@ -37,14 +41,27 @@ def metadata(venue, asset, start, end):
     chosen = ([max(before)] if before else []) + [item for item in objects if start < item[0] <= end]
     if not chosen:
         raise ValueError(f"no event-applicable instrument metadata for {venue}")
-    frames = []
-    for _, key in sorted(chosen):
+    def snapshot(key):
         obj = s3.get_object(Bucket="dt-exchange-venue-data", Key=key)
-        frames.append(pl.scan_parquet(BytesIO(obj["Body"].read())).select(
-            "symbol", "captured_at", "iv_unit", "oi_unit", "contract_size", "price_unit"))
-    return pl.concat(frames).with_columns(
-        pl.col("captured_at").str.to_datetime(time_zone="UTC")
-    ).sort("captured_at").collect()
+        return pl.read_parquet(BytesIO(obj["Body"].read()), columns=SPEC_COLUMNS)
+
+    # A 30-day window names ~700 snapshots per venue. Fetched one at a time they
+    # cost minutes, and concatenated whole they are millions of rows of a chain
+    # that barely changes — enough to take the container down.
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        frames = list(pool.map(snapshot, [key for _, key in sorted(chosen)]))
+    spec = SPEC_COLUMNS[2:]
+    return (pl.concat(frames)
+            .with_columns(pl.col("captured_at").str.to_datetime(time_zone="UTC"))
+            .sort("symbol", "captured_at")
+            # The as-of join only needs the instant a spec CHANGED, so drop the
+            # repeats between changes. Consecutive, not distinct: a symbol that
+            # goes A -> B -> A must keep both A rows or the second one resolves
+            # back to B.
+            .filter(pl.any_horizontal(
+                [pl.col(column).ne_missing(pl.col(column).shift(1).over("symbol"))
+                 for column in spec]).fill_null(True))
+            .sort("captured_at"))
 
 
 def with_units(rows, specs):
@@ -124,8 +141,13 @@ def run(asset, window, start, end):
     queries = build_queries(asset, start, end, render=True)
     end_ms, start_ms = int(end.timestamp() * 1000), int(start.timestamp() * 1000)
     gaps, specs, evidence = [], {}, {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        reads = [(q, pool.submit(run_query, q)) for q in queries]
+    # Partition reads get their own pool: they are the ones holding a window in
+    # memory, so their concurrency is a memory budget, not a latency choice.
+    readers = query_workers(end - start)
+    set_budget(readers)
+    with ThreadPoolExecutor(max_workers=readers) as reader_pool, \
+            ThreadPoolExecutor(max_workers=8) as pool:
+        reads = [(q, reader_pool.submit(run_query, q)) for q in queries]
         meta = {v: pool.submit(metadata, v, asset, start, end) for v in VENUES}
         # Publication age is a WALL-CLOCK question, so the reader's `now` must
         # not be the window end: collect_recap accepts --now for replays, and

@@ -91,14 +91,45 @@ def test_leg_adapter_uses_typed_geometry_not_package_description():
     assert mapped["SIDE"] == "BUY" and mapped["QTY"] == 40
 
 
-def instrument_object(captured_at):
+def instrument_object(captured_at, contract_size=0.1):
     """captured_at rides as a String — metadata() parses it with the .str namespace."""
     frame = pl.DataFrame({"symbol": ["BTC-11SEP26-70000-P"], "captured_at": [captured_at],
                           "iv_unit": ["decimal"], "oi_unit": ["contracts"],
-                          "contract_size": [0.1], "price_unit": ["coin"]})
+                          "contract_size": [contract_size], "price_unit": ["coin"]})
     buffer = BytesIO()
     frame.write_parquet(buffer)
     return {"Body": BytesIO(buffer.getvalue())}
+
+
+def test_metadata_keeps_every_spec_change_not_every_snapshot(monkeypatch):
+    """Repeat snapshots collapse, but a spec that reverts keeps both of its rows.
+
+    Deduplicating on distinct specs rather than consecutive ones would drop the
+    second A of an A -> B -> A history, and every trade after it would then
+    resolve back to B."""
+    base = "meta/instruments/exchange=deribit/currency=btc/"
+    sizes = {1: 0.1, 2: 0.1, 3: 0.5, 4: 0.5, 5: 0.1}
+    snapshots = {f"{base}instruments__deribit__btc__2026090{day}T000000Z.parquet":
+                 (f"2026-09-0{day}T00:00:00Z", size) for day, size in sizes.items()}
+
+    class Paginator:
+        def paginate(self, **_):
+            return [{"Contents": [{"Key": key} for key in snapshots]}]
+
+    class Client:
+        def get_paginator(self, _):
+            return Paginator()
+
+        def get_object(self, Bucket, Key):
+            captured_at, size = snapshots[Key]
+            return instrument_object(captured_at, size)
+
+    monkeypatch.setattr(direct, "boto3",
+                        type("Stub", (), {"client": staticmethod(lambda *a, **k: Client())}))
+    specs = direct.metadata("deribit", "BTC",
+                            datetime(2026, 8, 31, tzinfo=timezone.utc),
+                            datetime(2026, 9, 6, tzinfo=timezone.utc))
+    assert specs["contract_size"].to_list() == [0.1, 0.5, 0.1]
 
 
 def test_one_stray_object_does_not_cost_a_venue_its_units(monkeypatch):
@@ -126,5 +157,9 @@ def test_one_stray_object_does_not_cost_a_venue_its_units(monkeypatch):
     # Patch the module under test, not the real boto3 every other module shares.
     monkeypatch.setattr(direct, "boto3", type("Stub", (), {"client": staticmethod(lambda *a, **k: Client())}))
     specs = direct.metadata("deribit", "BTC", START, END)
-    assert specs.height == 2
-    assert specs["contract_size"].to_list() == [0.1, 0.1]
+    # Both snapshots carry the same spec, so one row covers the window; what
+    # matters is that the stray objects did not take the venue's units with them.
+    assert specs["symbol"].to_list() == ["BTC-11SEP26-70000-P"]
+    assert specs["contract_size"].to_list() == [0.1]
+    assert specs["captured_at"].dt.strftime("%Y-%m-%dT%H:%M:%SZ").to_list() == [
+        "2026-09-08T07:00:00Z"]
