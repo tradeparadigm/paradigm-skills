@@ -60,6 +60,20 @@ def hour_patterns(source: str, venue: str, data_type: str, currency: str,
     return days, hours
 
 
+def hours_present(connection: duckdb.DuckDBPyConnection, source: str, venue: str,
+                  data_type: str, currency: str, start: dt.datetime,
+                  end: dt.datetime) -> tuple[set[str], tuple[str, ...]]:
+    """Which hours a feed actually wrote, and which it was expected to.
+
+    Coverage only needs the object listing, never the rows, so this costs one
+    LIST per day per venue — 1.56s for five venues over 30 days, and near-flat
+    in window width because the globs are day-level.
+    """
+    patterns, expected = hour_patterns(source, venue, data_type, currency, start, end)
+    _, missing = resolve_paths(connection, patterns, tuple(expected))
+    return set(expected) - set(missing), tuple(expected)
+
+
 def snapshot_patterns(venue: str, currency: str, start: dt.datetime,
                       end: dt.datetime) -> list[str]:
     """Exact window-open and latest-complete five-minute snapshot buckets."""
@@ -249,6 +263,11 @@ def run_query(query: Query) -> tuple[dict[str, Any], list[Any]]:
                                    missing_pattern_count=len(missing))
         if missing:
             source["path_plan"]["missing_patterns"] = missing[:10]
+            if query.expected_hours:
+                # The full list, not the first ten: the caller classifies these
+                # against the venue's continuous feed before deciding they are
+                # a gap at all, and a truncated list would misclassify.
+                source["path_plan"]["missing_hours"] = tuple(missing)
         if not files:
             source.update(status="unavailable", row_count=0,
                           error=f"no objects matched any of {len(query.paths)} partition "

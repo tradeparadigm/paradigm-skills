@@ -11,7 +11,8 @@ import boto3
 import polars as pl
 
 import recap
-from collect_recap import VENUES, build_queries, query_workers, run_query, set_budget
+from collect_recap import (VENUES, build_queries, connect, hours_present,
+                           query_workers, run_query, set_budget)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "data-discovery" / "scripts"))
 from execution_tape import S3_ENDPOINT, calculation_rows, read_executions
@@ -201,6 +202,44 @@ def inputs(totals, evidence, specs, gaps):
     return snapshot, blocks, turnover
 
 
+# A venue's trade tape is INTERMITTENT — it writes an object only when a trade
+# happens — so a missing hour there proves nothing on its own. option_summary is
+# CONTINUOUS: it writes every period, so a missing hour there is a dead feed.
+# exchange-raw.md has said to check a companion feed since before this skill
+# existed; nothing implemented it, and the result was that every coverage
+# warning /recap emitted was a false alarm. Measured over 30 days: Bullish
+# traded in 341 of 720 hours and was reported as 53% missing, while its quote
+# feed was 720/720 intact.
+COMPANION = "option_summary"
+
+
+def coverage_verdict(venue, asset, start, end, missing_trade_hours):
+    """Classify a venue's window: complete, quiet, or a real feed gap.
+
+    Returns (state, detail). Only `feed_gap` means data was lost.
+    """
+    connection = connect()
+    try:
+        present, expected = hours_present(connection, "normalized", venue, COMPANION,
+                                          asset.lower(), start, end)
+    finally:
+        connection.close()
+    if not expected:
+        return "unknown", {}
+    companion_missing = set(expected) - present
+    lost = sorted(set(missing_trade_hours) & companion_missing)
+    quiet = sorted(set(missing_trade_hours) - companion_missing)
+    if lost:
+        return "feed_gap", {"lost_hours": lost, "quiet_hours": quiet,
+                            "expected": len(expected)}
+    if companion_missing:
+        # The feed dropped hours the trade tape happened to cover anyway.
+        return "feed_gap", {"lost_hours": sorted(companion_missing),
+                            "quiet_hours": quiet, "expected": len(expected)}
+    return ("quiet" if quiet else "complete"), {"quiet_hours": quiet,
+                                                "expected": len(expected)}
+
+
 def run(asset, window, start, end):
     recap.WARNINGS.clear()
     queries = build_queries(asset, start, end, render=True)
@@ -210,6 +249,8 @@ def run(asset, window, start, end):
     # warning with the read warnings, and the ⚠ lines are part of the output.
     read_gaps, meta_gaps, block_gaps = [], [], []
     gaps, specs, evidence, totals = [], {}, {}, {}
+    # venue -> (state, detail); what was actually behind this window per venue.
+    coverage = {}
     # Partition reads get their own pool: they are the ones holding a window in
     # memory, so their concurrency is a memory budget, not a latency choice.
     readers = query_workers(end - start)
@@ -250,14 +291,29 @@ def run(asset, window, start, end):
                     rows = rows.clear()
             if source["status"] != "ok":
                 read_gaps.append(f"{query.name}: unavailable — {source['error']}")
-            elif source["path_plan"].get("missing_pattern_count"):
-                read_gaps.append(f"{query.name}: {source['path_plan']['missing_pattern_count']}/{source['path_plan']['pattern_count']} hourly/bucket paths absent; partial coverage")
-            elif not rows.height:
+            elif not rows.height and not query.name.startswith("option_trades_"):
                 read_gaps.append(f"{query.name}: no usable observations")
+            elif (source["path_plan"].get("missing_pattern_count")
+                    and not query.name.startswith("option_trades_")):
+                read_gaps.append(f"{query.name}: {source['path_plan']['missing_pattern_count']}/{source['path_plan']['pattern_count']} hourly/bucket paths absent; partial coverage")
             if query.name.startswith("option_trades_"):
                 # Reduced here and dropped, so the next venue's read never sits
                 # beside this one's window.
                 venue = query.name[len("option_trades_"):]
+                # An absent trade hour is only a gap if the venue's continuous
+                # feed lost it too; otherwise the venue was simply quiet.
+                if source["status"] == "ok":
+                    state, detail = coverage_verdict(
+                        venue, asset, start, end,
+                        source["path_plan"].get("missing_hours", ()))
+                    coverage[venue] = (state, detail)
+                    if state == "feed_gap":
+                        lost = len(detail["lost_hours"])
+                        read_gaps.append(
+                            f"{venue}: {lost} of {detail['expected']} hours missing from the "
+                            f"venue's own feed — trades, volume and share below are understated")
+                else:
+                    coverage[venue] = ("unreadable", {})
                 trades = rows.filter(pl.col("record_type") == "trade") if rows.height else rows
                 totals[venue] = aggregate_trades(venue, trades, spec_for(venue), block_gaps)
                 del rows, trades
