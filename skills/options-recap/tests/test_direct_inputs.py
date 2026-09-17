@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 import sys
+import types
 
 import polars as pl
 import pytest
@@ -11,6 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import direct_inputs as direct
 import recap
+import collect_recap as collector
 from collect_recap import build_queries
 
 UTC = timezone.utc
@@ -25,6 +27,12 @@ def spec():
                          "price_unit": ["coin"] * 2})
 
 
+TRADE_SCHEMA = {"record_type": pl.String, "exchange": pl.String,
+                "timestamp": pl.String, "symbol": pl.String, "amount": pl.Float64,
+                "price": pl.Float64, "index_price": pl.Float64,
+                "turnover_usd": pl.Float64, "block_id": pl.String, "iv": pl.Float64}
+
+
 def trade(**updates):
     return {"record_type": "trade", "exchange": "okex-options",
             "timestamp": "2026-09-08T08:30:00Z", "symbol": "BTC-11SEP26-70000-P",
@@ -32,10 +40,15 @@ def trade(**updates):
             "turnover_usd": None, "block_id": "block-1", "iv": 0.4, **updates}
 
 
+def trades(*rows):
+    """inputs() reads frames now — a dict per row is what blew the memory budget."""
+    return pl.DataFrame(list(rows), schema=TRADE_SCHEMA)
+
+
 def test_event_time_units_not_latest_metadata():
     gaps = []
     snapshot, blocks, turnover = direct.inputs(
-        {"option_trades_okex-options": [trade()]}, {"okex-options": spec()}, gaps)
+        {"option_trades_okex-options": trades(trade())}, {"okex-options": spec()}, gaps)
     assert turnover == 800.0  # 100 contracts * 0.01 BTC * 0.01 premium * 80k
     assert blocks[0]["volume_coin"] == 1.0
     assert blocks[0]["iv_sum"] == 40.0
@@ -45,14 +58,14 @@ def test_event_time_units_not_latest_metadata():
 
 def test_unavailable_metadata_does_not_default_contract_size():
     gaps = []
-    snapshot, blocks, turnover = direct.inputs({"option_trades_okex-options": [trade()]}, {}, gaps)
+    snapshot, blocks, turnover = direct.inputs({"option_trades_okex-options": trades(trade())}, {}, gaps)
     assert not snapshot["turnover_complete"]
     assert not blocks and turnover == 0
     assert any("lack a provable USD premium" in gap for gap in gaps)
 
 
 def test_existing_usd_turnover_is_not_scaled_twice():
-    _, _, turnover = direct.inputs({"option_trades_okex-options": [trade(turnover_usd=123.0)]},
+    _, _, turnover = direct.inputs({"option_trades_okex-options": trades(trade(turnover_usd=123.0))},
                                     {"okex-options": spec()}, [])
     assert turnover == 123.0
 
@@ -163,3 +176,103 @@ def test_one_stray_object_does_not_cost_a_venue_its_units(monkeypatch):
     assert specs["contract_size"].to_list() == [0.1]
     assert specs["captured_at"].dt.strftime("%Y-%m-%dT%H:%M:%SZ").to_list() == [
         "2026-09-08T07:00:00Z"]
+
+
+def fake_connection(glob_files):
+    """A duckdb.connect stand-in whose glob() returns exactly `glob_files`.
+
+    Lives in this lane rather than the stdlib one because run_query now returns
+    a polars frame, so the double has to produce one.
+    """
+
+    class Connection:
+        description = [("max_event_at",), ("price",)]
+
+        def execute(self, sql):
+            self._glob = sql.lstrip().startswith("SELECT file FROM glob(")
+            return self
+
+        def fetchall(self):
+            return [(name,) for name in glob_files] if self._glob else [("x", 1)]
+
+        def pl(self):
+            return pl.DataFrame({"max_event_at": ["2026-08-30T12:00:00Z"], "price": [1]})
+
+        def cursor(self):
+            return Connection()
+
+        def close(self):
+            pass
+
+    return Connection
+
+
+def run_query_with(glob_files, query):
+    """Drive run_query against a fake DuckDB, with no network for either reader.
+
+    A streaming query would otherwise fetch from S3, so s3_async is stubbed; the
+    fake connection supplies the result frame in both cases.
+    """
+    original = collector.duckdb.connect
+    previous = sys.modules.get("s3_async")
+    collector.duckdb.connect = fake_connection(glob_files)
+    sys.modules["s3_async"] = types.SimpleNamespace(
+        read_objects=lambda paths, columns=None: pl.DataFrame())
+    try:
+        return collector.run_query(query)
+    finally:
+        collector.duckdb.connect = original
+        if previous is None:
+            sys.modules.pop("s3_async", None)
+        else:
+            sys.modules["s3_async"] = previous
+
+
+def test_evidence_contract_names_provenance_and_freshness():
+    query = collector.Query("x", ["s3://direct"], "SELECT 1", {"price": "USD"}, True)
+    metadata, rows = run_query_with(["s3://direct/a.parquet"], query)
+    assert metadata["path_plan"] == {
+        "pattern_count": 1, "first_pattern": "s3://direct", "last_pattern": "s3://direct",
+        "resolved_file_count": 1, "missing_pattern_count": 0}
+    assert metadata["units"] == {"price": "USD"}
+    assert metadata["max_event_at"] == "2026-08-30T12:00:00Z"
+    assert rows["price"][0] == 1
+
+
+def test_absent_partition_does_not_erase_the_rest_of_the_window():
+    """One unwritten hour must not take the whole window's evidence down."""
+    patterns = [f"s3://bucket/hour={hour:02d}/**/*.parquet" for hour in (17, 18, 19)]
+    query = collector.Query("trades", patterns, "SELECT * FROM read_parquet(__PATHS__)", {}, True)
+    # Hours 17 and 18 landed; the current hour 19 has not been written yet.
+    metadata, rows = run_query_with(
+        ["s3://bucket/hour=17/a.parquet", "s3://bucket/hour=18/b.parquet"], query)
+    assert metadata["status"] == "ok" and rows.height
+    assert metadata["path_plan"]["resolved_file_count"] == 2
+    assert metadata["path_plan"]["missing_pattern_count"] == 1
+    assert metadata["path_plan"]["missing_patterns"] == [patterns[2]]
+
+
+def test_missing_hours_are_read_off_the_returned_keys():
+    """Day-level globs cannot probe per hour, so an absent hour is found by its
+    absence from the resolved file names — same warning, 1/24 the listings."""
+    start = datetime(2026, 8, 30, 10, tzinfo=UTC)
+    end = datetime(2026, 8, 30, 13, tzinfo=UTC)
+    trades = next(q for q in collector.build_queries("BTC", start, end)
+                  if q.name == "option_trades_deribit")
+    assert trades.expected_hours == ("20260830T10", "20260830T11", "20260830T12")
+    # Hours 10 and 12 landed; hour 11 never wrote a file.
+    metadata, _ = run_query_with([
+        "s3://b/year=2026/month=08/day=30/hour=10/x__rows__20260830T100000Z.parquet",
+        "s3://b/year=2026/month=08/day=30/hour=12/x__rows__20260830T121500Z.parquet"], trades)
+    assert metadata["path_plan"]["missing_pattern_count"] == 1
+    assert metadata["path_plan"]["missing_patterns"] == ["20260830T11"]
+    assert metadata["path_plan"]["pattern_count"] == 3
+
+
+def test_fully_absent_window_reports_unavailable_not_a_quiet_market():
+    patterns = ["s3://bucket/hour=17/**/*.parquet", "s3://bucket/hour=18/**/*.parquet"]
+    query = collector.Query("trades", patterns, "SELECT * FROM read_parquet(__PATHS__)", {}, True)
+    metadata, rows = run_query_with([], query)
+    assert metadata["status"] == "unavailable"
+    assert rows.height == 0 and metadata["row_count"] == 0
+    assert "2 partition patterns" in metadata["error"]

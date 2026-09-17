@@ -90,65 +90,7 @@ def test_partition_plan_is_explicit_and_hot_free():
     check("surface samples every expiry and type independently", "PARTITION BY observation, expirationDate, optionType, target_delta" in surface_sql)
 
 
-def test_evidence_contract_names_provenance_and_freshness():
-    source = collector.Query("x", ["s3://direct"], "SELECT 1", {"price": "USD"}, True)
-    original = collector.duckdb.connect
 
-    collector.duckdb.connect = fake_connection(["s3://direct/a.parquet"])
-    try:
-        metadata, rows = collector.run_query(source)
-    finally:
-        collector.duckdb.connect = original
-    check("source plan retained", metadata["path_plan"] == {
-        "pattern_count": 1, "first_pattern": "s3://direct", "last_pattern": "s3://direct",
-        "resolved_file_count": 1, "missing_pattern_count": 0})
-    check("units retained", metadata["units"] == {"price": "USD"})
-    check("event freshness retained", metadata["max_event_at"] == "2026-08-30T12:00:00Z")
-    check("observations are not rendered", rows[0]["price"] == 1)
-
-
-def fake_connection(glob_files):
-    """A duckdb.connect stand-in whose glob() returns exactly `glob_files`."""
-
-    class Connection:
-        description = [("max_event_at",), ("price",)]
-
-        def execute(self, sql):
-            self._glob = sql.lstrip().startswith("SELECT file FROM glob(")
-            self.description = [("file",)] if self._glob else [("max_event_at",), ("price",)]
-            return self
-
-        def fetchall(self):
-            if self._glob:
-                return [(name,) for name in glob_files]
-            return [("2026-08-30T12:00:00Z", 1)]
-
-        def cursor(self):
-            return Connection()
-
-        def close(self):
-            pass
-
-    return Connection
-
-
-def test_absent_partition_does_not_erase_the_rest_of_the_window():
-    """One unwritten hour must not take the whole window's evidence down."""
-    patterns = [f"s3://bucket/hour={hour:02d}/**/*.parquet" for hour in (17, 18, 19)]
-    source = collector.Query("trades", patterns, "SELECT * FROM read_parquet(__PATHS__)", {}, True)
-    original = collector.duckdb.connect
-
-    # Hours 17 and 18 landed; the current hour 19 has not been written yet.
-    collector.duckdb.connect = fake_connection(
-        ["s3://bucket/hour=17/a.parquet", "s3://bucket/hour=18/b.parquet"])
-    try:
-        metadata, rows = collector.run_query(source)
-    finally:
-        collector.duckdb.connect = original
-    check("partial window still reads", metadata["status"] == "ok" and rows)
-    check("resolved only the present partitions", metadata["path_plan"]["resolved_file_count"] == 2)
-    check("absent partition counted", metadata["path_plan"]["missing_pattern_count"] == 1)
-    check("absent partition named", metadata["path_plan"]["missing_patterns"] == [patterns[2]])
 
 
 def test_render_queries_keep_their_coverage_expectations():
@@ -161,43 +103,10 @@ def test_render_queries_keep_their_coverage_expectations():
         check(f"{rendered.name} keeps expected_hours",
               rendered.expected_hours == plain[rendered.name].expected_hours,
               rendered.name)
+        check(f"{rendered.name} keeps its reader",
+              rendered.stream == plain[rendered.name].stream, rendered.name)
 
 
-def test_missing_hours_are_read_off_the_returned_keys():
-    """Day-level globs cannot probe per hour, so an absent hour is found by its
-    absence from the resolved file names — same warning, 1/24 the listings."""
-    start = dt.datetime(2026, 8, 30, 10, 0, tzinfo=dt.timezone.utc)
-    end = dt.datetime(2026, 8, 30, 13, 0, tzinfo=dt.timezone.utc)
-    queries = collector.build_queries("BTC", start, end)
-    trades = next(q for q in queries if q.name == "option_trades_deribit")
-    check("three hours expected", trades.expected_hours ==
-          ("20260830T10", "20260830T11", "20260830T12"), trades.expected_hours)
-    original = collector.duckdb.connect
-    # Hours 10 and 12 landed; hour 11 never wrote a file.
-    collector.duckdb.connect = fake_connection([
-        "s3://b/year=2026/month=08/day=30/hour=10/x__rows__20260830T100000Z.parquet",
-        "s3://b/year=2026/month=08/day=30/hour=12/x__rows__20260830T121500Z.parquet"])
-    try:
-        metadata, _ = collector.run_query(trades)
-    finally:
-        collector.duckdb.connect = original
-    check("absent hour counted", metadata["path_plan"]["missing_pattern_count"] == 1, metadata["path_plan"])
-    check("absent hour named", metadata["path_plan"]["missing_patterns"] == ["20260830T11"], metadata["path_plan"])
-    check("coverage denominator stays hourly", metadata["path_plan"]["pattern_count"] == 3, metadata["path_plan"])
-
-
-def test_fully_absent_window_reports_unavailable_not_a_quiet_market():
-    patterns = ["s3://bucket/hour=17/**/*.parquet", "s3://bucket/hour=18/**/*.parquet"]
-    source = collector.Query("trades", patterns, "SELECT * FROM read_parquet(__PATHS__)", {}, True)
-    original = collector.duckdb.connect
-    collector.duckdb.connect = fake_connection([])
-    try:
-        metadata, rows = collector.run_query(source)
-    finally:
-        collector.duckdb.connect = original
-    check("no objects means unavailable", metadata["status"] == "unavailable")
-    check("no rows fabricated", rows == [] and metadata["row_count"] == 0)
-    check("error names the pattern span", "2 partition patterns" in metadata["error"])
 
 
 def test_s3_reads_pin_the_regional_endpoint():
@@ -228,6 +137,11 @@ def test_s3_reads_pin_the_regional_endpoint():
                 for call in re.findall(
                         r"\b(?:client|resource)\(\s*[\'\"]s3[\'\"][^)]*\)", body):
                     if "endpoint_url" not in call:
+                        unpinned.append(os.path.relpath(path, skills))
+                # The async reader does not go through boto3 for its GETs, so
+                # it carries the pin on its own store constructor.
+                for call in re.findall(r"S3Store\(", body):
+                    if "endpoint=" not in body:
                         unpinned.append(os.path.relpath(path, skills))
     check("every S3 read pins the regional endpoint", not unpinned, unpinned)
 

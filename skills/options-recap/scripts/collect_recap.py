@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["duckdb>=1.3", "polars>=1.0", "boto3>=1.35"]
+# dependencies = ["duckdb>=1.3", "polars>=1.0", "boto3>=1.35", "obstore>=0.3", "pyarrow>=17"]
 # ///
 """Collect bounded direct exchange evidence without deciding the recap narrative."""
 
@@ -124,16 +124,19 @@ def tuning_statements(workers: int = 3) -> str:
     thousands of objects per window, so the threads sit blocked on the network
     rather than competing for the quota and a far higher count is correct.
     Connection caching matters for the same reason: without it every object pays
-    a fresh TLS handshake.
+    a fresh TLS handshake. Insertion order is deliberately left alone: callers
+    take a block's timestamp from the first row of its group, and reordering was
+    worth nothing measurable next to the two settings above.
     """
     limit = container_memory_bytes()
-    # DuckDB is not the only tenant: --render hands every trade row back as
-    # Python dicts, which polars then copies. Half the container is its share.
-    per_query = int(limit * 0.5 / workers) if limit else None
+    # DuckDB is not the only tenant, and it is no longer the hungry one: rows
+    # cross as Arrow now, so what it still needs is room to scan and sort one
+    # window. A quarter is enough, and temp_directory lets it spill past that
+    # instead of taking the container down.
+    per_query = int(limit * 0.25 / workers) if limit else None
     statements = [
         f"SET threads={MAX_READ_THREADS};",
         "SET httpfs_connection_caching=true;",
-        "SET preserve_insertion_order=false;",
         f"SET temp_directory='{tempfile.gettempdir()}/duckdb_recap';",
     ]
     if per_query:
@@ -165,9 +168,27 @@ class Query:
     required: bool = False
     # Hours the day-level globs should cover; empty means report per pattern.
     expected_hours: tuple[str, ...] = ()
+    # Read the objects directly instead of through DuckDB's httpfs. Only for
+    # queries that name their columns: the async path does not synthesise the
+    # path-derived partition columns that hive_partitioning=true adds, so a
+    # SELECT * over the raw read would lose them.
+    stream: bool = False
+
+
+def empty_frame():
+    """An empty result, so every caller can ask a frame the same questions.
+
+    polars is imported here rather than at module scope: the stdlib-only test
+    lane loads this module to check argument parsing and the partition plan,
+    neither of which needs a dataframe library.
+    """
+    import polars as pl
+    return pl.DataFrame()
 
 
 HOUR_IN_KEY = re.compile(r"__rows__(\d{8}T\d{2})")
+# The whole read_parquet(...) call, however it is wrapped across lines.
+RAW_READ = re.compile(r"read_parquet\(__PATHS__[^)]*\)")
 
 
 def resolve_paths(connection: duckdb.DuckDBPyConnection, patterns: list[str],
@@ -228,28 +249,37 @@ def run_query(query: Query) -> tuple[dict[str, Any], list[Any]]:
             source.update(status="unavailable", row_count=0,
                           error=f"no objects matched any of {len(query.paths)} partition "
                                 f"patterns between {query.paths[0]} and {query.paths[-1]}")
-            return source, []
-        result = connection.execute(query.sql.replace("__PATHS__", sql_list(files)))
-        columns = [column[0] for column in result.description]
-        rows = [dict(zip(columns, row)) for row in result.fetchall()]
+            return source, empty_frame()
+        if query.stream:
+            from s3_async import read_objects
+            # Bound by name in this frame; DuckDB resolves it by replacement scan.
+            partition_rows = read_objects(files)  # noqa: F841
+            sql = RAW_READ.sub("partition_rows", query.sql)
+        else:
+            sql = query.sql.replace("__PATHS__", sql_list(files))
+        # A frame, not dicts: a Python dict per row costs ~3KB against a
+        # container limit these windows already strain, and every consumer
+        # either aggregates or reads a handful of rows.
+        rows = connection.execute(sql).pl()
     except duckdb.Error as exc:
         source.update(status="unavailable", row_count=0, error=str(exc)[-1000:])
-        return source, []
+        return source, empty_frame()
     finally:
         if "connection" in locals():
             connection.close()
-    source.update(status="ok", row_count=len(rows))
+    source.update(status="ok", row_count=rows.height)
     source["partition_coverage"] = "partial" if missing else "all_planned_patterns_present"
     if query.name.startswith("option_surface_"):
-        source["missing_observations"] = sorted(
-            {"window_open", "latest"} - {row["observation"] for row in rows})
+        seen = set(rows["observation"].to_list()) if "observation" in rows.columns else set()
+        source["missing_observations"] = sorted({"window_open", "latest"} - seen)
     if query.name.startswith("venue_blocks_"):
         source["selection"] = "all_matching_rows_in_window; boundary groups may be incomplete"
     if query.name.startswith("option_trades_"):
         source["selection"] = "all-row aggregates plus top 25 known-turnover-first sample; not a complete trade list"
-    timestamps = [row.get("max_event_at") for row in rows if isinstance(row, dict) and row.get("max_event_at")]
-    if timestamps:
-        source["max_event_at"] = max(timestamps)
+    if "max_event_at" in rows.columns:
+        latest = rows["max_event_at"].drop_nulls()
+        if latest.len():
+            source["max_event_at"] = latest.max()
     return source, rows
 
 
@@ -290,7 +320,7 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime, *, render=Fa
                "premium_turnover_usd": "USD; null unless every matching row has turnover",
                "known_premium_turnover_usd": "USD partial sum, not a complete total",
                "iv": "venue-native; normalized column names do not harmonize units"},
-               True, tuple(trade_hours)))
+               True, tuple(trade_hours), stream=True))
 
         summary_paths = snapshot_patterns(venue, currency, start, end)
         open_point = start.replace(minute=start.minute - start.minute % 5, second=0, microsecond=0)
@@ -358,7 +388,7 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime, *, render=Fa
       FROM read_parquet(__PATHS__, union_by_name=true, hive_partitioning=true)
       WHERE {between} GROUP BY asset, index_name
     """, {"open": "vol points", "close": "vol points", "low": "vol points", "high": "vol points"},
-           expected_hours=tuple(dvol_hours)))
+           expected_hours=tuple(dvol_hours), stream=True))
 
     for venue in ("deribit", "okex-options", "bybit-options"):
         perp_paths, perp_hours = hour_patterns("normalized", venue, "perp_summary", currency, start, end)
@@ -377,7 +407,7 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime, *, render=Fa
         queries = [Query(q.name, q.paths,
                          q.sql.replace(" LIMIT 25", "").replace(
                              "WHERE evidence_rank=1", "WHERE target_delta=0.50"),
-                         q.units, q.required, q.expected_hours)
+                         q.units, q.required, q.expected_hours, q.stream)
                    for q in queries if q.name.startswith("option_trades_")
                    or q.name in ("option_surface_deribit", "dvol_window")]
     return queries
@@ -410,7 +440,7 @@ def main() -> int:
     sources = [source for source, _ in results]
     for source in sources:
         source["requested_event_time"] = {"start_at": start.isoformat(), "end_at": end.isoformat()}
-    evidence = {query.name: rows for query, (_, rows) in zip(queries, results)}
+    evidence = {query.name: rows.to_dicts() for query, (_, rows) in zip(queries, results)}
     gaps = [{"source": source["name"], "reason": source.get("error", "no rows")}
             for source in sources if source["status"] != "ok" or source["row_count"] == 0]
     gaps += [{"source": source["name"],

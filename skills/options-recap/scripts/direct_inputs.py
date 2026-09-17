@@ -1,5 +1,6 @@
 """Non-hot inputs for the existing recap calculator and renderer."""
 
+import gc
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -64,14 +65,52 @@ def metadata(venue, asset, start, end):
             .sort("captured_at"))
 
 
-def with_units(rows, specs):
+UNIT_COLUMNS = {"oi_unit": pl.String, "price_unit": pl.String,
+                "iv_unit": pl.String, "contract_size": pl.Float64}
+
+
+def event_at(dtype):
+    """`timestamp` arrives as a string from some venues, a datetime from others."""
+    column = pl.col("timestamp")
+    if dtype == pl.String:
+        return column.str.to_datetime(time_zone="UTC")
+    if isinstance(dtype, pl.Datetime) and dtype.time_zone is None:
+        return column.dt.replace_time_zone("UTC")
+    return column.dt.convert_time_zone("UTC")
+
+
+def with_units(frame, specs):
     """An as-of join never applies a future instrument spec to a past trade."""
-    return (pl.from_dicts(rows, infer_schema_length=None).lazy()
-            .with_columns(pl.col("timestamp").cast(pl.String).str.to_datetime(time_zone="UTC").alias("event_at"))
+    return (frame.lazy()
+            .with_columns(event_at(frame.schema["timestamp"]).alias("event_at"))
             .sort("event_at")
             .join_asof(specs.lazy().sort("captured_at"), left_on="event_at", right_on="captured_at",
                        by="symbol", strategy="backward", check_sortedness=False)
-            .collect().to_dicts())
+            .collect())
+
+
+def priced(frame):
+    """Coin size and USD premium per trade, from event-applicable units.
+
+    Expression-for-expression with the row loop this replaced, falsy checks
+    included: a zero contract_size or index_price leaves the value unproven
+    rather than quietly producing a zero.
+    """
+    amount, oi, size = pl.col("amount"), pl.col("oi_unit"), pl.col("contract_size")
+    frame = frame.with_columns(
+        pl.when(oi == "coin").then(amount)
+          .when((oi == "contracts") & amount.is_not_null()
+                & size.is_not_null() & (size != 0)).then(amount * size)
+          .otherwise(None).alias("coin"))
+    coin, price, index = pl.col("coin"), pl.col("price"), pl.col("index_price")
+    unit = pl.col("price_unit")
+    computable = coin.is_not_null() & price.is_not_null()
+    return frame.with_columns(pl.coalesce(
+        pl.col("turnover_usd"),
+        pl.when(computable & (unit == "quote_usd")).then(coin * price),
+        pl.when(computable & (unit == "coin") & index.is_not_null() & (index != 0))
+          .then(coin * price * index),
+    ).alias("premium"))
 
 
 def inputs(evidence, specs, gaps):
@@ -79,59 +118,71 @@ def inputs(evidence, specs, gaps):
     turnover, missing_values = 0.0, 0
     blocks = []
     for venue in VENUES:
-        rows = [r for r in evidence.get(f"option_trades_{venue}", []) if r["record_type"] == "trade"]
-        snapshot["trades_by_venue"][venue] = len(rows)
-        snapshot["trades_total"] += len(rows)
-        snapshot["put_trades"] += sum(r["symbol"].endswith("-P") for r in rows)
-        snapshot["call_trades"] += sum(r["symbol"].endswith("-C") for r in rows)
-        converted = with_units(rows, specs[venue]) if rows and venue in specs else rows
-        groups = {}
-        for row in converted:
-            amount = row.get("amount")
-            coin = (amount if row.get("oi_unit") == "coin" else
-                    amount * row["contract_size"] if amount is not None
-                    and row.get("oi_unit") == "contracts" and row.get("contract_size") else None)
-            premium = row.get("turnover_usd")
-            if premium is None and coin is not None and row.get("price") is not None:
-                if row.get("price_unit") == "quote_usd":
-                    premium = coin * row["price"]
-                elif row.get("price_unit") == "coin" and row.get("index_price"):
-                    premium = coin * row["price"] * row["index_price"]
-            if premium is None:
-                missing_values += 1
-            else:
-                turnover += premium
-            if not row.get("block_id"):
-                continue
-            bid = str(row["block_id"])
-            group = groups.setdefault(bid, {"exchange": venue, "block_id": bid,
-                "volume_coin": 0.0, "iv_sum": 0.0, "iv_count": 0, "leg_count": 0,
-                "bucket_at": int(datetime.fromisoformat(str(row["timestamp"]).replace("Z", "+00:00")).timestamp() * 1000),
-                "complete": True})
-            group["complete"] &= coin is not None
-            group["volume_coin"] += coin or 0
-            group["leg_count"] += 1
-            iv = row.get("iv")
-            if iv is not None and row.get("iv_unit") in ("decimal", "vol_points"):
-                group["iv_sum"] += iv * (100 if row["iv_unit"] == "decimal" else 1)
-                group["iv_count"] += 1
-        blocks.extend(g for g in groups.values() if g["complete"])
-        if any(not g["complete"] for g in groups.values()):
+        # Popped, not read: a venue's rows are finished with once aggregated,
+        # and at 30d holding all five windows at once is most of the peak.
+        frame = evidence.pop(f"option_trades_{venue}", None)
+        rows = (frame.filter(pl.col("record_type") == "trade")
+                if frame is not None and frame.height else None)
+        del frame
+        count = rows.height if rows is not None else 0
+        snapshot["trades_by_venue"][venue] = count
+        snapshot["trades_total"] += count
+        if not count:
+            continue
+        symbol = pl.col("symbol")
+        snapshot["put_trades"] += rows.select(symbol.str.ends_with("-P").sum()).item()
+        snapshot["call_trades"] += rows.select(symbol.str.ends_with("-C").sum()).item()
+        if venue in specs:
+            converted = with_units(rows, specs[venue])
+        else:
+            # No metadata for this venue: the unit columns stay null so nothing
+            # converts, which is what the absent dict keys used to mean.
+            converted = rows.with_columns(
+                [pl.lit(None, dtype).alias(name) for name, dtype in UNIT_COLUMNS.items()]
+            ).with_columns(event_at(rows.schema["timestamp"]).alias("event_at"))
+        valued = priced(converted)
+        missing_values += valued.select(pl.col("premium").is_null().sum()).item()
+        turnover += valued["premium"].sum() or 0.0
+
+        identifier = pl.col("block_id").cast(pl.String)
+        identified = valued.filter(pl.col("block_id").is_not_null() & (identifier != ""))
+        if not identified.height:
+            continue
+        iv, iv_unit = pl.col("iv"), pl.col("iv_unit")
+        usable = iv.is_not_null() & iv_unit.is_in(["decimal", "vol_points"])
+        points = iv * pl.when(iv_unit == "decimal").then(100).otherwise(1)
+        # maintain_order + first() reproduces the setdefault this replaced: the
+        # block takes its bucket from the earliest leg, because with_units has
+        # already sorted the rows by event time.
+        grouped = (identified
+                   .group_by(identifier.alias("block_id"), maintain_order=True)
+                   .agg(volume_coin=pl.col("coin").fill_null(0).sum(),
+                        iv_sum=points.filter(usable).sum(),
+                        iv_count=iv.filter(usable).len(),
+                        leg_count=pl.len(),
+                        bucket_at=pl.col("event_at").dt.timestamp("ms").first(),
+                        complete=pl.col("coin").is_not_null().all()))
+        blocks.extend({"exchange": venue, **group}
+                      for group in grouped.filter(pl.col("complete")).to_dicts())
+        if grouped.select((~pl.col("complete")).any()).item():
             gaps.append(f"{venue}: block notional unavailable for groups lacking event-time unit metadata")
+        del rows, converted, valued, identified, grouped
+        gc.collect()
     snapshot.update(turnover_usd=turnover, turnover_complete=missing_values == 0)
     if missing_values:
         gaps.append(f"Volume: {missing_values} trades lack a provable USD premium; shown sum is the valued subset")
-    dvol = evidence.get("dvol_window", [])
-    if dvol:
-        snapshot.update(dvol=dvol[0]["close"], dvol_open=dvol[0]["open"],
-                        dvol_low=dvol[0]["low"], dvol_high=dvol[0]["high"])
-    surface = evidence.get("option_surface_deribit", [])
-    if surface and "deribit" in specs:
-        surface = with_units(surface, specs["deribit"])
+    dvol = evidence.get("dvol_window")
+    if dvol is not None and dvol.height:
+        first = dvol.row(0, named=True)
+        snapshot.update(dvol=first["close"], dvol_open=first["open"],
+                        dvol_low=first["low"], dvol_high=first["high"])
+    surface = evidence.get("option_surface_deribit")
+    if surface is not None and surface.height and "deribit" in specs:
+        observed = with_units(surface, specs["deribit"]).to_dicts()
         for observation, key in (("window_open", "vs_open"), ("latest", "vs_now")):
             snapshot[key] = {r["symbol"]: {"mark_iv": r["markIV"] * (100 if r["iv_unit"] == "decimal" else 1),
                                            "delta": r["delta"]}
-                             for r in surface if r["observation"] == observation
+                             for r in observed if r["observation"] == observation
                              and r.get("markIV") is not None and r.get("iv_unit") in ("decimal", "vol_points")}
     return snapshot, blocks, turnover
 
@@ -159,19 +210,22 @@ def run(asset, window, start, end):
         market = pool.submit(recap._fetch_market_fallback, asset, start_ms, end_ms, want_surface=False)
         for query, future in reads:
             source, rows = future.result()
-            if query.name in ("dvol_window", "option_surface_deribit") and rows:
-                latest = [r for r in rows if r.get("observation", "latest") == "latest"]
+            if query.name in ("dvol_window", "option_surface_deribit") and rows.height:
+                # Both are small — one row and a snapshot — so reading them back
+                # as dicts here costs nothing.
+                observed = rows.to_dicts()
+                latest = [r for r in observed if r.get("observation", "latest") == "latest"]
                 times = [datetime.fromisoformat(str(r["max_event_at"]).replace("Z", "+00:00"))
                          for r in latest if r.get("max_event_at")]
                 if not times or not timedelta(0) <= end - max(times) <= timedelta(minutes=45):
                     gaps.append(f"{query.name}: latest observation stale or freshness unverified; excluded")
-                    rows = []
+                    rows = rows.clear()
             evidence[query.name] = rows
             if source["status"] != "ok":
                 gaps.append(f"{query.name}: unavailable — {source['error']}")
             elif source["path_plan"].get("missing_pattern_count"):
                 gaps.append(f"{query.name}: {source['path_plan']['missing_pattern_count']}/{source['path_plan']['pattern_count']} hourly/bucket paths absent; partial coverage")
-            elif not rows:
+            elif not rows.height:
                 gaps.append(f"{query.name}: no usable observations")
         for venue, future in meta.items():
             try:
@@ -197,7 +251,8 @@ def run(asset, window, start, end):
             except Exception as exc:
                 gaps.append(f"Deribit {key} unavailable — {exc}")
     snapshot, blocks, known_turnover = inputs(evidence, specs, gaps)
-    if not snapshot["trades_total"] and not evidence.get("option_surface_deribit"):
+    surface_rows = evidence.get("option_surface_deribit")
+    if not snapshot["trades_total"] and not (surface_rows is not None and surface_rows.height):
         raise RuntimeError("recap: no usable core direct-data source; " + "; ".join(gaps))
     result = recap.build(asset, window, start_ms, end_ms, deri, snapshot, executions, blocks)
     # Direct inputs cover the requested window, not the retired 24h rollup.
