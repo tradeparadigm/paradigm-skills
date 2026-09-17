@@ -45,10 +45,15 @@ def trades(*rows):
     return pl.DataFrame(list(rows), schema=TRADE_SCHEMA)
 
 
+def reduce(frame, spec, gaps, venue="okex-options"):
+    """The streaming path: reduce one venue, then assemble from the totals."""
+    totals = {venue: direct.aggregate_trades(venue, frame, spec, gaps)}
+    return direct.inputs(totals, {}, {venue: spec} if spec is not None else {}, gaps)
+
+
 def test_event_time_units_not_latest_metadata():
     gaps = []
-    snapshot, blocks, turnover = direct.inputs(
-        {"option_trades_okex-options": trades(trade())}, {"okex-options": spec()}, gaps)
+    snapshot, blocks, turnover = reduce(trades(trade()), spec(), gaps)
     assert turnover == 800.0  # 100 contracts * 0.01 BTC * 0.01 premium * 80k
     assert blocks[0]["volume_coin"] == 1.0
     assert blocks[0]["iv_sum"] == 40.0
@@ -58,15 +63,14 @@ def test_event_time_units_not_latest_metadata():
 
 def test_unavailable_metadata_does_not_default_contract_size():
     gaps = []
-    snapshot, blocks, turnover = direct.inputs({"option_trades_okex-options": trades(trade())}, {}, gaps)
+    snapshot, blocks, turnover = reduce(trades(trade()), None, gaps)
     assert not snapshot["turnover_complete"]
     assert not blocks and turnover == 0
     assert any("lack a provable USD premium" in gap for gap in gaps)
 
 
 def test_existing_usd_turnover_is_not_scaled_twice():
-    _, _, turnover = direct.inputs({"option_trades_okex-options": trades(trade(turnover_usd=123.0))},
-                                    {"okex-options": spec()}, [])
+    _, _, turnover = reduce(trades(trade(turnover_usd=123.0)), spec(), [])
     assert turnover == 123.0
 
 

@@ -113,41 +113,38 @@ def priced(frame):
     ).alias("premium"))
 
 
-def inputs(evidence, specs, gaps):
-    snapshot = {"trades_by_venue": {}, "trades_total": 0, "put_trades": 0, "call_trades": 0}
-    turnover, missing_values = 0.0, 0
-    blocks = []
-    for venue in VENUES:
-        # Popped, not read: a venue's rows are finished with once aggregated,
-        # and at 30d holding all five windows at once is most of the peak.
-        frame = evidence.pop(f"option_trades_{venue}", None)
-        rows = (frame.filter(pl.col("record_type") == "trade")
-                if frame is not None and frame.height else None)
-        del frame
-        count = rows.height if rows is not None else 0
-        snapshot["trades_by_venue"][venue] = count
-        snapshot["trades_total"] += count
-        if not count:
-            continue
-        symbol = pl.col("symbol")
-        snapshot["put_trades"] += rows.select(symbol.str.ends_with("-P").sum()).item()
-        snapshot["call_trades"] += rows.select(symbol.str.ends_with("-C").sum()).item()
-        if venue in specs:
-            converted = with_units(rows, specs[venue])
-        else:
-            # No metadata for this venue: the unit columns stay null so nothing
-            # converts, which is what the absent dict keys used to mean.
-            converted = rows.with_columns(
-                [pl.lit(None, dtype).alias(name) for name, dtype in UNIT_COLUMNS.items()]
-            ).with_columns(event_at(rows.schema["timestamp"]).alias("event_at"))
-        valued = priced(converted)
-        missing_values += valued.select(pl.col("premium").is_null().sum()).item()
-        turnover += valued["premium"].sum() or 0.0
+EMPTY_TOTAL = {"count": 0, "puts": 0, "calls": 0, "turnover": 0.0,
+               "missing": 0, "blocks": []}
 
-        identifier = pl.col("block_id").cast(pl.String)
-        identified = valued.filter(pl.col("block_id").is_not_null() & (identifier != ""))
-        if not identified.height:
-            continue
+
+def aggregate_trades(venue, rows, spec, gaps):
+    """Reduce one venue's trades to totals and blocks so the frame can be freed.
+
+    Called as each read lands rather than after all of them: at 30d the five
+    venue windows are ~1.9M rows between them, and holding them together while
+    the joins run is what exhausted the container.
+    """
+    total = dict(EMPTY_TOTAL, count=rows.height, blocks=[])
+    if not rows.height:
+        return total
+    symbol = pl.col("symbol")
+    total["puts"] = rows.select(symbol.str.ends_with("-P").sum()).item()
+    total["calls"] = rows.select(symbol.str.ends_with("-C").sum()).item()
+    if spec is not None:
+        converted = with_units(rows, spec)
+    else:
+        # No metadata for this venue: the unit columns stay null so nothing
+        # converts, which is what the absent dict keys used to mean.
+        converted = rows.with_columns(
+            [pl.lit(None, dtype).alias(name) for name, dtype in UNIT_COLUMNS.items()]
+        ).with_columns(event_at(rows.schema["timestamp"]).alias("event_at"))
+    valued = priced(converted)
+    total["missing"] = valued.select(pl.col("premium").is_null().sum()).item()
+    total["turnover"] = valued["premium"].sum() or 0.0
+
+    identifier = pl.col("block_id").cast(pl.String)
+    identified = valued.filter(pl.col("block_id").is_not_null() & (identifier != ""))
+    if identified.height:
         iv, iv_unit = pl.col("iv"), pl.col("iv_unit")
         usable = iv.is_not_null() & iv_unit.is_in(["decimal", "vol_points"])
         points = iv * pl.when(iv_unit == "decimal").then(100).otherwise(1)
@@ -162,12 +159,29 @@ def inputs(evidence, specs, gaps):
                         leg_count=pl.len(),
                         bucket_at=pl.col("event_at").dt.timestamp("ms").first(),
                         complete=pl.col("coin").is_not_null().all()))
-        blocks.extend({"exchange": venue, **group}
-                      for group in grouped.filter(pl.col("complete")).to_dicts())
+        total["blocks"] = [{"exchange": venue, **group}
+                           for group in grouped.filter(pl.col("complete")).to_dicts()]
         if grouped.select((~pl.col("complete")).any()).item():
             gaps.append(f"{venue}: block notional unavailable for groups lacking event-time unit metadata")
-        del rows, converted, valued, identified, grouped
-        gc.collect()
+        del grouped, identified
+    del converted, valued
+    gc.collect()
+    return total
+
+
+def inputs(totals, evidence, specs, gaps):
+    snapshot = {"trades_by_venue": {}, "trades_total": 0, "put_trades": 0, "call_trades": 0}
+    turnover, missing_values = 0.0, 0
+    blocks = []
+    for venue in VENUES:
+        total = totals.get(venue, EMPTY_TOTAL)
+        snapshot["trades_by_venue"][venue] = total["count"]
+        snapshot["trades_total"] += total["count"]
+        snapshot["put_trades"] += total["puts"]
+        snapshot["call_trades"] += total["calls"]
+        turnover += total["turnover"]
+        missing_values += total["missing"]
+        blocks.extend(total["blocks"])
     snapshot.update(turnover_usd=turnover, turnover_complete=missing_values == 0)
     if missing_values:
         gaps.append(f"Volume: {missing_values} trades lack a provable USD premium; shown sum is the valued subset")
@@ -191,7 +205,11 @@ def run(asset, window, start, end):
     recap.WARNINGS.clear()
     queries = build_queries(asset, start, end, render=True)
     end_ms, start_ms = int(end.timestamp() * 1000), int(start.timestamp() * 1000)
-    gaps, specs, evidence = [], {}, {}
+    # Gaps are collected per stage and concatenated in the original order at
+    # the end: aggregating early would otherwise interleave a venue's block
+    # warning with the read warnings, and the ⚠ lines are part of the output.
+    read_gaps, meta_gaps, block_gaps = [], [], []
+    gaps, specs, evidence, totals = [], {}, {}, {}
     # Partition reads get their own pool: they are the ones holding a window in
     # memory, so their concurrency is a memory budget, not a latency choice.
     readers = query_workers(end - start)
@@ -208,6 +226,16 @@ def run(asset, window, start, end):
         closes = pool.submit(recap.fetch_7d_closes, asset, end_ms)
         # Same Deribit perpetual-price proxy and realized-vol definition as before.
         market = pool.submit(recap._fetch_market_fallback, asset, start_ms, end_ms, want_surface=False)
+        def spec_for(venue):
+            """Resolve one venue's metadata once, when its trades need it."""
+            if venue not in specs and venue in meta:
+                try:
+                    specs[venue] = meta.pop(venue).result()
+                except Exception as exc:
+                    meta.pop(venue, None)
+                    meta_gaps.append(f"{venue}: unit metadata unavailable — {exc}")
+            return specs.get(venue)
+
         for query, future in reads:
             source, rows = future.result()
             if query.name in ("dvol_window", "option_surface_deribit") and rows.height:
@@ -218,20 +246,26 @@ def run(asset, window, start, end):
                 times = [datetime.fromisoformat(str(r["max_event_at"]).replace("Z", "+00:00"))
                          for r in latest if r.get("max_event_at")]
                 if not times or not timedelta(0) <= end - max(times) <= timedelta(minutes=45):
-                    gaps.append(f"{query.name}: latest observation stale or freshness unverified; excluded")
+                    read_gaps.append(f"{query.name}: latest observation stale or freshness unverified; excluded")
                     rows = rows.clear()
-            evidence[query.name] = rows
             if source["status"] != "ok":
-                gaps.append(f"{query.name}: unavailable — {source['error']}")
+                read_gaps.append(f"{query.name}: unavailable — {source['error']}")
             elif source["path_plan"].get("missing_pattern_count"):
-                gaps.append(f"{query.name}: {source['path_plan']['missing_pattern_count']}/{source['path_plan']['pattern_count']} hourly/bucket paths absent; partial coverage")
+                read_gaps.append(f"{query.name}: {source['path_plan']['missing_pattern_count']}/{source['path_plan']['pattern_count']} hourly/bucket paths absent; partial coverage")
             elif not rows.height:
-                gaps.append(f"{query.name}: no usable observations")
-        for venue, future in meta.items():
-            try:
-                specs[venue] = future.result()
-            except Exception as exc:
-                gaps.append(f"{venue}: unit metadata unavailable — {exc}")
+                read_gaps.append(f"{query.name}: no usable observations")
+            if query.name.startswith("option_trades_"):
+                # Reduced here and dropped, so the next venue's read never sits
+                # beside this one's window.
+                venue = query.name[len("option_trades_"):]
+                trades = rows.filter(pl.col("record_type") == "trade") if rows.height else rows
+                totals[venue] = aggregate_trades(venue, trades, spec_for(venue), block_gaps)
+                del rows, trades
+                gc.collect()
+            else:
+                evidence[query.name] = rows
+        for venue in list(meta):
+            spec_for(venue)
         try:
             tape_result = tape.result()
             executions = calculation_rows(tape_result["rows"])
@@ -250,7 +284,8 @@ def run(asset, window, start, end):
                 deri[key] = future.result()
             except Exception as exc:
                 gaps.append(f"Deribit {key} unavailable — {exc}")
-    snapshot, blocks, known_turnover = inputs(evidence, specs, gaps)
+    gaps = read_gaps + meta_gaps + gaps + block_gaps
+    snapshot, blocks, known_turnover = inputs(totals, evidence, specs, gaps)
     surface_rows = evidence.get("option_surface_deribit")
     if not snapshot["trades_total"] and not (surface_rows is not None and surface_rows.height):
         raise RuntimeError("recap: no usable core direct-data source; " + "; ".join(gaps))
