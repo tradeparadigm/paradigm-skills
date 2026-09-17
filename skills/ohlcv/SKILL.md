@@ -21,14 +21,23 @@ metadata:
 ## Command
 
 `/ohlcv [asset] [venue] [interval] [window]` is order-independent. Defaults are
-BTC, the venue named below, `1h` bars and a `24h` window.
+BTC, `deribit`, a `24h` window and the `1h` bars that window derives.
 
-Two `Nm`/`Nh`/`Nd` tokens are read as interval then window, in that order. One
-such token is the window, and the interval is chosen from its width. A bare
-alphabetic token is the venue when it names a known venue, otherwise the asset.
+Two `Nm`/`Nh`/`Nd` tokens resolve by length — the shorter is the interval, the
+longer the window — so `1h 24h` and `24h 1h` mean the same thing. One
+such token is the window, and the interval derives from its width: `1m` up to
+4h, `1h` up to 3d, `1d` beyond. A bare alphabetic token is the venue when it
+names one below, otherwise the asset. A repeated slot — two windows, two
+intervals, two venues, two assets — is an error, not a silent choice.
 
-State the interval, window and venue actually queried. Never widen a window,
-never silently substitute a different interval, and never quietly cap either.
+Valid venues are the ones that publish trade rows: `deribit` (perps, BTC and
+ETH) and `bullish` (perps and spot). The other venues in the catalog carry
+option and summary feeds only, so they cannot produce candles and are refused
+up front rather than after an empty read.
+
+State the interval, window and venue actually queried — a derived interval is
+stated, not assumed. Never widen a window, never substitute a different
+interval for one the user gave, and never quietly cap either.
 
 ## Live execution
 
@@ -37,6 +46,14 @@ Run one command from this skill's directory:
 ```bash
 bash scripts/run_ohlcv.sh BTC deribit 1h 24h
 ```
+
+Windows are bounded by what the read can actually serve, not by what the data
+retains: a request spanning more days than the read bound allows is refused
+before any listing, because one day-level glob per calendar day lists every
+object in that day and a long window spends minutes enumerating keys before it
+reads a byte. The refusal names the bound. Report it and let the user choose a
+window; do not re-run at the limit and do not fall back to a coarser interval
+to squeeze under it.
 
 The script reads non-hot partitions, builds the bars, and prints the finished
 table. Relay stdout verbatim as the entire answer, including the coverage and
