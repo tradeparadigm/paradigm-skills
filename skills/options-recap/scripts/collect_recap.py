@@ -173,6 +173,10 @@ class Query:
     # path-derived partition columns that hive_partitioning=true adds, so a
     # SELECT * over the raw read would lose them.
     stream: bool = False
+    # The columns that SQL names. Without them the streamed read materialises
+    # every column in Arrow before DuckDB projects, which is both the bytes the
+    # projection was meant to save and memory outside DuckDB's own limit.
+    columns: tuple[str, ...] = ()
 
 
 def empty_frame():
@@ -253,7 +257,7 @@ def run_query(query: Query) -> tuple[dict[str, Any], list[Any]]:
         if query.stream:
             from s3_async import read_objects
             # Bound by name in this frame; DuckDB resolves it by replacement scan.
-            partition_rows = read_objects(files)  # noqa: F841
+            partition_rows = read_objects(files, query.columns or None)  # noqa: F841
             sql = RAW_READ.sub("partition_rows", query.sql)
         else:
             sql = query.sql.replace("__PATHS__", sql_list(files))
@@ -261,7 +265,10 @@ def run_query(query: Query) -> tuple[dict[str, Any], list[Any]]:
         # container limit these windows already strain, and every consumer
         # either aggregates or reads a handful of rows.
         rows = connection.execute(sql).pl()
-    except duckdb.Error as exc:
+    except Exception as exc:
+        # Not just duckdb.Error: the streamed path raises obstore, pyarrow and
+        # botocore errors, and an unreadable source is a named gap, never a
+        # traceback that takes the other venues down with it.
         source.update(status="unavailable", row_count=0, error=str(exc)[-1000:])
         return source, empty_frame()
     finally:
@@ -320,7 +327,8 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime, *, render=Fa
                "premium_turnover_usd": "USD; null unless every matching row has turnover",
                "known_premium_turnover_usd": "USD partial sum, not a complete total",
                "iv": "venue-native; normalized column names do not harmonize units"},
-               True, tuple(trade_hours), stream=True))
+               True, tuple(trade_hours), stream=True, columns=("exchange", "timestamp", "symbol", "side", "amount", "price", "iv",
+                 "index_price", "turnover_usd", "block_id", "id")))
 
         summary_paths = snapshot_patterns(venue, currency, start, end)
         open_point = start.replace(minute=start.minute - start.minute % 5, second=0, microsecond=0)
@@ -388,7 +396,8 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime, *, render=Fa
       FROM read_parquet(__PATHS__, union_by_name=true, hive_partitioning=true)
       WHERE {between} GROUP BY asset, index_name
     """, {"open": "vol points", "close": "vol points", "low": "vol points", "high": "vol points"},
-           expected_hours=tuple(dvol_hours), stream=True))
+           expected_hours=tuple(dvol_hours), stream=True,
+           columns=("asset", "index_name", "volatility", "timestamp")))
 
     for venue in ("deribit", "okex-options", "bybit-options"):
         perp_paths, perp_hours = hour_patterns("normalized", venue, "perp_summary", currency, start, end)
@@ -407,7 +416,7 @@ def build_queries(asset: str, start: dt.datetime, end: dt.datetime, *, render=Fa
         queries = [Query(q.name, q.paths,
                          q.sql.replace(" LIMIT 25", "").replace(
                              "WHERE evidence_rank=1", "WHERE target_delta=0.50"),
-                         q.units, q.required, q.expected_hours, q.stream)
+                         q.units, q.required, q.expected_hours, q.stream, q.columns)
                    for q in queries if q.name.startswith("option_trades_")
                    or q.name in ("option_surface_deribit", "dvol_window")]
     return queries

@@ -280,3 +280,47 @@ def test_fully_absent_window_reports_unavailable_not_a_quiet_market():
     assert metadata["status"] == "unavailable"
     assert rows.height == 0 and metadata["row_count"] == 0
     assert "2 partition patterns" in metadata["error"]
+
+
+def test_a_streaming_failure_is_a_gap_not_a_traceback(monkeypatch):
+    """The async reader raises obstore/pyarrow/botocore errors, none of them
+    duckdb.Error. Uncaught they killed the whole recap — every trade query and
+    dvol stream, so it is the common path — instead of naming one bad source."""
+    query = collector.Query("option_trades_deribit", ["s3://b/**/*.parquet"],
+                            "SELECT * FROM read_parquet(__PATHS__)", {}, True,
+                            stream=True, columns=("timestamp",))
+    original = collector.duckdb.connect
+    previous = sys.modules.get("s3_async")
+    collector.duckdb.connect = fake_connection(["s3://b/a.parquet"])
+
+    def boom(paths, columns=None):
+        raise pl.exceptions.ComputeError("schema drift across objects")
+
+    sys.modules["s3_async"] = types.SimpleNamespace(read_objects=boom)
+    try:
+        metadata, rows = collector.run_query(query)
+    finally:
+        collector.duckdb.connect = original
+        if previous is None:
+            sys.modules.pop("s3_async", None)
+        else:
+            sys.modules["s3_async"] = previous
+    assert metadata["status"] == "unavailable"
+    assert "schema drift" in metadata["error"]
+    assert rows.height == 0
+
+
+def test_schema_drift_across_objects_falls_back_to_string():
+    """union_by_name=true reads a column that is int in one object and string in
+    another as VARCHAR; permissive Arrow promotion raises instead."""
+    import pyarrow as pa
+    from importlib import util as _util
+    spec = _util.spec_from_file_location(
+        "s3_async", Path(__file__).resolve().parents[1] / "scripts" / "s3_async.py")
+    mod = _util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    merged = mod._concat([pa.table({"id": pa.array([1, 2], pa.int64())}),
+                          pa.table({"id": pa.array(["x"], pa.string())})])
+    assert merged.num_rows == 3
+    assert merged.schema.field("id").type == pa.string()
+    assert merged.column("id").to_pylist() == ["1", "2", "x"]

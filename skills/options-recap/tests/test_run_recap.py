@@ -105,6 +105,22 @@ def test_render_queries_keep_their_coverage_expectations():
               rendered.name)
         check(f"{rendered.name} keeps its reader",
               rendered.stream == plain[rendered.name].stream, rendered.name)
+        check(f"{rendered.name} keeps its projection",
+              rendered.columns == plain[rendered.name].columns, rendered.name)
+
+
+def test_streamed_queries_name_every_column_their_sql_reads():
+    """The async reader projects to Query.columns, so a column the SQL uses but
+    the tuple omits is silently absent at query time."""
+    start = dt.datetime(2026, 8, 30, 10, 0, tzinfo=dt.timezone.utc)
+    end = dt.datetime(2026, 8, 30, 12, 0, tzinfo=dt.timezone.utc)
+    for query in collector.build_queries("BTC", start, end):
+        if not query.stream:
+            continue
+        check(f"{query.name} declares its columns", bool(query.columns), query.name)
+        body = query.sql.split("read_parquet", 1)[0] + query.sql.split(")", 1)[-1]
+        for column in ("timestamp",):
+            check(f"{query.name} projects {column}", column in query.columns, query.columns)
 
 
 
