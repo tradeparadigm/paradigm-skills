@@ -25,7 +25,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape (the
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.9"
+  version: "1.8"
 ---
 
 # Paradigm Block Trade Analyst
@@ -479,17 +479,6 @@ offset = `(|net_fill| − |net_mark|) × 10000` (bps coin / % USD): positive ⇒
 both *against* the taker: token stays neutral, but never render an against-the-taker fill as edge.
 **Single-leg is unchanged** — the precomputed `OFFSET_BPS`, verbatim. Example — RRPut 25 Sep 26
 55000/75000, Seller: Recd **0.0009** net credit vs mark **0.0015** → **−6 bps below mark**.
-
-**Unequal leg sizes — do the weighting, it is where this goes wrong.** When the legs trade
-different QTY the package is a *ratio*, and every leg counts `QTY ÷ base` times, base = the
-smallest option-leg QTY. That base is also the **structure size** in the header (`×<base>`), not
-the largest leg. Worked example — a 1×2 call ratio filled `BUY 30 @ 0.0180` (70000 C, ref 0.0175)
-and `SELL 60 @ 0.0062` (80000 C, ref 0.0061): base 30, so weights are 1 and 2 →
-`net_fill = 0.0180 − 2×0.0062 = 0.0056` debit (Buyer, `Paid 0.0056`),
-`net_mark = 0.0175 − 2×0.0061 = 0.0053`, offset `(0.0056 − 0.0053) × 10000 = +3 bps above mark`,
-header size `×30`. The per-leg `OFFSET_BPS` values are **not** the package's and frequently cancel
-to something that looks neutral while the package is not — never report one in a multi-leg header
-or `[Fair]`.
 
 **Line 2 — View, one clause:**
 `<spot + moneyness> · <exposure in greek shorthand> · <key level> · <flow type>`
