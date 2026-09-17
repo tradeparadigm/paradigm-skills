@@ -190,6 +190,12 @@ def empty_frame():
     return pl.DataFrame()
 
 
+# execution_tape and s3_async are data-discovery's: it owns the shared readers.
+# Module scope, not inside main(): --render returns from main() before the
+# execution-tape import that used to carry this insert, and the streamed read
+# in run_query() imports s3_async lazily by then.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "data-discovery" / "scripts"))
+
 HOUR_IN_KEY = re.compile(r"__rows__(\d{8}T\d{2})")
 # The whole read_parquet(...) call, however it is wrapped across lines.
 RAW_READ = re.compile(r"read_parquet\(__PATHS__[^)]*\)")
@@ -459,7 +465,6 @@ def main() -> int:
              for source in sources
              if source["status"] == "ok" and source["row_count"] > 0
              and source["path_plan"].get("missing_pattern_count")]
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "data-discovery" / "scripts"))
     from execution_tape import read_executions
     try:
         executions = read_executions(start, end, asset=args.asset)

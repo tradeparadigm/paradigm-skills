@@ -316,7 +316,7 @@ def test_schema_drift_across_objects_falls_back_to_string():
     import pyarrow as pa
     from importlib import util as _util
     spec = _util.spec_from_file_location(
-        "s3_async", Path(__file__).resolve().parents[1] / "scripts" / "s3_async.py")
+        "s3_async", Path(__file__).resolve().parents[2] / "data-discovery" / "scripts" / "s3_async.py")
     mod = _util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     merged = mod._concat([pa.table({"id": pa.array([1, 2], pa.int64())}),
