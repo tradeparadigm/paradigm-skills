@@ -179,18 +179,22 @@ def coverage(bars: list[dict], interval_ms: int, start_ms: int, end_ms: int,
     # is exactly the bar the partial check exists to find.
     inside = [bar for bar in bars
               if bar["time"] + interval_ms > start_ms and bar["time"] < end_ms]
+    # Partial findings carry their instants as fields rather than interpolated
+    # into the reason: a renderer has to format them as clock times, and a raw
+    # epoch printed in the output reads as a fabricated number.
     if inside:
         first, last = inside[0], inside[-1]
         if start_ms > first["time"]:
-            findings.append({"kind": "partial", "from": first["time"],
-                             "to": start_ms,
-                             "reason": "window opens mid-period"})
+            findings.append({"kind": "partial", "reason": "opens mid-period",
+                             "from": first["time"], "to": start_ms,
+                             "period_start": first["time"],
+                             "window_edge": start_ms})
         period_end = last["time"] + interval_ms
         if watermark_ms is not None and watermark_ms < period_end:
-            findings.append({"kind": "partial", "from": last["time"],
-                             "to": period_end,
-                             "reason": "period incomplete — data reaches "
-                                       f"{watermark_ms}"})
+            findings.append({"kind": "partial", "reason": "period incomplete",
+                             "from": last["time"], "to": period_end,
+                             "period_end": period_end,
+                             "reaches": watermark_ms})
     return findings
 
 
