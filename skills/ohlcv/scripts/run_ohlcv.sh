@@ -15,10 +15,11 @@ INTERVALS="1m 5m 15m 1h 4h 1d"
 MAX_BARS=2000
 # Listing bound, and the one that actually protects the runtime. The collector
 # issues one day-level glob per calendar day, and each lists every object in
-# that day — roughly 1,440 at level=1m. Seven days is already ~10,000 keys,
-# which is where the recap skill measured 7m08s and was killed twice in the
-# pod. This number is inherited from that measurement, NOT measured for candle
-# partitions; raise it via the environment once someone profiles a real window.
+# that day — about 288 at the 5m rows level it reads, so roughly 2,000 keys at
+# seven days. That is under the ~10,000 listings where the recap skill measured
+# 7m08s and was killed twice in the pod, which is where this number comes from:
+# inherited from that measurement, NOT measured for candle partitions. Raise it
+# via the environment once someone profiles a real window.
 MAX_DAYS="${OHLCV_MAX_DAYS:-7}"
 
 ASSET=BTC

@@ -85,10 +85,19 @@ for the partition layout, venue matrix, field names and units, and
 [s3-access.md](../data-discovery/references/s3-access.md) for the DuckDB
 credential preamble and the pinned regional endpoint.
 
-Bars come from trade rows — `perp_trade` and `spot_trade` under
-`raw/`/`normalized/` — bucketed by event time. Where a per-period aggregate
-already carries open/high/low/close for the requested level, read it instead of
-rebuilding from rows, and resample only downward.
+Bars come from normalized `perp_trade` rows, bucketed by event time.
+`normalized/` rather than `raw/` because it gives the same column names across
+venues; bars are still built one venue at a time, never unioned.
+
+Every interval reads the `5m` rows level and buckets up from there. `level` is
+file granularity, not sampling — the catalog is explicit that `1m`, `5m` and
+`1h` files carry the same events and must not be combined — and rows exist only
+at `1m` and `5m`, so `5m` is the coarsest level that can build a candle at all.
+Reading it for every interval also keeps the listing cost flat in the interval.
+
+Whether the `1h` aggregate files already carry open/high/low/close is not
+established anywhere in the catalog, so nothing here reads them. If a probe
+confirms that schema, a coarse-interval shortcut becomes available.
 
 ## Output
 
