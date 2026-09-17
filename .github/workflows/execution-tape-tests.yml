@@ -37,7 +37,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install test dependencies
-        run: python -m pip install pytest polars boto3 duckdb
+        run: python -m pip install pytest polars boto3 duckdb pyarrow obstore
 
       - name: Every pytest module must be selected by this lane
         run: |
