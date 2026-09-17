@@ -718,6 +718,19 @@ def _dedupe_venue_blocks(venue_rows: list[dict],
     return out, [{"reason": reason, "rows": rows} for reason, rows in dropped.items()]
 
 
+def _price_at(row):
+    """A venue block's own trade-time index, or None. NaN is truthy and would
+    otherwise pass straight through an `or spot` fallback into round()."""
+    px = _num(row, "index_px")
+    return px if px is not None and px == px and px > 0 else None
+
+
+def _state(value):
+    """A venue's coverage state. It is stored as (state, detail); comparing the
+    tuple against a string silently disabled the Activity marker once already."""
+    return value[0] if isinstance(value, (list, tuple)) else value
+
+
 def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
     """Shape venue-tape block rows into the block dicts build_tape_blocks
     merges (source="venue"). The venue tape carries totals per block — no leg
@@ -731,7 +744,9 @@ def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
     trade-time figures for Biggest Print, so pricing them at the window close
     made the ranking a function of the spot move over the window. No price at
     all → skip with a warning, never guess."""
-    if rows and not spot and not any(_num(r, "index_px") for r in rows):
+    if rows and not spot and not all(_price_at(r) for r in rows):
+        # `any` was wrong: with no spot, one row carrying an index and one
+        # without still reached `vol * (index_px or spot)` and multiplied by None.
         warn("venue-tape blocks skipped — no trade-time index or spot to price coin volume")
         return []
     out = []
@@ -753,7 +768,7 @@ def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
             "rfq_id": r.get("block_id"),  # its own worked order
             "structure": f"{venue} Block", "expiry": "",
             "venue": venue,
-            "notional_usd": round(vol * (_num(r, "index_px") or spot)),
+            "notional_usd": round(vol * (_price_at(r) or spot)),
             "unit_size": round(vol, 1),  # total coin size — legs unknown
             "side": "", "avg_iv": avg_iv,
             # bucket_at is the block's first 5m bucket — ~5-min resolution,
@@ -892,9 +907,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         unread = set()
         for v, n in (hot.get("trades_by_venue") or {}).items():
             label = _venue_label(v)
-            state = states.get(v)
-            state = state[0] if isinstance(state, (list, tuple)) else state
-            if state in ("unreadable", "feed_gap"):
+            if _state(states.get(v)) in ("unreadable", "feed_gap"):
                 unread.add(label)
             by_label[label] += n
         activity_split = [
@@ -1171,12 +1184,10 @@ def render_md(r: dict) -> str:
     if states:
         _WORDS = {"complete": None, "quiet": "no trades", "feed_gap": "feed gap",
                   "unreadable": "READ FAILED", "unknown": "unverified"}
-        read = sum(1 for v in states.values()
-                   if (v[0] if isinstance(v, (list, tuple)) else v) != "unreadable")
+        read = sum(1 for v in states.values() if _state(v) != "unreadable")
         notes = []
         for venue, state in states.items():
-            state = state[0] if isinstance(state, (list, tuple)) else state
-            word = _WORDS.get(state)
+            word = _WORDS.get(_state(state))
             if word:
                 notes.append(f"{_venue_label(venue)} {word}")
         detail = " · ".join(notes) if notes else "all venue feeds complete"

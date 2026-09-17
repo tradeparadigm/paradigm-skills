@@ -1934,6 +1934,22 @@ def test_coverage_leads_the_snapshot_and_names_unread_venues():
           "Bybit 20%+" in act, act)
 
 
+def test_a_block_with_no_trade_time_index_falls_back_without_crashing():
+    """index_px is NaN when no leg carried an index (0/0). NaN is truthy, so it
+    walked past the `or spot` fallback and reached round() — a crash on the live
+    path, not a wrong number."""
+    rows = [{"exchange": "okex-options", "block_id": "O-1", "volume_coin": "2",
+             "index_px": float("nan"), "bucket_at": 1_500_000},
+            {"exchange": "okex-options", "block_id": "O-2", "volume_coin": "1",
+             "index_px": 80000.0, "bucket_at": 1_500_000}]
+    out = recap._venue_tape_blocks(rows, 100000.0)
+    check("a NaN index falls back to spot", bool(out) and out[0]["notional_usd"] == 200000, out)
+    check("a real index is used over spot",
+          len(out) > 1 and out[1]["notional_usd"] == 80000, out)
+    check("no spot and an unpriced row skips rather than crashes",
+          recap._venue_tape_blocks(rows, None) == [], "expected skip")
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     print(f"Running {len(tests)} test functions...")

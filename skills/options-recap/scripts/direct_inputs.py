@@ -114,6 +114,9 @@ def priced(frame):
     ).alias("premium"))
 
 
+# A leg only contributes to the block's trade-time price if it actually has one.
+_PRICED = pl.col("index_price").is_not_null() & (pl.col("index_price") != 0)
+
 EMPTY_TOTAL = {"count": 0, "puts": 0, "calls": 0, "turnover": 0.0,
                "missing": 0, "blocks": []}
 
@@ -158,8 +161,21 @@ def aggregate_trades(venue, rows, spec, gaps):
                         # Coin-weighted index at the legs' own trade times, so
                         # the block can be valued when it printed rather than at
                         # the window's close.
-                        index_px=((pl.col("index_price") * pl.col("coin")).sum()
-                                  / pl.col("coin").sum()),
+                        # Weighted only over legs that HAVE an index: polars
+                        # skips nulls in the numerator, so dividing by the full
+                        # coin sum under-priced a block whose legs were mixed.
+                        # Weighted only over legs that HAVE an index: polars
+                        # skips nulls in the numerator, so dividing by the full
+                        # coin sum under-priced a block whose legs were mixed.
+                        # Null, never NaN, when no leg carries one — NaN is
+                        # truthy, so it slipped past the `or spot` fallback and
+                        # reached round() as a crash.
+                        index_px=pl.when(
+                            pl.col("coin").filter(_PRICED).sum() > 0
+                        ).then(
+                            (pl.col("index_price") * pl.col("coin")).filter(_PRICED).sum()
+                            / pl.col("coin").filter(_PRICED).sum()
+                        ).otherwise(None),
                         iv_sum=points.filter(usable).sum(),
                         iv_count=iv.filter(usable).len(),
                         leg_count=pl.len(),
@@ -208,7 +224,7 @@ def inputs(totals, evidence, specs, gaps, coverage=None):
                              if r.get("markIV") is not None and r.get("iv_unit") in ("decimal", "vol_points")}
             # A strike dropped here narrows the delta range the surface
             # interpolates over, which moves ATM, skew and the term label.
-            dropped = len(eligible) - len(snapshot[key])
+            dropped = len({r["symbol"] for r in eligible}) - len(snapshot[key])
             if dropped and eligible:
                 gaps.append(
                     f"Vol Surface ({observation.replace('_', ' ')}): {dropped} of "
@@ -412,6 +428,17 @@ def run(asset, window, start, end):
                 f"Block Flow: {excluded['blocks']} {venues} block(s) excluded "
                 f"({excluded['coin']} coin) — {excluded['reason'].replace('_', ' ')}; "
                 f"the totals below do not include them")
+    # A venue whose rows carry no index_price falls back to window-close spot,
+    # so its blocks are ranked against trade-time-priced ones on a different
+    # clock — the very thing this phase fixed. Uniform-close was at least
+    # internally consistent; silent mixing is not.
+    fallback = sorted({b["exchange"] for b in blocks if not b.get("index_px")})
+    if fallback and len(fallback) < len({b["exchange"] for b in blocks}):
+        gaps.append(
+            f"Block Flow: {', '.join(fallback)} block(s) priced at the window's "
+            f"closing spot — those venues publish no trade-time index, so their "
+            f"notional is ranked against others valued when they printed")
+
     # Bybit publishes is_block_trade as a flag with no group id, so its blocks
     # cannot be reconstructed at all — 43,137 trades yielded 0 blocks in a real
     # 24h window. The catalog says so; nothing ever said it to the reader, and

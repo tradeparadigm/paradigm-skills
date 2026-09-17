@@ -351,3 +351,30 @@ def test_the_hour_still_being_written_is_not_a_feed_gap(monkeypatch):
                                             ["20260916T10", "20260916T12"])
     assert state == "feed_gap"
     assert detail["lost_hours"] == ["20260916T10"]
+
+
+def test_a_block_missing_one_legs_index_is_not_half_priced():
+    """polars skips nulls in the numerator; dividing by the full coin sum then
+    halved a block whose legs were mixed. Weight only over legs that have one."""
+    rows = trades(
+        trade(block_id="b1", amount=100.0, index_price=80000.0, turnover_usd=1.0),
+        trade(block_id="b1", amount=100.0, index_price=None, turnover_usd=1.0))
+    _, blocks, _ = reduce(rows, spec(), [])
+    assert len(blocks) == 1
+    # Both legs are 1 coin after the contract-size conversion, so the weighted
+    # index over the priced leg alone is 80000 — not 40000.
+    assert abs(blocks[0]["index_px"] - 80000.0) < 1e-6
+
+
+def test_a_symbol_winning_both_delta_targets_is_not_a_dropped_strike():
+    """The surface query ranks per (observation, expiry, type, target_delta) for
+    targets 0.25 and 0.50, so one symbol can appear twice. Counting rows against
+    a symbol-keyed dict reported the duplicate as a strike dropped for want of
+    units — a false gap, in the phase whose point is not raising false gaps."""
+    row = {"observation": "latest", "symbol": "BTC-11SEP26-70000-P",
+           "timestamp": "2026-09-08T08:30:00Z", "markIV": 0.5, "delta": 0.5}
+    surface = pl.DataFrame([row, dict(row)], schema_overrides={"markIV": pl.Float64})
+    gaps = []
+    direct.inputs({}, {"option_surface_deribit": surface},
+                  {"deribit": spec()}, gaps)
+    assert not any("dropped for want of IV units" in g for g in gaps), gaps
