@@ -118,7 +118,12 @@ def priced(frame):
 _PRICED = pl.col("index_price").is_not_null() & (pl.col("index_price") != 0)
 
 EMPTY_TOTAL = {"count": 0, "puts": 0, "calls": 0, "turnover": 0.0,
-               "missing": 0, "blocks": []}
+               "missing": 0, "missing_symbols": 0, "unclassified": 0, "blocks": []}
+
+# The option type is the last bare C/P token, optionally followed by a settlement
+# suffix. `ends_with("-P")` matched four venues and none of Bybit's 571k trades
+# (BTC-26MAR27-130000-P-USDT), which silently left 72% of the tape out of P/C.
+_OPTION_TYPE = r"-([CP])(?:-[A-Z0-9]+)?$"
 
 
 def aggregate_trades(venue, rows, spec, gaps):
@@ -131,9 +136,10 @@ def aggregate_trades(venue, rows, spec, gaps):
     total = dict(EMPTY_TOTAL, count=rows.height, blocks=[])
     if not rows.height:
         return total
-    symbol = pl.col("symbol")
-    total["puts"] = rows.select(symbol.str.ends_with("-P").sum()).item()
-    total["calls"] = rows.select(symbol.str.ends_with("-C").sum()).item()
+    kind = pl.col("symbol").str.extract(_OPTION_TYPE, 1)
+    total["puts"] = rows.select((kind == "P").sum()).item()
+    total["calls"] = rows.select((kind == "C").sum()).item()
+    total["unclassified"] = rows.height - total["puts"] - total["calls"]
     if spec is not None:
         converted = with_units(rows, spec)
     else:
@@ -143,7 +149,9 @@ def aggregate_trades(venue, rows, spec, gaps):
             [pl.lit(None, dtype).alias(name) for name, dtype in UNIT_COLUMNS.items()]
         ).with_columns(event_at(rows.schema["timestamp"]).alias("event_at"))
     valued = priced(converted)
-    total["missing"] = valued.select(pl.col("premium").is_null().sum()).item()
+    unvalued = valued.filter(pl.col("premium").is_null())
+    total["missing"] = unvalued.height
+    total["missing_symbols"] = unvalued.get_column("symbol").n_unique() if unvalued.height else 0
     total["turnover"] = valued["premium"].sum() or 0.0
 
     identifier = pl.col("block_id").cast(pl.String)
@@ -161,9 +169,6 @@ def aggregate_trades(venue, rows, spec, gaps):
                         # Coin-weighted index at the legs' own trade times, so
                         # the block can be valued when it printed rather than at
                         # the window's close.
-                        # Weighted only over legs that HAVE an index: polars
-                        # skips nulls in the numerator, so dividing by the full
-                        # coin sum under-priced a block whose legs were mixed.
                         # Weighted only over legs that HAVE an index: polars
                         # skips nulls in the numerator, so dividing by the full
                         # coin sum under-priced a block whose legs were mixed.
@@ -193,7 +198,8 @@ def aggregate_trades(venue, rows, spec, gaps):
 
 def inputs(totals, evidence, specs, gaps, coverage=None):
     snapshot = {"trades_by_venue": {}, "trades_total": 0, "put_trades": 0, "call_trades": 0}
-    turnover, missing_values = 0.0, 0
+    turnover, missing_values, unclassified = 0.0, 0, 0
+    unvalued_by_venue, unclassified_venues = [], []
     blocks = []
     for venue in VENUES:
         total = totals.get(venue, EMPTY_TOTAL)
@@ -203,11 +209,27 @@ def inputs(totals, evidence, specs, gaps, coverage=None):
         snapshot["call_trades"] += total["calls"]
         turnover += total["turnover"]
         missing_values += total["missing"]
+        if total["missing"]:
+            unvalued_by_venue.append((venue, total["missing"], total["count"],
+                                      total["missing_symbols"]))
+        if total["unclassified"]:
+            unclassified += total["unclassified"]
+            unclassified_venues.append(venue)
         blocks.extend(total["blocks"])
     snapshot.update(turnover_usd=turnover, turnover_complete=missing_values == 0)
     snapshot["venue_coverage"] = coverage or {}
     if missing_values:
-        gaps.append(f"Volume: {missing_values} trades lack a provable USD premium; shown sum is the valued subset")
+        # Naming the venue is the whole point: a bare total reads as diffuse
+        # noise, while "bybit-options 32%" points at one venue's instrument
+        # metadata not covering the symbols its own tape traded.
+        detail = "; ".join(
+            f"{venue} {count:,} of {rows:,} ({100 * count / rows:.0f}%) across {symbols:,} symbols"
+            for venue, count, rows, symbols in sorted(unvalued_by_venue, key=lambda v: -v[1]))
+        gaps.append(f"Volume: {missing_values:,} trades lack a provable USD premium — "
+                    f"{detail}; shown sum is the valued subset")
+    if unclassified:
+        gaps.append(f"P/C: {unclassified:,} trades carry no recognisable option type in their "
+                    f"symbol ({', '.join(unclassified_venues)}) and are excluded from the ratio")
     dvol = evidence.get("dvol_window")
     if dvol is not None and dvol.height:
         first = dvol.row(0, named=True)

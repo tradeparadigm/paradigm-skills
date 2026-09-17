@@ -378,3 +378,38 @@ def test_a_symbol_winning_both_delta_targets_is_not_a_dropped_strike():
     direct.inputs({}, {"option_surface_deribit": surface},
                   {"deribit": spec()}, gaps)
     assert not any("dropped for want of IV units" in g for g in gaps), gaps
+
+
+def test_every_venue_symbol_format_is_classified_put_or_call():
+    """Bybit suffixes its settlement currency, so `ends_with("-P")` matched none
+    of its 571k trades and P/C was silently computed from 28% of the tape."""
+    formats = {"BTC-25SEP26-150000-P": "P", "BTC_USDC-25DEC26-86000-P": "P",
+               "BTC-USD-260904-78000-C": "C", "BTC-26MAR27-130000-P-USDT": "P",
+               "BTC-USDC-20261127-80000-P": "P", "BTC-9SEP26-82500-C-USDT": "C"}
+    frame = trades(*(trade(symbol=s) for s in formats))
+    total = direct.aggregate_trades("bybit-options", frame, None, [])
+    assert total["puts"] == sum(1 for v in formats.values() if v == "P")
+    assert total["calls"] == sum(1 for v in formats.values() if v == "C")
+    assert total["unclassified"] == 0
+
+
+def test_a_symbol_with_no_option_type_is_excluded_and_declared():
+    gaps = []
+    frame = trades(trade(symbol="BTC-PERPETUAL"), trade(symbol="BTC-25SEP26-150000-C"))
+    totals = {"deribit": direct.aggregate_trades("deribit", frame, None, gaps)}
+    direct.inputs(totals, {}, {}, gaps)
+    assert totals["deribit"]["unclassified"] == 1
+    assert any("no recognisable option type" in g and "deribit" in g for g in gaps)
+
+
+def test_unvalued_trades_name_the_venue_whose_metadata_is_short():
+    """A bare total reads as diffuse noise; the real 14d case is one venue's
+    instrument snapshots not covering the symbols its own tape traded."""
+    gaps = []
+    frame = trades(trade(symbol="BTC-26MAR27-130000-P-USDT", turnover_usd=None),
+                   trade(symbol="BTC-26MAR27-140000-C-USDT", turnover_usd=None))
+    totals = {"bybit-options": direct.aggregate_trades("bybit-options", frame, None, gaps)}
+    direct.inputs(totals, {}, {}, gaps)
+    volume = [g for g in gaps if g.startswith("Volume:")]
+    assert volume, gaps
+    assert "bybit-options 2 of 2 (100%) across 2 symbols" in volume[0]
