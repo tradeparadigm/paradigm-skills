@@ -317,6 +317,21 @@ def struct_net(rows: list[dict], field: str) -> float:
     return tot
 
 
+def structure_unit(rows: list[dict]) -> float:
+    """The package's base size: the smallest OPTION leg QTY.
+
+    struct_net weights every leg against this base, so the displayed size must be
+    the same number or the header contradicts its own premium. A 2:1 put ratio
+    filled 40/20 is 20 packages of (buy 2, sell 1) — not 40 of anything. Taking
+    the first row's QTY happened to be right only while every leg traded equal
+    size. Perp/future hedge rows are excluded for the same reason they are
+    excluded from the premium.
+    """
+    opt = [r for r in rows if parse_product(r.get("PRODUCT", "")).get("kind") == "OPTION"]
+    qs = [q for q in (_f(r.get("QTY")) for r in (opt or rows)) if q and q > 0]
+    return min(qs) if qs else 1.0
+
+
 def apply_orientation(parsed: dict, rows: list[dict]) -> tuple[list[dict], str, bool]:
     """Assign each leg the taker's real sign and return (legs, side_label, reliable).
 

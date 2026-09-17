@@ -279,5 +279,23 @@ ok(ac.extract_legs_generic("Strangle 28 Aug 26 57000/68000") == [], "no explicit
 up = ac.parse_description("Seagull 31 Jul 26 55000/60000/70000")
 ok(up["classified"] is False, "unmapped name → not classified")
 
+# ── structure unit: the displayed size must be the base the premium nets against ──
+ratio_rows = [
+    {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Cstm  -2.00  Put  24 Jul 26  59000       +1.00  Put  24 Jul 26  65000",
+     "QTY": 40, "PRICE": 0.0023, "REF_PRICE": 0.0021, "SIDE": "BUY"},
+    {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Cstm  -2.00  Put  24 Jul 26  59000       +1.00  Put  24 Jul 26  65000",
+     "QTY": 20, "PRICE": 0.0210, "REF_PRICE": 0.0212, "SIDE": "SELL"},
+]
+# 40/20 is 20 packages of (buy 2, sell 1) — taking the first row's QTY said 40,
+# which contradicted the premium struct_net nets against the same base.
+ok(ac.structure_unit(ratio_rows) == 20.0, "ratio package unit is the base leg, not the first row")
+ok(abs(ac.struct_net(ratio_rows, "PRICE") + 0.0164) < 1e-9, "2:1 weighted fill nets to 0.0164 credit")
+ok(abs(ac.struct_net(ratio_rows, "REF_PRICE") + 0.0170) < 1e-9, "2:1 weighted mark nets to 0.0170 credit")
+equal_rows = [dict(r, QTY=100) for r in ratio_rows]
+ok(ac.structure_unit(equal_rows) == 100.0, "equal-size legs are unaffected")
+hedged = ratio_rows + [{"PRODUCT": "BTC PERPETUAL - DBT", "DESCRIPTION": "Perpetual 65,000",
+                        "QTY": 5, "PRICE": 65000, "REF_PRICE": 64955.57, "SIDE": "SELL"}]
+ok(ac.structure_unit(hedged) == 20.0, "a smaller perp hedge row does not become the structure unit")
+
 print(f"\n{_p} passed, {_f} failed")
 sys.exit(1 if _f else 0)

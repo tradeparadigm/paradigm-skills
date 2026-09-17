@@ -136,7 +136,7 @@ def _run(args):
     asset = prod["asset"]
     desc = fill[0].get("DESCRIPTION", "")
     quote = (fill[0].get("QUOTE_CURRENCY") or "").upper()
-    qty = ac._f(fill[0].get("QTY")) or 1.0
+    qty = ac.structure_unit(fill)
     # Two tape shapes: (a) one combined-DESCRIPTION block (ICondor/Cstm/single) →
     # parse fill[0]; (b) one row PER LEG, each a single-leg desc or a perp/future →
     # build legs from the rows, sign straight from each row's SIDE (most reliable).
