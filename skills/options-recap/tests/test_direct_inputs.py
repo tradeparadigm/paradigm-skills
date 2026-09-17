@@ -1,6 +1,6 @@
 """Direct input adapters preserve the established numerical/output contract."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 import sys
@@ -324,3 +324,30 @@ def test_schema_drift_across_objects_falls_back_to_string():
     assert merged.num_rows == 3
     assert merged.schema.field("id").type == pa.string()
     assert merged.column("id").to_pylist() == ["1", "2", "x"]
+
+
+def test_the_hour_still_being_written_is_not_a_feed_gap(monkeypatch):
+    """A live window ends inside the current hour, which no producer has
+    finished writing. Counting it made all five venues report a feed gap on
+    every run — the exact false alarm this coverage check exists to remove."""
+    end = datetime(2026, 9, 16, 12, 30, tzinfo=UTC)
+    start = end - timedelta(hours=3)
+    # The venue wrote 10:00 and 11:00; 12:00 is in progress, so it is absent
+    # from the continuous feed too — that must not read as lost data.
+    monkeypatch.setattr(direct, "hours_present",
+                        lambda *a, **k: ({"20260916T09", "20260916T10", "20260916T11"},
+                                         ("20260916T09", "20260916T10", "20260916T11",
+                                          "20260916T12")))
+    monkeypatch.setattr(direct, "connect", lambda: types.SimpleNamespace(close=lambda: None))
+    state, _ = direct.coverage_verdict("deribit", "BTC", start, end, ["20260916T12"])
+    assert state == "complete"
+
+    # A genuinely missing mid-window hour still reports.
+    monkeypatch.setattr(direct, "hours_present",
+                        lambda *a, **k: ({"20260916T09", "20260916T11"},
+                                         ("20260916T09", "20260916T10", "20260916T11",
+                                          "20260916T12")))
+    state, detail = direct.coverage_verdict("deribit", "BTC", start, end,
+                                            ["20260916T10", "20260916T12"])
+    assert state == "feed_gap"
+    assert detail["lost_hours"] == ["20260916T10"]

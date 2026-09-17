@@ -724,12 +724,15 @@ def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
     geometry (expiry/strike/type/side) — so the structure label is the venue +
     "Block" (there is no per-row venue column; the label is where the venue
     shows) and the detail carries a compact "(venue tape)" provenance note.
-    notional_usd = volume_coin × spot: underlying-USD, the same basis as the
-    Paradigm tape's NOTIONAL_VOLUME_USD (valued at recap-time spot, not
-    trade-time — a disclosed approximation). No spot → skip with a warning,
-    never guess."""
-    if rows and not spot:
-        warn("venue-tape blocks skipped — no spot to price coin volume")
+    notional_usd = volume_coin × the block's own coin-weighted index price,
+    falling back to window-close spot only when the venue rows carry none.
+    Underlying-USD, the same basis as the Paradigm tape's NOTIONAL_VOLUME_USD —
+    and now the same price EPOCH too: these blocks are ranked against Paradigm's
+    trade-time figures for Biggest Print, so pricing them at the window close
+    made the ranking a function of the spot move over the window. No price at
+    all → skip with a warning, never guess."""
+    if rows and not spot and not any(_num(r, "index_px") for r in rows):
+        warn("venue-tape blocks skipped — no trade-time index or spot to price coin volume")
         return []
     out = []
     for r in rows:
@@ -750,7 +753,7 @@ def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
             "rfq_id": r.get("block_id"),  # its own worked order
             "structure": f"{venue} Block", "expiry": "",
             "venue": venue,
-            "notional_usd": round(vol * spot),
+            "notional_usd": round(vol * (_num(r, "index_px") or spot)),
             "unit_size": round(vol, 1),  # total coin size — legs unknown
             "side": "", "avg_iv": avg_iv,
             # bucket_at is the block's first 5m bucket — ~5-min resolution,
@@ -881,10 +884,19 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         # push a real venue off the line. tt already spans all raw venues, so the
         # per-label pcts remain a correct share of total activity.
         by_label: dict[str, float] = defaultdict(float)
+        # A venue that could not be READ contributes 0 trades, so it silently
+        # left the denominator and inflated everyone else's share — a failed
+        # Deribit read made Bybit look like more of the market than it was.
+        # Carry its state instead of its absence.
+        states = hot.get("venue_coverage") or {}
+        unread = set()
         for v, n in (hot.get("trades_by_venue") or {}).items():
-            by_label[_venue_label(v)] += n
+            label = _venue_label(v)
+            if states.get(v) in ("unreadable", "feed_gap"):
+                unread.add(label)
+            by_label[label] += n
         activity_split = [
-            {"venue": lbl, "pct": round(100 * n / tt)}
+            {"venue": lbl, "pct": round(100 * n / tt), "partial": lbl in unread}
             for lbl, n in sorted(by_label.items(), key=lambda kv: -kv[1])
         ]
 
@@ -988,6 +1000,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
                 "d_rr": _delta(e["rr_25d"], "rr_25d", o),
                 "d_fly": _delta(e["fly_25d"], "fly_25d", o),
                 "extrapolated": e["wings_extrapolated"],
+                "atm_extrapolated": e.get("atm_extrapolated", False),
             })
         surface_out = {
             "skew_line": surf.get("skew_label"),
@@ -1179,7 +1192,9 @@ def render_md(r: dict) -> str:
         tt = s["activity_trades"]
         tnum = (f"{tt / 1e6:.1f}M" if tt >= 1e6 else
                 f"{round(tt / 1e3)}k" if tt >= 1e3 else f"{int(tt)}")
-        split = " · ".join(f"{v['venue']} {v['pct']}%"
+        # A partial venue's share is a floor, not a share — mark it where it is
+        # read, because the ⚠ line above names a query and this names a venue.
+        split = " · ".join(f"{v['venue']} {v['pct']}%{'+' if v.get('partial') else ''}"
                            for v in (s.get("activity_split") or [])[:4])
         L.append(f"{'Activity':<9} {tnum:<11} trades — {split} (by trade count)")
     else:
@@ -1244,10 +1259,14 @@ def render_md(r: dict) -> str:
               f"{'-' * 9:<11}{'-' * 6:<9}{'-' * 6:<9}{'-' * 8:<10}{'-' * 6:<9}{'-' * 5:<8}{'-' * 6}"]
         for e in vs["rows"]:
             star = "*" if e.get("extrapolated") else ""
-            atm = f"{e['atm']}v" if e.get("atm") is not None else "n/a"
+            # The ATM column gets its own star: a thin chain reaches ATM by
+            # clamping to an endpoint just as the wings do, and that figure also
+            # drives front/back ATM and the term-structure label.
+            atm_star = "*" if e.get("atm_extrapolated") else ""
+            atm = f"{e['atm']}v{atm_star}" if e.get("atm") is not None else "n/a"
             rr = f"{e['rr_25d']:+}v{star}" if e.get("rr_25d") is not None else "n/a"
             fly = f"{e['fly']}v" if e.get("fly") is not None else "n/a"
-            datm = _delta_fmt(e.get("d_atm"))
+            datm = _delta_fmt(e.get("d_atm"), atm_star)
             drr = _delta_fmt(e.get("d_rr"), star)
             dfly = _delta_fmt(e.get("d_fly"))
             L.append(f"{e['expiry']:<11}{atm:<9}{datm:<9}{rr:<10}{drr:<9}{fly:<8}{dfly}")

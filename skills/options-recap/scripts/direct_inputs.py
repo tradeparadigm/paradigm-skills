@@ -155,6 +155,11 @@ def aggregate_trades(venue, rows, spec, gaps):
         grouped = (identified
                    .group_by(identifier.alias("block_id"), maintain_order=True)
                    .agg(volume_coin=pl.col("coin").fill_null(0).sum(),
+                        # Coin-weighted index at the legs' own trade times, so
+                        # the block can be valued when it printed rather than at
+                        # the window's close.
+                        index_px=((pl.col("index_price") * pl.col("coin")).sum()
+                                  / pl.col("coin").sum()),
                         iv_sum=points.filter(usable).sum(),
                         iv_count=iv.filter(usable).len(),
                         leg_count=pl.len(),
@@ -170,7 +175,7 @@ def aggregate_trades(venue, rows, spec, gaps):
     return total
 
 
-def inputs(totals, evidence, specs, gaps):
+def inputs(totals, evidence, specs, gaps, coverage=None):
     snapshot = {"trades_by_venue": {}, "trades_total": 0, "put_trades": 0, "call_trades": 0}
     turnover, missing_values = 0.0, 0
     blocks = []
@@ -184,6 +189,7 @@ def inputs(totals, evidence, specs, gaps):
         missing_values += total["missing"]
         blocks.extend(total["blocks"])
     snapshot.update(turnover_usd=turnover, turnover_complete=missing_values == 0)
+    snapshot["venue_coverage"] = coverage or {}
     if missing_values:
         gaps.append(f"Volume: {missing_values} trades lack a provable USD premium; shown sum is the valued subset")
     dvol = evidence.get("dvol_window")
@@ -195,10 +201,19 @@ def inputs(totals, evidence, specs, gaps):
     if surface is not None and surface.height and "deribit" in specs:
         observed = with_units(surface, specs["deribit"]).to_dicts()
         for observation, key in (("window_open", "vs_open"), ("latest", "vs_now")):
+            eligible = [r for r in observed if r["observation"] == observation]
             snapshot[key] = {r["symbol"]: {"mark_iv": r["markIV"] * (100 if r["iv_unit"] == "decimal" else 1),
                                            "delta": r["delta"]}
-                             for r in observed if r["observation"] == observation
-                             and r.get("markIV") is not None and r.get("iv_unit") in ("decimal", "vol_points")}
+                             for r in eligible
+                             if r.get("markIV") is not None and r.get("iv_unit") in ("decimal", "vol_points")}
+            # A strike dropped here narrows the delta range the surface
+            # interpolates over, which moves ATM, skew and the term label.
+            dropped = len(eligible) - len(snapshot[key])
+            if dropped and eligible:
+                gaps.append(
+                    f"Vol Surface ({observation.replace('_', ' ')}): {dropped} of "
+                    f"{len(eligible)} strikes dropped for want of IV units — the surface "
+                    f"is interpolated over a narrower range than the chain")
     return snapshot, blocks, turnover
 
 
@@ -224,6 +239,15 @@ def coverage_verdict(venue, asset, start, end, missing_trade_hours):
                                           asset.lower(), start, end)
     finally:
         connection.close()
+    if not expected:
+        return "unknown", {}
+    # The window's final bucket is the hour still in progress — producers write
+    # into it a few minutes late, so it is absent from every feed on a live run.
+    # Counting it made all five venues report a feed gap every time.
+    in_progress = f"{end:%Y%m%dT%H}"
+    expected = tuple(h for h in expected if h != in_progress)
+    present = present - {in_progress}
+    missing_trade_hours = [h for h in missing_trade_hours if h != in_progress]
     if not expected:
         return "unknown", {}
     companion_missing = set(expected) - present
@@ -293,9 +317,18 @@ def run(asset, window, start, end):
                 read_gaps.append(f"{query.name}: unavailable — {source['error']}")
             elif not rows.height and not query.name.startswith("option_trades_"):
                 read_gaps.append(f"{query.name}: no usable observations")
-            elif (source["path_plan"].get("missing_pattern_count")
-                    and not query.name.startswith("option_trades_")):
-                read_gaps.append(f"{query.name}: {source['path_plan']['missing_pattern_count']}/{source['path_plan']['pattern_count']} hourly/bucket paths absent; partial coverage")
+            elif not query.name.startswith("option_trades_"):
+                # Same in-progress hour as coverage_verdict excludes: every feed
+                # is legitimately absent from the bucket still being written.
+                absent = [h for h in source["path_plan"].get("missing_hours", ())
+                          if h != f"{end:%Y%m%dT%H}"]
+                expected = max(source["path_plan"].get("pattern_count", 0) - 1, 1)
+                if absent:
+                    read_gaps.append(
+                        f"{query.name}: {len(absent)} of {expected} hourly paths absent; "
+                        f"partial coverage")
+                elif source["path_plan"].get("missing_pattern_count") and not source["path_plan"].get("missing_hours"):
+                    read_gaps.append(f"{query.name}: {source['path_plan']['missing_pattern_count']}/{source['path_plan']['pattern_count']} bucket paths absent; partial coverage")
             if query.name.startswith("option_trades_"):
                 # Reduced here and dropped, so the next venue's read never sits
                 # beside this one's window.
@@ -322,6 +355,17 @@ def run(asset, window, start, end):
                 evidence[query.name] = rows
         for venue in list(meta):
             spec_for(venue)
+        # metadata() takes one predecessor snapshot at or before the window
+        # start. The catalog keeps 30 days of it, so a long window can begin
+        # before any snapshot exists and every symbol not yet seen is unvaluable
+        # for the early hours — 695,415 unvalued trades in a real 30d run, with
+        # no gap of its own to explain them.
+        for venue, spec in specs.items():
+            first = spec["captured_at"].min() if spec.height else None
+            if first is not None and first > start:
+                meta_gaps.append(
+                    f"{venue}: instrument metadata starts {first:%Y-%m-%d %H:%M}Z, after the "
+                    f"window opened — trades before that cannot be valued or unit-converted")
         tape_available = True
         try:
             tape_result = tape.result()
@@ -348,7 +392,7 @@ def run(asset, window, start, end):
             except Exception as exc:
                 gaps.append(f"Deribit {key} unavailable — {exc}")
     gaps = read_gaps + meta_gaps + gaps + block_gaps
-    snapshot, blocks, known_turnover = inputs(totals, evidence, specs, gaps)
+    snapshot, blocks, known_turnover = inputs(totals, evidence, specs, gaps, coverage)
     surface_rows = evidence.get("option_surface_deribit")
     if not snapshot["trades_total"] and not (surface_rows is not None and surface_rows.height):
         raise RuntimeError("recap: no usable core direct-data source; " + "; ".join(gaps))

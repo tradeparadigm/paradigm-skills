@@ -978,6 +978,11 @@ def compute_vol_surface(tickers: dict[str, dict], spot: float | None = None,
             "rr_25d": rr,
             "fly_25d": fly,
             "wings_extrapolated": bool(c25_ex or p25_ex),
+            # _interp already says whether it had to clamp to an endpoint; for
+            # ATM that answer was computed and dropped, so a thin chain rendered
+            # a clamped IV as the ATM figure with nothing to say it was reached
+            # by extrapolation — and it drives front/back ATM and the term label.
+            "atm_extrapolated": bool(atm_ex),
         })
 
     # Chronological order (unknown expiry_ms sorts last).
