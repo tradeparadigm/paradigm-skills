@@ -416,6 +416,9 @@ def _run_one_case(client, agent_model: str, grader_model: str,
     return {
         "id": case["id"],
         "prompt": case["prompt"],
+        # Not the run-level flag: a case carrying `context` suppresses simulate
+        # above, so the run-level one labels these as simulated when they are not.
+        "simulated": effective_simulate,
         "passed": passed,
         "total": total,
         "score": round(passed / total, 3) if total else 0,
@@ -529,7 +532,10 @@ def run_skill(client, skill_name: str, agent_model: str, grader_model: str,
         "skill": evals_data["skill_name"],
         "dir": skill_name,
         "requires_auth": requires_auth,
-        "simulated": simulate,
+        # What the cases ACTUALLY ran as, not what was asked for: a case carrying
+        # `context` suppresses simulate, so a run where every case had one is not
+        # a simulated run and the [sim] marker would be a lie.
+        "simulated": any(c.get("simulated") for c in case_results),
         "skipped_live": skipped_live,
         "cases": case_results,
         "passed": overall_passed,

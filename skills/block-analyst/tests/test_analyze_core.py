@@ -279,5 +279,134 @@ ok(ac.extract_legs_generic("Strangle 28 Aug 26 57000/68000") == [], "no explicit
 up = ac.parse_description("Seagull 31 Jul 26 55000/60000/70000")
 ok(up["classified"] is False, "unmapped name → not classified")
 
+# ── structure unit: the displayed size must be the base the premium nets against ──
+ratio_rows = [
+    {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Cstm  -2.00  Put  24 Jul 26  59000       +1.00  Put  24 Jul 26  65000",
+     "QTY": 40, "PRICE": 0.0023, "REF_PRICE": 0.0021, "SIDE": "BUY"},
+    {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Cstm  -2.00  Put  24 Jul 26  59000       +1.00  Put  24 Jul 26  65000",
+     "QTY": 20, "PRICE": 0.0210, "REF_PRICE": 0.0212, "SIDE": "SELL"},
+]
+# 40/20 is 20 packages of (buy 2, sell 1) — taking the first row's QTY said 40,
+# which contradicted the premium struct_net nets against the same base.
+ok(ac.structure_unit(ratio_rows) == 20.0, "ratio package unit is the base leg, not the first row")
+ok(abs(ac.struct_net(ratio_rows, "PRICE") + 0.0164) < 1e-9, "2:1 weighted fill nets to 0.0164 credit")
+ok(abs(ac.struct_net(ratio_rows, "REF_PRICE") + 0.0170) < 1e-9, "2:1 weighted mark nets to 0.0170 credit")
+equal_rows = [dict(r, QTY=100) for r in ratio_rows]
+ok(ac.structure_unit(equal_rows) == 100.0, "equal-size legs are unaffected")
+hedged = ratio_rows + [{"PRODUCT": "BTC PERPETUAL - DBT", "DESCRIPTION": "Perpetual 65,000",
+                        "QTY": 5, "PRICE": 65000, "REF_PRICE": 64955.57, "SIDE": "SELL"}]
+ok(ac.structure_unit(hedged) == 20.0, "a smaller perp hedge row does not become the structure unit")
+
+# The same trade in the tape's other shapes. Smallest row QTY is the base only
+# when every row is one distinct leg; these two are where it is not.
+one_row = [dict(ratio_rows[0], QTY=40)]
+ok(ac.structure_unit(one_row) == 20.0, "a single row STATING -2.00/+1.00 divides by its widest ratio")
+ok(abs(ac.struct_net(one_row, "PRICE") - 0.0023) < 1e-9,
+   "that row's PRICE is already the package price, so it still weights as 1")
+# A named structure's ratios are OUR canonical geometry, not something the tape
+# wrote: CFly parses to 1/2/1, and dividing by that made a 100-lot fly ×50 and
+# halved its greeks with it.
+fly_row = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "CFly 24 Jul 26 59000/62000/65000",
+            "QTY": 100, "PRICE": 0.0023, "REF_PRICE": 0.0021, "SIDE": "BUY"}]
+ok([l["ratio"] for l in ac.parse_description(fly_row[0]["DESCRIPTION"])["legs"]] == [1.0, 2.0, 1.0],
+   "CFly's 1/2/1 comes from the structure map, not the DESCRIPTION text")
+ok(ac.structure_unit(fly_row) == 100.0, "a 100-lot fly is 100 flies, not 50")
+# The sold leg clipped across two makers, every row repeating the package string.
+# Nothing in that string says which row is which leg, so this is NOT recovered —
+# the smallest row wins and the caller is told the size is inferred.
+clipped = [dict(ratio_rows[0], QTY=40), dict(ratio_rows[1], QTY=10), dict(ratio_rows[1], QTY=10)]
+ok(ac.structure_unit(clipped) == 40.0, "a clipped leg under a combined DESCRIPTION keeps the pre-PR size")
+ok(not ac.package_size_certain(clipped), "and the caller is told so")
+per_leg = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 24 Jul 26 59000",
+            "QTY": 40, "PRICE": 0.0023, "REF_PRICE": 0.0021, "SIDE": "BUY"},
+           {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 24 Jul 26 65000",
+            "QTY": 20, "PRICE": 0.0210, "REF_PRICE": 0.0212, "SIDE": "SELL"}]
+ok(ac.structure_unit(per_leg) == 20.0, "per-leg rows give the same unit as the combined form")
+# One leg, several makers: the clips ADD. Taking the smallest called a 50-lot
+# call x20 and counted its premium 2.5 times.
+clips = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Call 7 May 26 84000",
+          "QTY": q, "PRICE": 0.0122, "REF_PRICE": 0.0118, "SIDE": "BUY"} for q in (30, 20)]
+ok(ac.structure_unit(clips) == 50.0, "clips of one instrument add rather than compete for the minimum")
+ok(abs(ac.struct_net(clips, "PRICE") - 0.0122) < 1e-9,
+   "and the premium counts that leg once, not 2.5 times")
+# A DESCRIPTION that does not resolve to ONE leg carries no identity, so rows
+# under it are not grouped at all: the smallest row wins, as it did before this
+# PR, and package_size_certain reports that the answer is inferred. Inferring
+# clips from side and/or price was tried and mis-sized a different family of
+# equal-size structures each time — see the PR body.
+unkeyed = [dict(r, DESCRIPTION="C 7 May 26 84000") for r in clips]
+ok(ac.structure_unit(unkeyed) == 30.0, "an unresolvable DESCRIPTION keeps the pre-PR size")
+ok(not ac.package_size_certain(unkeyed), "and says the size is inferred")
+# Put-call parity makes an at-the-forward straddle's two legs print the SAME
+# price, and its two rows the same side. Grouping on either merged them into one
+# leg of double the size — ×200 with the premium AND the bps offset halved.
+straddle = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Straddle 25 Sep 26 62000",
+             "QTY": 100, "PRICE": 0.0410, "REF_PRICE": 0.0405, "SIDE": "SELL"}] * 2
+ok(ac.structure_unit(straddle) == 100.0, "a straddle's two same-priced legs are legs, not clips")
+ok(abs(ac.struct_net(straddle, "PRICE") + 0.0820) < 1e-9,
+   "so its package premium is both legs, not one")
+ok(not ac.package_size_certain(straddle), "same side under one description is never certain")
+# The same shape with a leg clipped is indistinguishable from it, which is the
+# whole reason nothing is inferred here.
+clipped_straddle = [straddle[0], dict(straddle[1], QTY=50), dict(straddle[1], QTY=50)]
+ok(not ac.package_size_certain(clipped_straddle), "a clipped leg cannot be told from a third leg")
+# Certainty holds where identity is real, or where no two rows share a side.
+ok(ac.package_size_certain(clips), "per-instrument rows carry real identity")
+ok(ac.package_size_certain(ratio_rows), "distinct sides under one description are unambiguous")
+ok(ac.package_size_certain(fly_row), "a single row is never ambiguous")
+# The whole point of the fallback: an ambiguous block must never be sized worse
+# than it was before this PR. These are the shapes round 4 got wrong.
+_pre = lambda rows: ac._f(rows[0].get("QTY")) or 1.0
+for _rows, _name in ((clipped, "a clipped ratio leg"), (straddle, "a straddle"),
+                     (clipped_straddle, "a clipped straddle"), (unkeyed, "bare clips")):
+    ok(ac.structure_unit(_rows) == _pre(_rows), f"{_name} keeps the pre-PR size")
+    ok(not ac.package_size_certain(_rows), f"{_name} is declared inferred")
+
+
+# ── the header itself: structure_unit reaching the rendered ×N ──────────────────
+# analyze.py:139 is the user-visible half of the ratio fix, and reverting it to
+# fill[0]["QTY"] left every check above green. _run is exercised with the network
+# stubbed so the assertion is on the rendered line, not on the core function.
+def _rendered(rows):
+    import csv as _csv, io, tempfile, types
+    from contextlib import redirect_stdout
+    saved = (az._get, az.fetch_ticker, az.fetch_trades_bucket)
+    az._get = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no network in tests"))
+    az.fetch_ticker = lambda sym: (sym, None)
+    az.fetch_trades_bucket = lambda sym, now_ms: (sym, None)
+    directory = tempfile.mkdtemp()
+    try:
+        with open(os.path.join(directory, "fill.csv"), "w", newline="") as handle:
+            writer = _csv.DictWriter(handle, fieldnames=sorted(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            az._run(types.SimpleNamespace(csv_dir=directory, now_ms=1_752_000_000_000,
+                                          render=True))
+        return out.getvalue()
+    finally:
+        az._get, az.fetch_ticker, az.fetch_trades_bucket = saved
+
+
+# Every shape through the renderer, not just the one that was already right:
+# structure_unit/struct_net stayed green through the whole round-1 bug, so the
+# level that matters is the printed line.
+for _rows, _want, _never, _label in (
+        (ratio_rows, "×20", "×40", "ratio rows"),
+        (one_row, "×20", "×40", "a single row stating its ratios"),
+        (fly_row, "×100", "×50", "a named fly, whose ratios the tape never wrote"),
+        (clips, "×50", "×20", "one leg filled by two makers"),
+        (straddle, "×100", "×200", "an at-the-forward straddle, both legs one price")):
+    _out = _rendered(_rows)
+    ok(_want in _out, f"header sizes {_label} {_want} [{_out[:110]}]")
+    ok(_never not in _out, f"header never sizes {_label} {_never}")
+
+# An inferred size says so where the reader sees it, not in a trailing comment.
+_amb = _rendered(clipped)
+ok("⚠ ×N INFERRED" in _amb, f"an inferred size is declared in the body [{_amb[:110]}]")
+ok(_rendered(ratio_rows).count("⚠ ×N INFERRED") == 0,
+   "and an unambiguous one says nothing")
+
 print(f"\n{_p} passed, {_f} failed")
 sys.exit(1 if _f else 0)

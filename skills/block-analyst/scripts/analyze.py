@@ -136,7 +136,8 @@ def _run(args):
     asset = prod["asset"]
     desc = fill[0].get("DESCRIPTION", "")
     quote = (fill[0].get("QUOTE_CURRENCY") or "").upper()
-    qty = ac._f(fill[0].get("QTY")) or 1.0
+    qty = ac.structure_unit(fill)
+    qty_inferred = not ac.package_size_certain(fill)
     # Two tape shapes: (a) one combined-DESCRIPTION block (ICondor/Cstm/single) →
     # parse fill[0]; (b) one row PER LEG, each a single-leg desc or a perp/future →
     # build legs from the rows, sign straight from each row's SIDE (most reliable).
@@ -233,7 +234,8 @@ def _run(args):
     result = {
         "asset": asset, "venue": prod["venue"], "structure": parsed["code"],
         "rfq_kind": rfq_kind,
-        "desc": desc, "side": side, "qty": qty, "reliable_signs": reliable,
+        "desc": desc, "side": side, "qty": qty, "qty_inferred": qty_inferred,
+        "reliable_signs": reliable,
         "unmapped": unmapped, "spot": spot, "quote": quote,
         "fill_net": round(fill_net, 6), "ref_net": round(ref_net, 6), "offset": off,
         "legs": [{"cp": l["cp"], "strike": l["strike"], "ratio": l["ratio"],
@@ -362,6 +364,14 @@ def render(r) -> str:
     strikes = "/".join(_sk(l["strike"]) for l in legs if l["cp"] != "FUT")
     struct = _struct_name(r["structure"], legs)
     L = []
+    if r.get("qty_inferred"):
+        # Visible, not a trailing comment: several rows share one combined
+        # DESCRIPTION and two trade the same side, so a clipped leg and two legs
+        # on that side read identically. The size below is the smallest row.
+        L.append("⚠ ×N INFERRED — these rows share one combined DESCRIPTION and two trade "
+                 "the same side, so a clipped leg cannot be told from a second leg. The size "
+                 "below is the smallest row; check it against the tape rows before quoting it.")
+        L.append("")
     L.append(f"**{a} {exp} {strikes} {struct} · ×{r['qty']:g} | {r['side']} | "
              f"{verb} {fillabs:g} | {_offset_txt(r['offset'])}**")
     sp = f"{r['spot']:,.0f}" if r.get("spot") else "n/a"

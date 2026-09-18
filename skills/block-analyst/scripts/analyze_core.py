@@ -255,6 +255,12 @@ def legs_from_rows(rows: list[dict]):
     the caller parses the combined DESCRIPTION instead)."""
     if not rows or len(rows) < 2:
         return None
+    # Each row's own QTY is the leg's ratio against the package base, the same
+    # base struct_net nets the premium against. A single-leg DESCRIPTION parses
+    # to ratio 1.0, so without this a 40/20 ratio reaches net_greeks as 20/20 —
+    # the header would claim a base unit the greeks do not honour. Perp/future
+    # hedge rows keep ratio 1.0: their QTY is in a different unit entirely.
+    base = structure_unit(rows)
     out = []
     for r in rows:
         pr = parse_product(r.get("PRODUCT", ""))
@@ -267,6 +273,7 @@ def legs_from_rows(rows: list[dict]):
         if d["classified"] and len(d["legs"]) == 1 and d["code"] in ("CL", "PL"):
             lg = d["legs"][0]
             lg["sign"] = sgn
+            lg["ratio"] = (_f(r.get("QTY")) or base) / base
             lg["_row"] = r
             out.append(lg)
         else:
@@ -302,10 +309,7 @@ def struct_net(rows: list[dict], field: str) -> float:
     so their net is unchanged. Perp/future legs are EXCLUDED — a delta hedge executes at
     spot and is not part of the option premium (including it leaked the perp price into
     'Paid'). Falls back to all rows if there are no option legs."""
-    opt = [r for r in rows if parse_product(r.get("PRODUCT", "")).get("kind") == "OPTION"]
-    prem = opt or rows
-    qs = [q for q in (_f(r.get("QTY")) for r in prem) if q and q > 0]
-    base = min(qs) if qs else 1.0
+    prem, base, _ = _package(rows)
     tot = 0.0
     for r in prem:
         v = _f(r.get(field))
@@ -315,6 +319,93 @@ def struct_net(rows: list[dict], field: str) -> float:
         w = (_f(r.get("QTY")) or base) / base
         tot += sgn * w * v
     return tot
+
+
+def _leg_identity(row: dict):
+    """The instrument a row trades, or None when its DESCRIPTION packs the whole
+    package (the tape repeats the combined string on every leg's row)."""
+    parsed = parse_description(row.get("DESCRIPTION", ""))
+    if parsed["classified"] and len(parsed["legs"]) == 1:
+        leg = parsed["legs"][0]
+        return (leg["cp"], leg["strike"], leg.get("expiry_c"))
+    return None
+
+
+def _package(rows: list[dict]) -> tuple[list[dict], float, float]:
+    """(premium rows, weighting base, package size) — derived together so the
+    displayed size cannot drift from the base the premium is netted against.
+
+    Perp/future rows are dropped: a delta hedge executes at spot and is not part
+    of the option premium.
+
+    Rows are grouped ONLY on real identity — a DESCRIPTION that resolves to one
+    leg. That covers the multi-maker case, where one leg arrives as several rows
+    and their sizes add. When several rows share one COMBINED description,
+    nothing in that string says which row is which leg; inferring it from side
+    and/or price mis-sized a different family of equal-size structures each time
+    it was tried, so nothing is inferred and the pre-PR answer stands.
+    `package_size_certain` reports that, and analyze.py renders a ⚠.
+
+    The one place base and size differ: a SINGLE row whose DESCRIPTION STATES
+    its ratios counts the widest leg in QTY while its PRICE is already the
+    package price, so it weights as 1 against a package of QTY/widest. Only Cstm
+    states them — a named structure's ratios are our own canonical geometry, and
+    a 100-lot CFly is 100 flies.
+    """
+    opt = [r for r in rows if parse_product(r.get("PRODUCT", "")).get("kind") == "OPTION"]
+    prem = opt or rows
+    sized = [(r, q) for r, q in ((r, _f(r.get("QTY"))) for r in prem) if q and q > 0]
+    if not sized:
+        return prem, 1.0, 1.0
+    if len(sized) == 1:
+        row, qty = sized[0]
+        legs = parse_description(row.get("DESCRIPTION", ""))["legs"]
+        if len(legs) > 1 and all(leg.get("_explicit") for leg in legs):
+            widest = max((leg.get("ratio") or 1.0 for leg in legs), default=1.0) or 1.0
+            return prem, qty, qty / widest
+        return prem, qty, qty
+    identities = [_leg_identity(row) for row, _ in sized]
+    if all(identity is not None for identity in identities):
+        totals: dict = {}
+        for identity, (_, qty) in zip(identities, sized):
+            totals[identity] = totals.get(identity, 0.0) + qty
+        base = min(totals.values())
+    elif len({(r.get("SIDE") or "").upper() for r, _ in sized}) == len(sized):
+        # Every row a different side, so every row IS a leg and none can be a
+        # clip of another: the smallest is the package base. This is the ratio
+        # case the whole change is for — 40 BUY / 20 SELL is 20 packages.
+        base = min(qty for _, qty in sized)
+    else:
+        # Two rows share a side under one combined DESCRIPTION, so a clipped leg
+        # and a second leg on that side are indistinguishable. Keep the pre-PR
+        # answer — the first row — so an ambiguous block is never sized worse
+        # than before, and let `package_size_certain` make it visible instead.
+        base = sized[0][1]
+    return prem, base, base
+
+
+def package_size_certain(rows: list[dict]) -> bool:
+    """False when several rows share one combined DESCRIPTION and two of them
+    share a side, so a clip of one leg and two legs on that side are
+    indistinguishable. `structure_unit` then returns the smallest row, which is
+    right for two legs and too small for a clipped one — the caller warns."""
+    opt = [r for r in rows if parse_product(r.get("PRODUCT", "")).get("kind") == "OPTION"]
+    prem = opt or rows
+    sized = [r for r in prem if (_f(r.get("QTY")) or 0) > 0]
+    if len(sized) < 2 or all(_leg_identity(r) is not None for r in sized):
+        return True
+    sides = [(r.get("SIDE") or "").upper() for r in sized]
+    return len(set(sides)) == len(sides)
+
+
+def structure_unit(rows: list[dict]) -> float:
+    """How many packages the block is — the `xN` in the header.
+
+    struct_net weights each leg by QTY/base, so this must be that same base or
+    the header contradicts its own premium: a 2:1 put ratio filled 40/20 is 20
+    packages of (buy 2, sell 1), not 40 of anything.
+    """
+    return _package(rows)[2]
 
 
 def apply_orientation(parsed: dict, rows: list[dict]) -> tuple[list[dict], str, bool]:
