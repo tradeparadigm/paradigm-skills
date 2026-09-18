@@ -45,6 +45,24 @@ def hook(name, *args):
     return (result.stdout.strip() or result.stderr.strip()), result.returncode
 
 
+def calls(body, name):
+    """Argument lists for `name(...)`, paren-balanced. A regex stops at the
+    first `)`, so a two-level nested call failed to match at all and an
+    unpinned store inside one would have gone unseen."""
+    found = []
+    for match in re.finditer(rf"\b{name}\(", body):
+        depth = 0
+        for index in range(match.end() - 1, len(body)):
+            if body[index] == "(":
+                depth += 1
+            elif body[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    found.append(body[match.end():index])
+                    break
+    return found
+
+
 def test_arguments():
     check("default is BTC 24h", hook("RECAP_PRINT_ARGS")[0] == "BTC 24h")
     check("options token is ignored", hook("RECAP_PRINT_ARGS", "eth", "options", "8h")[0] == "ETH 8h")
@@ -186,14 +204,15 @@ def test_s3_reads_pin_the_regional_endpoint():
                     if "endpoint_url" not in call:
                         unpinned.append(os.path.relpath(path, skills))
                 # The async reader does not go through boto3 for its GETs, so
-                # it carries the pin on its own store constructor.
-                # Match the constructor AND its argument list, like the
-                # client/resource guard above: checking the whole file let a
-                # second, unpinned store pass in a file that already had one.
-                # Markdown counts too — its examples are what agents copy — so
-                # prose is excluded by having no arguments rather than by suffix.
-                for call in re.findall(r"\bS3Store\((?:[^()]|\([^()]*\))*\)", body):
-                    if "=" in call and "endpoint=" not in call:
+                # it carries the pin on its own store constructor. Markdown
+                # counts too — its examples are what agents copy — so the one
+                # exemption is the bare ellipsis placeholder prose writes.
+                # bucket is obstore's only positional parameter, so requiring
+                # an `=` anywhere let a positional-bucket call through.
+                for arguments in calls(body, "S3Store"):
+                    if arguments.strip() in ("", "..."):
+                        continue
+                    if "endpoint=" not in arguments:
                         unpinned.append(os.path.relpath(path, skills))
     check("every S3 read pins the regional endpoint", not unpinned, unpinned)
 
