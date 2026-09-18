@@ -321,14 +321,18 @@ def struct_net(rows: list[dict], field: str) -> float:
     return tot
 
 
-def _leg_key(row: dict):
-    """Which instrument this row trades, or None when its DESCRIPTION packs the
-    whole package (the tape repeats the combined string on every leg's row)."""
-    d = parse_description(row.get("DESCRIPTION", ""))
-    if not d["classified"] or len(d["legs"]) != 1:
-        return None
-    leg = d["legs"][0]
-    return (leg["cp"], leg["strike"], leg.get("expiry_c"))
+def _row_key(row: dict):
+    """Which leg a row trades. When the DESCRIPTION carries the whole package the
+    tape repeats it on every row, so fall back to the row's own terms: clips of
+    one leg share side and price and still group, while distinct legs stay apart.
+    Two distinct legs at an identical side AND price would merge — nothing in a
+    combined DESCRIPTION can tell them apart."""
+    parsed = parse_description(row.get("DESCRIPTION", ""))
+    if parsed["classified"] and len(parsed["legs"]) == 1:
+        leg = parsed["legs"][0]
+        return (leg["cp"], leg["strike"], leg.get("expiry_c"))
+    return ("~", row.get("DESCRIPTION"), (row.get("SIDE") or "").upper(),
+            _f(row.get("PRICE")))
 
 
 def _package(rows: list[dict]) -> tuple[list[dict], float, float]:
@@ -339,30 +343,30 @@ def _package(rows: list[dict]) -> tuple[list[dict], float, float]:
     of the option premium.
 
     The two numbers differ in exactly one shape. When a SINGLE row carries a
-    multi-leg DESCRIPTION its QTY counts the widest leg and its PRICE is already
-    the package price, so it weights as 1 while the package it describes is
-    QTY/widest-ratio. Everywhere else they are the same number.
+    DESCRIPTION that STATES its ratios, its QTY counts the widest leg but its
+    PRICE is already the package price, so it weights as 1 while the package it
+    describes is QTY/widest. Only Cstm states them; a named structure's ratios
+    are our own canonical geometry, and a 100-lot CFly is 100 flies.
     """
     opt = [r for r in rows if parse_product(r.get("PRODUCT", "")).get("kind") == "OPTION"]
     prem = opt or rows
     sized = [(r, q) for r, q in ((r, _f(r.get("QTY"))) for r in prem) if q and q > 0]
     if not sized:
         return prem, 1.0, 1.0
-    keys = [_leg_key(r) for r, _ in sized]
-    if len(sized) == 1 and keys[0] is None:
+    if len(sized) == 1:
         row, qty = sized[0]
         legs = parse_description(row.get("DESCRIPTION", ""))["legs"]
-        widest = max((leg.get("ratio") or 1.0 for leg in legs), default=1.0) or 1.0
-        return prem, qty, qty / widest
-    if all(key is not None for key in keys):
-        # One leg filled by several makers arrives as several rows of the same
-        # instrument, and their sizes ADD: a 50-lot call filled 30+20 is x50.
-        totals: dict = {}
-        for key, (_, qty) in zip(keys, sized):
-            totals[key] = totals.get(key, 0.0) + qty
-        base = min(totals.values())
-        return prem, base, base
-    base = min(qty for _, qty in sized)
+        if len(legs) > 1 and all(leg.get("_explicit") for leg in legs):
+            widest = max((leg.get("ratio") or 1.0 for leg in legs), default=1.0) or 1.0
+            return prem, qty, qty / widest
+        return prem, qty, qty
+    # One leg filled by several makers arrives as several rows, and their sizes
+    # ADD: a 50-lot call filled 30+20 is x50, not x20.
+    totals: dict = {}
+    for row, qty in sized:
+        key = _row_key(row)
+        totals[key] = totals.get(key, 0.0) + qty
+    base = min(totals.values())
     return prem, base, base
 
 

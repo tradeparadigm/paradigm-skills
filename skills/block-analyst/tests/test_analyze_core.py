@@ -300,9 +300,22 @@ ok(ac.structure_unit(hedged) == 20.0, "a smaller perp hedge row does not become 
 # The same trade in the tape's other shapes. Smallest row QTY is the base only
 # when every row is one distinct leg; these two are where it is not.
 one_row = [dict(ratio_rows[0], QTY=40)]
-ok(ac.structure_unit(one_row) == 20.0, "a single combined-DESCRIPTION row divides by its widest leg ratio")
+ok(ac.structure_unit(one_row) == 20.0, "a single row STATING -2.00/+1.00 divides by its widest ratio")
 ok(abs(ac.struct_net(one_row, "PRICE") - 0.0023) < 1e-9,
    "that row's PRICE is already the package price, so it still weights as 1")
+# A named structure's ratios are OUR canonical geometry, not something the tape
+# wrote: CFly parses to 1/2/1, and dividing by that made a 100-lot fly ×50 and
+# halved its greeks with it.
+fly_row = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "CFly 24 Jul 26 59000/62000/65000",
+            "QTY": 100, "PRICE": 0.0023, "REF_PRICE": 0.0021, "SIDE": "BUY"}]
+ok([l["ratio"] for l in ac.parse_description(fly_row[0]["DESCRIPTION"])["legs"]] == [1.0, 2.0, 1.0],
+   "CFly's 1/2/1 comes from the structure map, not the DESCRIPTION text")
+ok(ac.structure_unit(fly_row) == 100.0, "a 100-lot fly is 100 flies, not 50")
+# The sold leg clipped across two makers, every row repeating the package string.
+clipped = [dict(ratio_rows[0], QTY=40), dict(ratio_rows[1], QTY=10), dict(ratio_rows[1], QTY=10)]
+ok(ac.structure_unit(clipped) == 20.0, "clips group by side and price when the DESCRIPTION is the package")
+ok(abs(ac.struct_net(clipped, "PRICE") + 0.0164) < 1e-9,
+   "and the clipped package nets the same as the unclipped one")
 per_leg = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 24 Jul 26 59000",
             "QTY": 40, "PRICE": 0.0023, "REF_PRICE": 0.0021, "SIDE": "BUY"},
            {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 24 Jul 26 65000",
@@ -315,6 +328,8 @@ clips = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Call 7 May 26 84000",
 ok(ac.structure_unit(clips) == 50.0, "clips of one instrument add rather than compete for the minimum")
 ok(abs(ac.struct_net(clips, "PRICE") - 0.0122) < 1e-9,
    "and the premium counts that leg once, not 2.5 times")
+unkeyed = [dict(r, DESCRIPTION="C 7 May 26 84000") for r in clips]
+ok(ac.structure_unit(unkeyed) == 50.0, "clips still sum when the DESCRIPTION does not parse to a leg")
 
 # ── per-leg rows carry their QTY into the greeks, not just the premium ─────────
 # A ratio whose legs arrive as separate rows parses each DESCRIPTION to ratio 1.0,
@@ -366,9 +381,18 @@ def _rendered(rows):
         az._get, az.fetch_ticker, az.fetch_trades_bucket = saved
 
 
-_header = _rendered(ratio_rows)
-ok("×20" in _header, f"the rendered header sizes the ratio package ×20, not ×40 [{_header[:120]}]")
-ok("×40" not in _header, "the largest leg's QTY never reaches the header")
+# Every shape through the renderer, not just the one that was already right:
+# structure_unit/struct_net stayed green through the whole round-1 bug, so the
+# level that matters is the printed line.
+for _rows, _want, _never, _label in (
+        (ratio_rows, "×20", "×40", "ratio rows"),
+        (one_row, "×20", "×40", "a single row stating its ratios"),
+        (fly_row, "×100", "×50", "a named fly, whose ratios the tape never wrote"),
+        (clips, "×50", "×20", "one leg filled by two makers"),
+        (clipped, "×20", "×10", "a clipped leg inside a combined DESCRIPTION")):
+    _out = _rendered(_rows)
+    ok(_want in _out, f"header sizes {_label} {_want} [{_out[:110]}]")
+    ok(_never not in _out, f"header never sizes {_label} {_never}")
 
 print(f"\n{_p} passed, {_f} failed")
 sys.exit(1 if _f else 0)
