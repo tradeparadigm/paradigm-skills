@@ -627,14 +627,19 @@ def _dedupe_venue_blocks(venue_rows: list[dict],
         others = [r for r in venue_rows
                   if (r.get("exchange") or "").lower() not in _TAPE_BROKERED_VENUES]
         if not tape_available or not tape_rows:
-            # Nothing to double-count AGAINST. An unreadable tape and a tape
-            # that read fine and carried no rows are the same fact here, and
-            # keying on the exception alone left the empty case deleting
-            # everything: the producer stopped on 2026-09-12 and this branch
-            # then fired on every run, silently dropping 109 Deribit blocks and
-            # $1.25bn of underlying notional per day from Block Flow.
-            return venue_rows, [{"reason": "paradigm_overlap_unverified",
-                                 "rows": brokered}] if brokered else []
+            # Nothing to double-count AGAINST, so the blocks stay. Keying on the
+            # exception alone left the empty case deleting everything: the
+            # producer stopped on 2026-09-12 and this branch then fired on every
+            # run, dropping 109 Deribit blocks and $1.25bn of underlying
+            # notional per day from Block Flow in silence.
+            #
+            # The two sub-cases keep different reasons. That is the ONLY thing
+            # `tape_available` decides — it does not change what is kept — and
+            # naming it here means the caller reads this decision instead of
+            # recomputing the same signal from its own local, which is how the
+            # two drifted apart.
+            reason = "tape_unreadable" if not tape_available else "tape_empty"
+            return venue_rows, [{"reason": reason, "rows": brokered}] if brokered else []
         # The tape is readable and simply carries no venue ids — the id space
         # really is unproven, so the conservative exclusion stands.
         return others, ([{"reason": "id_space_unproven", "rows": brokered}]

@@ -1945,8 +1945,16 @@ def test_absent_paradigm_tape_keeps_the_venues_own_blocks():
     kept, excluded = recap._dedupe_venue_blocks(brokered, [], tape_available=False)
     check("no tape at all keeps every venue's blocks",
           {r["block_id"] for r in kept} == {"D-1", "B-1", "O-1"}, kept)
-    check("and says the Paradigm overlap could not be checked",
-          [e["reason"] for e in excluded] == ["paradigm_overlap_unverified"], excluded)
+    check("and records that the tape could not be READ",
+          [e["reason"] for e in excluded] == ["tape_unreadable"], excluded)
+    # The other sub-case keeps the same blocks but a different reason: the flag's
+    # only job is to tell them apart, so the caller reads this instead of
+    # recomputing the signal and drifting away from it.
+    kept_empty, excluded_empty = recap._dedupe_venue_blocks(brokered, [], tape_available=True)
+    check("an empty-but-readable tape keeps them too",
+          {r["block_id"] for r in kept_empty} == {"D-1", "B-1", "O-1"}, kept_empty)
+    check("but records that the tape was EMPTY",
+          [e["reason"] for e in excluded_empty] == ["tape_empty"], excluded_empty)
 
     kept2, excluded2 = recap._dedupe_venue_blocks(
         brokered, [{"PRODUCT": "BTC OPTION - DBT", "BLOCK_TRADE_ID": "P1"}],

@@ -511,12 +511,13 @@ def run(asset, window, start, end):
     # the whole point of the section is how much flow there was.
     for excluded in result.pop("block_exclusions", []):
         venues = ", ".join(excluded["venues"])
-        if excluded["reason"] == "paradigm_overlap_unverified":
-            # Two sub-cases reach this, and neither can double-count: the tape
-            # failed to read, or it read and carried no Paradigm blocks for this
-            # asset. Saying "may be counted twice" was arithmetically impossible
-            # on both — there is nothing in the pool to count twice.
-            why = ("could not be read" if not tape_available
+        if excluded["reason"] in ("tape_unreadable", "tape_empty"):
+            # Neither sub-case can double-count: the tape failed to read, or it
+            # read and carried no Paradigm blocks for this asset. "May be
+            # counted twice" was arithmetically impossible on both — there is
+            # nothing in the pool to count twice. Which one it was comes from
+            # the reason the gate recorded, not from a second copy of the signal.
+            why = ("could not be read" if excluded["reason"] == "tape_unreadable"
                    else "carried no Paradigm blocks for this asset")
             gaps.append(
                 f"Block Flow: {excluded['blocks']} {venues} block(s) (${excluded['notional_m']}M) "
