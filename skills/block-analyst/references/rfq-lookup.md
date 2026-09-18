@@ -41,6 +41,8 @@ Run it as one `exec`:
 duckdb -c "
 INSTALL httpfs; LOAD httpfs;
 INSTALL aws;    LOAD aws;
+SET ca_cert_file='/etc/ssl/certs/ca-certificates.crt';
+SET enable_server_cert_verification=true;
 CREATE OR REPLACE SECRET s3_irsa (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1');
 -- single scan → temp table holding the target RFQ + 30d matching structures.
 -- Source is the Snowflake-free hot paradigm_trade tape (trailing 30 days,

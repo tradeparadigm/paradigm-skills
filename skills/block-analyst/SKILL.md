@@ -25,7 +25,7 @@ compatibility: Resolves the rfq_id by searching the Paradigm trade tape (the
   unreachable, never fabricating the fill.
 metadata:
   author: tradeparadigm
-  version: "1.8"
+  version: "1.9"
 ---
 
 # Paradigm Block Trade Analyst
