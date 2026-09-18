@@ -1307,7 +1307,9 @@ def render_md(r: dict) -> str:
         tt = s["activity_trades"]
         tnum = (f"{tt / 1e6:.1f}M" if tt >= 1e6 else
                 f"{round(tt / 1e3)}k" if tt >= 1e3 else f"{int(tt)}")
-        split = " · ".join(f"{v['venue']} {v['pct']}%{'+' if v.get('partial') else ''}"
+        # No `+` floor marker: an unread venue is named after the line instead
+        # of carrying a share, so nothing on the line is a floor any more.
+        split = " · ".join(f"{v['venue']} {v['pct']}%"
                            for v in (s.get("activity_split") or [])[:4])
         # Naming the unread venue is what makes the other shares readable: they
         # are shares of what was read, and the denominator is short by it.

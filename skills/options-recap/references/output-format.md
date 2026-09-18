@@ -38,12 +38,33 @@ three warning lines that sat outside it. `RV 7d` and `VRP` print
 being dropped.
 
 `Coverage` leads the figures because every one of them is a function of how
-much of the window was read, and that cannot be inferred from the figures. `N` is
-venues successfully read, `M` venues attempted. The detail names any venue that
-is not `complete`: `no trades` (feed healthy, nothing traded — measured on the
-venue's continuous `option_summary` feed, never on its intermittent trade tape),
-`feed gap` (hours genuinely lost), `READ FAILED`, `unverified`. A venue whose
-share is a floor rather than a share carries a `+` on the Activity line.
+much of the window was read, and that cannot be inferred from the figures. `M`
+counts venues by DISPLAY LABEL, the same folding the Activity line uses, so the
+two lines always agree; `N` is those whose trade data was read and proven. The
+detail names any venue that is not `complete`:
+
+- `quiet hours` — the venue's continuous `option_summary` feed covered every
+  hour, and some of those hours carried no prints. NOT "this venue never
+  traded": it is a claim about hours, and a venue can be 40% of the tape and
+  still have quiet hours.
+- `feed gap` — hours missing from BOTH feeds, so trade data was genuinely lost.
+- `quote gap` — hours missing only from `option_summary`. The trade tape covered
+  them, so nothing below is understated; only the coverage proof is short.
+- `READ FAILED` — the trade read itself failed.
+- `unverified` — the companion listing could not be read or came back empty, so
+  coverage could not be established either way.
+
+The last three, plus `READ FAILED`, mean that venue's trades are missing or
+unproven. Its share is then omitted from the Activity line entirely and the
+venue named after it — `(by trade count; Deribit unread — shares are of what
+was read)` — because the remaining percentages are shares of a denominator
+short by it. An unrecognised state renders `state not recognised` and counts as
+unread; it never raises.
+
+`ATM`, `25d RR` and `Fly` carry a trailing `*` when the value was reached by
+clamping to an endpoint of a thin chain rather than interpolated, and the Term
+label carries one when any expiry's ATM was. `Fly` is `(c25 + p25)/2 - atm`, so
+it takes the star if EITHER input was clamped.
 
 Volume is the valued subset, not a market total: trades whose USD premium
 cannot be proven are counted in a gap line instead of being estimated into the
