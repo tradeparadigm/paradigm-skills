@@ -66,6 +66,26 @@ clamping to an endpoint of a thin chain rather than interpolated, and the Term
 label carries one when any expiry's ATM was. `Fly` is `(c25 + p25)/2 - atm`, so
 it takes the star if EITHER input was clamped.
 
+Every `⚠` line names venues with the SAME words the Snapshot uses — `Bybit`,
+`OKX`, `Deribit`, `Deribit USDC`, `Bullish` — never the raw partition id
+(`okex-options`). The two Deribit ids stay apart in a `⚠` line, which describes
+one venue, and fold together in Coverage and Activity, which describe shares.
+Money in a `⚠` line is `$X.XXM`, the same unit as the Block Flow header.
+
+Block Flow states every exclusion with its size, because the section's subject is
+how much flow there was:
+
+- blocks excluded for an unprovable Paradigm overlap, with their notional and
+  coin — these are real prints withheld rather than absent;
+- blocks below the $250k floor, with their combined notional;
+- blocks dropped for want of event-time unit metadata, with how many of the
+  venue's blocks remain;
+- Bybit, which publishes a block flag with no group id and so can never appear.
+
+`Spot` is normally Deribit's own index. When that feed is unreachable it falls
+back to the venue tape's last trade-time index and says so in a `⚠` line; treat
+`Spot` and any block priced without its own index as approximate on that run.
+
 Volume is the valued subset, not a market total: trades whose USD premium
 cannot be proven are counted in a gap line instead of being estimated into the
 number. Never write `all venues` — a venue's trade source can be a gap — and

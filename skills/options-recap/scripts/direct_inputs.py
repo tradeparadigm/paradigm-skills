@@ -350,6 +350,13 @@ def coverage_verdict(venue, asset, start, end, missing_trade_hours, now=None):
     return ("quiet" if quiet else "complete"), detail
 
 
+# What each dedupe outcome means to a reader, in words.
+_EXCLUSION_REASONS = {
+    "id_space_unproven": ("the Paradigm tape carries no venue block ids for them, so a "
+                          "Paradigm-brokered print among them cannot be ruled out"),
+}
+
+
 def run(asset, window, start, end):
     recap.WARNINGS.clear()
     queries = build_queries(asset, start, end, render=True)
@@ -537,11 +544,14 @@ def run(asset, window, start, end):
                 f"included without a Paradigm cross-check — the execution tape {why}, so a "
                 f"Paradigm-brokered print among them could not be identified as one")
         else:
+            # Spelled out: `reason.replace("_", " ")` leaked the enum name into
+            # the reader's line as "id space unproven".
+            why = _EXCLUSION_REASONS.get(
+                excluded["reason"], excluded["reason"].replace("_", " "))
             gaps.append(
                 f"Block Flow: {excluded['blocks']} {venues} block(s) excluded "
-                f"(${excluded['notional_m']}M, {excluded['coin']} coin) — "
-                f"{excluded['reason'].replace('_', ' ')}; the totals below do not "
-                f"include them")
+                f"(${excluded['notional_m']:.2f}M, {excluded['coin']} coin) — "
+                f"{why}; the totals below do not include them")
     # A venue whose rows carry no index_price falls back to window-close spot,
     # so its blocks are ranked against trade-time-priced ones on a different
     # clock — the very thing this phase fixed. Uniform-close was at least
@@ -569,7 +579,7 @@ def run(asset, window, start, end):
     if trimmed:
         gaps.append(
             f"Block Flow: {trimmed['blocks']} block(s) below the $250k floor "
-            f"(${trimmed['notional_usd']:,}) are excluded from the totals")
+            f"(${trimmed['notional_usd'] / 1e6:.2f}M) are excluded from the totals")
     # Direct inputs cover the requested window, not the retired 24h rollup.
     result["hot_horizon"] = None
     result["snapshot"]["volume_usd_m"] = round(known_turnover / 1e6, 2)
