@@ -30,9 +30,9 @@ BUCKET = "dt-exchange-venue-data"
 S3_ENDPOINT = "https://s3.ap-northeast-1.amazonaws.com"
 CONCURRENCY = 512
 # CONCURRENCY caps the raw bodies in flight; BATCH caps the parsed tables held
-# before each intermediate concat. Neither bounds the result: _gather keeps
-# every batch's table and concatenates at the end, so peak is the whole window
-# twice over and grows with it.
+# before each intermediate concat. Neither bounds the result: every object's
+# rows end up resident at once, so peak grows with the window. The concat
+# itself is free — pa.concat_tables is zero-copy when the schemas match.
 BATCH = 2048
 
 

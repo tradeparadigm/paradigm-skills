@@ -162,6 +162,34 @@ def test_s3_reads_pin_the_regional_endpoint():
     check("every S3 read pins the regional endpoint", not unpinned, unpinned)
 
 
+def test_importing_collect_recap_makes_the_shared_reader_importable():
+    """s3_async lives in data-discovery now. Every other test either stubs it in
+    sys.modules or loads it by path, so nothing would notice if the module-scope
+    sys.path insert went away — and every stream=True query would degrade to
+    "unavailable" in production only."""
+    scripts = os.path.join(ROOT, "scripts")
+    # find_spec resolves the path without executing it, so this stays stdlib-only:
+    # s3_async imports obstore and pyarrow, which this lane does not install.
+    program = (
+        "import sys, types, importlib.util as u;"
+        "sys.modules.setdefault('duckdb', types.SimpleNamespace(Error=Exception, connect=None));"
+        f"sys.path.insert(0, {scripts!r});"
+        f"spec = u.spec_from_file_location('collect_recap', {COLLECTOR!r});"
+        "mod = u.module_from_spec(spec);"
+        "sys.modules['collect_recap'] = mod;"
+        "spec.loader.exec_module(mod);"
+        "found = u.find_spec('s3_async');"
+        "print(found.origin if found else 'NOT FOUND')"
+    )
+    result = subprocess.run([sys.executable, "-c", program],
+                            capture_output=True, text=True)
+    origin = result.stdout.strip()
+    check("importing collect_recap puts the shared reader on the path",
+          result.returncode == 0
+          and origin.endswith(os.path.join("data-discovery", "scripts", "s3_async.py")),
+          origin or result.stderr.strip()[-200:])
+
+
 def main():
     for name, function in sorted(globals().items()):
         if name.startswith("test_") and callable(function):
@@ -172,3 +200,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
