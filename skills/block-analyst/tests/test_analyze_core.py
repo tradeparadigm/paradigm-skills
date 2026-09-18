@@ -297,6 +297,25 @@ hedged = ratio_rows + [{"PRODUCT": "BTC PERPETUAL - DBT", "DESCRIPTION": "Perpet
                         "QTY": 5, "PRICE": 65000, "REF_PRICE": 64955.57, "SIDE": "SELL"}]
 ok(ac.structure_unit(hedged) == 20.0, "a smaller perp hedge row does not become the structure unit")
 
+# The same trade in the tape's other shapes. Smallest row QTY is the base only
+# when every row is one distinct leg; these two are where it is not.
+one_row = [dict(ratio_rows[0], QTY=40)]
+ok(ac.structure_unit(one_row) == 20.0, "a single combined-DESCRIPTION row divides by its widest leg ratio")
+ok(abs(ac.struct_net(one_row, "PRICE") - 0.0023) < 1e-9,
+   "that row's PRICE is already the package price, so it still weights as 1")
+per_leg = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 24 Jul 26 59000",
+            "QTY": 40, "PRICE": 0.0023, "REF_PRICE": 0.0021, "SIDE": "BUY"},
+           {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 24 Jul 26 65000",
+            "QTY": 20, "PRICE": 0.0210, "REF_PRICE": 0.0212, "SIDE": "SELL"}]
+ok(ac.structure_unit(per_leg) == 20.0, "per-leg rows give the same unit as the combined form")
+# One leg, several makers: the clips ADD. Taking the smallest called a 50-lot
+# call x20 and counted its premium 2.5 times.
+clips = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Call 7 May 26 84000",
+          "QTY": q, "PRICE": 0.0122, "REF_PRICE": 0.0118, "SIDE": "BUY"} for q in (30, 20)]
+ok(ac.structure_unit(clips) == 50.0, "clips of one instrument add rather than compete for the minimum")
+ok(abs(ac.struct_net(clips, "PRICE") - 0.0122) < 1e-9,
+   "and the premium counts that leg once, not 2.5 times")
+
 # ── per-leg rows carry their QTY into the greeks, not just the premium ─────────
 # A ratio whose legs arrive as separate rows parses each DESCRIPTION to ratio 1.0,
 # so without QTY-derived ratios net_greeks sizes a 40/20 package as 20/20 — the
@@ -319,6 +338,37 @@ _hedged = per_leg + [{"PRODUCT": "BTC PERPETUAL - DBT", "DESCRIPTION": "Perpetua
                       "QTY": 207000, "PRICE": 65000, "REF_PRICE": 64955.57, "SIDE": "SELL"}]
 ok([l["ratio"] for l in ac.legs_from_rows(_hedged)] == [2.0, 1.0, 1.0],
    "a perp hedge keeps ratio 1.0 — its QTY is in a different unit")
+
+
+# ── the header itself: structure_unit reaching the rendered ×N ──────────────────
+# analyze.py:139 is the user-visible half of the ratio fix, and reverting it to
+# fill[0]["QTY"] left every check above green. _run is exercised with the network
+# stubbed so the assertion is on the rendered line, not on the core function.
+def _rendered(rows):
+    import csv as _csv, io, tempfile, types
+    from contextlib import redirect_stdout
+    saved = (az._get, az.fetch_ticker, az.fetch_trades_bucket)
+    az._get = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no network in tests"))
+    az.fetch_ticker = lambda sym: (sym, None)
+    az.fetch_trades_bucket = lambda sym, now_ms: (sym, None)
+    directory = tempfile.mkdtemp()
+    try:
+        with open(os.path.join(directory, "fill.csv"), "w", newline="") as handle:
+            writer = _csv.DictWriter(handle, fieldnames=sorted(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            az._run(types.SimpleNamespace(csv_dir=directory, now_ms=1_752_000_000_000,
+                                          render=True))
+        return out.getvalue()
+    finally:
+        az._get, az.fetch_ticker, az.fetch_trades_bucket = saved
+
+
+_header = _rendered(ratio_rows)
+ok("×20" in _header, f"the rendered header sizes the ratio package ×20, not ×40 [{_header[:120]}]")
+ok("×40" not in _header, "the largest leg's QTY never reaches the header")
 
 print(f"\n{_p} passed, {_f} failed")
 sys.exit(1 if _f else 0)

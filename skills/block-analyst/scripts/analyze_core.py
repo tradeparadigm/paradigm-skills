@@ -309,10 +309,7 @@ def struct_net(rows: list[dict], field: str) -> float:
     so their net is unchanged. Perp/future legs are EXCLUDED — a delta hedge executes at
     spot and is not part of the option premium (including it leaked the perp price into
     'Paid'). Falls back to all rows if there are no option legs."""
-    opt = [r for r in rows if parse_product(r.get("PRODUCT", "")).get("kind") == "OPTION"]
-    prem = opt or rows
-    qs = [q for q in (_f(r.get("QTY")) for r in prem) if q and q > 0]
-    base = min(qs) if qs else 1.0
+    prem, base, _ = _package(rows)
     tot = 0.0
     for r in prem:
         v = _f(r.get(field))
@@ -324,19 +321,59 @@ def struct_net(rows: list[dict], field: str) -> float:
     return tot
 
 
-def structure_unit(rows: list[dict]) -> float:
-    """The package's base size: the smallest OPTION leg QTY.
+def _leg_key(row: dict):
+    """Which instrument this row trades, or None when its DESCRIPTION packs the
+    whole package (the tape repeats the combined string on every leg's row)."""
+    d = parse_description(row.get("DESCRIPTION", ""))
+    if not d["classified"] or len(d["legs"]) != 1:
+        return None
+    leg = d["legs"][0]
+    return (leg["cp"], leg["strike"], leg.get("expiry_c"))
 
-    struct_net weights every leg against this base, so the displayed size must be
-    the same number or the header contradicts its own premium. A 2:1 put ratio
-    filled 40/20 is 20 packages of (buy 2, sell 1) — not 40 of anything. Taking
-    the first row's QTY happened to be right only while every leg traded equal
-    size. Perp/future hedge rows are excluded for the same reason they are
-    excluded from the premium.
+
+def _package(rows: list[dict]) -> tuple[list[dict], float, float]:
+    """(premium rows, weighting base, package size) — derived together so the
+    displayed size cannot drift from the base the premium is netted against.
+
+    Perp/future rows are dropped: a delta hedge executes at spot and is not part
+    of the option premium.
+
+    The two numbers differ in exactly one shape. When a SINGLE row carries a
+    multi-leg DESCRIPTION its QTY counts the widest leg and its PRICE is already
+    the package price, so it weights as 1 while the package it describes is
+    QTY/widest-ratio. Everywhere else they are the same number.
     """
     opt = [r for r in rows if parse_product(r.get("PRODUCT", "")).get("kind") == "OPTION"]
-    qs = [q for q in (_f(r.get("QTY")) for r in (opt or rows)) if q and q > 0]
-    return min(qs) if qs else 1.0
+    prem = opt or rows
+    sized = [(r, q) for r, q in ((r, _f(r.get("QTY"))) for r in prem) if q and q > 0]
+    if not sized:
+        return prem, 1.0, 1.0
+    keys = [_leg_key(r) for r, _ in sized]
+    if len(sized) == 1 and keys[0] is None:
+        row, qty = sized[0]
+        legs = parse_description(row.get("DESCRIPTION", ""))["legs"]
+        widest = max((leg.get("ratio") or 1.0 for leg in legs), default=1.0) or 1.0
+        return prem, qty, qty / widest
+    if all(key is not None for key in keys):
+        # One leg filled by several makers arrives as several rows of the same
+        # instrument, and their sizes ADD: a 50-lot call filled 30+20 is x50.
+        totals: dict = {}
+        for key, (_, qty) in zip(keys, sized):
+            totals[key] = totals.get(key, 0.0) + qty
+        base = min(totals.values())
+        return prem, base, base
+    base = min(qty for _, qty in sized)
+    return prem, base, base
+
+
+def structure_unit(rows: list[dict]) -> float:
+    """How many packages the block is — the `xN` in the header.
+
+    struct_net weights each leg by QTY/base, so this must be that same base or
+    the header contradicts its own premium: a 2:1 put ratio filled 40/20 is 20
+    packages of (buy 2, sell 1), not 40 of anything.
+    """
+    return _package(rows)[2]
 
 
 def apply_orientation(parsed: dict, rows: list[dict]) -> tuple[list[dict], str, bool]:
