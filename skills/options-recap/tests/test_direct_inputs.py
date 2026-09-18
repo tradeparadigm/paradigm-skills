@@ -463,7 +463,7 @@ def test_run_reaches_the_read_loop_and_wires_coverage_through(monkeypatch):
 
 def test_a_feed_gap_says_the_figures_below_are_understated(monkeypatch):
     _, captured, _ = _run_once(monkeypatch)
-    gap = [g for g in captured["gaps"] if g.startswith("deribit:")]
+    gap = [g for g in captured["gaps"] if g.startswith("Deribit:")]
     assert gap and "understated" in gap[0], captured["gaps"]
 
 
@@ -471,7 +471,7 @@ def test_a_companion_gap_does_not_claim_the_trades_are_understated(monkeypatch):
     _, captured, _ = _run_once(
         monkeypatch, coverage=("companion_gap", {"lost_hours": ["20260916T10"],
                                                  "expected": 3, "quiet_hours": []}))
-    gap = [g for g in captured["gaps"] if g.startswith("deribit:")]
+    gap = [g for g in captured["gaps"] if g.startswith("Deribit:")]
     assert gap, captured["gaps"]
     assert "quote feed" in gap[0] and "understated" not in gap[0], gap
 
@@ -480,7 +480,7 @@ def test_an_unverifiable_venue_still_says_so(monkeypatch):
     """Returning `unknown` for an empty listing closed a false alarm and opened a
     silence: a genuinely dead companion feed produced no line at all."""
     _, captured, _ = _run_once(monkeypatch, coverage=("unknown", {}))
-    gap = [g for g in captured["gaps"] if g.startswith("deribit:")]
+    gap = [g for g in captured["gaps"] if g.startswith("Deribit:")]
     assert gap and "could not be verified" in gap[0], captured["gaps"]
 
 
@@ -543,7 +543,24 @@ def test_unvalued_trades_name_the_venue_whose_metadata_is_short():
     direct.inputs(totals, {}, {}, gaps)
     volume = [g for g in gaps if g.startswith("Volume:")]
     assert volume, gaps
-    assert "bybit-options 2 of 2 (100%) across 2 symbols" in volume[0]
+    assert "Bybit 2 of 2 (100%) across 2 symbols" in volume[0]
+
+
+def test_every_venue_named_in_a_gap_uses_the_snapshot_vocabulary():
+    """A ⚠ line read `okex-options` three lines above `OKX 17%` on the Activity
+    line for the same venue. One vocabulary, and the two Deribit ids stay apart
+    because a gap names ONE venue and two identical labels would be worse."""
+    assert recap.venue_name("okex-options") == "OKX"
+    assert recap.venue_name("bybit-options") == "Bybit"
+    assert recap.venue_name("deribit") == "Deribit"
+    assert recap.venue_name("deribit-usdc") == "Deribit USDC"
+    # Unknown venues degrade rather than raise, same as the Snapshot label.
+    assert recap.venue_name("cme-options") == "Cme"
+    assert recap.venue_name(None) == "?"
+    # And the two are the same vocabulary: every name is the label, or the label
+    # plus a qualifier that keeps two folded ids apart.
+    for venue in ("deribit", "deribit-usdc", "okex-options", "bybit-options", "bullish"):
+        assert recap.venue_name(venue).startswith(recap._venue_label(venue)), venue
 
 
 def test_a_block_dropped_for_missing_units_is_counted_not_just_mentioned():
@@ -556,7 +573,7 @@ def test_a_block_dropped_for_missing_units_is_counted_not_just_mentioned():
     direct.aggregate_trades("okex-options", frame, spec(), gaps)
     dropped = [g for g in gaps if "block(s) excluded" in g]
     assert dropped, gaps
-    assert "Block Flow: 1 okex-options block(s) excluded" in dropped[0]
+    assert "Block Flow: 1 OKX block(s) excluded" in dropped[0]
     assert "1 of 2 remain" in dropped[0]
 
 

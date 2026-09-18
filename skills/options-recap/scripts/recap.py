@@ -342,6 +342,19 @@ _VENUE_LABELS = {"deribit": "Deribit", "deribit-usdc": "Deribit",
                  "bullish": "Bullish"}
 
 
+# Gap lines name ONE venue each, so they must not fold — two "Deribit: ..." lines
+# with different numbers is worse than the raw id. Shares and Coverage do fold,
+# deliberately, because there the two ids are one market to the reader.
+_VENUE_NAMES = dict(_VENUE_LABELS, **{"deribit-usdc": "Deribit USDC"})
+
+
+def venue_name(exchange: str) -> str:
+    """Display name for one venue in a ⚠ line. Same vocabulary the Snapshot uses,
+    so `okex-options` never appears three lines above `OKX` for the same venue."""
+    e = (exchange or "").lower()
+    return _VENUE_NAMES.get(e, (exchange or "?").split("-")[0].title())
+
+
 def _venue_label(exchange: str) -> str:
     """Short display label for a venue id (e.g. okex-options -> OKX). Unknown/future
     venues degrade to a readable stem (e.g. cme-options -> Cme) — never crashes,

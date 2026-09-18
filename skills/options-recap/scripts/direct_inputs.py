@@ -212,7 +212,7 @@ def aggregate_trades(venue, rows, spec, gaps):
         dropped = grouped.filter(~pl.col("complete"))
         if dropped.height:
             coin = round(dropped.get_column("volume_coin").sum() or 0, 2)
-            gaps.append(f"Block Flow: {dropped.height} {venue} block(s) excluded "
+            gaps.append(f"Block Flow: {dropped.height} {recap.venue_name(venue)} block(s) excluded "
                         f"({coin} coin) — no event-time unit metadata, so their notional "
                         f"cannot be computed; {grouped.height - dropped.height} of "
                         f"{grouped.height} remain")
@@ -254,7 +254,7 @@ def inputs(totals, evidence, specs, gaps, coverage=None):
         # noise, while "bybit-options 32%" points at one venue's instrument
         # metadata not covering the symbols its own tape traded.
         detail = "; ".join(
-            f"{venue} {count:,} of {rows:,} ({100 * count / rows:.0f}%) across {symbols:,} symbols"
+            f"{recap.venue_name(venue)} {count:,} of {rows:,} ({100 * count / rows:.0f}%) across {symbols:,} symbols"
             for venue, count, rows, symbols in sorted(unvalued_by_venue, key=lambda v: -v[1]))
         gaps.append(f"Volume: {missing_values:,} trades lack a provable USD premium — "
                     f"{detail}; shown sum is the valued subset")
@@ -387,7 +387,7 @@ def run(asset, window, start, end):
                     specs[venue] = meta.pop(venue).result()
                 except Exception as exc:
                     meta.pop(venue, None)
-                    meta_gaps.append(f"{venue}: unit metadata unavailable — {exc}")
+                    meta_gaps.append(f"{recap.venue_name(venue)}: unit metadata unavailable — {exc}")
             return specs.get(venue)
 
         for index in range(len(reads)):
@@ -441,7 +441,7 @@ def run(asset, window, start, end):
                     if state == "feed_gap":
                         lost = len(detail["lost_hours"])
                         read_gaps.append(
-                            f"{venue}: {lost} of {detail['expected']} hours missing from the "
+                            f"{recap.venue_name(venue)}: {lost} of {detail['expected']} hours missing from the "
                             f"venue's own feed — trades, volume and share below are understated")
                     elif state == "unknown":
                         # Closing the empty-listing false alarm made this branch
@@ -449,7 +449,7 @@ def run(asset, window, start, end):
                         # at all, and the venue kept an unmarked share.
                         why = detail.get("error") or "no companion listing returned"
                         read_gaps.append(
-                            f"{venue}: coverage could not be verified — {why}; its share "
+                            f"{recap.venue_name(venue)}: coverage could not be verified — {why}; its share "
                             f"and any gap in its trades are unconfirmed")
                     elif state == "companion_gap":
                         # The trade tape covered these hours; only the quote
@@ -457,7 +457,7 @@ def run(asset, window, start, end):
                         # false for exactly the hours that triggered it.
                         lost = len(detail["lost_hours"])
                         read_gaps.append(
-                            f"{venue}: {lost} of {detail['expected']} hours missing from the "
+                            f"{recap.venue_name(venue)}: {lost} of {detail['expected']} hours missing from the "
                             f"quote feed — trades below are complete, but coverage for those "
                             f"hours could not be confirmed")
                 else:
@@ -479,7 +479,7 @@ def run(asset, window, start, end):
             first = spec["captured_at"].min() if spec.height else None
             if first is not None and first > start:
                 meta_gaps.append(
-                    f"{venue}: instrument metadata starts {first:%Y-%m-%d %H:%M}Z, after the "
+                    f"{recap.venue_name(venue)}: instrument metadata starts {first:%Y-%m-%d %H:%M}Z, after the "
                     f"window opened — trades before that cannot be valued or unit-converted")
         tape_available = True
         try:
@@ -546,7 +546,7 @@ def run(asset, window, start, end):
     # so its blocks are ranked against trade-time-priced ones on a different
     # clock — the very thing this phase fixed. Uniform-close was at least
     # internally consistent; silent mixing is not.
-    fallback = sorted({b["exchange"] for b in blocks if not b.get("index_px")})
+    fallback = sorted({recap.venue_name(b["exchange"]) for b in blocks if not b.get("index_px")})
     # Unconditional: gating on "some venue still has a trade-time index" went
     # silent in the WORST case, where every venue block falls back to close
     # while Paradigm blocks stay trade-time — the exact mixing this targets.
