@@ -506,7 +506,10 @@ def run(asset, window, start, end):
     # clock — the very thing this phase fixed. Uniform-close was at least
     # internally consistent; silent mixing is not.
     fallback = sorted({b["exchange"] for b in blocks if not b.get("index_px")})
-    if fallback and len(fallback) < len({b["exchange"] for b in blocks}):
+    # Unconditional: gating on "some venue still has a trade-time index" went
+    # silent in the WORST case, where every venue block falls back to close
+    # while Paradigm blocks stay trade-time — the exact mixing this targets.
+    if fallback:
         gaps.append(
             f"Block Flow: {', '.join(fallback)} block(s) priced at the window's "
             f"closing spot — those venues publish no trade-time index, so their "

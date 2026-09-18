@@ -1059,12 +1059,17 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "hot_horizon": hot_horizon,
         "stale_sources": stale or [],
         "warnings": list(WARNINGS),
+        # Re-filtered to the window: the dedupe gate deliberately looks WIDER
+        # than the window, so a pre-window block was inflating both the count
+        # and the coin of what this line claims the totals lost.
         "block_exclusions": [
             {"reason": e["reason"],
-             "venues": sorted({(r.get("exchange") or "?") for r in e["rows"]}),
-             "blocks": len(e["rows"]),
-             "coin": round(sum(_num(r, "volume_coin") or 0 for r in e["rows"]), 2)}
-            for e in _excluded],
+             "venues": sorted({(r.get("exchange") or "?") for r in _win}),
+             "blocks": len(_win),
+             "coin": round(sum(_num(r, "volume_coin") or 0 for r in _win), 2)}
+            for e in _excluded
+            for _win in [[r for r in e["rows"] if (_num(r, "bucket_at") or 0) >= start_ms]]
+            if _win],
         "blocks_below_floor": block.get("trimmed", {}),
     }
 
@@ -1324,7 +1329,11 @@ def render_md(r: dict) -> str:
 
     if vs and vs.get("rows"):
         fa, ba, term = vs.get("front_atm"), vs.get("back_atm"), vs.get("term_line")
-        term_txt = (f"{fa}v → {ba}v → {term}" if fa is not None and ba is not None
+        # The term label is read off front/back ATM, so an extrapolated ATM
+        # anywhere makes the label itself provisional — the reason the ATM
+        # column got its own star in the first place.
+        term_star = "*" if any(r.get("atm_extrapolated") for r in vs["rows"]) else ""
+        term_txt = (f"{fa}v → {ba}v → {term}{term_star}" if fa is not None and ba is not None
                     and term else (term or "n/a"))
         L.append(f"Skew: {vs.get('skew_line') or 'n/a'} · Term: {term_txt}")
         L += ["", "```yaml",
@@ -1338,10 +1347,13 @@ def render_md(r: dict) -> str:
             atm_star = "*" if e.get("atm_extrapolated") else ""
             atm = f"{e['atm']}v{atm_star}" if e.get("atm") is not None else "n/a"
             rr = f"{e['rr_25d']:+}v{star}" if e.get("rr_25d") is not None else "n/a"
-            fly = f"{e['fly']}v" if e.get("fly") is not None else "n/a"
+            # Fly is (c25 + p25)/2 - atm, so it inherits BOTH clamps: it was
+            # rendering bare beside a starred RR built from the same points.
+            fly_star = star or atm_star
+            fly = f"{e['fly']}v{fly_star}" if e.get("fly") is not None else "n/a"
             datm = _delta_fmt(e.get("d_atm"), atm_star)
             drr = _delta_fmt(e.get("d_rr"), star)
-            dfly = _delta_fmt(e.get("d_fly"))
+            dfly = _delta_fmt(e.get("d_fly"), fly_star)
             L.append(f"{e['expiry']:<11}{atm:<9}{datm:<9}{rr:<10}{drr:<9}{fly:<8}{dfly}")
         L.append("```")
     else:

@@ -402,6 +402,37 @@ def test_a_failed_coverage_read_does_not_abort_the_recap(monkeypatch):
     assert "AccessDenied" in detail["error"]
 
 
+def test_run_wires_coverage_and_tape_availability_into_the_render(monkeypatch):
+    """`run()` itself was never executed by any test: `raise AssertionError` as
+    its first statement left the whole gate green, leaving the coverage wiring,
+    the tape_available signal and every `Block Flow:` line unexercised."""
+    calls = {}
+
+    def fake_build(asset, window, start_ms, end_ms, deri, snapshot, executions,
+                   blocks, **kwargs):
+        calls["tape_available"] = kwargs.get("tape_available")
+        calls["venue_coverage"] = snapshot.get("venue_coverage")
+        return {"snapshot": snapshot, "source_gaps": [], "hot_horizon": None}
+
+    monkeypatch.setattr(recap, "build", fake_build)
+    monkeypatch.setattr(recap, "render_md", lambda result: "RENDERED")
+    monkeypatch.setattr(direct, "build_queries", lambda *a, **k: [])
+    monkeypatch.setattr(direct, "metadata", lambda *a, **k: pl.DataFrame())
+    monkeypatch.setattr(direct, "read_executions",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no partition")))
+    monkeypatch.setattr(recap, "fetch_7d_closes", lambda *a, **k: [])
+    monkeypatch.setattr(recap, "_fetch_market_fallback", lambda *a, **k: None)
+    monkeypatch.setattr(direct, "inputs",
+                        lambda totals, evidence, specs, gaps, coverage=None: (
+                            {"trades_total": 1, "venue_coverage": coverage}, [], 0.0))
+    out = direct.run("BTC", "24h", COV_START, COV_END)
+    assert out == "RENDERED"
+    # read_executions raised, so the tape is genuinely absent — the signal that
+    # stops _dedupe_venue_blocks deleting every brokered block.
+    assert calls["tape_available"] is False, calls
+    assert calls["venue_coverage"] == {}, calls
+
+
 def test_a_block_missing_one_legs_index_is_not_half_priced():
     """polars skips nulls in the numerator; dividing by the full coin sum then
     halved a block whose legs were mixed. Weight only over legs that have one."""
