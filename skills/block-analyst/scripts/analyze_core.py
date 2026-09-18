@@ -321,18 +321,14 @@ def struct_net(rows: list[dict], field: str) -> float:
     return tot
 
 
-def _row_key(row: dict):
-    """Which leg a row trades. When the DESCRIPTION carries the whole package the
-    tape repeats it on every row, so fall back to the row's own terms: clips of
-    one leg share side and price and still group, while distinct legs stay apart.
-    Two distinct legs at an identical side AND price would merge — nothing in a
-    combined DESCRIPTION can tell them apart."""
+def _leg_identity(row: dict):
+    """The instrument a row trades, or None when its DESCRIPTION packs the whole
+    package (the tape repeats the combined string on every leg's row)."""
     parsed = parse_description(row.get("DESCRIPTION", ""))
     if parsed["classified"] and len(parsed["legs"]) == 1:
         leg = parsed["legs"][0]
         return (leg["cp"], leg["strike"], leg.get("expiry_c"))
-    return ("~", row.get("DESCRIPTION"), (row.get("SIDE") or "").upper(),
-            _f(row.get("PRICE")))
+    return None
 
 
 def _package(rows: list[dict]) -> tuple[list[dict], float, float]:
@@ -360,11 +356,29 @@ def _package(rows: list[dict]) -> tuple[list[dict], float, float]:
             widest = max((leg.get("ratio") or 1.0 for leg in legs), default=1.0) or 1.0
             return prem, qty, qty / widest
         return prem, qty, qty
-    # One leg filled by several makers arrives as several rows, and their sizes
-    # ADD: a 50-lot call filled 30+20 is x50, not x20.
+    identities = [_leg_identity(row) for row, _ in sized]
+    if all(identity is not None for identity in identities):
+        keys = identities
+    else:
+        # A combined DESCRIPTION says how many legs the package has, which is
+        # what separates distinct legs from clips of one. Guessing from side and
+        # price instead sized an at-the-forward straddle — whose two legs print
+        # the SAME price by put-call parity — as one leg of double the size.
+        legs = max((len(parse_description(r.get("DESCRIPTION", ""))["legs"])
+                    for r, _ in sized), default=0)
+        described = any((r.get("DESCRIPTION") or "").strip() for r, _ in sized)
+        if len(sized) <= legs or not described:
+            # No DESCRIPTION at all means no evidence either way, and rows that
+            # bare are per-leg in every real tape shape — treat them as legs.
+            keys = list(range(len(sized)))
+        else:
+            # Clips exist. Group by side only: the price is the field that
+            # VARIES between makers, so keying on it stopped two clips of one
+            # leg grouping in the normal case.
+            keys = [(row.get("DESCRIPTION"), (row.get("SIDE") or "").upper())
+                    for row, _ in sized]
     totals: dict = {}
-    for row, qty in sized:
-        key = _row_key(row)
+    for key, (_, qty) in zip(keys, sized):
         totals[key] = totals.get(key, 0.0) + qty
     base = min(totals.values())
     return prem, base, base

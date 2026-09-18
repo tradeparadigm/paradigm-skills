@@ -330,6 +330,22 @@ ok(abs(ac.struct_net(clips, "PRICE") - 0.0122) < 1e-9,
    "and the premium counts that leg once, not 2.5 times")
 unkeyed = [dict(r, DESCRIPTION="C 7 May 26 84000") for r in clips]
 ok(ac.structure_unit(unkeyed) == 50.0, "clips still sum when the DESCRIPTION does not parse to a leg")
+# Put-call parity makes an at-the-forward straddle's two legs print the SAME
+# price, so grouping on (side, price) merged them into one leg of double the
+# size — ×200, with the premium AND the bps offset halved.
+straddle = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Straddle 25 Sep 26 62000",
+             "QTY": 100, "PRICE": 0.0410, "REF_PRICE": 0.0405, "SIDE": "SELL"}] * 2
+ok(ac.structure_unit(straddle) == 100.0, "a straddle's two same-priced legs are legs, not clips")
+ok(abs(ac.struct_net(straddle, "PRICE") + 0.0820) < 1e-9,
+   "so its package premium is both legs, not one")
+# The mirror: different makers fill at different prices, which is the normal
+# case, and keying on price stopped the clips grouping at all.
+split_px = [dict(ratio_rows[0], QTY=40),
+            dict(ratio_rows[1], QTY=10, PRICE=0.0211),
+            dict(ratio_rows[1], QTY=10, PRICE=0.0209)]
+ok(ac.structure_unit(split_px) == 20.0, "clips at two different prices still group")
+ok(abs(ac.struct_net(split_px, "PRICE") + 0.0164) < 1e-9,
+   "and net the same as a single fill at the average")
 
 # ── per-leg rows carry their QTY into the greeks, not just the premium ─────────
 # A ratio whose legs arrive as separate rows parses each DESCRIPTION to ratio 1.0,
@@ -389,7 +405,9 @@ for _rows, _want, _never, _label in (
         (one_row, "×20", "×40", "a single row stating its ratios"),
         (fly_row, "×100", "×50", "a named fly, whose ratios the tape never wrote"),
         (clips, "×50", "×20", "one leg filled by two makers"),
-        (clipped, "×20", "×10", "a clipped leg inside a combined DESCRIPTION")):
+        (clipped, "×20", "×10", "a clipped leg inside a combined DESCRIPTION"),
+        (straddle, "×100", "×200", "an at-the-forward straddle, both legs one price"),
+        (split_px, "×20", "×10", "clips filled at two different prices")):
     _out = _rendered(_rows)
     ok(_want in _out, f"header sizes {_label} {_want} [{_out[:110]}]")
     ok(_never not in _out, f"header never sizes {_label} {_never}")
