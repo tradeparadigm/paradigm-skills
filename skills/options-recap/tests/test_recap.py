@@ -592,6 +592,39 @@ def test_a_dead_price_feed_does_not_zero_block_flow():
                 tape_available=False).get("spot_from_venue_tape") is False)
 
 
+def test_an_extrapolated_surface_value_is_starred_where_it_renders():
+    """Every star mutation survived the gate: nothing rendered a surface whose
+    values were clamped to a thin chain's endpoint rather than interpolated."""
+    res = build("btc", "8h", 0, 8 * 3600_000, {"closes_7d": [], "market": None},
+                {"spot_close": 100000.0, "trades_total": 1}, tape_available=False)
+    res["vol_surface"] = {
+        "skew_line": "front 25Δ RR +1.0v → calls bid", "term_line": "humped",
+        "front_atm": 30.0, "back_atm": 32.0,
+        "rows": [{"expiry": "19SEP26", "atm": 30.0, "rr_25d": 1.0, "fly": 0.5,
+                  "d_atm": 1.0, "d_rr": 0.5, "d_fly": 0.2,
+                  "extrapolated": False, "atm_extrapolated": True},
+                 {"expiry": "25SEP26", "atm": 32.0, "rr_25d": 2.0, "fly": 0.6,
+                  "d_atm": None, "d_rr": None, "d_fly": None,
+                  "extrapolated": True, "atm_extrapolated": False}]}
+    lines = render_md(res).splitlines()
+    first = next(ln for ln in lines if ln.startswith("19SEP26"))
+    second = next(ln for ln in lines if ln.startswith("25SEP26"))
+    term = next(ln for ln in lines if ln.startswith("Skew:"))
+    # ATM clamped → ATM and its delta starred, and Fly too: it is
+    # (c25 + p25)/2 - atm, so it inherits either clamp.
+    check("a clamped ATM is starred", "30.0v*" in first, first)
+    check("its delta carries the same star", "+1.0v*" in first, first)
+    check("and Fly inherits the ATM clamp", "0.5v*" in first, first)
+    check("an unclamped RR is bare", "+1.0v*" not in first.split("+1.0v*")[-1], first)
+    # Wings clamped → RR and Fly starred, ATM bare.
+    check("clamped wings star the RR", "+2.0v*" in second, second)
+    check("and Fly inherits the wing clamp", "0.6v*" in second, second)
+    check("an unclamped ATM stays bare", "32.0v " in second or second.count("32.0v*") == 0,
+          second)
+    # The term label reads off the whole curve, so any clamped ATM marks it.
+    check("the term label is starred when any ATM was clamped", "humped*" in term, term)
+
+
 def test_exclusion_magnitudes_count_only_what_the_totals_lost():
     """The dedupe gate looks wider than the window and _venue_tape_blocks drops
     rows of its own, so the reported blocks/coin were not what Block Flow lost."""
