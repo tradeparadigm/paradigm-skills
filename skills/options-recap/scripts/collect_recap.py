@@ -11,7 +11,6 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import json
-import os
 import re
 import sys
 import tempfile
@@ -288,11 +287,15 @@ def run_query(query: Query) -> tuple[dict[str, Any], list[Any]]:
         # much as there are objects to fetch. A two-file query given 64 of them
         # buys nothing and runs its window functions out of memory. A streamed
         # query fetches through s3_async instead, so DuckDB issues no HTTP at
-        # all and object count says nothing about what it should get: size that
-        # one by cores, which is what its sort and window functions use.
-        threads = (min(MAX_READ_THREADS, max(4, os.cpu_count() or 4)) if query.stream
-                   else min(MAX_READ_THREADS, max(4, len(files))))
-        connection.execute(f"SET threads={threads};")
+        # all and object count says nothing about what it should get. Hand that
+        # case back to DuckDB: its default reads the cgroup's cpu.max, which is
+        # the CFS quota. os.cpu_count() reports the node's cores and ignores the
+        # quota entirely, so sizing by it just restored the 64 this overrides.
+        if query.stream:
+            connection.execute("RESET threads;")
+        else:
+            connection.execute(
+                f"SET threads={min(MAX_READ_THREADS, max(4, len(files)))};")
         source["path_plan"].update(resolved_file_count=len(files),
                                    missing_pattern_count=len(missing))
         if missing:

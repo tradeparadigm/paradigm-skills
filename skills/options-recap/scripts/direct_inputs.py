@@ -251,13 +251,16 @@ def run(asset, window, start, end):
                     meta_gaps.append(f"{venue}: unit metadata unavailable — {exc}")
             return specs.get(venue)
 
-        for index, (query, future) in enumerate(reads):
-            source, rows = future.result()
-            # A Future keeps its result forever, and `reads` keeps every Future,
-            # so reducing a venue and deleting its frame below freed nothing —
-            # all five windows stayed alive until the loop ended, which is the
-            # opposite of what this loop exists to do.
+        for index in range(len(reads)):
+            # Indexed, not `for query, future in reads`: the for-target holds the
+            # pair until the loop advances, so the `del` below could not free the
+            # frame it names. A Future also keeps its result and `reads` keeps
+            # every Future, so both have to be released here for the reduce-and-
+            # drop below to mean anything.
+            query, future = reads[index]
             reads[index] = None
+            source, rows = future.result()
+            del future
             if query.name in ("dvol_window", "option_surface_deribit") and rows.height:
                 # Both are small — one row and a snapshot — so reading them back
                 # as dicts here costs nothing.

@@ -21,7 +21,6 @@ would read as a zero-length window. Intraday windows stay HH:MM-only.
 
 ```yaml
 ⚠ [one line per gap, when there are any]
-Coverage  [n]/[m] venues  [per-venue read state, when anything is not complete]
 Spot      $[X]        [up/down X%, or flat] (from $[Y], low $[Z])
 DVOL      [X]v        [flat/rising/falling] ([open] -> [close])
 RV 7d     [X]v        implied [CHEAP/RICH/IN LINE] vs realized
@@ -31,9 +30,9 @@ Volume    $[X]M       observed valued trades · USD premium
 P/C       [X.Xx]      [descriptor] (observed trades · see coverage)
 ```
 
-The `⚠` lines and the Coverage row are the FIRST lines inside the fence, not
-above it: on 2026-09-08 a relaying model kept every figure in the fence and
-deleted all three warning lines that sat outside it. `RV 7d` and `VRP` print
+The `⚠` lines are the FIRST lines inside the fence, not above it: on
+2026-09-08 a relaying model kept every figure in the fence and deleted all
+three warning lines that sat outside it. `RV 7d` and `VRP` print
 `unavailable` when the Deribit close history cannot be fetched, rather than
 being dropped.
 

@@ -119,15 +119,32 @@ def test_streamed_queries_name_every_column_their_sql_reads():
     # The identifiers the reader must hand DuckDB are exactly the ones named
     # before FROM read_parquet(...) — read them off the SQL rather than testing
     # a hardcoded tuple, which compared nothing.
-    noise = {"with", "as", "materialized", "select", "distinct", "filename",
-             "arg_min", "arg_max", "min", "max", "sum", "count", "any_value"}
+    # SQL words and built-ins are not columns. A future query using a keyword
+    # absent from this set fails loudly here, which is the safe direction.
+    keywords = {
+        "with", "as", "materialized", "select", "distinct", "from", "where",
+        "and", "or", "not", "in", "is", "null", "nulls", "group", "by", "order",
+        "asc", "desc", "limit", "union", "all", "case", "when", "then", "else",
+        "end", "over", "partition", "filter", "cast", "try_cast", "timestamptz",
+        "timestamp", "last", "first", "least", "greatest", "lower", "upper",
+        "coalesce", "count", "sum", "min", "max", "avg", "abs", "round",
+        "arg_min", "arg_max", "any_value", "row_number", "filename",
+        "name",  # DuckDB's UNION ALL BY NAME
+    }
     for query in streamed:
         check(f"{query.name} declares its columns", bool(query.columns), query.name)
-        head = query.sql.split("FROM read_parquet", 1)[0]
-        head = re.sub(r"--[^\n]*", " ", head)
-        skip = set(re.findall(r"\bAS\s+([a-z_][a-z0-9_]*)", head, re.I))
-        skip |= set(re.findall(r"\bWITH\s+([a-z_][a-z0-9_]*)", head, re.I))
-        named = set(re.findall(r"\b[a-z_][a-z0-9_]*\b", head.lower())) - noise - skip
+        # The whole statement, not just the select list: a column used only in
+        # WHERE or GROUP BY is as absent from a projection that omits it. Strip
+        # read_parquet's own arguments, comments and string literals first —
+        # none of those name a column.
+        sql = re.sub(r"read_parquet\([^)]*\)", " ", query.sql)
+        sql = re.sub(r"--[^\n]*", " ", sql)
+        sql = re.sub(r"'[^']*'", " ", sql)
+        skip = set(re.findall(r"\bAS\s+([a-z_][a-z0-9_]*)", sql, re.I))
+        skip |= set(re.findall(
+            r"(?:WITH|,)\s*([a-z_][a-z0-9_]*)\s+AS\s*(?:NOT\s+)?(?:MATERIALIZED\s*)?\(",
+            sql, re.I))
+        named = set(re.findall(r"\b[a-z_][a-z0-9_]*\b", sql.lower())) - keywords - skip
         missing = named - set(query.columns)
         check(f"{query.name} projects every source column its SQL names",
               not missing, sorted(missing))
@@ -169,10 +186,10 @@ def test_s3_reads_pin_the_regional_endpoint():
                 # Match the constructor AND its argument list, like the
                 # client/resource guard above: checking the whole file let a
                 # second, unpinned store pass in a file that already had one.
-                # Code only — prose naming the constructor builds nothing.
-                for call in re.findall(r"\bS3Store\([^)]*\)",
-                                       body if name.endswith(".py") else ""):
-                    if "endpoint=" not in call:
+                # Markdown counts too — its examples are what agents copy — so
+                # prose is excluded by having no arguments rather than by suffix.
+                for call in re.findall(r"\bS3Store\((?:[^()]|\([^()]*\))*\)", body):
+                    if "=" in call and "endpoint=" not in call:
                         unpinned.append(os.path.relpath(path, skills))
     check("every S3 read pins the regional endpoint", not unpinned, unpinned)
 
