@@ -111,6 +111,16 @@ except ca.AmbiguousRfqError as exc:
     ok("DRFQv2-" in str(exc) and "GRFQ-" in str(exc),
        "the ambiguity names both namespaces so the user can re-run")
 
+# --- row_type is still filtered, as the SQL did ---------------------------
+noise = tape_row(rfq_id="DRFQv2-r_target", trade_id="t8", block_trade_id="b8",
+                 row_type="quote_update")
+counts, _ = collect([tape_row(), noise])
+ok(counts["fill"] == 1, "a non-paradigm_trade row carrying an rfq_id stays out of fill")
+
+# --- an empty instrument_name takes the coin branch, as the SQL did -------
+ok(ca.quote_currency(tape_row(instrument_name="")) == "BTC",
+   "empty instrument_name is NOT NULL in SQL, so it derives the coin")
+
 # --- an unknown id is not an error ----------------------------------------
 counts, out = collect([tape_row()], rfq="r_missing")
 ok(counts["fill"] == 0 and out["fill"] == [], "an unmatched RFQ writes nothing")
@@ -139,6 +149,20 @@ ok("s3://" not in code and "read_parquet" not in code and "duckdb" not in code.l
    "the shell no longer reads S3 or runs SQL")
 # `status=$?` straight after `if ! cmd` reads the negation, not the command.
 ok("if ! uv run" not in code, "the exit status is captured from the command, not a negation")
+
+# --- absence under incomplete coverage is not "not found" ------------------
+real = ca.read_executions
+ca.read_executions = lambda *a, **k: {"rows": [tape_row()], "coverage_complete": False,
+                                      "coverage_note": "sync trails by 40 min"}
+try:
+    import tempfile as _t
+    with _t.TemporaryDirectory() as d:
+        c = ca.collect("r_absent", Path(d))
+    ok(c["fill"] == 0 and c.get("coverage_complete") is False,
+       "an unmatched id under incomplete coverage carries the coverage state out")
+    ok(c.get("coverage_note") == "sync trails by 40 min", "the note survives for the message")
+finally:
+    ca.read_executions = real
 
 print(f"\n{_p} passed, {_f} failed")
 sys.exit(1 if _f else 0)

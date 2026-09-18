@@ -39,6 +39,8 @@ if [ "$status" -ne 0 ]; then
   case "$status" in
     3) echo "ambiguous rfq_id — re-run with the exact DRFQv2- or GRFQ- prefix" ;;
     5) echo "rfq_id not found on the execution tape for the trailing 30 days" ;;
+    6) echo "rfq_id not found, but the tape's coverage is incomplete — this is missing" \
+            "evidence, not a missing trade. Retry after the next sync." ;;
     *) echo "execution tape unavailable — the analysis cannot run. This is a data" \
             "pipeline failure, not an unknown RFQ; see SKILL.md for the manual fallback." ;;
   esac

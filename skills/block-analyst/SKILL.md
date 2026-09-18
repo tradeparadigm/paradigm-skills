@@ -15,9 +15,8 @@ description: >
   execution. Covers outright calls/puts (CL/PL), strangles (SN), straddles (ST),
   butterflies (BF), condors (CO), calendars (CA), risk reversals (RR), covered
   calls, and custom multi-leg combos (CM). Also handles perp combos.
-compatibility: Resolves the rfq_id by searching the Paradigm trade tape (the
-  hot__paradigm_trade_tape_30d rows) through
-  the paradigm-data-discovery skill — see
+compatibility: Resolves the rfq_id against the Paradigm execution tape's daily
+  partitions through the paradigm-data-discovery skill's shared reader — see
   references/rfq-lookup.md; falls back to injected block-trade context or the
   Deribit tape. Trade-tape reads use that skill's S3/IRSA credentials. Market
   data needs no auth — deribit__get_ticker MCP (if available), web_fetch, or any
@@ -74,8 +73,8 @@ Steps 1–7. Otherwise use the script:
 bash scripts/analyze.sh <rfq_id>      # the id only; ignore any description after it
 ```
 
-`analyze.sh` does everything — STS bootstrap, the single DuckDB tape scan (resolve the
-`FILL` row by `RFQ_ID` + the 30d same-structure `HIST`, ID-authoritative), then `analyze.py`
+`analyze.sh` does everything — `collect_analysis.py` resolves the `FILL` legs by `RFQ_ID` plus
+the 30d same-structure `HIST` off the execution tape (ID-authoritative), then `analyze.py`
 (concurrent Deribit fetch of every leg's ticker + 30d trades, net greeks, fill-vs-mark offset
 in the right unit, recurrence) and prints the finished block. **Do not** re-fetch, reformat,
 recompute, add commentary, or run extra steps — its stdout already is the analysis. Deterministic
@@ -273,8 +272,9 @@ or conviction taker, not random flow.
   matching blocks, size range, most recent (date + level + side), and whether one-sided (single
   taker building) or two-way. Rows that share the strike/expiry but are a *different* structure
   are strike-level context, not recurrence of this structure.
-- **If the tape read failed** (no credentials / DuckDB unavailable): say so in one line and fall
-  back to identifying Paradigm-routed prints on the Deribit tape (see 3b). Never fabricate counts.
+- **If the tape read failed**: say so in one line and fall back to Paradigm-routed prints on the
+  Deribit tape (3b); never fabricate counts. `analyze.sh` separates the cases — a reader refusal
+  is a stale PRODUCER, a pipeline failure, never "this trade is not on the tape".
 
 ### 3b — Deribit tape, always fetch (public, no auth)
 **Fetch and aggregate in ONE `exec`** — never `web_fetch` 1000 raw trades into context and

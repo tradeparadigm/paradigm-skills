@@ -49,7 +49,8 @@ def quote_currency(row: dict) -> str:
     venue = product.split(" - ")[1].strip().upper() if " - " in product else ""
     asset = (row.get("asset") or "").upper()
     name = row.get("instrument_name")
-    if venue == "DBT" and asset in ("BTC", "ETH") and name and "USDC" not in name.upper():
+    if (venue == "DBT" and asset in ("BTC", "ETH")
+            and name is not None and "USDC" not in name.upper()):
         return asset
     return "USDC"
 
@@ -59,9 +60,16 @@ def normalised(description: str) -> str:
 
 
 def shaped(rows: list[dict]) -> list[dict]:
-    """Tape rows in the column names analyze.py reads."""
+    """Tape rows in the column names analyze.py reads.
+
+    row_type is still a live classification column and the reader applies no
+    filter of its own, so keep the predicate the SQL had: any other row carries
+    an rfq_id too, and would land in both fill and hist and inflate recurrence.
+    """
     out = []
     for row in rows:
+        if row.get("row_type") not in (None, "paradigm_trade"):
+            continue
         stamp = str(row.get("traded_at_iso") or "")
         date, _, time = stamp.replace("T", " ").partition(" ")
         out.append({
@@ -92,7 +100,13 @@ def collect(rfq_id: str, out_dir: Path, *, now=None, s3=None) -> dict:
     wanted = {core, f"DRFQv2-{core}", f"GRFQ-{core}"}
     fill = [r for r in rows if r["RFQ_ID"] in wanted]
     if not fill:
-        return {"fill": 0, "hist": 0, "blocks": 0}
+        # The reader reports the hourly-sync tail as incomplete rather than
+        # raising. Saying "not on the tape" for a trade inside that tail is the
+        # substitution its contract forbids — absence of evidence read as
+        # evidence of absence.
+        return {"fill": 0, "hist": 0, "blocks": 0,
+                "coverage_complete": bool(result.get("coverage_complete")),
+                "coverage_note": result.get("coverage_note")}
     namespaces = {r["RFQ_ID"] for r in fill}
     if len(namespaces) > 1:
         raise AmbiguousRfqError(
@@ -129,6 +143,11 @@ def main() -> int:
         print(f"analyze: execution tape unavailable — {exc}", file=sys.stderr)
         return 4
     if not counts["fill"]:
+        if not counts.get("coverage_complete", True):
+            print(f"analyze: {args.rfq_id} not found, but the tape's coverage is incomplete "
+                  f"({counts.get('coverage_note') or 'no watermark'}) — absent from the read "
+                  "is not absent from the market", file=sys.stderr)
+            return 6
         print(f"analyze: {args.rfq_id} not found on the execution tape", file=sys.stderr)
         return 5
     print(f"fill={counts['fill']} hist={counts['hist']} blocks={counts['blocks']}")
