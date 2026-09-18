@@ -11,6 +11,7 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import json
+import os
 import re
 import sys
 import tempfile
@@ -84,6 +85,10 @@ def sql_list(values: list[str]) -> str:
 DUCKDB_PREFIX = """
 INSTALL httpfs; LOAD httpfs;
 INSTALL aws; LOAD aws;
+-- Every window bound is UTC. TRY_CAST to TIMESTAMPTZ resolves a naive column
+-- against the session zone, so on a non-UTC host the bounds would shift
+-- silently rather than fail.
+SET TimeZone='UTC';
 CREATE OR REPLACE SECRET dime_s3 (
   TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1',
   ENDPOINT 's3.ap-northeast-1.amazonaws.com'
@@ -249,8 +254,13 @@ def run_query(query: Query) -> tuple[dict[str, Any], list[Any]]:
         files, missing = resolve_paths(connection, query.paths, query.expected_hours)
         # Threads here overlap network round trips, so they are worth only as
         # much as there are objects to fetch. A two-file query given 64 of them
-        # buys nothing and runs its window functions out of memory.
-        connection.execute(f"SET threads={min(MAX_READ_THREADS, max(4, len(files)))};")
+        # buys nothing and runs its window functions out of memory. A streamed
+        # query fetches through s3_async instead, so DuckDB issues no HTTP at
+        # all and object count says nothing about what it should get: size that
+        # one by cores, which is what its sort and window functions use.
+        threads = (min(MAX_READ_THREADS, max(4, os.cpu_count() or 4)) if query.stream
+                   else min(MAX_READ_THREADS, max(4, len(files))))
+        connection.execute(f"SET threads={threads};")
         source["path_plan"].update(resolved_file_count=len(files),
                                    missing_pattern_count=len(missing))
         if missing:

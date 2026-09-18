@@ -102,10 +102,13 @@ def test_leg_adapter_uses_typed_geometry_not_package_description():
            "strike_price": 70000.0, "rfq_id": "r_test", "block_trade_id": "bt_test",
            "venue_block_trade_id": "block-1", "product": "BTC OPTION - DBT", "asset": "BTC",
            "quantity": 40, "trade_price": 0.01, "mark_price": 0.02, "taker_side": "BUY",
-           "notional_volume_usd": 3200000}
+           "notional_volume_usd": 3200000, "trade_id": "t_test"}
     mapped = calculation_rows([row])[0]
     assert mapped["DESCRIPTION"] == "Put 11 Sep 26 70000"
     assert mapped["SIDE"] == "BUY" and mapped["QTY"] == 40
+    # read_executions guarantees trade_id is present, non-null and unique, and
+    # tape_block_key falls back to it when a leg carries no block id.
+    assert mapped["TRADE_ID"] == "t_test"
 
 
 def instrument_object(captured_at, contract_size=0.1):

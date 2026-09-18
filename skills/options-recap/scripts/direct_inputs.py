@@ -79,6 +79,17 @@ def event_at(dtype):
     return column.dt.convert_time_zone("UTC")
 
 
+def _utc(value):
+    """Freshness is compared against a UTC-aware `end`.
+
+    Some venues publish `timestamp` as a string and some as a naive datetime, so
+    this observation can arrive without a zone; subtracting it then raises
+    TypeError outside any try and takes the whole render down.
+    """
+    stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
 def with_units(frame, specs):
     """An as-of join never applies a future instrument spec to a past trade."""
     return (frame.lazy()
@@ -236,15 +247,19 @@ def run(asset, window, start, end):
                     meta_gaps.append(f"{venue}: unit metadata unavailable — {exc}")
             return specs.get(venue)
 
-        for query, future in reads:
+        for index, (query, future) in enumerate(reads):
             source, rows = future.result()
+            # A Future keeps its result forever, and `reads` keeps every Future,
+            # so reducing a venue and deleting its frame below freed nothing —
+            # all five windows stayed alive until the loop ended, which is the
+            # opposite of what this loop exists to do.
+            reads[index] = None
             if query.name in ("dvol_window", "option_surface_deribit") and rows.height:
                 # Both are small — one row and a snapshot — so reading them back
                 # as dicts here costs nothing.
                 observed = rows.to_dicts()
                 latest = [r for r in observed if r.get("observation", "latest") == "latest"]
-                times = [datetime.fromisoformat(str(r["max_event_at"]).replace("Z", "+00:00"))
-                         for r in latest if r.get("max_event_at")]
+                times = [_utc(r["max_event_at"]) for r in latest if r.get("max_event_at")]
                 if not times or not timedelta(0) <= end - max(times) <= timedelta(minutes=45):
                     read_gaps.append(f"{query.name}: latest observation stale or freshness unverified; excluded")
                     rows = rows.clear()

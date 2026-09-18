@@ -114,13 +114,22 @@ def test_streamed_queries_name_every_column_their_sql_reads():
     the tuple omits is silently absent at query time."""
     start = dt.datetime(2026, 8, 30, 10, 0, tzinfo=dt.timezone.utc)
     end = dt.datetime(2026, 8, 30, 12, 0, tzinfo=dt.timezone.utc)
-    for query in collector.build_queries("BTC", start, end):
-        if not query.stream:
-            continue
+    streamed = [q for q in collector.build_queries("BTC", start, end) if q.stream]
+    # The identifiers the reader must hand DuckDB are exactly the ones named
+    # before FROM read_parquet(...) — read them off the SQL rather than testing
+    # a hardcoded tuple, which compared nothing.
+    noise = {"with", "as", "materialized", "select", "distinct", "filename",
+             "arg_min", "arg_max", "min", "max", "sum", "count", "any_value"}
+    for query in streamed:
         check(f"{query.name} declares its columns", bool(query.columns), query.name)
-        body = query.sql.split("read_parquet", 1)[0] + query.sql.split(")", 1)[-1]
-        for column in ("timestamp",):
-            check(f"{query.name} projects {column}", column in query.columns, query.columns)
+        head = query.sql.split("FROM read_parquet", 1)[0]
+        head = re.sub(r"--[^\n]*", " ", head)
+        skip = set(re.findall(r"\bAS\s+([a-z_][a-z0-9_]*)", head, re.I))
+        skip |= set(re.findall(r"\bWITH\s+([a-z_][a-z0-9_]*)", head, re.I))
+        named = set(re.findall(r"\b[a-z_][a-z0-9_]*\b", head.lower())) - noise - skip
+        missing = named - set(query.columns)
+        check(f"{query.name} projects every source column its SQL names",
+              not missing, sorted(missing))
 
 
 
@@ -156,8 +165,13 @@ def test_s3_reads_pin_the_regional_endpoint():
                         unpinned.append(os.path.relpath(path, skills))
                 # The async reader does not go through boto3 for its GETs, so
                 # it carries the pin on its own store constructor.
-                for call in re.findall(r"S3Store\(", body):
-                    if "endpoint=" not in body:
+                # Match the constructor AND its argument list, like the
+                # client/resource guard above: checking the whole file let a
+                # second, unpinned store pass in a file that already had one.
+                # Code only — prose naming the constructor builds nothing.
+                for call in re.findall(r"\bS3Store\([^)]*\)",
+                                       body if name.endswith(".py") else ""):
+                    if "endpoint=" not in call:
                         unpinned.append(os.path.relpath(path, skills))
     check("every S3 read pins the regional endpoint", not unpinned, unpinned)
 
