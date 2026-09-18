@@ -17,7 +17,8 @@ NOW = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
 
 
 class S3:
-    def __init__(self, *, age=0, missing=False, watermark_lag=0, watermark=True):
+    def __init__(self, *, age=0, missing=False, watermark_lag=0, watermark=True,
+                 build_start_days=31, duplicate_ids=False, null_id=False):
         self.calls = []
         self.age = age
         self.missing = missing
@@ -25,6 +26,11 @@ class S3:
         # whether the object carries the field at all (pre-watermark objects).
         self.watermark_lag = watermark_lag
         self.watermark = watermark
+        # How far back the producer claims its build window reached, and whether
+        # the legs it wrote carry usable ids — each has a guard of its own.
+        self.build_start_days = build_start_days
+        self.duplicate_ids = duplicate_ids
+        self.null_id = null_id
 
     def get_object(self, Bucket, Key):
         self.calls.append(Key)
@@ -33,7 +39,9 @@ class S3:
         buf = io.BytesIO()
         pl.DataFrame(
             {
-                "trade_id": [f"leg-{i}" for i in range(150)],
+                "trade_id": (["leg-0"] * 150 if self.duplicate_ids
+                             else [None] + [f"leg-{i}" for i in range(1, 150)] if self.null_id
+                             else [f"leg-{i}" for i in range(150)]),
                 "rfq_id": ["DRFQv2-r_test"] * 150,
                 "traded_at": [int((NOW - timedelta(hours=1)).timestamp() * 1000)] * 150,
             }
@@ -45,7 +53,7 @@ class S3:
                     int((NOW - timedelta(minutes=self.age)).timestamp() * 1000)
                 ),
                 "build_window_start_ms": str(
-                    int((NOW - timedelta(days=31)).timestamp() * 1000)
+                    int((NOW - timedelta(days=self.build_start_days)).timestamp() * 1000)
                 ),
                 "build_window_end_ms": str(int(NOW.timestamp() * 1000)),
                 **(
@@ -229,3 +237,29 @@ def test_ambiguous_bare_id_fails_but_qualified_id_preserves_legs():
     result = reader.read_executions(NOW - timedelta(hours=2), NOW,
                                     rfq_id='DRFQv2-r_AbC', s3=Namespaces(), now=NOW)
     assert [row['trade_id'] for row in result['rows']] == ['a']
+
+
+def test_a_future_dated_publication_is_refused():
+    """A negative age means the producer's clock ran ahead of ours. The bound is
+    two-sided for that reason; a one-sided one would accept it silently."""
+    with pytest.raises(RuntimeError, match="stale or future-dated"):
+        reader.read_executions(NOW - timedelta(hours=2), NOW, rfq_id="r_test",
+                               s3=S3(age=-5), now=NOW)
+
+
+def test_a_partition_that_starts_after_the_request_is_refused():
+    """Covering only part of the window and saying nothing would understate the
+    flow rather than fail, which is the whole reason this raises."""
+    with pytest.raises(RuntimeError, match="does not cover requested start"):
+        reader.read_executions(NOW - timedelta(days=10), NOW, rfq_id="r_test",
+                               s3=S3(build_start_days=2), now=NOW)
+
+
+@pytest.mark.parametrize("stub", [S3(duplicate_ids=True), S3(null_id=True)],
+                         ids=["duplicate", "null"])
+def test_unusable_trade_ids_are_refused(stub):
+    """trade_id is the execution grain and tape_block_key's fallback, so a
+    duplicate or null one silently collapses legs into a single block."""
+    with pytest.raises(RuntimeError, match="duplicate/null trade IDs"):
+        reader.read_executions(NOW - timedelta(hours=2), NOW, rfq_id="r_test",
+                               s3=stub, now=NOW)
