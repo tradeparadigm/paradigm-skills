@@ -126,7 +126,10 @@ def test_streamed_queries_name_every_column_their_sql_reads():
         "and", "or", "not", "in", "is", "null", "nulls", "group", "by", "order",
         "asc", "desc", "limit", "union", "all", "case", "when", "then", "else",
         "end", "over", "partition", "filter", "cast", "try_cast", "timestamptz",
-        "timestamp", "last", "first", "least", "greatest", "lower", "upper",
+        # NOT `timestamp`: it is a real column in every venue and dvol schema
+        # and the window bound casts it, so exempting it let a projection drop
+        # it silently. `timestamptz` already covers the cast's type name.
+        "last", "first", "least", "greatest", "lower", "upper",
         "coalesce", "count", "sum", "min", "max", "avg", "abs", "round",
         "arg_min", "arg_max", "any_value", "row_number", "filename",
         "name",  # DuckDB's UNION ALL BY NAME
