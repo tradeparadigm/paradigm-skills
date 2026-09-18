@@ -249,6 +249,21 @@ def test_importing_collect_recap_makes_the_shared_reader_importable():
           origin or result.stderr.strip()[-200:])
 
 
+def test_connect_runs_the_session_prefix_and_the_tuning():
+    """The zone statement is tested on its own, but nothing asserted that
+    connect() still runs it — stubbing the call out left every lane green."""
+    executed = []
+    original = collector.duckdb
+    collector.duckdb = types.SimpleNamespace(
+        connect=lambda: types.SimpleNamespace(execute=executed.append))
+    try:
+        collector.connect()
+    finally:
+        collector.duckdb = original
+    check("connect runs the session prefix", collector.DUCKDB_PREFIX in executed, executed)
+    check("connect runs the tuning", collector.TUNING in executed, executed)
+
+
 def test_the_limit_is_read_from_this_cgroup_not_the_root():
     """The ceiling test stubs container_memory_bytes, so the resolution itself
     was unverified: in a nested layout the root file holds the no-limit
