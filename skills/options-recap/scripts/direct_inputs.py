@@ -319,6 +319,6 @@ def run(asset, window, start, end):
     # `;;` by the model twice in a row on 2026-09-08; the script never emitted
     # that, but a separator the relay cannot double removes the question.
     result["snapshot"]["volume_scope"] = "observed valued trades · USD premium"
-    result["snapshot"]["activity_scope"] = "observed trades · see coverage"
+    result["snapshot"]["activity_scope"] = "observed trades · see ⚠ lines"
     result["source_gaps"] = gaps
     return recap.render_md(result)

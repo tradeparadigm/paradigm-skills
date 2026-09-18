@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+import re
 import sys
 import types
 
@@ -327,3 +328,13 @@ def test_schema_drift_across_objects_falls_back_to_string():
     assert merged.num_rows == 3
     assert merged.schema.field("id").type == pa.string()
     assert merged.column("id").to_pylist() == ["1", "2", "x"]
+
+
+def test_the_scope_labels_match_the_documented_template():
+    """The Coverage row was removed from the template but both scope labels
+    still pointed at it, so the rendered Snapshot named a row that was gone."""
+    template = (Path(direct.__file__).resolve().parents[1]
+                / "references" / "output-format.md").read_text(encoding="utf-8")
+    source = Path(direct.__file__).read_text(encoding="utf-8")
+    for label in re.findall(r'\["(?:volume|activity)_scope"\] = "([^"]+)"', source):
+        assert label in template, label
