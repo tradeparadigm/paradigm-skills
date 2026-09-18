@@ -614,6 +614,12 @@ def test_exclusion_magnitudes_count_only_what_the_totals_lost():
                               1_000_000, 100_000.0)
     check("an above-floor block is reported with its notional",
           lost and lost[0]["blocks"] == 1 and lost[0]["notional_m"] > 0, lost)
+    # Built blocks carry `venue` and `unit_size`; reading the tape ROW keys
+    # rendered a real $682M exclusion as "68 ? block(s) ... 0 coin".
+    check("the exclusion names the venue rather than ?",
+          lost and lost[0]["venues"] != ["?"], lost)
+    check("and carries the coin volume",
+          lost and lost[0]["coin"] > 0, lost)
 
 
 def test_activity_split_collapses_deribit_venues():

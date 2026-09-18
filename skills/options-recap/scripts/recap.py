@@ -780,11 +780,14 @@ def _lost_blocks(excluded: list[dict], start_ms: int, spot: float | None) -> lis
         blocks = [b for b in _venue_tape_blocks(rows, spot)
                   if (b.get("notional_usd") or 0) >= MIN_BLOCK_NOTIONAL_USD]
         if blocks:
+            # `venue` and `unit_size`, not `exchange`/`volume_coin`: these are
+            # built blocks, not tape rows, and reading the row keys printed
+            # "68 ? block(s) ... 0 coin" against a real $682M exclusion.
             out.append({"reason": group["reason"],
-                        "venues": sorted({b.get("exchange") or "?" for b in blocks}),
+                        "venues": sorted({b.get("venue") or "?" for b in blocks}),
                         "blocks": len(blocks),
                         "notional_m": round(sum(b["notional_usd"] for b in blocks) / 1e6, 2),
-                        "coin": round(sum(b.get("volume_coin") or 0 for b in blocks), 2)})
+                        "coin": round(sum(b.get("unit_size") or 0 for b in blocks), 2)})
     return out
 
 
