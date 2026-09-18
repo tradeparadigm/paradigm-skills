@@ -200,7 +200,11 @@ def inputs(totals, evidence, specs, gaps):
     if dvol is not None and dvol.height:
         first = dvol.row(0, named=True)
         snapshot.update(dvol=first["close"], dvol_open=first["open"],
-                        dvol_low=first["low"], dvol_high=first["high"])
+                        dvol_low=first["low"], dvol_high=first["high"],
+                        # Read from the dvol_window partitions for the requested
+                        # window, so recap.build need not fall back to the REST
+                        # fetch on windows wider than the old hot file spanned.
+                        dvol_window_scoped=True)
     surface = evidence.get("option_surface_deribit")
     if surface is not None and surface.height and "deribit" in specs:
         observed = with_units(surface, specs["deribit"]).to_dicts()

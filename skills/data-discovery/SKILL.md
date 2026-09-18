@@ -22,6 +22,11 @@ constraints, not a fixed workflow.
 
 1. **Do not read `s3://dt-exchange-venue-data/hot/`.** Do not use an object
    whose name starts `hot__`, even if another skill or script suggests it.
+   `paradigm-block-analyst` has not migrated yet and still reads
+   `hot__market_signals_1m` and `hot__paradigm_trade_tape_30d`; the direct
+   inputs that replace both are in
+   [references/exchange-raw.md](references/exchange-raw.md#inputs-behind-the-hot-files),
+   which is where its citation of a removed schema section now points.
 2. **Check the catalog before declaring data unavailable.** Venue and asset
    assumptions are not evidence that a dataset is absent.
 3. **Bound every read.** Select only the venues, data types, currencies,
