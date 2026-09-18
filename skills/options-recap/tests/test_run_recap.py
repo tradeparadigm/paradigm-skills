@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import types
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -227,6 +228,30 @@ def test_importing_collect_recap_makes_the_shared_reader_importable():
           result.returncode == 0
           and origin.endswith(os.path.join("data-discovery", "scripts", "s3_async.py")),
           origin or result.stderr.strip()[-200:])
+
+
+def test_the_limit_is_read_from_this_cgroup_not_the_root():
+    """The ceiling test stubs container_memory_bytes, so the resolution itself
+    was unverified: in a nested layout the root file holds the no-limit
+    sentinel and only the process's own cgroup carries the real number."""
+    sentinel = str((1 << 63) - (1 << 12))
+    for version, proc_body, nested, top in (
+            ("v2", "0::/kubepods/podabc\n", "kubepods/podabc/memory.max", "memory.max"),
+            ("v1", "9:memory:/kubepods/podabc\n",
+             "memory/kubepods/podabc/memory.limit_in_bytes",
+             "memory/memory.limit_in_bytes")):
+        with tempfile.TemporaryDirectory() as root:
+            proc = os.path.join(root, "cgroup")
+            with open(proc, "w") as handle:
+                handle.write(proc_body)
+            for relative, value in ((top, sentinel), (nested, str(4 << 30))):
+                path = os.path.join(root, relative)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as handle:
+                    handle.write(value)
+            check(f"nested {version} limit is found",
+                  collector.container_memory_bytes(proc, root) == (4 << 30),
+                  collector.container_memory_bytes(proc, root))
 
 
 def test_the_window_ceiling_follows_the_container_not_the_tape():
