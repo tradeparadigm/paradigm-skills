@@ -25,6 +25,32 @@ BUCKET = "s3://dt-exchange-venue-data"
 VENUES = ("deribit", "deribit-usdc", "okex-options", "bybit-options", "bullish")
 
 
+# Measured in-pod against real S3, peak cgroup usage for a BTC recap:
+#   7d 1.7GiB · 14d 2.0GiB · 21d 3.7GiB · 30d 5.7GiB
+# The reader holds the whole window, so the widest safe request is a property of
+# the container, not of the tape. Exceeding it does not fail the query: the OOM
+# killer takes the whole process, which in the deployed stack drops the user's
+# session and wipes the credentials file, so the next run reports a credential
+# error and the cause looks like flaky S3.
+MEMORY_CEILINGS = ((8, 30), (6, 21), (4, 14), (2, 7))
+
+
+def window_ceiling() -> dt.timedelta | None:
+    """The widest window this container can hold, or None when unbounded.
+
+    No cgroup limit means a workstation, where the measurement does not apply
+    and the tape's 30 days is the only bound.
+    """
+    limit = container_memory_bytes()
+    if limit is None:
+        return None
+    gib = limit / (1 << 30)
+    for needs, days in MEMORY_CEILINGS:
+        if gib >= needs:
+            return dt.timedelta(days=days)
+    return dt.timedelta(days=1)
+
+
 def parse_window(value: str) -> dt.timedelta:
     match = re.fullmatch(r"([1-9][0-9]*)([mhd])", value.lower())
     if not match:
@@ -35,6 +61,12 @@ def parse_window(value: str) -> dt.timedelta:
     # only 30 days, and an unbounded window globs every hour of it per venue.
     if width > dt.timedelta(days=30):
         raise ValueError("window must be 30d or less; the execution tape keeps 30 days")
+    ceiling = window_ceiling()
+    if ceiling is not None and width > ceiling:
+        raise ValueError(
+            f"window must be {ceiling.days}d or less in this container "
+            f"({container_memory_bytes() // (1 << 30)}GiB): the read holds the whole "
+            f"window in memory, and exceeding it is an OOM kill, not a failed query")
     return width
 
 

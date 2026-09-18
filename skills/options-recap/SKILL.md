@@ -28,10 +28,13 @@ metadata:
 24h; `options` is a no-op token. Accept `Nm`, `Nh`, and `Nd` windows, and state
 the actual interval queried rather than silently capping or changing it.
 
-Windows longer than 30d are refused: the execution tape keeps 30 days. Report
-the refusal and the limit, then stop and let the user pick the window. Running
-30d instead is the wrong repair — it lists about ten thousand partitions and
-takes minutes, so it spends their time on a window they did not ask for.
+Windows longer than 30d are refused: the execution tape keeps 30 days. A
+NARROWER ceiling also applies wherever the container is small, because the read
+holds the whole window in memory — the script names the limit it is enforcing
+and which of the two it came from. Report the refusal and that limit, then stop
+and let the user pick the window. Re-running at the ceiling is the wrong repair:
+it lists thousands of partitions and takes minutes, spending their time on a
+window they did not ask for.
 
 ## Live execution
 

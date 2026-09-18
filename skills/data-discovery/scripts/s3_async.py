@@ -113,7 +113,6 @@ async def _gather(keys: list[tuple[str, str]],
     for start in range(0, len(keys), BATCH):
         tables = await asyncio.gather(*(one(k) for k in keys[start:start + BATCH]))
         batches.append(_concat(tables))
-        del tables
     return _concat(batches)
 
 

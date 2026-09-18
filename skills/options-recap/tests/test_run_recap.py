@@ -26,6 +26,7 @@ sys.modules[spec.name] = collector
 spec.loader.exec_module(collector)
 
 passed = failed = 0
+_real_container_memory = collector.container_memory_bytes
 
 
 def check(name, condition, detail=""):
@@ -181,13 +182,14 @@ def test_importing_collect_recap_makes_the_shared_reader_importable():
     sys.modules or loads it by path, so nothing would notice if the module-scope
     sys.path insert went away — and every stream=True query would degrade to
     "unavailable" in production only."""
-    scripts = os.path.join(ROOT, "scripts")
     # find_spec resolves the path without executing it, so this stays stdlib-only:
     # s3_async imports obstore and pyarrow, which this lane does not install.
+    # No sys.path seeding: spec_from_file_location resolves collect_recap by
+    # path, and seeding would pre-plant the sideways scripts/ entry the module
+    # under test is supposed to add for itself.
     program = (
         "import sys, types, importlib.util as u;"
         "sys.modules.setdefault('duckdb', types.SimpleNamespace(Error=Exception, connect=None));"
-        f"sys.path.insert(0, {scripts!r});"
         f"spec = u.spec_from_file_location('collect_recap', {COLLECTOR!r});"
         "mod = u.module_from_spec(spec);"
         "sys.modules['collect_recap'] = mod;"
@@ -195,13 +197,38 @@ def test_importing_collect_recap_makes_the_shared_reader_importable():
         "found = u.find_spec('s3_async');"
         "print(found.origin if found else 'NOT FOUND')"
     )
-    result = subprocess.run([sys.executable, "-c", program],
+    # -P drops the script directory and -E ignores PYTHONPATH: both sit ahead of
+    # the insert under test, so without them the child could resolve s3_async
+    # from its own cwd and pass with the insert deleted.
+    result = subprocess.run([sys.executable, "-P", "-E", "-c", program],
                             capture_output=True, text=True)
     origin = result.stdout.strip()
     check("importing collect_recap puts the shared reader on the path",
           result.returncode == 0
           and origin.endswith(os.path.join("data-discovery", "scripts", "s3_async.py")),
           origin or result.stderr.strip()[-200:])
+
+
+def test_the_window_ceiling_follows_the_container_not_the_tape():
+    """30d fits in 8GiB and OOMs at 4Gi, and an OOM kills the process rather
+    than failing the query — so the refusal has to track the container."""
+    for gib, expected in ((8, 30), (6, 21), (4, 14), (2, 7), (1, 1)):
+        collector.container_memory_bytes = lambda g=gib: int(g * (1 << 30))
+        check(f"{gib}GiB allows {expected}d",
+              collector.window_ceiling() == dt.timedelta(days=expected),
+              collector.window_ceiling())
+    collector.container_memory_bytes = lambda: int(4 * (1 << 30))
+    try:
+        collector.parse_window("30d")
+        check("4GiB refuses 30d", False, "no error")
+    except ValueError as exc:
+        check("4GiB refuses 30d", "14d or less" in str(exc), str(exc))
+    check("4GiB still allows 14d", collector.parse_window("14d") == dt.timedelta(days=14))
+    # No cgroup limit is a workstation: the tape's 30 days is the only bound.
+    collector.container_memory_bytes = lambda: None
+    check("unbounded container allows 30d",
+          collector.parse_window("30d") == dt.timedelta(days=30))
+    collector.container_memory_bytes = _real_container_memory
 
 
 def main():
