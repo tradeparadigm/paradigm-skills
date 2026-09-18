@@ -17,7 +17,7 @@ compatibility: >
   DVOL/spot fallback.
 metadata:
   author: tradeparadigm
-  version: "2.0"
+  version: "2.1"
 ---
 
 # Options Recap

@@ -264,6 +264,38 @@ def test_connect_runs_the_session_prefix_and_the_tuning():
     check("connect runs the tuning", collector.TUNING in executed, executed)
 
 
+def test_connect_names_a_ca_bundle_that_exists_and_no_other():
+    """duckdb's httpfs trusts its own compiled-in CA list, so on the agent pod —
+    where every 443 connection terminates at a certificate the egress proxy
+    minted — an unset ca_cert_file is every S3 read failing. Naming a file that
+    is NOT there is the opposite failure: duckdb raises on the SET itself, off
+    the pod, where there was nothing to fix."""
+    with tempfile.TemporaryDirectory() as root:
+        bundle = os.path.join(root, "ca-certificates.crt")
+        with open(bundle, "w") as handle:
+            handle.write("-----BEGIN CERTIFICATE-----\n")
+        sql = collector.ca_statements(bundle)
+        check("a bundle that exists is named", "ca_cert_file='%s'" % bundle in sql, sql)
+        check("and verification is turned on with it",
+              "enable_server_cert_verification=true" in sql, sql)
+        check("a bundle that does not exist is not named",
+              collector.ca_statements(os.path.join(root, "absent.crt")) == "")
+
+    executed = []
+    original_duckdb, original_ca = collector.duckdb, collector.ca_statements
+    collector.duckdb = types.SimpleNamespace(
+        connect=lambda: types.SimpleNamespace(execute=executed.append))
+    collector.ca_statements = lambda: "SET ca_cert_file='/x';"
+    try:
+        collector.connect()
+    finally:
+        collector.duckdb, collector.ca_statements = original_duckdb, original_ca
+    check("connect runs the CA statements", "SET ca_cert_file='/x';" in executed, executed)
+    check("and runs them after the extensions the prefix loads",
+          executed.index("SET ca_cert_file='/x';") > executed.index(collector.DUCKDB_PREFIX),
+          executed)
+
+
 def test_the_limit_is_read_from_this_cgroup_not_the_root():
     """The ceiling test stubs container_memory_bytes, so the resolution itself
     was unverified: in a nested layout the root file holds the no-limit

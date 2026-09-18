@@ -9,7 +9,7 @@ description: >
   Does not cover account state, positions, vaults, or order placement.
 metadata:
   author: tradeparadigm
-  version: "2.0"
+  version: "2.1"
 ---
 
 # Paradigm Data Discovery
@@ -99,6 +99,11 @@ Open DuckDB S3 queries with:
 ```sql
 INSTALL httpfs; LOAD httpfs;
 INSTALL aws;    LOAD aws;
+-- Egress is TLS-intercepted and duckdb trusts only its own compiled-in CA
+-- list, so name the pod's store or every read fails "SSL peer certificate ...
+-- was not OK". references/s3-access.md has the why.
+SET ca_cert_file='/etc/ssl/certs/ca-certificates.crt';
+SET enable_server_cert_verification=true;
 CREATE OR REPLACE SECRET s3_irsa (
   TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1',
   ENDPOINT 's3.ap-northeast-1.amazonaws.com'

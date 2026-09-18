@@ -15,6 +15,8 @@ same role), put the preamble below at the top of the query.
 ```sql
 INSTALL httpfs; LOAD httpfs;
 INSTALL aws;    LOAD aws;
+SET ca_cert_file='/etc/ssl/certs/ca-certificates.crt';
+SET enable_server_cert_verification=true;
 CREATE OR REPLACE SECRET s3_irsa (
   TYPE S3,
   PROVIDER CREDENTIAL_CHAIN,
@@ -22,6 +24,33 @@ CREATE OR REPLACE SECRET s3_irsa (
   ENDPOINT 's3.ap-northeast-1.amazonaws.com'
 );
 ```
+
+## Why the two `SET` lines
+
+The agent's egress is TLS-intercepted: every 443 connection terminates at a
+certificate the credential proxy minted for the host asked for, because it has
+to read and rewrite the request to swap credential placeholders for real
+secrets. Every program in the pod therefore has to trust the proxy's CA.
+
+duckdb is the one that cannot be told this any other way. It reads no CA
+environment variable and not the OS trust store either — its httpfs extension
+carries a compiled-in CA list, and only `ca_cert_file` displaces it. Without
+those two lines every read fails as:
+
+```
+IO Error: SSL peer certificate or SSH remote key was not OK
+```
+
+which names neither a certificate nor the proxy, and reads like a network
+fault. `/etc/ssl/certs/ca-certificates.crt` is the pod's own trust store with
+the proxy's CA folded into it, so it still verifies anything the proxy did not
+mint; do not point these at a single-certificate file, and never turn
+verification off — the interception is the product.
+
+The `duckdb` CLI also picks these up from a mounted `~/.duckdbrc`, so a query
+that forgets them still works there. Python does not: `import duckdb` reads no
+rc file, so a script has to issue them on the connection itself (see
+`options-recap/scripts/collect_recap.py`, `ca_statements`).
 
 Both extensions are pre-installed in the terminal image, so `INSTALL` is a
 no-op after the first use and never hits the extension repository.
@@ -96,6 +125,8 @@ Use a small non-hot source object to verify the credential and network path:
 ```sql
 INSTALL httpfs; LOAD httpfs;
 INSTALL aws;    LOAD aws;
+SET ca_cert_file='/etc/ssl/certs/ca-certificates.crt';
+SET enable_server_cert_verification=true;
 CREATE OR REPLACE SECRET s3_irsa (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1', ENDPOINT 's3.ap-northeast-1.amazonaws.com');
 
 SELECT COUNT(*)
@@ -107,7 +138,9 @@ A non-zero count confirms credentials and network path are good.
 An `HTTP 403` on a bucket that the query names correctly is an IAM problem, not
 a credential-plumbing problem — the pod's role is missing the read grant for
 that bucket. Report it as such rather than retrying with different credential
-mechanics.
+mechanics. The grant is per bucket and the three are granted together, so a 403
+on one of them while another reads fine means that customer's role was given a
+narrower list, not that the credential chain broke.
 
 ## Coverage probe pattern
 
