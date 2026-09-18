@@ -13,7 +13,7 @@
         "Response reports the fill as 0.0122 BTC paid against a 0.0118 mark, an offset of +4 bps above mark",
         "Response gives the structure size as 50",
         "Response does not invent greeks, per-leg IV, history or live bid/ask — each is omitted or explicitly marked unavailable",
-        "Response presents the taker as the Buyer of the call"
+        "View line (plain text, second line) describes the exposure the taker has bought — long upside above 84000 or equivalent; the context supplies no view line"
       ],
       "context": "<analysis>\nPackage figures already computed deterministically by the bundled script from the tape rows in this prompt. Report them directly — do NOT recompute them, and never substitute a single leg's OFFSET_BPS for the package offset:\n{\n  \"structure_size\": 50,\n  \"taker\": \"Buyer\",\n  \"premium\": {\n    \"verb\": \"Paid\",\n    \"net_package_price\": 0.0122\n  },\n  \"net_package_mark\": 0.0118,\n  \"package_offset_bps\": 4.0,\n  \"offset_direction\": \"above mark\"\n}\n\nGreeks, per-leg IV, trade history and live screen quotes are NOT supplied for this case. Omit those rows or mark them explicitly unavailable — never invent them, and never delay the execution answer waiting for them.\n</analysis>\n\n"
     },

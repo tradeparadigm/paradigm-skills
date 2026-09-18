@@ -467,7 +467,7 @@ Spot 62,728 · 60k −4.3% OTM · long near-Γ / short far-vega · max loss at 6
 `<COIN> <EXPIRY DDMMMYY> <strikes k/k> <ratio a×b> <Structure> | <Buyer|Seller> | <size/leg> BTC | <Paid|Recd> <price> <±N bps> <above|below> mark`
 - Plain structure name ("Call Ratio", "Straddle", "Risk Reversal") — never the raw code (CS/SD/RR).
 - `Buyer` if the taker paid a net debit, `Seller` if they took in a net credit.
-- `×N` (block qty) = the package base = the **smallest** option leg's size, never the first or largest row (40/20 ratio → `×20`); size **per leg in coin** = block qty × each leg ratio (100 lots at 1×1.5 → `100/150 BTC`).
+- `×N` (block qty) = the base `struct_net` weights against — smallest size **per instrument, clips summed**, never the first row (40/20 → `×20`; one leg filled 30+20 → `×50`); size **per leg in coin** = block qty × each leg ratio (100 lots at 1×1.5 → `100/150 BTC`).
 - Premium: `Paid`/`Recd` <net package price> + `<±N bps> above/below mark` per the **Net package offset** rule below — never a single leg's `OFFSET_BPS` in a package header.
 
 **Net package offset (the ONE convention — identical in the header, `[Fair]`, and the script):**
