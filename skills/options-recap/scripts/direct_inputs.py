@@ -575,6 +575,11 @@ def run(asset, window, start, end):
             "Block Flow: Bybit blocks cannot be shown — the venue publishes a "
             "block flag with no group id, so its blocks are absent from the "
             "totals however active it was")
+    if result.pop("spot_from_venue_tape", False):
+        gaps.append(
+            "Spot: taken from the venue tape's own trade-time index — the Deribit "
+            "price feed was unavailable, so Spot and any block priced without a "
+            "trade-time index of its own are approximate")
     trimmed = result.pop("blocks_below_floor", {})
     if trimmed:
         gaps.append(

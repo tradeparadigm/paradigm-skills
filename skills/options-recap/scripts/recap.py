@@ -961,15 +961,18 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         spot_low = min(s.get("low") or [0]) or None
 
     spot = spot_close or hot.get("surface_spot") or (mkt or {}).get("spot_now")
+    spot_from_venue_tape = False
     if not spot and hot.get("venue_index_close"):
         # Deribit's public API is the only spot source in direct mode, and when
         # it fails every venue block loses its price: Block Flow rendered
         # $0.0M / 0 blocks on a window holding 97 real blocks. The venue tape's
         # own trade-time index is already in memory, so use it and say so.
         spot = float(hot["venue_index_close"])
-        warn("Spot taken from the venue tape's own trade-time index — the Deribit "
-             "price feed was unavailable, so Spot and any block priced without a "
-             "trade-time index of its own are approximate")
+        # Reported through the result, not `warn()`: WARNINGS is discarded on the
+        # --render path, which is the only path a reader sees, so the hedge on
+        # this number was silent exactly where it mattered. Every other hedge in
+        # this recap travels as a gap line.
+        spot_from_venue_tape = True
 
     rv = realized_vs_implied(deri.get("closes_7d") or [], dvol_close)
 
@@ -1019,11 +1022,16 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         # leaving the OTHER rows — the ones actually inflated by its absence —
         # unmarked. Drop it from the split and name it beside the line instead:
         # every pct there is then plainly a share of what was read.
+        # The denominator has to drop with them. A feed_gap venue still
+        # contributes SOME trades to `tt`, so dividing by `tt` left the shown
+        # shares summing to less than 100% — `OKX 20% · Bybit 20%` under a line
+        # promising the shares were of what was read. They are now.
+        shown = {lbl: n for lbl, n in by_label.items() if lbl not in unread}
+        read_total = sum(shown.values())
         activity_split = [
-            {"venue": lbl, "pct": round(100 * n / tt)}
-            for lbl, n in sorted(by_label.items(), key=lambda kv: -kv[1])
-            if lbl not in unread
-        ]
+            {"venue": lbl, "pct": round(100 * n / read_total)}
+            for lbl, n in sorted(shown.items(), key=lambda kv: -kv[1])
+        ] if read_total else []
         activity_unread = sorted(unread)
 
     # Vol surface — v_vol_surface "now" snapshot is authoritative (it pairs with
@@ -1157,6 +1165,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         # blocks that would have appeared, not the rows that were removed.
         "block_exclusions": _lost_blocks(_excluded, start_ms, spot),
         "blocks_below_floor": block.get("trimmed", {}),
+        "spot_from_venue_tape": spot_from_venue_tape,
     }
 
 

@@ -581,9 +581,15 @@ def test_a_dead_price_feed_does_not_zero_block_flow():
                  venue_block_rows=venue_rows, tape_available=False)
     check("the venue tape's own index prices the block instead",
           res2["block_flow"]["n_blocks"] == 1, res2["block_flow"])
+    # Reported through the RESULT, not WARNINGS: warnings are discarded on the
+    # --render path, which is the only path a reader sees, so the hedge on this
+    # number was silent exactly where it mattered.
     check("and the reader is told the price is approximate",
-          any("venue tape's own trade-time index" in w for w in res2["warnings"]),
-          res2["warnings"])
+          res2.get("spot_from_venue_tape") is True, res2.get("spot_from_venue_tape"))
+    check("while a normal run claims nothing",
+          build("btc", "8h", 0, 8 * 3600_000, {"closes_7d": [], "market": None},
+                {"spot_close": 100000.0, "trades_total": 1},
+                tape_available=False).get("spot_from_venue_tape") is False)
 
 
 def test_exclusion_magnitudes_count_only_what_the_totals_lost():
