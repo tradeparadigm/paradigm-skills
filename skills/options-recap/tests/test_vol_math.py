@@ -724,6 +724,24 @@ def test_build_tape_blocks_empty():
     check("empty → no rows", res["rows"] == [], res)
 
 
+def test_atm_reached_by_clamping_is_marked():
+    """_interp reports when it had to clamp to an endpoint. For the wings that
+    answer sets the `*`; for ATM it was computed and thrown away, so a thin
+    chain rendered a clamped endpoint as the ATM figure with nothing to say so
+    — and that figure drives front/back ATM and the term-structure label."""
+    thin = compute_vol_surface({
+        "BTC-5JUN26-90000-C": {"mark_iv": 55.0, "delta": 0.11},
+        "BTC-5JUN26-95000-C": {"mark_iv": 58.0, "delta": 0.07},
+    }, spot=62000)
+    rows = thin["expiries"]
+    check("a chain with no delta near 0.50 marks ATM extrapolated",
+          bool(rows) and rows[0]["atm_extrapolated"] is True, rows)
+
+    full = compute_vol_surface(_surface_tickers(), spot=62000)
+    check("a chain straddling 0.50 does not mark ATM",
+          full["expiries"][0]["atm_extrapolated"] is False, full["expiries"][0])
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     print(f"Running {len(tests)} test functions...")

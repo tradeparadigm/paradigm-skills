@@ -20,6 +20,13 @@ import stat
 import sys
 import tempfile
 
+
+def _dedupe_kept(*args, **kwargs):
+    """The kept rows. _dedupe_venue_blocks also returns what it excluded now,
+    which these tests predate — they assert on what survives."""
+    return recap._dedupe_venue_blocks(*args, **kwargs)[0]
+
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 import recap  # noqa: E402
 from recap import (  # noqa: E402
@@ -319,15 +326,26 @@ def test_dedupe_excludes_paradigm_brokered_venues():
     with tempfile.TemporaryDirectory() as d:
         _write(d, "venue_blocks.csv", VENUE_BLOCKS_CSV)
         rows = load_venue_blocks(d, "BTC")
-    kept = {r["block_id"] for r in recap._dedupe_venue_blocks(rows)}
+    # The tape must actually carry rows for the exclusion to be the right call:
+    # an EMPTY tape has nothing to double-count against, which is the branch
+    # below. These rows are stamped with no VENUE_BLOCK_TRADE_ID, which is the
+    # id-space-unproven case this test is about.
+    unstamped = [{"PRODUCT": "BTC OPTION - DBT", "BLOCK_TRADE_ID": "P-1"}]
+    kept = {r["block_id"] for r in _dedupe_kept(rows, unstamped)}
     check("okx merges (never brokered)", {"OKX-BLK-1", "OKX-BLK-2"} <= kept, kept)
     check("deribit excluded (could be brokered)", "BLOCK-280624" not in kept, kept)
     check("bullish excluded (could be brokered)", "OTC-9" not in kept, kept)
     # Case-insensitive on the exchange id.
     mixed = [{"exchange": "Deribit", "block_id": "X"},
              {"exchange": "OKEX-OPTIONS", "block_id": "Y"}]
-    kept2 = {r["block_id"] for r in recap._dedupe_venue_blocks(mixed)}
+    kept2 = {r["block_id"] for r in _dedupe_kept(mixed, unstamped)}
     check("case-insensitive venue match", kept2 == {"Y"}, kept2)
+    # A tape that READ FINE and carried nothing has nothing to dedupe against,
+    # so the same rows must survive — keying on the exception alone deleted
+    # them for the six days the producer was down.
+    empty = {r["block_id"] for r in _dedupe_kept(rows, [])}
+    check("an empty-but-readable tape keeps the brokered blocks",
+          {"BLOCK-280624", "OTC-9"} <= empty, empty)
 
 
 def test_dedupe_exact_id_with_per_venue_coverage_gate():
@@ -349,7 +367,7 @@ def test_dedupe_exact_id_with_per_venue_coverage_gate():
         {"PRODUCT": "BTC OPTION - BLSH", "BLOCK_TRADE_ID": "DRFQv2-2",
          "VENUE_BLOCK_TRADE_ID": ""},  # unstamped → BLSH stays structural
     ]
-    kept = {r["block_id"] for r in recap._dedupe_venue_blocks(venue_rows, tape)}
+    kept = {r["block_id"] for r in _dedupe_kept(venue_rows, tape)}
     check("id-matched brokered copy dropped", "BLOCK-A" not in kept, kept)
     check("non-Paradigm deribit block merges", "BLOCK-B" in kept, kept)
     check("unstamped venue keeps structural exclusion", "OTC-1" not in kept, kept)
@@ -362,14 +380,14 @@ def test_dedupe_exact_id_with_per_venue_coverage_gate():
          "VENUE_BLOCK_TRADE_ID": None},
     ]
     kept_gap = {r["block_id"]
-                for r in recap._dedupe_venue_blocks(venue_rows, tape_dbt_gap)}
+                for r in _dedupe_kept(venue_rows, tape_dbt_gap)}
     check("matched id still dropped under gap", "BLOCK-A" not in kept_gap, kept_gap)
     check("unmatched brokered blocked under gap", "BLOCK-B" not in kept_gap, kept_gap)
     # Tape without the column at all (legacy csv.gz) → structural fallback,
     # byte-identical to today's behavior.
     legacy = [{"PRODUCT": "BTC OPTION - DBT", "BLOCK_TRADE_ID": "DRFQv2-1"}]
     kept_legacy = {r["block_id"]
-                   for r in recap._dedupe_venue_blocks(venue_rows, legacy)}
+                   for r in _dedupe_kept(venue_rows, legacy)}
     check("legacy tape → structural fallback", kept_legacy == {"OKX-1"}, kept_legacy)
 
 
@@ -542,6 +560,113 @@ def test_partial_turnover_does_not_claim_all_venues():
         hot2 = load_hot(d, "BTC")
     check("complete fixture passes the gate", hot2["turnover_complete"] is True,
           hot2["turnover_complete"])
+
+
+def test_a_dead_price_feed_does_not_zero_block_flow():
+    """Deribit's public API is the only spot source in direct mode. On 2026-09-18
+    it failed cert verification behind the egress proxy and Block Flow rendered
+    $0.0M / 0 blocks on a window holding 97 real blocks."""
+    venue_rows = [{"exchange": "deribit", "block_id": "V-1", "bucket_at": 1_500_000,
+                   "volume_coin": 10.0, "leg_count": 1}]
+    # No spot anywhere: no Deribit market, no hot surface, no spot_close.
+    res = build("btc", "8h", 0, 8 * 3600_000, {"closes_7d": [], "market": None},
+                {"trades_total": 10, "trades_by_venue": {"deribit": 10}},
+                venue_block_rows=venue_rows, tape_available=False)
+    check("with no price at all Block Flow is empty",
+          res["block_flow"]["n_blocks"] == 0, res["block_flow"])
+    # Same window, same rows, but the venue tape carried its own index.
+    res2 = build("btc", "8h", 0, 8 * 3600_000, {"closes_7d": [], "market": None},
+                 {"trades_total": 10, "trades_by_venue": {"deribit": 10},
+                  "venue_index_close": 100_000.0},
+                 venue_block_rows=venue_rows, tape_available=False)
+    check("the venue tape's own index prices the block instead",
+          res2["block_flow"]["n_blocks"] == 1, res2["block_flow"])
+    # Reported through the RESULT, not WARNINGS: warnings are discarded on the
+    # --render path, which is the only path a reader sees, so the hedge on this
+    # number was silent exactly where it mattered.
+    check("and the reader is told the price is approximate",
+          res2.get("spot_from_venue_tape") is True, res2.get("spot_from_venue_tape"))
+    check("while a normal run claims nothing",
+          build("btc", "8h", 0, 8 * 3600_000, {"closes_7d": [], "market": None},
+                {"spot_close": 100000.0, "trades_total": 1},
+                tape_available=False).get("spot_from_venue_tape") is False)
+
+
+def test_an_extrapolated_surface_value_is_starred_where_it_renders():
+    """Every star mutation survived the gate: nothing rendered a surface whose
+    values were clamped to a thin chain's endpoint rather than interpolated."""
+    res = build("btc", "8h", 0, 8 * 3600_000, {"closes_7d": [], "market": None},
+                {"spot_close": 100000.0, "trades_total": 1}, tape_available=False)
+    res["vol_surface"] = {
+        "skew_line": "front 25Δ RR +1.0v → calls bid", "term_line": "humped",
+        "front_atm": 30.0, "back_atm": 32.0,
+        "rows": [{"expiry": "19SEP26", "atm": 30.0, "rr_25d": 1.0, "fly": 0.5,
+                  "d_atm": 1.0, "d_rr": 0.5, "d_fly": 0.2,
+                  "extrapolated": False, "atm_extrapolated": True},
+                 {"expiry": "25SEP26", "atm": 32.0, "rr_25d": 2.0, "fly": 0.6,
+                  "d_atm": None, "d_rr": None, "d_fly": None,
+                  "extrapolated": True, "atm_extrapolated": False}]}
+    lines = render_md(res).splitlines()
+    first = next(ln for ln in lines if ln.startswith("19SEP26"))
+    second = next(ln for ln in lines if ln.startswith("25SEP26"))
+    term = next(ln for ln in lines if ln.startswith("Skew:"))
+    # ATM clamped → ATM and its delta starred, and Fly too: it is
+    # (c25 + p25)/2 - atm, so it inherits either clamp.
+    check("a clamped ATM is starred", "30.0v*" in first, first)
+    check("its delta carries the same star", "+1.0v*" in first, first)
+    check("and Fly inherits the ATM clamp", "0.5v*" in first, first)
+    check("an unclamped RR is bare", "+1.0v*" not in first.split("+1.0v*")[-1], first)
+    # Wings clamped → RR and Fly starred, ATM bare.
+    check("clamped wings star the RR", "+2.0v*" in second, second)
+    check("and Fly inherits the wing clamp", "0.6v*" in second, second)
+    check("an unclamped ATM stays bare", "32.0v " in second or second.count("32.0v*") == 0,
+          second)
+    # The term label reads off the whole curve, so any clamped ATM marks it.
+    check("the term label is starred when any ATM was clamped", "humped*" in term, term)
+
+
+def test_exclusion_magnitudes_count_only_what_the_totals_lost():
+    """The dedupe gate looks wider than the window and _venue_tape_blocks drops
+    rows of its own, so the reported blocks/coin were not what Block Flow lost."""
+    rows = [{"exchange": "deribit", "block_id": "IN", "bucket_at": 2_000_000,
+             "volume_coin": 100.0},
+            {"exchange": "deribit", "block_id": "PRE", "bucket_at": 500_000,
+             "volume_coin": 100.0},
+            {"exchange": "deribit", "block_id": "", "bucket_at": 2_000_000,
+             "volume_coin": 100.0},
+            {"exchange": "deribit", "block_id": "NOCOIN", "bucket_at": 2_000_000,
+             "volume_coin": 0.0},
+            {"exchange": "deribit", "block_id": "NOSTAMP", "bucket_at": None,
+             "volume_coin": 100.0}]
+    kept = [r for r in rows if recap._would_have_counted(r, 1_000_000)]
+    check("only the in-window, priced, identified block counts",
+          [r["block_id"] for r in kept] == ["IN"], [r["block_id"] for r in kept])
+    # And the $250k floor applies to the exclusion note too: a block the floor
+    # would have removed was never in the totals, so it was not lost to this.
+    priced = [dict(r, instrument_kind="option") for r in rows]
+    big = recap._lost_blocks([{"reason": "id_space_unproven", "rows": priced}],
+                             1_000_000, 100_000.0)
+    check("a sub-floor block is not reported as lost",
+          big == [] or all(b["blocks"] == 1 for b in big), big)
+    fat = [dict(priced[0], block_id="FAT", volume_coin=500.0)]
+    lost = recap._lost_blocks([{"reason": "id_space_unproven", "rows": fat}],
+                              1_000_000, 100_000.0)
+    check("an above-floor block is reported with its notional",
+          lost and lost[0]["blocks"] == 1 and lost[0]["notional_m"] > 0, lost)
+    # Built blocks carry `venue` and `unit_size`; reading the tape ROW keys
+    # rendered a real $682M exclusion as "68 ? block(s) ... 0 coin".
+    check("the exclusion names the venue rather than ?",
+          lost and lost[0]["venues"] != ["?"], lost)
+    # The floor clause itself: one block above it, one below, only the first is
+    # reported as lost. Nothing held this branch before.
+    mixed = [dict(priced[0], block_id="FAT", volume_coin=500.0),
+             dict(priced[0], block_id="THIN", volume_coin=0.01)]
+    split = recap._lost_blocks([{"reason": "id_space_unproven", "rows": mixed}],
+                               1_000_000, 100_000.0)
+    check("a below-floor block is not counted beside an above-floor one",
+          split and split[0]["blocks"] == 1, split)
+    check("and carries the coin volume",
+          lost and lost[0]["coin"] > 0, lost)
 
 
 def test_activity_split_collapses_deribit_venues():
@@ -1573,13 +1698,13 @@ def _tape(product, block_id="B1", venue_id="", trade_id=""):
 def test_dedupe_ids_are_scoped_per_venue():
     # Venue id spaces are independent and often plain numeric, so a collision
     # across them is not hypothetical. An unbrokered venue must be untouched...
-    out = _dedupe_venue_blocks([{"exchange": "okex-options", "block_id": "9182736"}],
+    out = _dedupe_kept([{"exchange": "okex-options", "block_id": "9182736"}],
                                [_tape("BTC OPTION - BLSH", "B1", "9182736")])
     check("okx block survives a cross-venue id collision", len(out) == 1, out)
     # ...and a BROKERED venue must not have its block deleted by another
     # venue's id. DBT is proven here (V1 matches), so the only thing that can
     # drop 'P1' is treating a PRDX id as a DBT one.
-    out = _dedupe_venue_blocks(
+    out = _dedupe_kept(
         [{"exchange": "deribit", "block_id": "V1"},
          {"exchange": "deribit", "block_id": "P1"}],
         [_tape("BTC OPTION - DBT", "D1", "V1"), _tape("BTC OPTION - PRDX", "P9", "P1")])
@@ -1593,7 +1718,7 @@ def test_dedupe_unparseable_product_fails_closed():
     # DBT is otherwise PROVEN (V1 matches), so the malformed row is the only
     # thing that can gate it — without that, the proof requirement would mask
     # this and the mutant survives.
-    out = _dedupe_venue_blocks(
+    out = _dedupe_kept(
         [{"exchange": "deribit", "block_id": "V1"},
          {"exchange": "deribit", "block_id": "V9"}],
         [_tape("BTC OPTION - DBT", "D1", "V1"), _tape("BTC OPTION", "D2", "")])
@@ -1606,7 +1731,7 @@ def test_dedupe_counts_trade_id_only_rows_as_blocks():
     # coverage gate, so the venue looked fully covered when it wasn't.
     # Again with DBT otherwise proven, so the TRADE_ID-only row is the only
     # thing that can gate it.
-    out = _dedupe_venue_blocks(
+    out = _dedupe_kept(
         [{"exchange": "deribit", "block_id": "V1"},
          {"exchange": "deribit", "block_id": "V9"}],
         [_tape("BTC OPTION - DBT", "D1", "V1"),
@@ -1618,7 +1743,7 @@ def test_dedupe_id_format_mismatch_does_not_double_count():
     # THE design risk: two independent pipelines, one stamping BLOCK-280624 and
     # the other 280624. Every id present, nothing matches, and the old code
     # merged every brokered block — silently doubling the headline number.
-    out = _dedupe_venue_blocks([{"exchange": "deribit", "block_id": "280624"}],
+    out = _dedupe_kept([{"exchange": "deribit", "block_id": "280624"}],
                                [_tape("BTC OPTION - DBT", "D1", "BLOCK-280624")])
     check("unproven id space excludes rather than doubles", out == [], out)
 
@@ -1627,7 +1752,7 @@ def test_dedupe_merges_once_the_id_space_is_proven():
     # The precision the id path exists for must still work: one confirmed match
     # proves the formats align, so a genuinely non-Paradigm block on that venue
     # merges.
-    out = _dedupe_venue_blocks(
+    out = _dedupe_kept(
         [{"exchange": "deribit", "block_id": "BLOCK-1"},
          {"exchange": "deribit", "block_id": "BLOCK-9"}],
         [_tape("BTC OPTION - DBT", "D1", "BLOCK-1")])
@@ -1639,7 +1764,7 @@ def test_dedupe_merges_once_the_id_space_is_proven():
 def test_dedupe_usdc_shares_the_deribit_venue_code():
     # deribit-usdc maps to DBT, so an unstamped DBT row must gate it too. The
     # previous fixture asserted this in a comment without an actual usdc row.
-    out = _dedupe_venue_blocks(
+    out = _dedupe_kept(
         [{"exchange": "deribit-usdc", "block_id": "BLOCK-U"}],
         [_tape("BTC OPTION - PRDX", "P1", "X1"), _tape("BTC OPTION - DBT", "D1", "")])
     check("deribit-usdc gated by an unstamped DBT row", out == [], out)
@@ -1652,9 +1777,10 @@ def test_build_passes_the_tape_to_the_dedupe():
     seen = {}
     orig = recap._dedupe_venue_blocks
 
-    def spy(venue_rows, tape_rows=None):
+    def spy(venue_rows, tape_rows=None, tape_available=True):
         seen["tape"] = tape_rows
-        return orig(venue_rows, tape_rows)
+        seen["tape_available"] = tape_available
+        return orig(venue_rows, tape_rows, tape_available=tape_available)
 
     recap._dedupe_venue_blocks = spy
     try:
@@ -1685,12 +1811,12 @@ def test_partial_id_mismatch_does_not_double_count():
     tape.append(_tape("BTC OPTION - DBT", "D5", "BLOCK-X5"))
     venue = [{"exchange": "deribit", "block_id": f"X{i}"} for i in range(1, 6)]
     check("one unmatched tape id withholds proof for the venue",
-          _dedupe_venue_blocks(venue, tape) == [], _dedupe_venue_blocks(venue, tape))
+          _dedupe_kept(venue, tape) == [], _dedupe_kept(venue, tape))
 
 
 def test_full_coverage_still_merges_a_genuine_block():
     # The precision the id path exists for must survive the stricter rule.
-    out = _dedupe_venue_blocks(
+    out = _dedupe_kept(
         [{"exchange": "deribit", "block_id": "X1"}, {"exchange": "deribit", "block_id": "Y9"}],
         [_tape("BTC OPTION - DBT", "D1", "X1")])
     check("every tape id matched -> the extra block merges",
@@ -1700,7 +1826,7 @@ def test_full_coverage_still_merges_a_genuine_block():
 def test_one_deribit_book_cannot_vouch_for_the_other():
     # deribit and deribit-usdc share code DBT, so per-venue proof let a match in
     # one book prove the other.
-    out = _dedupe_venue_blocks(
+    out = _dedupe_kept(
         [{"exchange": "deribit", "block_id": "X1"},
          {"exchange": "deribit-usdc", "block_id": "X2"}],
         [_tape("BTC OPTION - DBT", "D1", "X1"), _tape("BTC OPTION - DBT", "D2", "BLOCK-X2")])
@@ -1722,13 +1848,13 @@ def test_unknown_venue_code_cannot_bypass_the_coverage_gate():
         # Y9 is the discriminating row: under the bug DBT reads as fully
         # covered and Y9 merges. A fixture whose only venue row is the
         # MATCHING one is dropped either way and proves nothing.
-        out = _dedupe_venue_blocks(
+        out = _dedupe_kept(
             [{"exchange": "deribit", "block_id": "X1"},
              {"exchange": "deribit", "block_id": "Y9"}],
             [_tape("BTC OPTION - DBT", "D1", "X1"), _tape(product, "D2", "X2")])
         check(f"{label} taints the brokered venues", out == [], out)
     # and the clean case is unaffected
-    out = _dedupe_venue_blocks(
+    out = _dedupe_kept(
         [{"exchange": "deribit", "block_id": "X1"}, {"exchange": "deribit", "block_id": "Y9"}],
         [_tape("BTC OPTION - DBT", "D1", "X1")])
     check("recognised codes still merge", [r["block_id"] for r in out] == ["Y9"], out)
@@ -1763,13 +1889,13 @@ def test_ordinary_bybit_print_does_not_disable_the_merge():
     # _TAPE_VENUE_CODE has only the 3 deduped venues, but BYB/BIT are ordinary
     # Paradigm-tape suffixes. Treating them as unrecognised let one Bybit print
     # taint every brokered venue and silently revert the merge for the window.
-    out = _dedupe_venue_blocks(
+    out = _dedupe_kept(
         [{"exchange": "deribit", "block_id": "X1"}, {"exchange": "deribit", "block_id": "Y9"}],
         [_tape("BTC OPTION - DBT", "D1", "X1"), _tape("BTC OPTION - BYB", "D2", "X2")])
     check("recognised-but-not-deduped does not taint",
           [r["block_id"] for r in out] == ["Y9"], out)
     # a genuinely unknown code must still taint
-    out2 = _dedupe_venue_blocks(
+    out2 = _dedupe_kept(
         [{"exchange": "deribit", "block_id": "X1"}, {"exchange": "deribit", "block_id": "Y9"}],
         [_tape("BTC OPTION - DBT", "D1", "X1"), _tape("BTC OPTION - ZZZ", "D2", "X2")])
     check("unknown code still taints", out2 == [], out2)
@@ -1883,6 +2009,142 @@ def test_warning_banners_render_inside_snapshot_fence():
     check("blank line then Spot follow the warnings",
           warns and lines[max(warns) + 1] == "" and lines[max(warns) + 2].startswith("Spot"),
           lines[fence_open:fence_open + 8])
+
+
+def test_absent_paradigm_tape_keeps_the_venues_own_blocks():
+    """The producer stopped 2026-09-12. With no tape there is nothing to
+    double-count against, yet the structural branch kept firing and deleted 109
+    Deribit blocks and $1.25bn of underlying notional per day, in silence."""
+    brokered = [{"exchange": "deribit", "block_id": "D-1", "volume_coin": "3"},
+                {"exchange": "bullish", "block_id": "B-1", "volume_coin": "2"},
+                {"exchange": "okex-options", "block_id": "O-1", "volume_coin": "1"}]
+
+    kept, excluded = recap._dedupe_venue_blocks(brokered, [], tape_available=False)
+    check("no tape at all keeps every venue's blocks",
+          {r["block_id"] for r in kept} == {"D-1", "B-1", "O-1"}, kept)
+    check("and records that the tape could not be READ",
+          [e["reason"] for e in excluded] == ["tape_unreadable"], excluded)
+    # The other sub-case keeps the same blocks but a different reason: the flag's
+    # only job is to tell them apart, so the caller reads this instead of
+    # recomputing the signal and drifting away from it.
+    kept_empty, excluded_empty = recap._dedupe_venue_blocks(brokered, [], tape_available=True)
+    check("an empty-but-readable tape keeps them too",
+          {r["block_id"] for r in kept_empty} == {"D-1", "B-1", "O-1"}, kept_empty)
+    check("but records that the tape was EMPTY",
+          [e["reason"] for e in excluded_empty] == ["tape_empty"], excluded_empty)
+
+    kept2, excluded2 = recap._dedupe_venue_blocks(
+        brokered, [{"PRODUCT": "BTC OPTION - DBT", "BLOCK_TRADE_ID": "P1"}],
+        tape_available=True)
+    check("a readable tape with no venue ids still withholds proof",
+          {r["block_id"] for r in kept2} == {"O-1"}, kept2)
+    check("and hands back the rows it withheld, so the caller can name them",
+          bool(excluded2) and len(excluded2[0]["rows"]) == 2
+          and {r["exchange"] for r in excluded2[0]["rows"]} == {"deribit", "bullish"},
+          excluded2)
+
+
+def test_coverage_leads_the_snapshot_and_names_unread_venues():
+    """A reader cannot infer from the figures how much of the window was read.
+    The line sits INSIDE the Snapshot fence because on 2026-09-08 the relay kept
+    every Snapshot figure and deleted all three unfenced warning lines."""
+    out = render_md(build(
+        "BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+        {"spot_close": 100000.0, "trades_total": 10,
+         "trades_by_venue": {"deribit": 8, "bullish": 0, "bybit-options": 2},
+         "venue_coverage": {"deribit": ("complete", {}), "bullish": ("quiet", {}),
+                            "bybit-options": ("unreadable", {})}}))
+    lines = out.splitlines()
+    fence = [i for i, l in enumerate(lines) if l.strip().startswith("```")]
+    cov = [i for i, l in enumerate(lines) if l.startswith("Coverage")]
+    check("a Coverage line is rendered", bool(cov), lines[:14])
+    check("it sits inside the Snapshot fence",
+          bool(cov) and bool(fence) and fence[0] < cov[0] < fence[1], lines[:14])
+    check("an unreadable venue is not counted as read",
+          bool(cov) and "2/3 venues" in lines[cov[0]], lines[cov[0]] if cov else None)
+    check("it distinguishes quiet hours from a failed read",
+          bool(cov) and "Bullish quiet hours" in lines[cov[0]]
+          and "READ FAILED" in lines[cov[0]], lines[cov[0]] if cov else None)
+    # `quiet` is per-hour, so it must not read as "this venue never traded".
+    check("quiet is not rendered as no trades",
+          bool(cov) and "no trades" not in lines[cov[0]], lines[cov[0]] if cov else None)
+    # Every state's rendered word, pinned: three of them were only ever asserted
+    # through the state name, so renaming the word left the gate green.
+    words = {"quiet": "quiet hours", "feed_gap": "feed gap", "companion_gap": "quote gap",
+             "unreadable": "READ FAILED", "unknown": "unverified"}
+    for state, word in words.items():
+        one = render_md(build(
+            "BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+            {"spot_close": 100000.0, "trades_total": 10, "trades_by_venue": {"deribit": 10},
+             "venue_coverage": {"deribit": (state, {})}}))
+        line = next((l for l in one.splitlines() if l.startswith("Coverage")), "")
+        check(f"{state} renders as '{word}'", word in line, line)
+    # An unrecognised state must not take the render down with it.
+    odd = render_md(build(
+        "BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+        {"spot_close": 100000.0, "trades_total": 10,
+         "trades_by_venue": {"deribit": 8, "deribit-usdc": 2},
+         "venue_coverage": {"deribit": ("complete", {}), "deribit-usdc": ("stale_feed", {})}}))
+    check("an unknown state degrades instead of raising", "Coverage" in odd, odd[:120])
+    check("and does not count as read", "0/1 venues" in odd,
+          next((l for l in odd.splitlines() if l.startswith("Coverage")), ""))
+    # Coverage and Activity must not contradict each other on adjacent lines.
+    both = render_md(build(
+        "BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+        {"spot_close": 100000.0, "trades_total": 1000,
+         "trades_by_venue": {"deribit": 600, "okex-options": 400},
+         "venue_coverage": {"deribit": ("feed_gap", {}), "okex-options": ("companion_gap", {})}}))
+    cline = next((l for l in both.splitlines() if l.startswith("Coverage")), "")
+    aline = next((l for l in both.splitlines() if l.startswith("Activity")), "")
+    check("a feed_gap venue is unread on BOTH lines",
+          "1/2 venues" in cline and "Deribit unread" in aline, (cline, aline))
+    # An all-unread window must not render a dangling separator.
+    none_read = render_md(build(
+        "BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+        {"spot_close": 100000.0, "trades_total": 10, "trades_by_venue": {"deribit": 10},
+         "venue_coverage": {"deribit": ("unreadable", {})}}))
+    nline = next((l for l in none_read.splitlines() if l.startswith("Activity")), "")
+    check("no dangling separator when nothing was read", "trades — " not in nline, nline)
+    act = next((l for l in lines if l.startswith("Activity")), "")
+    # The unread venue's own share is unknowable; what the reader needs is that
+    # the OTHER shares are of a short denominator. `Bybit 20%+` said neither.
+    check("the unread venue is named beside the line", "Bybit unread" in act, act)
+    check("and the remaining shares are declared to be of what was read",
+          "shares are of what was read" in act, act)
+    check("the unread venue does not carry a share of its own",
+          "Bybit 20%" not in act and "Bybit 0%" not in act, act)
+    # The denominator drops with it. A feed_gap venue still contributes SOME
+    # trades, so dividing by the full total left the shown shares summing to
+    # less than 100% under a line promising they were shares of what was read.
+    partial = build("BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+                    {"spot_close": 100000.0, "trades_total": 1000,
+                     "trades_by_venue": {"deribit": 600, "okex-options": 200,
+                                         "bybit-options": 200},
+                     "venue_coverage": {"deribit": ("feed_gap", {}),
+                                        "okex-options": ("complete", {}),
+                                        "bybit-options": ("complete", {})}})
+    shares = [v["pct"] for v in partial["snapshot"]["activity_split"]]
+    check("the shown shares are of what was read, and say so by summing to 100",
+          sum(shares) == 100, shares)
+    check("and the unread venue is still named",
+          partial["snapshot"]["activity_unread"] == ["Deribit"],
+          partial["snapshot"]["activity_unread"])
+
+
+def test_a_block_with_no_trade_time_index_falls_back_without_crashing():
+    """index_px is NaN when no leg carried an index (0/0). NaN is truthy, so it
+    walked past the `or spot` fallback and reached round() — a crash on the live
+    path, not a wrong number."""
+    rows = [{"exchange": "okex-options", "block_id": "O-1", "volume_coin": "2",
+             "index_px": float("nan"), "bucket_at": 1_500_000},
+            {"exchange": "okex-options", "block_id": "O-2", "volume_coin": "1",
+             "index_px": 80000.0, "bucket_at": 1_500_000}]
+    out = recap._venue_tape_blocks(rows, 100000.0)
+    check("a NaN index falls back to spot", bool(out) and out[0]["notional_usd"] == 200000, out)
+    check("a real index is used over spot",
+          len(out) > 1 and out[1]["notional_usd"] == 80000, out)
+    check("no spot and an unpriced row skips rather than crashes",
+          recap._venue_tape_blocks(rows, None) == [], "expected skip")
 
 
 def main():
