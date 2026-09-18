@@ -726,6 +726,35 @@ def _price_at(row):
     return px if px is not None and px == px and px > 0 else None
 
 
+# The venue-coverage vocabulary, in ascending severity. ONE list: `build` and
+# `render_md` previously kept their own, so `feed_gap` counted as read on the
+# Coverage line while the Activity line called it unread, on adjacent rows.
+COVERAGE_STATES = ("complete", "quiet", "companion_gap", "feed_gap", "unknown", "unreadable")
+# Its trade data is missing or unproven, so every other venue's share is a share
+# of a short denominator.
+COVERAGE_UNDERSTATES = ("feed_gap", "unknown", "unreadable")
+
+
+def _understates(state) -> bool:
+    """Whether this venue's absence shortens every other venue's denominator.
+    An UNRECOGNISED state counts too — not knowing is not the same as having
+    read it. No state at all does NOT: the hot path carries no coverage, and
+    treating its silence as a claim marked every venue unread."""
+    if state is None:
+        return False
+    return state not in COVERAGE_STATES or state in COVERAGE_UNDERSTATES
+
+
+def _severity(state) -> int:
+    """Rank within COVERAGE_STATES. An unrecognised state sorts worst rather
+    than raising: `rank.index` took the entire render down with a ValueError
+    where the lookup it replaced had degraded to a missing word."""
+    try:
+        return COVERAGE_STATES.index(state)
+    except ValueError:
+        return len(COVERAGE_STATES)
+
+
 def _state(value):
     """A venue's coverage state. It is stored as (state, detail); comparing the
     tuple against a string silently disabled the Activity marker once already."""
@@ -919,7 +948,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         unread = set()
         for v, n in (hot.get("trades_by_venue") or {}).items():
             label = _venue_label(v)
-            if _state(states.get(v)) in ("unreadable", "feed_gap"):
+            if _understates(_state(states.get(v))):
                 unread.add(label)
             by_label[label] += n
         # An unread venue's own share is unknowable, and `0%+` said nothing while
@@ -1212,6 +1241,7 @@ def render_md(r: dict) -> str:
         _WORDS = {"complete": None, "quiet": "quiet hours", "feed_gap": "feed gap",
                   "companion_gap": "quote gap", "unreadable": "READ FAILED",
                   "unknown": "unverified"}
+        _UNKNOWN_WORD = "state not recognised"
         # Counted over the SAME folded labels the notes use: counting raw venue
         # ids printed `3/5 venues` beside four labels, a denominator the
         # Activity line below could not be reconciled with.
@@ -1219,12 +1249,13 @@ def render_md(r: dict) -> str:
         for venue, state in states.items():
             label = _venue_label(venue)
             # Worst state wins when two ids fold into one label.
-            rank = ("complete", "quiet", "companion_gap", "feed_gap", "unknown", "unreadable")
             current = by_label.get(label)
-            if current is None or rank.index(_state(state)) > rank.index(current):
+            if current is None or _severity(_state(state)) > _severity(current):
                 by_label[label] = _state(state)
-        read = sum(1 for st in by_label.values() if st not in ("unreadable", "unknown"))
-        notes = [f"{label} {_WORDS[st]}" for label, st in by_label.items() if _WORDS.get(st)]
+        read = sum(1 for st in by_label.values() if not _understates(st))
+        notes = [f"{label} {_WORDS.get(st, _UNKNOWN_WORD)}"
+                 for label, st in by_label.items()
+                 if st not in _WORDS or _WORDS[st]]
         detail = " · ".join(notes) if notes else "all venue feeds complete"
         L.append(f"{'Coverage':<9} {f'{read}/{len(by_label)} venues':<11} {detail}")
 
@@ -1270,7 +1301,9 @@ def render_md(r: dict) -> str:
         unread = s.get("activity_unread") or []
         note = ("by trade count" if not unread else
                 f"by trade count; {', '.join(unread)} unread — shares are of what was read")
-        L.append(f"{'Activity':<9} {tnum:<11} trades — {split} ({note})")
+        # An all-unread window leaves `split` empty; the separator would dangle.
+        body = f"trades — {split} ({note})" if split else f"trades ({note})"
+        L.append(f"{'Activity':<9} {tnum:<11} {body}")
     else:
         L.append(f"{'Activity':<9} {'n/a':<11} trades (by trade count)")
     vol = f"${s['volume_usd_m']}M" if s.get("volume_usd_m") else "n/a"

@@ -348,6 +348,9 @@ def run(asset, window, start, end):
     gaps, specs, evidence, totals = [], {}, {}, {}
     # venue -> (state, detail); what was actually behind this window per venue.
     coverage = {}
+    # The bucket still being written, or None when this is not a live window.
+    in_progress = (f"{end:%Y%m%dT%H}"
+                   if (datetime.now(timezone.utc) - end) < timedelta(hours=1) else None)
     # Partition reads get their own pool: they are the ones holding a window in
     # memory, so their concurrency is a memory budget, not a latency choice.
     readers = query_workers(end - start)
@@ -398,11 +401,13 @@ def run(asset, window, start, end):
             elif not rows.height and not query.name.startswith("option_trades_"):
                 read_gaps.append(f"{query.name}: no usable observations")
             elif not query.name.startswith("option_trades_"):
-                # Same in-progress hour as coverage_verdict excludes: every feed
-                # is legitimately absent from the bucket still being written.
+                # Same in-progress hour as coverage_verdict excludes, and on the
+                # same terms: only when the window ends in the CURRENT hour. On a
+                # replay `end` is historical and its final hour is genuinely due.
                 absent = [h for h in source["path_plan"].get("missing_hours", ())
-                          if h != f"{end:%Y%m%dT%H}"]
-                expected = max(source["path_plan"].get("pattern_count", 0) - 1, 1)
+                          if h != in_progress]
+                expected = max(source["path_plan"].get("pattern_count", 0)
+                               - (1 if in_progress else 0), 1)
                 if absent:
                     read_gaps.append(
                         f"{query.name}: {len(absent)} of {expected} hourly paths absent; "
@@ -425,6 +430,14 @@ def run(asset, window, start, end):
                         read_gaps.append(
                             f"{venue}: {lost} of {detail['expected']} hours missing from the "
                             f"venue's own feed — trades, volume and share below are understated")
+                    elif state == "unknown":
+                        # Closing the empty-listing false alarm made this branch
+                        # silent: a genuinely dead companion feed produced no ⚠
+                        # at all, and the venue kept an unmarked share.
+                        why = detail.get("error") or "no companion listing returned"
+                        read_gaps.append(
+                            f"{venue}: coverage could not be verified — {why}; its share "
+                            f"and any gap in its trades are unconfirmed")
                     elif state == "companion_gap":
                         # The trade tape covered these hours; only the quote
                         # feed lost them. Saying "understated" here would be

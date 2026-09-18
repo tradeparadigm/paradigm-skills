@@ -402,11 +402,26 @@ def test_a_failed_coverage_read_does_not_abort_the_recap(monkeypatch):
     assert "AccessDenied" in detail["error"]
 
 
-def test_run_wires_coverage_and_tape_availability_into_the_render(monkeypatch):
-    """`run()` itself was never executed by any test: `raise AssertionError` as
-    its first statement left the whole gate green, leaving the coverage wiring,
-    the tape_available signal and every `Block Flow:` line unexercised."""
+def _run_once(monkeypatch, *, coverage=("feed_gap", {"lost_hours": ["20260916T10"],
+                                                    "expected": 3, "quiet_hours": []}),
+              missing_hours=("20260916T10",), status="ok"):
+    """Drive `run()` through ONE real venue read, so the loop body executes.
+
+    Stubbing build_queries to [] emptied the loop, which left coverage_verdict,
+    both read-gap branches and every Block Flow line unexecuted while the test
+    that named them still passed.
+    """
     calls = {}
+    query = collector.Query(name="option_trades_deribit", paths=["s3://x"], sql="SELECT 1",
+                            units={}, stream=True, columns=("timestamp",))
+    rows = pl.DataFrame({"record_type": ["trade"], "timestamp": ["2026-09-16T10:00:00Z"]})
+    source = {"status": status, "error": "boom",
+              "path_plan": {"missing_hours": list(missing_hours), "pattern_count": 4,
+                            "missing_pattern_count": len(missing_hours)}}
+
+    class _Future:
+        def result(self):
+            return source, rows
 
     def fake_build(asset, window, start_ms, end_ms, deri, snapshot, executions,
                    blocks, **kwargs):
@@ -415,22 +430,58 @@ def test_run_wires_coverage_and_tape_availability_into_the_render(monkeypatch):
         return {"snapshot": snapshot, "source_gaps": [], "hot_horizon": None}
 
     monkeypatch.setattr(recap, "build", fake_build)
-    monkeypatch.setattr(recap, "render_md", lambda result: "RENDERED")
-    monkeypatch.setattr(direct, "build_queries", lambda *a, **k: [])
+    monkeypatch.setattr(recap, "render_md", lambda result: result)
+    monkeypatch.setattr(direct, "build_queries", lambda *a, **k: [query])
+    monkeypatch.setattr(direct, "run_query", lambda *a, **k: (source, rows))
     monkeypatch.setattr(direct, "metadata", lambda *a, **k: pl.DataFrame())
+    monkeypatch.setattr(direct, "coverage_verdict", lambda *a, **k: coverage)
+    monkeypatch.setattr(direct, "aggregate_trades", lambda *a, **k: dict(direct.EMPTY_TOTAL))
     monkeypatch.setattr(direct, "read_executions",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no partition")))
     monkeypatch.setattr(recap, "fetch_7d_closes", lambda *a, **k: [])
     monkeypatch.setattr(recap, "_fetch_market_fallback", lambda *a, **k: None)
-    monkeypatch.setattr(direct, "inputs",
-                        lambda totals, evidence, specs, gaps, coverage=None: (
-                            {"trades_total": 1, "venue_coverage": coverage}, [], 0.0))
-    out = direct.run("BTC", "24h", COV_START, COV_END)
-    assert out == "RENDERED"
+    captured = {}
+
+    def fake_inputs(totals, evidence, specs, gaps, coverage=None):
+        captured["gaps"] = list(gaps)
+        captured["coverage"] = coverage
+        return {"trades_total": 1, "venue_coverage": coverage}, [], 0.0
+
+    monkeypatch.setattr(direct, "inputs", fake_inputs)
+    result = direct.run("BTC", "24h", COV_START, COV_END)
+    return calls, captured, result
+
+
+def test_run_reaches_the_read_loop_and_wires_coverage_through(monkeypatch):
+    calls, captured, _ = _run_once(monkeypatch)
+    assert captured["coverage"]["deribit"][0] == "feed_gap", captured
+    assert calls["venue_coverage"] == captured["coverage"]
     # read_executions raised, so the tape is genuinely absent — the signal that
     # stops _dedupe_venue_blocks deleting every brokered block.
     assert calls["tape_available"] is False, calls
-    assert calls["venue_coverage"] == {}, calls
+
+
+def test_a_feed_gap_says_the_figures_below_are_understated(monkeypatch):
+    _, captured, _ = _run_once(monkeypatch)
+    gap = [g for g in captured["gaps"] if g.startswith("deribit:")]
+    assert gap and "understated" in gap[0], captured["gaps"]
+
+
+def test_a_companion_gap_does_not_claim_the_trades_are_understated(monkeypatch):
+    _, captured, _ = _run_once(
+        monkeypatch, coverage=("companion_gap", {"lost_hours": ["20260916T10"],
+                                                 "expected": 3, "quiet_hours": []}))
+    gap = [g for g in captured["gaps"] if g.startswith("deribit:")]
+    assert gap, captured["gaps"]
+    assert "quote feed" in gap[0] and "understated" not in gap[0], gap
+
+
+def test_an_unverifiable_venue_still_says_so(monkeypatch):
+    """Returning `unknown` for an empty listing closed a false alarm and opened a
+    silence: a genuinely dead companion feed produced no line at all."""
+    _, captured, _ = _run_once(monkeypatch, coverage=("unknown", {}))
+    gap = [g for g in captured["gaps"] if g.startswith("deribit:")]
+    assert gap and "could not be verified" in gap[0], captured["gaps"]
 
 
 def test_a_block_missing_one_legs_index_is_not_half_priced():
