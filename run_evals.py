@@ -247,9 +247,6 @@ def resolve_context(case: dict, skill_dir: Path) -> str:
     `derived`, so injecting raw per-strike IVs would only invite the agent to
     re-derive (and re-hallucinate) the surface.
 
-    A case whose PROMPT already embeds its data (e.g. block-analyst's resolved
-    tape rows) has no fixture to trigger this path; it opts out of simulate
-    mode with `"simulate": false` instead — see _run_one_case.
     """
     ctx = case.get("context", "")
     if not ctx:
@@ -396,12 +393,9 @@ def _run_one_case(client, agent_model: str, grader_model: str,
     prompt = context + case["prompt"] if context else case["prompt"]
     # Fixture cases carry real data, so suppress simulate mode for them — the
     # agent must read the injected values, not fabricate (and not disclaim).
-    # The same principle applies when the data rides INSIDE the prompt
-    # (block-analyst's resolved tape rows): SIMULATE_SUFFIX says "use
-    # plausible example values", which is a direct instruction to do the very
-    # thing those cases' do-not-invent assertions penalise. Such a case opts
-    # out with "simulate": false in evals.json.
-    effective_simulate = simulate and not context and case.get("simulate", True)
+    # SIMULATE_SUFFIX says "use plausible example values", which is a direct
+    # instruction to do the very thing their do-not-invent assertions penalise.
+    effective_simulate = simulate and not context
     output, timing = run_agent(client, agent_model, skill_md or "", prompt, effective_simulate)
     assertions = case["assertions"]
     graded: list = [None] * len(assertions)

@@ -42,6 +42,10 @@ def calculation_rows(rows):
                            f"{row['strike_price']:g}")
         result.append({
             "RFQ_ID": row["rfq_id"], "BLOCK_TRADE_ID": row["block_trade_id"],
+            # vol_math.tape_block_key falls back to TRADE_ID when a leg carries
+            # no block id; without it every such leg keys on None and they
+            # collapse into one block.
+            "TRADE_ID": row["trade_id"],
             "VENUE_BLOCK_TRADE_ID": row["venue_block_trade_id"],
             "PRODUCT": row["product"], "DESCRIPTION": description,
             "QUOTE_CURRENCY": row["asset"], "QTY": row["quantity"],

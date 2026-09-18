@@ -20,6 +20,7 @@ would read as a zero-length window. Intraday windows stay HH:MM-only.
 **Snapshot**
 
 ```yaml
+⚠ [one line per gap, when there are any]
 Coverage  [N]/[M] venues  [per-venue state, or "all venue feeds complete"]
 Spot      $[X]        [up/down X%, or flat] (from $[Y], low $[Z])
 DVOL      [X]v        [flat/rising/falling] ([open] -> [close])
@@ -27,10 +28,16 @@ RV 7d     [X]v        implied [CHEAP/RICH/IN LINE] vs realized
 VRP       [±X]v       vol [underpriced/overpriced/roughly fair] vs delivered
 Activity  [Nk]        trades — [Venue X% · Venue Y% · ...] (by trade count)
 Volume    $[X]M       observed valued trades · USD premium
-P/C       [X.Xx]      [descriptor] (observed trades · see coverage)
+P/C       [X.Xx]      [descriptor] (observed trades · see ⚠ lines)
 ```
 
-`Coverage` leads the block because every figure under it is a function of how
+The `⚠` lines are the FIRST lines inside the fence, not above it: on
+2026-09-08 a relaying model kept every figure in the fence and deleted all
+three warning lines that sat outside it. `RV 7d` and `VRP` print
+`unavailable` when the Deribit close history cannot be fetched, rather than
+being dropped.
+
+`Coverage` leads the figures because every one of them is a function of how
 much of the window was read, and that cannot be inferred from the figures. `N` is
 venues successfully read, `M` venues attempted. The detail names any venue that
 is not `complete`: `no trades` (feed healthy, nothing traded — measured on the

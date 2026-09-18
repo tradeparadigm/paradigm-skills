@@ -1081,6 +1081,16 @@ def test_beyond_24h_prefers_market_ohlc():
     check("48h spot from market", s["spot"] == 63000, s["spot"])
     check("48h spot_from = full-window open", s["spot_from"] == 61000, s["spot_from"])
     check("48h dvol from market", s["dvol"] == 39.0, s["dvol"])
+
+    # ...but evidence that states it spans the window is kept, or the direct
+    # dvol_window read is computed and then discarded on every window over a day.
+    with tempfile.TemporaryDirectory() as d:
+        scoped = _full_hot(d)
+    scoped["dvol_window_scoped"] = True
+    kept = build("btc", "48h", end - 48 * 3600_000, end,
+                 {"closes_7d": CLOSES_7D, "trades": [], "market": mkt}, scoped)["snapshot"]
+    check("48h dvol keeps a window-scoped read", kept["dvol"] == 43.3, kept["dvol"])
+    check("48h spot still comes from market", kept["spot"] == 63000, kept["spot"])
     check("48h dvol_open from market", round(s["dvol_open"], 1) == 40.0, s["dvol_open"])
     # Within 24h, hot stays authoritative even when a market series exists.
     res8 = build("btc", "8h", end - 8 * 3600_000, end,

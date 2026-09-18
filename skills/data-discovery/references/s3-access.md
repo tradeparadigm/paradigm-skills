@@ -72,12 +72,15 @@ Two properties bind its callers:
   cannot follow a 307, so `S3Store(...)` must carry `endpoint=`.
   `options-recap/tests/test_run_recap.py` is the only thing that checks this,
   which is why that workflow also watches this file.
-- **Peak memory is the whole window, twice.** `CONCURRENCY` and `BATCH` bound
-  only the raw bodies and the single batch being parsed, so they do not cap it:
-  `_gather` keeps every batch's Arrow table and copies the lot in a final
-  `_concat`. Cost scales with objects read, not with wall time — a 30-day
-  `/recap` peaks near 6 GiB against a 4 GiB production container. Reduce per
-  batch, or read the `__agg__` objects instead.
+- **Peak memory is the whole window, and the caller usually holds it twice.**
+  `_concat` is zero-copy where the schemas match, so the concatenation itself
+  costs nothing; what costs is that every object's rows are resident at once,
+  and `CONCURRENCY` and `BATCH` bound only the raw bodies and the single batch
+  being parsed. The second copy is the caller's: `/recap` keeps the returned
+  table alive as a replacement scan while DuckDB materialises a result that, in
+  render mode, is every row. Cost scales with objects read, not with wall time —
+  a 30-day window peaks near 6 GiB against a 4 GiB production container.
+  Reducing per batch, rather than returning one table, is what would bound it.
 
 ## Token lifecycle
 

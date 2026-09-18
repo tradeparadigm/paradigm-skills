@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import types
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -26,6 +27,7 @@ sys.modules[spec.name] = collector
 spec.loader.exec_module(collector)
 
 passed = failed = 0
+_real_container_memory = collector.container_memory_bytes
 
 
 def check(name, condition, detail=""):
@@ -41,6 +43,24 @@ def hook(name, *args):
     env = dict(os.environ, **{name: "1"})
     result = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True, env=env)
     return (result.stdout.strip() or result.stderr.strip()), result.returncode
+
+
+def calls(body, name):
+    """Argument lists for `name(...)`, paren-balanced. A regex stops at the
+    first `)`, so a two-level nested call failed to match at all and an
+    unpinned store inside one would have gone unseen."""
+    found = []
+    for match in re.finditer(rf"\b{name}\(", body):
+        depth = 0
+        for index in range(match.end() - 1, len(body)):
+            if body[index] == "(":
+                depth += 1
+            elif body[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    found.append(body[match.end():index])
+                    break
+    return found
 
 
 def test_arguments():
@@ -114,13 +134,42 @@ def test_streamed_queries_name_every_column_their_sql_reads():
     the tuple omits is silently absent at query time."""
     start = dt.datetime(2026, 8, 30, 10, 0, tzinfo=dt.timezone.utc)
     end = dt.datetime(2026, 8, 30, 12, 0, tzinfo=dt.timezone.utc)
-    for query in collector.build_queries("BTC", start, end):
-        if not query.stream:
-            continue
+    streamed = [q for q in collector.build_queries("BTC", start, end) if q.stream]
+    # The identifiers the reader must hand DuckDB are exactly the ones named
+    # before FROM read_parquet(...) — read them off the SQL rather than testing
+    # a hardcoded tuple, which compared nothing.
+    # SQL words and built-ins are not columns. A future query using a keyword
+    # absent from this set fails loudly here, which is the safe direction.
+    keywords = {
+        "with", "as", "materialized", "select", "distinct", "from", "where",
+        "and", "or", "not", "in", "is", "null", "nulls", "group", "by", "order",
+        "asc", "desc", "limit", "union", "all", "case", "when", "then", "else",
+        "end", "over", "partition", "filter", "cast", "try_cast", "timestamptz",
+        # NOT `timestamp`: it is a real column in every venue and dvol schema
+        # and the window bound casts it, so exempting it let a projection drop
+        # it silently. `timestamptz` already covers the cast's type name.
+        "last", "first", "least", "greatest", "lower", "upper",
+        "coalesce", "count", "sum", "min", "max", "avg", "abs", "round",
+        "arg_min", "arg_max", "any_value", "row_number", "filename",
+        "name",  # DuckDB's UNION ALL BY NAME
+    }
+    for query in streamed:
         check(f"{query.name} declares its columns", bool(query.columns), query.name)
-        body = query.sql.split("read_parquet", 1)[0] + query.sql.split(")", 1)[-1]
-        for column in ("timestamp",):
-            check(f"{query.name} projects {column}", column in query.columns, query.columns)
+        # The whole statement, not just the select list: a column used only in
+        # WHERE or GROUP BY is as absent from a projection that omits it. Strip
+        # read_parquet's own arguments, comments and string literals first —
+        # none of those name a column.
+        sql = re.sub(r"read_parquet\([^)]*\)", " ", query.sql)
+        sql = re.sub(r"--[^\n]*", " ", sql)
+        sql = re.sub(r"'[^']*'", " ", sql)
+        skip = set(re.findall(r"\bAS\s+([a-z_][a-z0-9_]*)", sql, re.I))
+        skip |= set(re.findall(
+            r"(?:WITH|,)\s*([a-z_][a-z0-9_]*)\s+AS\s*(?:NOT\s+)?(?:MATERIALIZED\s*)?\(",
+            sql, re.I))
+        named = set(re.findall(r"\b[a-z_][a-z0-9_]*\b", sql.lower())) - keywords - skip
+        missing = named - set(query.columns)
+        check(f"{query.name} projects every source column its SQL names",
+              not missing, sorted(missing))
 
 
 
@@ -155,11 +204,110 @@ def test_s3_reads_pin_the_regional_endpoint():
                     if "endpoint_url" not in call:
                         unpinned.append(os.path.relpath(path, skills))
                 # The async reader does not go through boto3 for its GETs, so
-                # it carries the pin on its own store constructor.
-                for call in re.findall(r"S3Store\(", body):
-                    if "endpoint=" not in body:
+                # it carries the pin on its own store constructor. Markdown
+                # counts too — its examples are what agents copy — so the one
+                # exemption is the bare ellipsis placeholder prose writes.
+                # bucket is obstore's only positional parameter, so requiring
+                # an `=` anywhere let a positional-bucket call through.
+                for arguments in calls(body, "S3Store"):
+                    if arguments.strip() in ("", "..."):
+                        continue
+                    if "endpoint=" not in arguments:
                         unpinned.append(os.path.relpath(path, skills))
     check("every S3 read pins the regional endpoint", not unpinned, unpinned)
+
+
+def test_importing_collect_recap_makes_the_shared_reader_importable():
+    """s3_async lives in data-discovery now. Every other test either stubs it in
+    sys.modules or loads it by path, so nothing would notice if the module-scope
+    sys.path insert went away — and every stream=True query would degrade to
+    "unavailable" in production only."""
+    # find_spec resolves the path without executing it, so this stays stdlib-only:
+    # s3_async imports obstore and pyarrow, which this lane does not install.
+    # No sys.path seeding: spec_from_file_location resolves collect_recap by
+    # path, and seeding would pre-plant the sideways scripts/ entry the module
+    # under test is supposed to add for itself.
+    program = (
+        "import sys, types, importlib.util as u;"
+        "sys.modules.setdefault('duckdb', types.SimpleNamespace(Error=Exception, connect=None));"
+        f"spec = u.spec_from_file_location('collect_recap', {COLLECTOR!r});"
+        "mod = u.module_from_spec(spec);"
+        "sys.modules['collect_recap'] = mod;"
+        "spec.loader.exec_module(mod);"
+        "found = u.find_spec('s3_async');"
+        "print(found.origin if found else 'NOT FOUND')"
+    )
+    # -P drops the script directory and -E ignores PYTHONPATH: both sit ahead of
+    # the insert under test, so without them the child could resolve s3_async
+    # from its own cwd and pass with the insert deleted.
+    result = subprocess.run([sys.executable, "-P", "-E", "-c", program],
+                            capture_output=True, text=True)
+    origin = result.stdout.strip()
+    check("importing collect_recap puts the shared reader on the path",
+          result.returncode == 0
+          and origin.endswith(os.path.join("data-discovery", "scripts", "s3_async.py")),
+          origin or result.stderr.strip()[-200:])
+
+
+def test_connect_runs_the_session_prefix_and_the_tuning():
+    """The zone statement is tested on its own, but nothing asserted that
+    connect() still runs it — stubbing the call out left every lane green."""
+    executed = []
+    original = collector.duckdb
+    collector.duckdb = types.SimpleNamespace(
+        connect=lambda: types.SimpleNamespace(execute=executed.append))
+    try:
+        collector.connect()
+    finally:
+        collector.duckdb = original
+    check("connect runs the session prefix", collector.DUCKDB_PREFIX in executed, executed)
+    check("connect runs the tuning", collector.TUNING in executed, executed)
+
+
+def test_the_limit_is_read_from_this_cgroup_not_the_root():
+    """The ceiling test stubs container_memory_bytes, so the resolution itself
+    was unverified: in a nested layout the root file holds the no-limit
+    sentinel and only the process's own cgroup carries the real number."""
+    sentinel = str((1 << 63) - (1 << 12))
+    for version, proc_body, nested, top in (
+            ("v2", "0::/kubepods/podabc\n", "kubepods/podabc/memory.max", "memory.max"),
+            ("v1", "9:memory:/kubepods/podabc\n",
+             "memory/kubepods/podabc/memory.limit_in_bytes",
+             "memory/memory.limit_in_bytes")):
+        with tempfile.TemporaryDirectory() as root:
+            proc = os.path.join(root, "cgroup")
+            with open(proc, "w") as handle:
+                handle.write(proc_body)
+            for relative, value in ((top, sentinel), (nested, str(4 << 30))):
+                path = os.path.join(root, relative)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as handle:
+                    handle.write(value)
+            check(f"nested {version} limit is found",
+                  collector.container_memory_bytes(proc, root) == (4 << 30),
+                  collector.container_memory_bytes(proc, root))
+
+
+def test_the_window_ceiling_follows_the_container_not_the_tape():
+    """30d fits in 8GiB and OOMs at 4Gi, and an OOM kills the process rather
+    than failing the query — so the refusal has to track the container."""
+    for gib, expected in ((8, 30), (6, 21), (4, 14), (2, 7), (1, 1)):
+        collector.container_memory_bytes = lambda g=gib: int(g * (1 << 30))
+        check(f"{gib}GiB allows {expected}d",
+              collector.window_ceiling() == dt.timedelta(days=expected),
+              collector.window_ceiling())
+    collector.container_memory_bytes = lambda: int(4 * (1 << 30))
+    try:
+        collector.parse_window("30d")
+        check("4GiB refuses 30d", False, "no error")
+    except ValueError as exc:
+        check("4GiB refuses 30d", "14d or less" in str(exc), str(exc))
+    check("4GiB still allows 14d", collector.parse_window("14d") == dt.timedelta(days=14))
+    # No cgroup limit is a workstation: the tape's 30 days is the only bound.
+    collector.container_memory_bytes = lambda: None
+    check("unbounded container allows 30d",
+          collector.parse_window("30d") == dt.timedelta(days=30))
+    collector.container_memory_bytes = _real_container_memory
 
 
 def main():
@@ -172,3 +320,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

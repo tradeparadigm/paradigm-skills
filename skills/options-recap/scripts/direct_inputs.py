@@ -80,6 +80,17 @@ def event_at(dtype):
     return column.dt.convert_time_zone("UTC")
 
 
+def _utc(value):
+    """Freshness is compared against a UTC-aware `end`.
+
+    Some venues publish `timestamp` as a string and some as a naive datetime, so
+    this observation can arrive without a zone; subtracting it then raises
+    TypeError outside any try and takes the whole render down.
+    """
+    stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
 def with_units(frame, specs):
     """An as-of join never applies a future instrument spec to a past trade."""
     return (frame.lazy()
@@ -241,7 +252,11 @@ def inputs(totals, evidence, specs, gaps, coverage=None):
     if dvol is not None and dvol.height:
         first = dvol.row(0, named=True)
         snapshot.update(dvol=first["close"], dvol_open=first["open"],
-                        dvol_low=first["low"], dvol_high=first["high"])
+                        dvol_low=first["low"], dvol_high=first["high"],
+                        # Read from the dvol_window partitions for the requested
+                        # window, so recap.build need not fall back to the REST
+                        # fetch on windows wider than the old hot file spanned.
+                        dvol_window_scoped=True)
     surface = evidence.get("option_surface_deribit")
     if surface is not None and surface.height and "deribit" in specs:
         observed = with_units(surface, specs["deribit"]).to_dicts()
@@ -346,15 +361,22 @@ def run(asset, window, start, end):
                     meta_gaps.append(f"{venue}: unit metadata unavailable — {exc}")
             return specs.get(venue)
 
-        for query, future in reads:
+        for index in range(len(reads)):
+            # Indexed, not `for query, future in reads`: the for-target holds the
+            # pair until the loop advances, so the `del` below could not free the
+            # frame it names. A Future also keeps its result and `reads` keeps
+            # every Future, so both have to be released here for the reduce-and-
+            # drop below to mean anything.
+            query, future = reads[index]
+            reads[index] = None
             source, rows = future.result()
+            del future
             if query.name in ("dvol_window", "option_surface_deribit") and rows.height:
                 # Both are small — one row and a snapshot — so reading them back
                 # as dicts here costs nothing.
                 observed = rows.to_dicts()
                 latest = [r for r in observed if r.get("observation", "latest") == "latest"]
-                times = [datetime.fromisoformat(str(r["max_event_at"]).replace("Z", "+00:00"))
-                         for r in latest if r.get("max_event_at")]
+                times = [_utc(r["max_event_at"]) for r in latest if r.get("max_event_at")]
                 if not times or not timedelta(0) <= end - max(times) <= timedelta(minutes=45):
                     read_gaps.append(f"{query.name}: latest observation stale or freshness unverified; excluded")
                     rows = rows.clear()
@@ -489,6 +511,6 @@ def run(asset, window, start, end):
     # `;;` by the model twice in a row on 2026-09-08; the script never emitted
     # that, but a separator the relay cannot double removes the question.
     result["snapshot"]["volume_scope"] = "observed valued trades · USD premium"
-    result["snapshot"]["activity_scope"] = "observed trades · see coverage"
+    result["snapshot"]["activity_scope"] = "observed trades · see ⚠ lines"
     result["source_gaps"] = gaps
     return recap.render_md(result)

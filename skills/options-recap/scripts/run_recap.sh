@@ -43,6 +43,8 @@ esac
 # -le 0 catches the multiplication overflowing to a negative span.
 if [ "$SPAN" -le 0 ] || [ "$SPAN" -gt 2592000 ]; then
   echo "recap: window '$WINDOW' exceeds 30d — the execution tape keeps 30 days." >&2
+  echo "recap: a smaller container enforces a narrower ceiling still; the" >&2
+  echo "recap: collector names whichever limit it applied." >&2
   echo "recap: report this and ask which window to use. Do not re-run at 30d:" >&2
   echo "recap: it lists ~10,000 partitions, takes minutes, and was not asked for." >&2
   exit 2

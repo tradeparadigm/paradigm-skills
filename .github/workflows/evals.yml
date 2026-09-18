@@ -65,7 +65,10 @@ jobs:
               for link in re.findall(r'\[.*?\]\(([^)]+)\)', parts[2]):
                   if link.startswith(("http://", "https://", "#")):
                       continue
-                  if not (skill_dir / link).exists():
+                  # A relative link may carry an anchor: check the file it names,
+                  # not the fragment, or deep-linking a reference is impossible.
+                  target = link.split("#", 1)[0]
+                  if target and not (skill_dir / target).exists():
                       failures.append(f"{skill}: broken reference '{link}'")
 
           if failures:
