@@ -312,10 +312,11 @@ ok([l["ratio"] for l in ac.parse_description(fly_row[0]["DESCRIPTION"])["legs"]]
    "CFly's 1/2/1 comes from the structure map, not the DESCRIPTION text")
 ok(ac.structure_unit(fly_row) == 100.0, "a 100-lot fly is 100 flies, not 50")
 # The sold leg clipped across two makers, every row repeating the package string.
+# Nothing in that string says which row is which leg, so this is NOT recovered —
+# the smallest row wins and the caller is told the size is inferred.
 clipped = [dict(ratio_rows[0], QTY=40), dict(ratio_rows[1], QTY=10), dict(ratio_rows[1], QTY=10)]
-ok(ac.structure_unit(clipped) == 20.0, "clips group by side and price when the DESCRIPTION is the package")
-ok(abs(ac.struct_net(clipped, "PRICE") + 0.0164) < 1e-9,
-   "and the clipped package nets the same as the unclipped one")
+ok(ac.structure_unit(clipped) == 10.0, "a clipped leg under a combined DESCRIPTION is not inferred")
+ok(not ac.package_size_certain(clipped), "and the caller is told so")
 per_leg = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 24 Jul 26 59000",
             "QTY": 40, "PRICE": 0.0023, "REF_PRICE": 0.0021, "SIDE": "BUY"},
            {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 24 Jul 26 65000",
@@ -328,47 +329,31 @@ clips = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Call 7 May 26 84000",
 ok(ac.structure_unit(clips) == 50.0, "clips of one instrument add rather than compete for the minimum")
 ok(abs(ac.struct_net(clips, "PRICE") - 0.0122) < 1e-9,
    "and the premium counts that leg once, not 2.5 times")
+# A DESCRIPTION that does not resolve to ONE leg carries no identity, so rows
+# under it are not grouped at all: the smallest row wins, as it did before this
+# PR, and package_size_certain reports that the answer is inferred. Inferring
+# clips from side and/or price was tried and mis-sized a different family of
+# equal-size structures each time — see the PR body.
 unkeyed = [dict(r, DESCRIPTION="C 7 May 26 84000") for r in clips]
-ok(ac.structure_unit(unkeyed) == 50.0, "clips still sum when the DESCRIPTION does not parse to a leg")
+ok(ac.structure_unit(unkeyed) == 20.0, "an unresolvable DESCRIPTION falls back to the smallest row")
+ok(not ac.package_size_certain(unkeyed), "and says the size is inferred")
 # Put-call parity makes an at-the-forward straddle's two legs print the SAME
-# price, so grouping on (side, price) merged them into one leg of double the
-# size — ×200, with the premium AND the bps offset halved.
+# price, and its two rows the same side. Grouping on either merged them into one
+# leg of double the size — ×200 with the premium AND the bps offset halved.
 straddle = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Straddle 25 Sep 26 62000",
              "QTY": 100, "PRICE": 0.0410, "REF_PRICE": 0.0405, "SIDE": "SELL"}] * 2
 ok(ac.structure_unit(straddle) == 100.0, "a straddle's two same-priced legs are legs, not clips")
 ok(abs(ac.struct_net(straddle, "PRICE") + 0.0820) < 1e-9,
    "so its package premium is both legs, not one")
-# The mirror: different makers fill at different prices, which is the normal
-# case, and keying on price stopped the clips grouping at all.
-split_px = [dict(ratio_rows[0], QTY=40),
-            dict(ratio_rows[1], QTY=10, PRICE=0.0211),
-            dict(ratio_rows[1], QTY=10, PRICE=0.0209)]
-ok(ac.structure_unit(split_px) == 20.0, "clips at two different prices still group")
-ok(abs(ac.struct_net(split_px, "PRICE") + 0.0164) < 1e-9,
-   "and net the same as a single fill at the average")
-
-# ── per-leg rows carry their QTY into the greeks, not just the premium ─────────
-# A ratio whose legs arrive as separate rows parses each DESCRIPTION to ratio 1.0,
-# so without QTY-derived ratios net_greeks sizes a 40/20 package as 20/20 — the
-# header would claim a base unit the greeks do not honour.
-per_leg = [
-    {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 24 Jul 26 59000",
-     "QTY": 40, "PRICE": 0.0023, "REF_PRICE": 0.0021, "SIDE": "BUY"},
-    {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 24 Jul 26 65000",
-     "QTY": 20, "PRICE": 0.0210, "REF_PRICE": 0.0212, "SIDE": "SELL"},
-]
-pl_legs = ac.legs_from_rows(per_leg)
-ok([l["ratio"] for l in pl_legs] == [2.0, 1.0], "per-leg rows take their ratio from QTY/base")
-_gk = {ac.leg_key(l): {"delta": 0.5, "vega": 1.0, "gamma": 0.0, "theta": 0.0} for l in pl_legs}
-ok(ac.net_greeks(pl_legs, _gk, ac.structure_unit(per_leg))["delta"] == 10.0,
-   "net delta counts 40 long against 20 short, not 20 against 20")
-_equal = [dict(r, QTY=100) for r in per_leg]
-ok([l["ratio"] for l in ac.legs_from_rows(_equal)] == [1.0, 1.0],
-   "equal-size per-leg rows keep ratio 1.0")
-_hedged = per_leg + [{"PRODUCT": "BTC PERPETUAL - DBT", "DESCRIPTION": "Perpetual 65,000",
-                      "QTY": 207000, "PRICE": 65000, "REF_PRICE": 64955.57, "SIDE": "SELL"}]
-ok([l["ratio"] for l in ac.legs_from_rows(_hedged)] == [2.0, 1.0, 1.0],
-   "a perp hedge keeps ratio 1.0 — its QTY is in a different unit")
+ok(not ac.package_size_certain(straddle), "same side under one description is never certain")
+# The same shape with a leg clipped is indistinguishable from it, which is the
+# whole reason nothing is inferred here.
+clipped_straddle = [straddle[0], dict(straddle[1], QTY=50), dict(straddle[1], QTY=50)]
+ok(not ac.package_size_certain(clipped_straddle), "a clipped leg cannot be told from a third leg")
+# Certainty holds where identity is real, or where no two rows share a side.
+ok(ac.package_size_certain(clips), "per-instrument rows carry real identity")
+ok(ac.package_size_certain(ratio_rows), "distinct sides under one description are unambiguous")
+ok(ac.package_size_certain(fly_row), "a single row is never ambiguous")
 
 
 # ── the header itself: structure_unit reaching the rendered ×N ──────────────────
@@ -405,12 +390,16 @@ for _rows, _want, _never, _label in (
         (one_row, "×20", "×40", "a single row stating its ratios"),
         (fly_row, "×100", "×50", "a named fly, whose ratios the tape never wrote"),
         (clips, "×50", "×20", "one leg filled by two makers"),
-        (clipped, "×20", "×10", "a clipped leg inside a combined DESCRIPTION"),
-        (straddle, "×100", "×200", "an at-the-forward straddle, both legs one price"),
-        (split_px, "×20", "×10", "clips filled at two different prices")):
+        (straddle, "×100", "×200", "an at-the-forward straddle, both legs one price")):
     _out = _rendered(_rows)
     ok(_want in _out, f"header sizes {_label} {_want} [{_out[:110]}]")
     ok(_never not in _out, f"header never sizes {_label} {_never}")
+
+# An inferred size says so where the reader sees it, not in a trailing comment.
+_amb = _rendered(clipped)
+ok("⚠ ×N INFERRED" in _amb, f"an inferred size is declared in the body [{_amb[:110]}]")
+ok(_rendered(ratio_rows).count("⚠ ×N INFERRED") == 0,
+   "and an unambiguous one says nothing")
 
 print(f"\n{_p} passed, {_f} failed")
 sys.exit(1 if _f else 0)

@@ -338,11 +338,18 @@ def _package(rows: list[dict]) -> tuple[list[dict], float, float]:
     Perp/future rows are dropped: a delta hedge executes at spot and is not part
     of the option premium.
 
-    The two numbers differ in exactly one shape. When a SINGLE row carries a
-    DESCRIPTION that STATES its ratios, its QTY counts the widest leg but its
-    PRICE is already the package price, so it weights as 1 while the package it
-    describes is QTY/widest. Only Cstm states them; a named structure's ratios
-    are our own canonical geometry, and a 100-lot CFly is 100 flies.
+    Rows are grouped ONLY on real identity — a DESCRIPTION that resolves to one
+    leg. That covers the multi-maker case, where one leg arrives as several rows
+    and their sizes add. When several rows share one COMBINED description,
+    nothing in that string says which row is which leg, so no grouping is
+    attempted and the smallest row wins as it did before; `package_size_certain`
+    reports that, and analyze.py warns rather than printing a confident size.
+
+    The one place base and size differ: a SINGLE row whose DESCRIPTION STATES
+    its ratios counts the widest leg in QTY while its PRICE is already the
+    package price, so it weights as 1 against a package of QTY/widest. Only Cstm
+    states them — a named structure's ratios are our own canonical geometry, and
+    a 100-lot CFly is 100 flies.
     """
     opt = [r for r in rows if parse_product(r.get("PRODUCT", "")).get("kind") == "OPTION"]
     prem = opt or rows
@@ -358,30 +365,27 @@ def _package(rows: list[dict]) -> tuple[list[dict], float, float]:
         return prem, qty, qty
     identities = [_leg_identity(row) for row, _ in sized]
     if all(identity is not None for identity in identities):
-        keys = identities
+        totals: dict = {}
+        for identity, (_, qty) in zip(identities, sized):
+            totals[identity] = totals.get(identity, 0.0) + qty
+        base = min(totals.values())
     else:
-        # A combined DESCRIPTION says how many legs the package has, which is
-        # what separates distinct legs from clips of one. Guessing from side and
-        # price instead sized an at-the-forward straddle — whose two legs print
-        # the SAME price by put-call parity — as one leg of double the size.
-        legs = max((len(parse_description(r.get("DESCRIPTION", ""))["legs"])
-                    for r, _ in sized), default=0)
-        described = any((r.get("DESCRIPTION") or "").strip() for r, _ in sized)
-        if len(sized) <= legs or not described:
-            # No DESCRIPTION at all means no evidence either way, and rows that
-            # bare are per-leg in every real tape shape — treat them as legs.
-            keys = list(range(len(sized)))
-        else:
-            # Clips exist. Group by side only: the price is the field that
-            # VARIES between makers, so keying on it stopped two clips of one
-            # leg grouping in the normal case.
-            keys = [(row.get("DESCRIPTION"), (row.get("SIDE") or "").upper())
-                    for row, _ in sized]
-    totals: dict = {}
-    for key, (_, qty) in zip(keys, sized):
-        totals[key] = totals.get(key, 0.0) + qty
-    base = min(totals.values())
+        base = min(qty for _, qty in sized)
     return prem, base, base
+
+
+def package_size_certain(rows: list[dict]) -> bool:
+    """False when several rows share one combined DESCRIPTION and two of them
+    share a side, so a clip of one leg and two legs on that side are
+    indistinguishable. `structure_unit` then returns the smallest row, which is
+    right for two legs and too small for a clipped one — the caller warns."""
+    opt = [r for r in rows if parse_product(r.get("PRODUCT", "")).get("kind") == "OPTION"]
+    prem = opt or rows
+    sized = [r for r in prem if (_f(r.get("QTY")) or 0) > 0]
+    if len(sized) < 2 or all(_leg_identity(r) is not None for r in sized):
+        return True
+    sides = [(r.get("SIDE") or "").upper() for r in sized]
+    return len(set(sides)) == len(sides)
 
 
 def structure_unit(rows: list[dict]) -> float:
