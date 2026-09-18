@@ -1953,6 +1953,43 @@ def test_coverage_leads_the_snapshot_and_names_unread_venues():
     # `quiet` is per-hour, so it must not read as "this venue never traded".
     check("quiet is not rendered as no trades",
           bool(cov) and "no trades" not in lines[cov[0]], lines[cov[0]] if cov else None)
+    # Every state's rendered word, pinned: three of them were only ever asserted
+    # through the state name, so renaming the word left the gate green.
+    words = {"quiet": "quiet hours", "feed_gap": "feed gap", "companion_gap": "quote gap",
+             "unreadable": "READ FAILED", "unknown": "unverified"}
+    for state, word in words.items():
+        one = render_md(build(
+            "BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+            {"spot_close": 100000.0, "trades_total": 10, "trades_by_venue": {"deribit": 10},
+             "venue_coverage": {"deribit": (state, {})}}))
+        line = next((l for l in one.splitlines() if l.startswith("Coverage")), "")
+        check(f"{state} renders as '{word}'", word in line, line)
+    # An unrecognised state must not take the render down with it.
+    odd = render_md(build(
+        "BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+        {"spot_close": 100000.0, "trades_total": 10,
+         "trades_by_venue": {"deribit": 8, "deribit-usdc": 2},
+         "venue_coverage": {"deribit": ("complete", {}), "deribit-usdc": ("stale_feed", {})}}))
+    check("an unknown state degrades instead of raising", "Coverage" in odd, odd[:120])
+    check("and does not count as read", "0/1 venues" in odd,
+          next((l for l in odd.splitlines() if l.startswith("Coverage")), ""))
+    # Coverage and Activity must not contradict each other on adjacent lines.
+    both = render_md(build(
+        "BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+        {"spot_close": 100000.0, "trades_total": 1000,
+         "trades_by_venue": {"deribit": 600, "okex-options": 400},
+         "venue_coverage": {"deribit": ("feed_gap", {}), "okex-options": ("companion_gap", {})}}))
+    cline = next((l for l in both.splitlines() if l.startswith("Coverage")), "")
+    aline = next((l for l in both.splitlines() if l.startswith("Activity")), "")
+    check("a feed_gap venue is unread on BOTH lines",
+          "1/2 venues" in cline and "Deribit unread" in aline, (cline, aline))
+    # An all-unread window must not render a dangling separator.
+    none_read = render_md(build(
+        "BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+        {"spot_close": 100000.0, "trades_total": 10, "trades_by_venue": {"deribit": 10},
+         "venue_coverage": {"deribit": ("unreadable", {})}}))
+    nline = next((l for l in none_read.splitlines() if l.startswith("Activity")), "")
+    check("no dangling separator when nothing was read", "trades — " not in nline, nline)
     act = next((l for l in lines if l.startswith("Activity")), "")
     # The unread venue's own share is unknowable; what the reader needs is that
     # the OTHER shares are of a short denominator. `Bybit 20%+` said neither.
