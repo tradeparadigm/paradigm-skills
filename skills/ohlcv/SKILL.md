@@ -121,20 +121,21 @@ Reading it for every interval also keeps the listing cost flat in the interval.
 
 The `__agg__` file beside each `__rows__` file already carries the candle —
 the raw exchange catalog lists its fields under "Aggregate fields" — and one
-row per period instead of several hundred trades would cut this skill's memory
-use sharply.
+row per period instead of several hundred trades reads like an easy saving.
 
-It is deliberately not used, and the catalog says why: an aggregate has already
-collapsed whatever was null underneath it, so it cannot say whether it is
-complete. A period whose rows lacked applicable metadata reads as a smaller
+It is not measured to be one. The same question was benchmarked for `/recap`:
+33–57% fewer rows, but **no reduction in bytes for deribit**, which is this
+skill's default venue. Rows are not what the read is paying for.
+
+And the catalog gives the reason not to, independent of cost: an aggregate has
+already collapsed whatever was null underneath it, so it cannot say whether it
+is complete. A period whose rows lacked applicable metadata reads as a smaller
 number rather than as a gap. This skill's whole contract is the opposite — a
 trade with no reported size is counted and declared, never quietly absorbed
-into a smaller volume. Reading aggregates would buy memory with the one
-guarantee the output makes.
+into a smaller volume.
 
-If that trade is ever worth taking, it has to be visible: the aggregate path
-would have to say in a coverage line that its volume cannot be proven
-complete.
+So the aggregate path is not a saving being deferred; it is a worse answer that
+happens to be no cheaper.
 
 ## Output
 
