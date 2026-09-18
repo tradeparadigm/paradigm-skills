@@ -625,12 +625,13 @@ def _dedupe_venue_blocks(venue_rows: list[dict],
                     if (r.get("exchange") or "").lower() in _TAPE_BROKERED_VENUES]
         others = [r for r in venue_rows
                   if (r.get("exchange") or "").lower() not in _TAPE_BROKERED_VENUES]
-        if not tape_available:
-            # No tape at all means nothing to double-count against. Excluding
-            # here trades a hypothetical double count for a certain total loss:
-            # the producer stopped on 2026-09-12 and this branch then fired on
-            # every run, silently deleting 109 Deribit blocks and $1.25bn of
-            # underlying notional per day from Block Flow.
+        if not tape_available or not tape_rows:
+            # Nothing to double-count AGAINST. An unreadable tape and a tape
+            # that read fine and carried no rows are the same fact here, and
+            # keying on the exception alone left the empty case deleting
+            # everything: the producer stopped on 2026-09-12 and this branch
+            # then fired on every run, silently dropping 109 Deribit blocks and
+            # $1.25bn of underlying notional per day from Block Flow.
             return venue_rows, [{"reason": "paradigm_overlap_unverified",
                                  "rows": brokered}] if brokered else []
         # The tape is readable and simply carries no venue ids — the id space
@@ -838,8 +839,13 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
           deri: dict, hot: dict, block_rows: list[dict] | None = None,
           venue_block_rows: list[dict] | None = None,
           stale: list[dict] | None = None,
-          tape_available: bool = True) -> dict:
+          tape_available: bool | None = None) -> dict:
     asset = asset.upper()
+    # Defaulting to True silently kept the pre-PR deletion on whichever caller
+    # forgot to pass it. Unset now means "read it off the rows you handed me",
+    # which is the answer that caller would have computed anyway.
+    if tape_available is None:
+        tape_available = bool(block_rows)
     mkt = deri.get("market")
     window_h = (end_ms - start_ms) / 3600_000
 
@@ -897,7 +903,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     pt, ct = hot.get("put_trades"), hot.get("call_trades")
     pc = round(pt / ct, 2) if pt is not None and ct else None
     tt = hot.get("trades_total")
-    activity_split = None
+    activity_split, activity_unread = None, []
     if tt:
         # Fold raw venue ids into display labels FIRST, so venues that share a label
         # (deribit + deribit-usdc → "Deribit") collapse into a single entry before
@@ -916,10 +922,16 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
             if _state(states.get(v)) in ("unreadable", "feed_gap"):
                 unread.add(label)
             by_label[label] += n
+        # An unread venue's own share is unknowable, and `0%+` said nothing while
+        # leaving the OTHER rows — the ones actually inflated by its absence —
+        # unmarked. Drop it from the split and name it beside the line instead:
+        # every pct there is then plainly a share of what was read.
         activity_split = [
-            {"venue": lbl, "pct": round(100 * n / tt), "partial": lbl in unread}
+            {"venue": lbl, "pct": round(100 * n / tt)}
             for lbl, n in sorted(by_label.items(), key=lambda kv: -kv[1])
+            if lbl not in unread
         ]
+        activity_unread = sorted(unread)
 
     # Vol surface — v_vol_surface "now" snapshot is authoritative (it pairs with
     # the "open" snapshot for consistent window-over-window deltas); fall back to
@@ -1002,6 +1014,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "volume_scope": volume_scope,
         "activity_trades": tt,
         "activity_split": activity_split,
+        "activity_unread": activity_unread,
         "pc_ratio": pc, "pc_descriptor": pc_descriptor(pc),
         "spot_vol_label": spot_vol_label(spot_open, spot_close, dvol_open, dvol_close),
     }
@@ -1188,16 +1201,27 @@ def render_md(r: dict) -> str:
     # unfenced ⚠ lines.
     states = s.get("venue_coverage") or {}
     if states:
-        _WORDS = {"complete": None, "quiet": "no trades", "feed_gap": "feed gap",
-                  "unreadable": "READ FAILED", "unknown": "unverified"}
-        read = sum(1 for v in states.values() if _state(v) != "unreadable")
-        notes = []
+        # `quiet` is "hours with no prints", NOT "this venue never traded" —
+        # Bullish traded 341 of 720 hours and would have read `Bullish no
+        # trades` beside `Bullish 40%` in the same fence.
+        _WORDS = {"complete": None, "quiet": "quiet hours", "feed_gap": "feed gap",
+                  "companion_gap": "quote gap", "unreadable": "READ FAILED",
+                  "unknown": "unverified"}
+        # Counted over the SAME folded labels the notes use: counting raw venue
+        # ids printed `3/5 venues` beside four labels, a denominator the
+        # Activity line below could not be reconciled with.
+        by_label: dict = {}
         for venue, state in states.items():
-            word = _WORDS.get(_state(state))
-            if word:
-                notes.append(f"{_venue_label(venue)} {word}")
+            label = _venue_label(venue)
+            # Worst state wins when two ids fold into one label.
+            rank = ("complete", "quiet", "companion_gap", "feed_gap", "unknown", "unreadable")
+            current = by_label.get(label)
+            if current is None or rank.index(_state(state)) > rank.index(current):
+                by_label[label] = _state(state)
+        read = sum(1 for st in by_label.values() if st not in ("unreadable", "unknown"))
+        notes = [f"{label} {_WORDS[st]}" for label, st in by_label.items() if _WORDS.get(st)]
         detail = " · ".join(notes) if notes else "all venue feeds complete"
-        L.append(f"{'Coverage':<9} {f'{read}/{len(states)} venues':<11} {detail}")
+        L.append(f"{'Coverage':<9} {f'{read}/{len(by_label)} venues':<11} {detail}")
 
     spot = f"${s['spot']:,}" if s.get("spot") else "n/a"
     chg = s.get("spot_change_pct")
@@ -1234,11 +1258,14 @@ def render_md(r: dict) -> str:
         tt = s["activity_trades"]
         tnum = (f"{tt / 1e6:.1f}M" if tt >= 1e6 else
                 f"{round(tt / 1e3)}k" if tt >= 1e3 else f"{int(tt)}")
-        # A partial venue's share is a floor, not a share — mark it where it is
-        # read, because the ⚠ line above names a query and this names a venue.
         split = " · ".join(f"{v['venue']} {v['pct']}%{'+' if v.get('partial') else ''}"
                            for v in (s.get("activity_split") or [])[:4])
-        L.append(f"{'Activity':<9} {tnum:<11} trades — {split} (by trade count)")
+        # Naming the unread venue is what makes the other shares readable: they
+        # are shares of what was read, and the denominator is short by it.
+        unread = s.get("activity_unread") or []
+        note = ("by trade count" if not unread else
+                f"by trade count; {', '.join(unread)} unread — shares are of what was read")
+        L.append(f"{'Activity':<9} {tnum:<11} trades — {split} ({note})")
     else:
         L.append(f"{'Activity':<9} {'n/a':<11} trades (by trade count)")
     vol = f"${s['volume_usd_m']}M" if s.get("volume_usd_m") else "n/a"
@@ -1422,8 +1449,11 @@ def main() -> None:
                 warn(f"stale hot {'/'.join(kept)} retained — no live replacement; "
                      "those Snapshot figures are NOT live")
 
+    # The same signal computed below for `block_tape_empty`: --no-s3 never
+    # attempts the read, so the tape is not "missing" there.
     result = build(asset, args.window, start_ms, now_ms, deri, hot, block_rows,
-                   venue_block_rows, stale=stale)
+                   venue_block_rows, stale=stale,
+                   tape_available=bool(args.no_s3 or block_rows))
     # With the legacy csv.gz read gone there is nothing to fall back TO, so an
     # empty blocks.csv is no longer "serving stale" — it is Block Flow missing
     # outright. Still rendered rather than warned: WARNINGS are discarded on

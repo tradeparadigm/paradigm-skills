@@ -326,15 +326,26 @@ def test_dedupe_excludes_paradigm_brokered_venues():
     with tempfile.TemporaryDirectory() as d:
         _write(d, "venue_blocks.csv", VENUE_BLOCKS_CSV)
         rows = load_venue_blocks(d, "BTC")
-    kept = {r["block_id"] for r in _dedupe_kept(rows)}
+    # The tape must actually carry rows for the exclusion to be the right call:
+    # an EMPTY tape has nothing to double-count against, which is the branch
+    # below. These rows are stamped with no VENUE_BLOCK_TRADE_ID, which is the
+    # id-space-unproven case this test is about.
+    unstamped = [{"PRODUCT": "BTC OPTION - DBT", "BLOCK_TRADE_ID": "P-1"}]
+    kept = {r["block_id"] for r in _dedupe_kept(rows, unstamped)}
     check("okx merges (never brokered)", {"OKX-BLK-1", "OKX-BLK-2"} <= kept, kept)
     check("deribit excluded (could be brokered)", "BLOCK-280624" not in kept, kept)
     check("bullish excluded (could be brokered)", "OTC-9" not in kept, kept)
     # Case-insensitive on the exchange id.
     mixed = [{"exchange": "Deribit", "block_id": "X"},
              {"exchange": "OKEX-OPTIONS", "block_id": "Y"}]
-    kept2 = {r["block_id"] for r in _dedupe_kept(mixed)}
+    kept2 = {r["block_id"] for r in _dedupe_kept(mixed, unstamped)}
     check("case-insensitive venue match", kept2 == {"Y"}, kept2)
+    # A tape that READ FINE and carried nothing has nothing to dedupe against,
+    # so the same rows must survive — keying on the exception alone deleted
+    # them for the six days the producer was down.
+    empty = {r["block_id"] for r in _dedupe_kept(rows, [])}
+    check("an empty-but-readable tape keeps the brokered blocks",
+          {"BLOCK-280624", "OTC-9"} <= empty, empty)
 
 
 def test_dedupe_exact_id_with_per_venue_coverage_gate():
@@ -1936,12 +1947,20 @@ def test_coverage_leads_the_snapshot_and_names_unread_venues():
           bool(cov) and bool(fence) and fence[0] < cov[0] < fence[1], lines[:14])
     check("an unreadable venue is not counted as read",
           bool(cov) and "2/3 venues" in lines[cov[0]], lines[cov[0]] if cov else None)
-    check("it distinguishes no-trades from a failed read",
-          bool(cov) and "Bullish no trades" in lines[cov[0]]
+    check("it distinguishes quiet hours from a failed read",
+          bool(cov) and "Bullish quiet hours" in lines[cov[0]]
           and "READ FAILED" in lines[cov[0]], lines[cov[0]] if cov else None)
+    # `quiet` is per-hour, so it must not read as "this venue never traded".
+    check("quiet is not rendered as no trades",
+          bool(cov) and "no trades" not in lines[cov[0]], lines[cov[0]] if cov else None)
     act = next((l for l in lines if l.startswith("Activity")), "")
-    check("a venue that could not be read is marked on the Activity line",
-          "Bybit 20%+" in act, act)
+    # The unread venue's own share is unknowable; what the reader needs is that
+    # the OTHER shares are of a short denominator. `Bybit 20%+` said neither.
+    check("the unread venue is named beside the line", "Bybit unread" in act, act)
+    check("and the remaining shares are declared to be of what was read",
+          "shares are of what was read" in act, act)
+    check("the unread venue does not carry a share of its own",
+          "Bybit 20%" not in act and "Bybit 0%" not in act, act)
 
 
 def test_a_block_with_no_trade_time_index_falls_back_without_crashing():

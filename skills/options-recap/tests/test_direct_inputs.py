@@ -330,31 +330,76 @@ def test_schema_drift_across_objects_falls_back_to_string():
     assert merged.column("id").to_pylist() == ["1", "2", "x"]
 
 
+HOURS = ("20260916T09", "20260916T10", "20260916T11", "20260916T12")
+COV_END = datetime(2026, 9, 16, 12, 30, tzinfo=UTC)
+COV_START = COV_END - timedelta(hours=3)
+
+
+def _verdict(monkeypatch, present, missing_trade_hours, now=COV_END):
+    monkeypatch.setattr(direct, "hours_present", lambda *a, **k: (set(present), HOURS))
+    monkeypatch.setattr(direct, "connect", lambda: types.SimpleNamespace(close=lambda: None))
+    return direct.coverage_verdict("deribit", "BTC", COV_START, COV_END, missing_trade_hours, now=now)
+
+
+def test_a_trade_hour_the_companion_feed_kept_is_a_quiet_market(monkeypatch):
+    """THE headline claim: missing from both feeds is lost data, missing only
+    from the intermittent trade tape is a quiet market. Neither earlier fixture
+    reached the intersection — in one the missing hour was the in-progress one,
+    in the other it was companion-missing too, so `lost` was identical with the
+    companion check removed."""
+    state, detail = _verdict(monkeypatch, HOURS, ["20260916T10"])
+    assert state == "quiet", (state, detail)
+    assert detail["quiet_hours"] == ["20260916T10"]
+
+
 def test_the_hour_still_being_written_is_not_a_feed_gap(monkeypatch):
     """A live window ends inside the current hour, which no producer has
-    finished writing. Counting it made all five venues report a feed gap on
-    every run — the exact false alarm this coverage check exists to remove."""
-    end = datetime(2026, 9, 16, 12, 30, tzinfo=UTC)
-    start = end - timedelta(hours=3)
-    # The venue wrote 10:00 and 11:00; 12:00 is in progress, so it is absent
-    # from the continuous feed too — that must not read as lost data.
-    monkeypatch.setattr(direct, "hours_present",
-                        lambda *a, **k: ({"20260916T09", "20260916T10", "20260916T11"},
-                                         ("20260916T09", "20260916T10", "20260916T11",
-                                          "20260916T12")))
-    monkeypatch.setattr(direct, "connect", lambda: types.SimpleNamespace(close=lambda: None))
-    state, _ = direct.coverage_verdict("deribit", "BTC", start, end, ["20260916T12"])
+    finished writing. Counting it made all five venues report a feed gap."""
+    state, _ = _verdict(monkeypatch, HOURS[:3], ["20260916T12"])
     assert state == "complete"
 
-    # A genuinely missing mid-window hour still reports.
-    monkeypatch.setattr(direct, "hours_present",
-                        lambda *a, **k: ({"20260916T09", "20260916T11"},
-                                         ("20260916T09", "20260916T10", "20260916T11",
-                                          "20260916T12")))
-    state, detail = direct.coverage_verdict("deribit", "BTC", start, end,
-                                            ["20260916T10", "20260916T12"])
+
+def test_a_replay_window_does_not_excuse_its_final_hour(monkeypatch):
+    """The in-progress exclusion is about NOW, not about `end`. Deriving it from
+    `end` alone reported a genuinely dead final hour as fully covered."""
+    later = COV_END + timedelta(hours=6)
+    state, detail = _verdict(monkeypatch, HOURS[:3], ["20260916T12"], now=later)
+    assert state == "feed_gap", (state, detail)
+    assert detail["lost_hours"] == ["20260916T12"]
+
+
+def test_a_genuinely_missing_mid_window_hour_still_reports(monkeypatch):
+    state, detail = _verdict(monkeypatch, {"20260916T09", "20260916T11"},
+                             ["20260916T10", "20260916T12"])
     assert state == "feed_gap"
     assert detail["lost_hours"] == ["20260916T10"]
+
+
+def test_a_companion_only_gap_is_not_a_feed_gap(monkeypatch):
+    """The trade tape covered these hours; only the quote feed lost them. Calling
+    that `feed_gap` made the caller say the trades below were understated, which
+    is false for exactly the hours that triggered it."""
+    state, detail = _verdict(monkeypatch, {"20260916T09", "20260916T11"}, [])
+    assert state == "companion_gap", (state, detail)
+    assert detail["lost_hours"] == ["20260916T10"]
+
+
+def test_an_empty_companion_listing_is_unknown_not_a_total_outage(monkeypatch):
+    """An empty LIST is indistinguishable from a wrong prefix, so it cannot be
+    read as every hour lost on a venue whose trade tape is 100% complete."""
+    state, _ = _verdict(monkeypatch, set(), [])
+    assert state == "unknown"
+
+
+def test_a_failed_coverage_read_does_not_abort_the_recap(monkeypatch):
+    """Advisory: the trade rows are already in memory, so a 403 on the companion
+    LIST must cost the coverage note and nothing else."""
+    def boom():
+        raise RuntimeError("AccessDenied on LIST")
+    monkeypatch.setattr(direct, "connect", boom)
+    state, detail = direct.coverage_verdict("deribit", "BTC", COV_START, COV_END, [])
+    assert state == "unknown"
+    assert "AccessDenied" in detail["error"]
 
 
 def test_a_block_missing_one_legs_index_is_not_half_priced():

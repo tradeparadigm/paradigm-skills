@@ -288,40 +288,53 @@ def inputs(totals, evidence, specs, gaps, coverage=None):
 COMPANION = "option_summary"
 
 
-def coverage_verdict(venue, asset, start, end, missing_trade_hours):
-    """Classify a venue's window: complete, quiet, or a real feed gap.
+def coverage_verdict(venue, asset, start, end, missing_trade_hours, now=None):
+    """Classify a venue's window: complete, quiet, companion_gap or feed_gap.
 
-    Returns (state, detail). Only `feed_gap` means data was lost.
+    Returns (state, detail). Only `feed_gap` means the venue's OWN trade data
+    was lost; `companion_gap` is the quote feed dropping hours the trade tape
+    covered anyway, which understates nothing below it.
+
+    Advisory: any failure to read the companion listing returns `unknown`
+    rather than raising. The trade rows are already in memory by this point,
+    and a 403 on a LIST must not cost the whole recap.
     """
-    connection = connect()
     try:
-        present, expected = hours_present(connection, "normalized", venue, COMPANION,
-                                          asset.lower(), start, end)
-    finally:
-        connection.close()
-    if not expected:
+        connection = connect()
+        try:
+            present, expected = hours_present(connection, "normalized", venue, COMPANION,
+                                              asset.lower(), start, end)
+        finally:
+            connection.close()
+    except Exception as exc:
+        return "unknown", {"error": str(exc)}
+    if not expected or not present:
+        # An empty listing is indistinguishable from a wrong prefix or a silent
+        # empty LIST, so it cannot be read as a total outage — that reported
+        # every hour lost on a venue whose trade tape was 100% complete.
         return "unknown", {}
-    # The window's final bucket is the hour still in progress — producers write
-    # into it a few minutes late, so it is absent from every feed on a live run.
-    # Counting it made all five venues report a feed gap every time.
-    in_progress = f"{end:%Y%m%dT%H}"
-    expected = tuple(h for h in expected if h != in_progress)
-    present = present - {in_progress}
-    missing_trade_hours = [h for h in missing_trade_hours if h != in_progress]
+    # The final bucket is the hour still being written, but ONLY on a live run:
+    # deriving it from `end` alone hid a genuinely dead final hour on a replay.
+    now = now or datetime.now(timezone.utc)
+    live = (now - end) < timedelta(hours=1)
+    in_progress = f"{end:%Y%m%dT%H}" if live else None
+    if in_progress:
+        expected = tuple(h for h in expected if h != in_progress)
+        present = present - {in_progress}
+        missing_trade_hours = [h for h in missing_trade_hours if h != in_progress]
     if not expected:
         return "unknown", {}
     companion_missing = set(expected) - present
     lost = sorted(set(missing_trade_hours) & companion_missing)
     quiet = sorted(set(missing_trade_hours) - companion_missing)
+    detail = {"quiet_hours": quiet, "expected": len(expected)}
     if lost:
-        return "feed_gap", {"lost_hours": lost, "quiet_hours": quiet,
-                            "expected": len(expected)}
+        return "feed_gap", dict(detail, lost_hours=lost)
     if companion_missing:
-        # The feed dropped hours the trade tape happened to cover anyway.
-        return "feed_gap", {"lost_hours": sorted(companion_missing),
-                            "quiet_hours": quiet, "expected": len(expected)}
-    return ("quiet" if quiet else "complete"), {"quiet_hours": quiet,
-                                                "expected": len(expected)}
+        # The quote feed dropped hours the trade tape covered anyway. Nothing
+        # below is understated, so this must not render as a feed gap.
+        return "companion_gap", dict(detail, lost_hours=sorted(companion_missing))
+    return ("quiet" if quiet else "complete"), detail
 
 
 def run(asset, window, start, end):
@@ -412,6 +425,15 @@ def run(asset, window, start, end):
                         read_gaps.append(
                             f"{venue}: {lost} of {detail['expected']} hours missing from the "
                             f"venue's own feed — trades, volume and share below are understated")
+                    elif state == "companion_gap":
+                        # The trade tape covered these hours; only the quote
+                        # feed lost them. Saying "understated" here would be
+                        # false for exactly the hours that triggered it.
+                        lost = len(detail["lost_hours"])
+                        read_gaps.append(
+                            f"{venue}: {lost} of {detail['expected']} hours missing from the "
+                            f"quote feed — trades below are complete, but coverage for those "
+                            f"hours could not be confirmed")
                 else:
                     coverage[venue] = ("unreadable", {})
                 trades = rows.filter(pl.col("record_type") == "trade") if rows.height else rows
