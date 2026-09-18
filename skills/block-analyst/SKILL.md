@@ -201,20 +201,18 @@ convention reasoning.
 > Deribit ticker/greeks. Steps 2a/2b apply on the manual fallback only (script
 > unavailable / injected data), or when filling in a `⚠ UNMAPPED` block.
 
-**Step 2a — surface anchor (one DuckDB read).** Read the hot snapshot
-for the current ATM IV per venue + recent block activity before
-hitting per-leg endpoints:
-`s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet`.
-See `paradigm-data-discovery` Dataset 6 for the schema. Use to anchor
-each leg's IV against the venue's current ATM (rich/cheap framing) and
-to surface recent block activity (`signal_type = 'block_summary'`,
-covering deribit/okex/bullish) that may contextualise the trade. For the
-full per-strike surface (Step 5 vol-surface impact), read the consolidated
-`v_vol_surface` store at
-`s3://dt-paradigm-data/paradigm_data/v_vol_surface/_hot.parquet`
-(per-strike `mark_iv`/`delta`, keyed by instrument `symbol`; see
-`paradigm-data-discovery`) instead of fetching it.
-The snapshot does NOT replace per-leg fetches — block-analyst still needs
+**Step 2a — surface anchor (one DuckDB read).** Anchor each leg's IV against
+its venue's current ATM (rich/cheap framing) from the normalized
+`option_summary` per-period aggregates — NOT a `hot__*` object:
+`normalized/exchange=<venue>/data_type=option_summary/currency=<ccy>/level=1m/
+…/*__agg__*.parquet`. One row per `(exchange, symbol, period)` carrying
+`markIV_close`, `delta_close` and `openInterest_close`, so ATM is the row
+nearest 50 delta: `ORDER BY abs(abs(delta_close) - 0.5)`. The same files serve
+the full per-strike surface for Step 5. Read with `union_by_name=true`, glob
+per UTC day, and see `paradigm-data-discovery`'s `references/exchange-raw.md`
+for the layout and the unit rules. For recent block activity that may
+contextualise the trade, read the raw venue block-trade rows per venue.
+These aggregates do NOT replace per-leg fetches — block-analyst still needs
 specific instrument marks for fill benchmarking.
 
 **Step 2b — per-leg fetches.** For each leg, fetch its current mark from the venues below in

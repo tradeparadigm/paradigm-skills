@@ -164,5 +164,16 @@ try:
 finally:
     ca.read_executions = real
 
+# --- no skill file directs a read at a hot object or v_vol_surface ---------
+import re  # noqa: E402
+
+SKILL = Path(HERE).parent
+for doc in sorted(SKILL.glob("*.md")) + sorted((SKILL / "references").glob("*.md")):
+    text = doc.read_text()
+    # A prohibition names the object to forbid it; a READ puts it in a path.
+    reads = re.findall(r"s3://\S*(?:hot/|hot__|v_vol_surface)\S*", text)
+    reads += re.findall(r"`[^`]*(?:hot__|v_vol_surface)[^`]*\.parquet`", text)
+    ok(not reads, f"{doc.name} directs no read at a hot object: {reads}")
+
 print(f"\n{_p} passed, {_f} failed")
 sys.exit(1 if _f else 0)
