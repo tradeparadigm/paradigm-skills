@@ -341,9 +341,10 @@ def _package(rows: list[dict]) -> tuple[list[dict], float, float]:
     Rows are grouped ONLY on real identity — a DESCRIPTION that resolves to one
     leg. That covers the multi-maker case, where one leg arrives as several rows
     and their sizes add. When several rows share one COMBINED description,
-    nothing in that string says which row is which leg, so no grouping is
-    attempted and the smallest row wins as it did before; `package_size_certain`
-    reports that, and analyze.py warns rather than printing a confident size.
+    nothing in that string says which row is which leg; inferring it from side
+    and/or price mis-sized a different family of equal-size structures each time
+    it was tried, so nothing is inferred and the pre-PR answer stands.
+    `package_size_certain` reports that, and analyze.py renders a ⚠.
 
     The one place base and size differ: a SINGLE row whose DESCRIPTION STATES
     its ratios counts the widest leg in QTY while its PRICE is already the
@@ -369,8 +370,17 @@ def _package(rows: list[dict]) -> tuple[list[dict], float, float]:
         for identity, (_, qty) in zip(identities, sized):
             totals[identity] = totals.get(identity, 0.0) + qty
         base = min(totals.values())
-    else:
+    elif len({(r.get("SIDE") or "").upper() for r, _ in sized}) == len(sized):
+        # Every row a different side, so every row IS a leg and none can be a
+        # clip of another: the smallest is the package base. This is the ratio
+        # case the whole change is for — 40 BUY / 20 SELL is 20 packages.
         base = min(qty for _, qty in sized)
+    else:
+        # Two rows share a side under one combined DESCRIPTION, so a clipped leg
+        # and a second leg on that side are indistinguishable. Keep the pre-PR
+        # answer — the first row — so an ambiguous block is never sized worse
+        # than before, and let `package_size_certain` make it visible instead.
+        base = sized[0][1]
     return prem, base, base
 
 

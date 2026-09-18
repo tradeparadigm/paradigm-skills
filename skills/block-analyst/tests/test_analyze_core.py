@@ -315,7 +315,7 @@ ok(ac.structure_unit(fly_row) == 100.0, "a 100-lot fly is 100 flies, not 50")
 # Nothing in that string says which row is which leg, so this is NOT recovered —
 # the smallest row wins and the caller is told the size is inferred.
 clipped = [dict(ratio_rows[0], QTY=40), dict(ratio_rows[1], QTY=10), dict(ratio_rows[1], QTY=10)]
-ok(ac.structure_unit(clipped) == 10.0, "a clipped leg under a combined DESCRIPTION is not inferred")
+ok(ac.structure_unit(clipped) == 40.0, "a clipped leg under a combined DESCRIPTION keeps the pre-PR size")
 ok(not ac.package_size_certain(clipped), "and the caller is told so")
 per_leg = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 24 Jul 26 59000",
             "QTY": 40, "PRICE": 0.0023, "REF_PRICE": 0.0021, "SIDE": "BUY"},
@@ -335,7 +335,7 @@ ok(abs(ac.struct_net(clips, "PRICE") - 0.0122) < 1e-9,
 # clips from side and/or price was tried and mis-sized a different family of
 # equal-size structures each time — see the PR body.
 unkeyed = [dict(r, DESCRIPTION="C 7 May 26 84000") for r in clips]
-ok(ac.structure_unit(unkeyed) == 20.0, "an unresolvable DESCRIPTION falls back to the smallest row")
+ok(ac.structure_unit(unkeyed) == 30.0, "an unresolvable DESCRIPTION keeps the pre-PR size")
 ok(not ac.package_size_certain(unkeyed), "and says the size is inferred")
 # Put-call parity makes an at-the-forward straddle's two legs print the SAME
 # price, and its two rows the same side. Grouping on either merged them into one
@@ -354,6 +354,13 @@ ok(not ac.package_size_certain(clipped_straddle), "a clipped leg cannot be told 
 ok(ac.package_size_certain(clips), "per-instrument rows carry real identity")
 ok(ac.package_size_certain(ratio_rows), "distinct sides under one description are unambiguous")
 ok(ac.package_size_certain(fly_row), "a single row is never ambiguous")
+# The whole point of the fallback: an ambiguous block must never be sized worse
+# than it was before this PR. These are the shapes round 4 got wrong.
+_pre = lambda rows: ac._f(rows[0].get("QTY")) or 1.0
+for _rows, _name in ((clipped, "a clipped ratio leg"), (straddle, "a straddle"),
+                     (clipped_straddle, "a clipped straddle"), (unkeyed, "bare clips")):
+    ok(ac.structure_unit(_rows) == _pre(_rows), f"{_name} keeps the pre-PR size")
+    ok(not ac.package_size_certain(_rows), f"{_name} is declared inferred")
 
 
 # ── the header itself: structure_unit reaching the rendered ×N ──────────────────
