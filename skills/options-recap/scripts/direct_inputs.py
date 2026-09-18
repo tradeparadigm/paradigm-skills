@@ -372,6 +372,7 @@ def run(asset, window, start, end):
     # this is not a live window.
     now = datetime.now(timezone.utc)
     in_progress = f"{end:%Y%m%dT%H}" if (now - end) < timedelta(hours=1) else None
+    hour_aligned = not (end.minute or end.second or end.microsecond)
     # Partition reads get their own pool: they are the ones holding a window in
     # memory, so their concurrency is a memory budget, not a latency choice.
     readers = query_workers(end - start)
@@ -427,8 +428,12 @@ def run(asset, window, start, end):
                 # replay `end` is historical and its final hour is genuinely due.
                 absent = [h for h in source["path_plan"].get("missing_hours", ())
                           if h != in_progress]
+                # Subtract only when that bucket is actually IN the plan.
+                # hour_patterns steps `while cursor < end`, so an hour-aligned
+                # end never includes its own hour and the discount printed
+                # "24 of 23" for a window where 24 hours really were expected.
                 expected = max(source["path_plan"].get("pattern_count", 0)
-                               - (1 if in_progress else 0), 1)
+                               - (1 if in_progress and not hour_aligned else 0), 1)
                 if absent:
                     read_gaps.append(
                         f"{query.name}: {len(absent)} of {expected} hourly paths absent; "

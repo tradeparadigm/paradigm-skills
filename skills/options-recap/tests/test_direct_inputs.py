@@ -404,7 +404,9 @@ def test_a_failed_coverage_read_does_not_abort_the_recap(monkeypatch):
 
 def _run_once(monkeypatch, *, coverage=("feed_gap", {"lost_hours": ["20260916T10"],
                                                     "expected": 3, "quiet_hours": []}),
-              missing_hours=("20260916T10",), status="ok"):
+              missing_hours=("20260916T10",), status="ok",
+              query_name="option_trades_deribit", end=None, pattern_count=4,
+              coverage_patch=True):
     """Drive `run()` through ONE real venue read, so the loop body executes.
 
     Stubbing build_queries to [] emptied the loop, which left coverage_verdict,
@@ -412,11 +414,12 @@ def _run_once(monkeypatch, *, coverage=("feed_gap", {"lost_hours": ["20260916T10
     that named them still passed.
     """
     calls = {}
-    query = collector.Query(name="option_trades_deribit", paths=["s3://x"], sql="SELECT 1",
+    query = collector.Query(name=query_name, paths=["s3://x"], sql="SELECT 1",
                             units={}, stream=True, columns=("timestamp",))
     rows = pl.DataFrame({"record_type": ["trade"], "timestamp": ["2026-09-16T10:00:00Z"]})
     source = {"status": status, "error": "boom",
-              "path_plan": {"missing_hours": list(missing_hours), "pattern_count": 4,
+              "path_plan": {"missing_hours": list(missing_hours),
+                            "pattern_count": pattern_count,
                             "missing_pattern_count": len(missing_hours)}}
 
     class _Future:
@@ -434,7 +437,8 @@ def _run_once(monkeypatch, *, coverage=("feed_gap", {"lost_hours": ["20260916T10
     monkeypatch.setattr(direct, "build_queries", lambda *a, **k: [query])
     monkeypatch.setattr(direct, "run_query", lambda *a, **k: (source, rows))
     monkeypatch.setattr(direct, "metadata", lambda *a, **k: pl.DataFrame())
-    monkeypatch.setattr(direct, "coverage_verdict", lambda *a, **k: coverage)
+    if coverage_patch:
+        monkeypatch.setattr(direct, "coverage_verdict", lambda *a, **k: coverage)
     monkeypatch.setattr(direct, "aggregate_trades", lambda *a, **k: dict(direct.EMPTY_TOTAL))
     monkeypatch.setattr(direct, "read_executions",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no partition")))
@@ -448,7 +452,8 @@ def _run_once(monkeypatch, *, coverage=("feed_gap", {"lost_hours": ["20260916T10
         return {"trades_total": 1, "venue_coverage": coverage}, [], 0.0
 
     monkeypatch.setattr(direct, "inputs", fake_inputs)
-    result = direct.run("BTC", "24h", COV_START, COV_END)
+    window_end = end or COV_END
+    result = direct.run("BTC", "24h", window_end - timedelta(hours=3), window_end)
     return calls, captured, result
 
 
@@ -544,6 +549,65 @@ def test_unvalued_trades_name_the_venue_whose_metadata_is_short():
     volume = [g for g in gaps if g.startswith("Volume:")]
     assert volume, gaps
     assert "Bybit 2 of 2 (100%) across 2 symbols" in volume[0]
+
+
+def test_an_hour_aligned_window_does_not_discount_a_bucket_it_never_had():
+    """hour_patterns steps `while cursor < end`, so an hour-aligned end never
+    includes its own hour. Discounting it anyway printed "24 of 23" for a window
+    where 24 hours really were expected."""
+    end = datetime(2026, 9, 18, 12, 0, tzinfo=UTC)
+    _, aligned = collector.hour_patterns("normalized", "deribit", "option_summary",
+                                         "btc", end - timedelta(hours=24), end)
+    assert len(aligned) == 24 and f"{end:%Y%m%dT%H}" not in aligned
+    mid = end.replace(minute=30)
+    _, unaligned = collector.hour_patterns("normalized", "deribit", "option_summary",
+                                           "btc", mid - timedelta(hours=24), mid)
+    assert f"{mid:%Y%m%dT%H}" in unaligned, unaligned[-1]
+
+
+def test_the_read_gap_denominator_matches_the_plan(monkeypatch):
+    """The `N of M` on a partial-coverage line: M must be the hours the plan
+    actually asked for."""
+    for end, expected in ((datetime(2026, 9, 18, 12, 0, tzinfo=UTC), "of 24"),
+                          (datetime(2026, 9, 18, 12, 30, tzinfo=UTC), "of 24")):
+        _, captured, _ = _run_once(
+            monkeypatch, query_name="venue_blocks_deribit", end=end,
+            missing_hours=("20260918T03",), pattern_count=(24 if end.minute == 0 else 25))
+        line = [g for g in captured["gaps"] if g.startswith("venue_blocks_deribit:")]
+        assert line and expected in line[0], (end.isoformat(), captured["gaps"])
+
+
+def test_the_run_passes_one_clock_to_the_coverage_check(monkeypatch):
+    """Two clocks microseconds apart can straddle the hour boundary and disagree
+    about whether the final bucket is still open."""
+    seen = {}
+
+    def spy(venue, asset, start, end, missing, now=None):
+        seen["now"] = now
+        return "complete", {"quiet_hours": [], "expected": 3}
+
+    monkeypatch.setattr(direct, "coverage_verdict", spy)
+    _run_once(monkeypatch, coverage_patch=False)
+    assert seen["now"] is not None, "run() must hand coverage_verdict its own clock"
+
+
+def test_the_venue_index_comes_from_the_busiest_venue(monkeypatch):
+    """Last resort spot. A one-trade venue's index is a worse estimate than the
+    venue carrying most of the tape, and picking by VENUES order would take it."""
+    totals = {
+        "deribit": dict(direct.EMPTY_TOTAL, count=5, index_close=50_000.0),
+        "bybit-options": dict(direct.EMPTY_TOTAL, count=900, index_close=100_000.0),
+    }
+    snapshot, _, _ = direct.inputs(totals, {}, {}, [])
+    assert snapshot["venue_index_close"] == 100_000.0, snapshot["venue_index_close"]
+
+
+def test_an_exclusion_reason_reads_as_a_sentence():
+    """`reason.replace("_", " ")` leaked the enum name to the reader as
+    "id space unproven"."""
+    assert "id_space_unproven" in direct._EXCLUSION_REASONS
+    said = direct._EXCLUSION_REASONS["id_space_unproven"]
+    assert "_" not in said and said.startswith("the "), said
 
 
 def test_every_venue_named_in_a_gap_uses_the_snapshot_vocabulary():
