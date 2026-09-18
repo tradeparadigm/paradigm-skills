@@ -1,5 +1,6 @@
 {
   "skill_name": "paradigm-block-analyst",
+  "grading_note": "WHAT THESE MEASURE: relaying, not derivation. run_evals.py calls the model with NO tools, so the agent cannot run analyze.py; every case below injects the package figures the script computes deterministically (`context`) and asserts the model reports them unchanged. A regression in structure_unit(), struct_net() or the rendered header will NOT move this score — test_analyze_core.py is the guard for those. Read the percentage as reporting fidelity, not skill correctness.",
   "requires_auth": false,
   "evals": [
     {
@@ -12,7 +13,7 @@
         "Response reports the fill as 0.0122 BTC paid against a 0.0118 mark, an offset of +4 bps above mark",
         "Response gives the structure size as 50",
         "Response does not invent greeks, per-leg IV, history or live bid/ask — each is omitted or explicitly marked unavailable",
-        "Response does not add a simulated-data or example-values disclaimer"
+        "Response presents the taker as the Buyer of the call"
       ],
       "context": "<analysis>\nPackage figures already computed deterministically by the bundled script from the tape rows in this prompt. Report them directly — do NOT recompute them, and never substitute a single leg's OFFSET_BPS for the package offset:\n{\n  \"structure_size\": 50,\n  \"taker\": \"Buyer\",\n  \"premium\": {\n    \"verb\": \"Paid\",\n    \"net_package_price\": 0.0122\n  },\n  \"net_package_mark\": 0.0118,\n  \"package_offset_bps\": 4.0,\n  \"offset_direction\": \"above mark\"\n}\n\nGreeks, per-leg IV, trade history and live screen quotes are NOT supplied for this case. Omit those rows or mark them explicitly unavailable — never invent them, and never delay the execution answer waiting for them.\n</analysis>\n\n"
     },
@@ -26,7 +27,7 @@
         "Response reports the fill as 0.0045 BTC paid against a 0.0041 mark, an offset of +4 bps above mark",
         "Response gives the structure size as 100",
         "Response does not invent greeks, per-leg IV, history or live bid/ask — each is omitted or explicitly marked unavailable",
-        "Response does not add a simulated-data or example-values disclaimer"
+        "View line describes the directional exposure — long upside / short downside or equivalent"
       ],
       "context": "<analysis>\nPackage figures already computed deterministically by the bundled script from the tape rows in this prompt. Report them directly — do NOT recompute them, and never substitute a single leg's OFFSET_BPS for the package offset:\n{\n  \"structure_size\": 100,\n  \"taker\": \"Buyer\",\n  \"premium\": {\n    \"verb\": \"Paid\",\n    \"net_package_price\": 0.0045\n  },\n  \"net_package_mark\": 0.0041,\n  \"package_offset_bps\": 4.0,\n  \"offset_direction\": \"above mark\"\n}\n\nGreeks, per-leg IV, trade history and live screen quotes are NOT supplied for this case. Omit those rows or mark them explicitly unavailable — never invent them, and never delay the execution answer waiting for them.\n</analysis>\n\n"
     },

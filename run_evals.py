@@ -395,6 +395,9 @@ def _run_one_case(client, agent_model: str, grader_model: str,
     return {
         "id": case["id"],
         "prompt": case["prompt"],
+        # Not the run-level flag: a case carrying `context` suppresses simulate
+        # above, so the run-level one labels these as simulated when they are not.
+        "simulated": effective_simulate,
         "passed": passed,
         "total": total,
         "score": round(passed / total, 3) if total else 0,
