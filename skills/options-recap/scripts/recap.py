@@ -945,6 +945,15 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         spot_low = min(s.get("low") or [0]) or None
 
     spot = spot_close or hot.get("surface_spot") or (mkt or {}).get("spot_now")
+    if not spot and hot.get("venue_index_close"):
+        # Deribit's public API is the only spot source in direct mode, and when
+        # it fails every venue block loses its price: Block Flow rendered
+        # $0.0M / 0 blocks on a window holding 97 real blocks. The venue tape's
+        # own trade-time index is already in memory, so use it and say so.
+        spot = float(hot["venue_index_close"])
+        warn("Spot taken from the venue tape's own trade-time index — the Deribit "
+             "price feed was unavailable, so Spot and any block priced without a "
+             "trade-time index of its own are approximate")
 
     rv = realized_vs_implied(deri.get("closes_7d") or [], dvol_close)
 

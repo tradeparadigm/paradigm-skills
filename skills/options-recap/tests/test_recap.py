@@ -562,6 +562,30 @@ def test_partial_turnover_does_not_claim_all_venues():
           hot2["turnover_complete"])
 
 
+def test_a_dead_price_feed_does_not_zero_block_flow():
+    """Deribit's public API is the only spot source in direct mode. On 2026-09-18
+    it failed cert verification behind the egress proxy and Block Flow rendered
+    $0.0M / 0 blocks on a window holding 97 real blocks."""
+    venue_rows = [{"exchange": "deribit", "block_id": "V-1", "bucket_at": 1_500_000,
+                   "volume_coin": 10.0, "leg_count": 1}]
+    # No spot anywhere: no Deribit market, no hot surface, no spot_close.
+    res = build("btc", "8h", 0, 8 * 3600_000, {"closes_7d": [], "market": None},
+                {"trades_total": 10, "trades_by_venue": {"deribit": 10}},
+                venue_block_rows=venue_rows, tape_available=False)
+    check("with no price at all Block Flow is empty",
+          res["block_flow"]["n_blocks"] == 0, res["block_flow"])
+    # Same window, same rows, but the venue tape carried its own index.
+    res2 = build("btc", "8h", 0, 8 * 3600_000, {"closes_7d": [], "market": None},
+                 {"trades_total": 10, "trades_by_venue": {"deribit": 10},
+                  "venue_index_close": 100_000.0},
+                 venue_block_rows=venue_rows, tape_available=False)
+    check("the venue tape's own index prices the block instead",
+          res2["block_flow"]["n_blocks"] == 1, res2["block_flow"])
+    check("and the reader is told the price is approximate",
+          any("venue tape's own trade-time index" in w for w in res2["warnings"]),
+          res2["warnings"])
+
+
 def test_exclusion_magnitudes_count_only_what_the_totals_lost():
     """The dedupe gate looks wider than the window and _venue_tape_blocks drops
     rows of its own, so the reported blocks/coin were not what Block Flow lost."""

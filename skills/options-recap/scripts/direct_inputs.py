@@ -129,7 +129,8 @@ def priced(frame):
 _PRICED = pl.col("index_price").is_not_null() & (pl.col("index_price") != 0)
 
 EMPTY_TOTAL = {"count": 0, "puts": 0, "calls": 0, "turnover": 0.0,
-               "missing": 0, "missing_symbols": 0, "unclassified": 0, "blocks": []}
+               "missing": 0, "missing_symbols": 0, "unclassified": 0,
+               "index_close": None, "blocks": []}
 
 # The option type is the last bare C/P token, optionally followed by a settlement
 # suffix. `ends_with("-P")` matched four venues and none of Bybit's 571k trades
@@ -159,6 +160,13 @@ def aggregate_trades(venue, rows, spec, gaps):
         converted = rows.with_columns(
             [pl.lit(None, dtype).alias(name) for name, dtype in UNIT_COLUMNS.items()]
         ).with_columns(event_at(rows.schema["timestamp"]).alias("event_at"))
+    # The window's last underlying index this venue printed. Spot otherwise comes
+    # only from Deribit's public API, and when that is unreachable every venue
+    # block loses its price and Block Flow renders $0.0M / 0 blocks — the tape we
+    # already read carries the number.
+    indexed = rows.filter(_PRICED)
+    if indexed.height:
+        total["index_close"] = indexed.sort("timestamp").get_column("index_price")[-1]
     valued = priced(converted)
     unvalued = valued.filter(pl.col("premium").is_null())
     total["missing"] = unvalued.height
@@ -235,6 +243,11 @@ def inputs(totals, evidence, specs, gaps, coverage=None):
             unclassified_venues.append(venue)
         blocks.extend(total["blocks"])
     snapshot.update(turnover_usd=turnover, turnover_complete=missing_values == 0)
+    # Last resort only: build() ranks Deribit's own spot above this.
+    busiest = sorted(((totals.get(v) or EMPTY_TOTAL) for v in VENUES),
+                     key=lambda t: -t["count"])
+    snapshot["venue_index_close"] = next(
+        (t["index_close"] for t in busiest if t.get("index_close")), None)
     snapshot["venue_coverage"] = coverage or {}
     if missing_values:
         # Naming the venue is the whole point: a bare total reads as diffuse
