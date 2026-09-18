@@ -2066,6 +2066,22 @@ def test_coverage_leads_the_snapshot_and_names_unread_venues():
           "shares are of what was read" in act, act)
     check("the unread venue does not carry a share of its own",
           "Bybit 20%" not in act and "Bybit 0%" not in act, act)
+    # The denominator drops with it. A feed_gap venue still contributes SOME
+    # trades, so dividing by the full total left the shown shares summing to
+    # less than 100% under a line promising they were shares of what was read.
+    partial = build("BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+                    {"spot_close": 100000.0, "trades_total": 1000,
+                     "trades_by_venue": {"deribit": 600, "okex-options": 200,
+                                         "bybit-options": 200},
+                     "venue_coverage": {"deribit": ("feed_gap", {}),
+                                        "okex-options": ("complete", {}),
+                                        "bybit-options": ("complete", {})}})
+    shares = [v["pct"] for v in partial["snapshot"]["activity_split"]]
+    check("the shown shares are of what was read, and say so by summing to 100",
+          sum(shares) == 100, shares)
+    check("and the unread venue is still named",
+          partial["snapshot"]["activity_unread"] == ["Deribit"],
+          partial["snapshot"]["activity_unread"])
 
 
 def test_a_block_with_no_trade_time_index_falls_back_without_crashing():
