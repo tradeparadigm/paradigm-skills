@@ -808,18 +808,24 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     mkt = deri.get("market")
     window_h = (end_ms - start_ms) / 3600_000
 
-    # DVOL / spot: hot authoritative for windows the rolling aggregates file
-    # actually spans (~24h); fall back to Deribit market if hot is absent.
-    # PAST ~24h the hot OHLC silently covers only the file's retention — a 2d
-    # recap once quoted a 24h-scoped low under a banner claiming full-window
-    # spot — so for >24h windows the Deribit market fetch (full history) is
-    # authoritative instead, with hot as the fallback.
+    # Spot: the supplied evidence wins for windows it actually spans (~24h for
+    # the old rolling aggregates file); past that its OHLC silently covered only
+    # the file's retention — a 2d recap once quoted a 24h-scoped low under a
+    # banner claiming full-window spot — so the Deribit market fetch (full
+    # history) is authoritative instead, with the supplied value as fallback.
+    #
+    # DVOL is exempt when the caller SAYS its value spans the window. The direct
+    # path reads dvol_window, bounded to the request whatever its width, and
+    # drops it upstream when freshness cannot be proved — preferring the REST
+    # fetch there computed that evidence and threw it away on every window over
+    # a day. Injected legacy evidence makes no such claim and keeps the guard.
     prefer_mkt = window_h > 24
     dvol_close = hot.get("dvol"); dvol_open = hot.get("dvol_open")
     dvol_low, dvol_high = hot.get("dvol_low"), hot.get("dvol_high")
     spot_close = hot.get("spot_close"); spot_open = hot.get("spot_open")
     spot_low = hot.get("spot_low")
-    if (dvol_close is None or prefer_mkt) and mkt and mkt.get("dvol"):
+    dvol_spans_window = bool(hot.get("dvol_window_scoped"))
+    if (dvol_close is None or (prefer_mkt and not dvol_spans_window)) and mkt and mkt.get("dvol"):
         d = mkt["dvol"]
         dvol_open = d[0][1]; dvol_close = d[-1][4]
         dvol_low = min(r[3] for r in d); dvol_high = max(r[2] for r in d)

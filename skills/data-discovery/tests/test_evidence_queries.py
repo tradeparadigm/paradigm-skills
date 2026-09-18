@@ -94,3 +94,26 @@ def test_single_bucket_can_supply_both_anchors(tmp_path):
     result = execute(tmp_path, 'option_surface_deribit', rows, end=START + dt.timedelta(minutes=2))
     assert {row['observation'] for row in result} == {'window_open', 'latest'}
 
+
+
+def test_the_session_zone_statement_runs_and_pins_the_window():
+    """Nothing else executes DUCKDB_PREFIX, so a statement DuckDB rejects here
+    would ship and only fail in the pod. The extension installs need network;
+    the zone statement is the one that changes results, so run that."""
+    statement = [line for line in recap.DUCKDB_PREFIX.splitlines()
+                 if line.strip().startswith("SET TimeZone")]
+    assert statement, recap.DUCKDB_PREFIX
+
+    naive = "2026-09-08T00:30:00"
+    bound = "TIMESTAMPTZ '2026-09-08T00:00:00+00:00'"
+    predicate = f"SELECT TRY_CAST('{naive}' AS TIMESTAMPTZ) >= {bound}"
+
+    shifted = duckdb.connect()
+    shifted.execute("SET TimeZone='Asia/Tokyo';")
+    assert shifted.execute(predicate).fetchone()[0] is False
+
+    pinned = duckdb.connect()
+    for line in statement:
+        pinned.execute(line.strip())
+    assert pinned.execute("SELECT current_setting('TimeZone')").fetchone()[0] == "UTC"
+    assert pinned.execute(predicate).fetchone()[0] is True

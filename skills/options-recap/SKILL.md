@@ -10,6 +10,11 @@ description: >
   "last Xh of flow", or what the vol surface looks like. Dataset inventory,
   schema and historical lookups belong to data-discovery. The output format
   is fixed — always the same four sections in the same order.
+compatibility: >
+  Requires uv (the scripts are PEP 723 single-file programs), S3 read access to
+  dt-exchange-venue-data resolved through the AWS credential chain (IRSA in the
+  deployed stack), and the Deribit public API for realized vol and the
+  DVOL/spot fallback.
 metadata:
   author: tradeparadigm
   version: "2.0"
@@ -23,10 +28,13 @@ metadata:
 24h; `options` is a no-op token. Accept `Nm`, `Nh`, and `Nd` windows, and state
 the actual interval queried rather than silently capping or changing it.
 
-Windows longer than 30d are refused: the execution tape keeps 30 days. Report
-the refusal and the limit, then stop and let the user pick the window. Running
-30d instead is the wrong repair — it lists about ten thousand partitions and
-takes minutes, so it spends their time on a window they did not ask for.
+Windows longer than 30d are refused: the execution tape keeps 30 days. A
+NARROWER ceiling also applies wherever the container is small, because the read
+holds the whole window in memory — the script names the limit it is enforcing
+and which of the two it came from. Report the refusal and that limit, then stop
+and let the user pick the window. Re-running at the ceiling is the wrong repair:
+it lists thousands of partitions and takes minutes, spending their time on a
+window they did not ask for.
 
 ## Live execution
 
@@ -84,15 +92,18 @@ Exclude expired instruments at the comparison anchor and report observed time.
 Start from the requested output and use the smallest direct data set that can
 support it. Typical choices are:
 
-- raw `option_trade` rows from Deribit, Deribit USDC, OKX, Bybit, and Bullish
-  for volume, put/call activity, screen flow, IV at trade, and venue blocks;
-- raw `option_summary` rows for current/window-open mark IV, bid/ask, greeks,
-  OI, underlying price, skew, and term structure;
+- normalized `option_trade` rows from Deribit, Deribit USDC, OKX, Bybit, and
+  Bullish for volume, put/call activity, screen flow, IV at trade, and venue
+  blocks — what `run_recap.sh` reads;
+- normalized `option_summary` rows for current/window-open mark IV, bid/ask,
+  greeks, OI, underlying price, skew, and term structure;
 - existing normalized `option_summary` per-period aggregates when a period-end
   observation suffices; use rows for exact event-time selection and apply the
   same metadata-driven unit conversions;
 - Deribit raw `dvol` for DVOL open/close/high/low;
-- raw `perp_summary` or relevant raw spot/perp trades for spot and funding;
+- raw `perp_summary` or relevant raw spot/perp trades for spot and funding —
+  not read by `run_recap.sh`, which takes spot and the DVOL/spot fallback from
+  the Deribit public API;
 - `meta/instruments/` for contract size and IV/OI/premium units;
 - the daily partitioned Paradigm execution tape for brokered option legs
   (`evidence.paradigm_executions`), the current RFQ tape for request activity,
