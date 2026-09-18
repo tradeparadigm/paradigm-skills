@@ -519,15 +519,15 @@ def run(asset, window, start, end):
             why = ("could not be read" if not tape_available
                    else "carried no Paradigm blocks for this asset")
             gaps.append(
-                f"Block Flow: {excluded['blocks']} {venues} block(s) included without a "
-                f"Paradigm cross-check — the execution tape {why}, so a Paradigm-brokered "
-                f"print among them could not be identified as one")
+                f"Block Flow: {excluded['blocks']} {venues} block(s) (${excluded['notional_m']}M) "
+                f"included without a Paradigm cross-check — the execution tape {why}, so a "
+                f"Paradigm-brokered print among them could not be identified as one")
         else:
             gaps.append(
                 f"Block Flow: {excluded['blocks']} {venues} block(s) excluded "
-                f"({excluded['coin']} coin) — {excluded['reason'].replace('_', ' ')}; "
-                f"the totals below do not include them, and the count is before "
-                f"the $250k floor")
+                f"(${excluded['notional_m']}M, {excluded['coin']} coin) — "
+                f"{excluded['reason'].replace('_', ' ')}; the totals below do not "
+                f"include them")
     # A venue whose rows carry no index_price falls back to window-close spot,
     # so its blocks are ranked against trade-time-priced ones on a different
     # clock — the very thing this phase fixed. Uniform-close was at least

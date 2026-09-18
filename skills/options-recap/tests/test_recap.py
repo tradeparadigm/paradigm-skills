@@ -578,6 +578,18 @@ def test_exclusion_magnitudes_count_only_what_the_totals_lost():
     kept = [r for r in rows if recap._would_have_counted(r, 1_000_000)]
     check("only the in-window, priced, identified block counts",
           [r["block_id"] for r in kept] == ["IN"], [r["block_id"] for r in kept])
+    # And the $250k floor applies to the exclusion note too: a block the floor
+    # would have removed was never in the totals, so it was not lost to this.
+    priced = [dict(r, instrument_kind="option") for r in rows]
+    big = recap._lost_blocks([{"reason": "id_space_unproven", "rows": priced}],
+                             1_000_000, 100_000.0)
+    check("a sub-floor block is not reported as lost",
+          big == [] or all(b["blocks"] == 1 for b in big), big)
+    fat = [dict(priced[0], block_id="FAT", volume_coin=500.0)]
+    lost = recap._lost_blocks([{"reason": "id_space_unproven", "rows": fat}],
+                              1_000_000, 100_000.0)
+    check("an above-floor block is reported with its notional",
+          lost and lost[0]["blocks"] == 1 and lost[0]["notional_m"] > 0, lost)
 
 
 def test_activity_split_collapses_deribit_venues():

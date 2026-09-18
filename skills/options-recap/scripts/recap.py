@@ -56,6 +56,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from vol_math import (  # noqa: E402
     realized_vs_implied,
     build_tape_blocks,
+    MIN_BLOCK_NOTIONAL_USD,
     compute_vol_surface,
     tape_block_key,
     _TAPE_VENUE as _VOL_MATH_VENUE_CODES,
@@ -761,6 +762,27 @@ def _state(value):
     return value[0] if isinstance(value, (list, tuple)) else value
 
 
+def _lost_blocks(excluded: list[dict], start_ms: int, spot: float | None) -> list[dict]:
+    """Per exclusion, the blocks Block Flow would have shown but for it.
+
+    Counting raw ROWS overstated it three ways: the dedupe gate looks wider than
+    the window, _venue_tape_blocks drops rows with no id or no coin, and the
+    $250k floor would have removed some of what survived anyway.
+    """
+    out = []
+    for group in excluded:
+        rows = [r for r in group["rows"] if _would_have_counted(r, start_ms)]
+        blocks = [b for b in _venue_tape_blocks(rows, spot)
+                  if (b.get("notional_usd") or 0) >= MIN_BLOCK_NOTIONAL_USD]
+        if blocks:
+            out.append({"reason": group["reason"],
+                        "venues": sorted({b.get("exchange") or "?" for b in blocks}),
+                        "blocks": len(blocks),
+                        "notional_m": round(sum(b["notional_usd"] for b in blocks) / 1e6, 2),
+                        "coin": round(sum(b.get("volume_coin") or 0 for b in blocks), 2)})
+    return out
+
+
 def _would_have_counted(row: dict, start_ms: int) -> bool:
     """Whether this row would have reached Block Flow but for the exclusion.
 
@@ -1100,18 +1122,10 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "hot_horizon": hot_horizon,
         "stale_sources": stale or [],
         "warnings": list(WARNINGS),
-        # Only rows that would otherwise have REACHED Block Flow. The dedupe
-        # gate looks deliberately wider than the window, and _venue_tape_blocks
-        # discards rows with no block id or no coin volume on its own — counting
-        # either here claimed a loss the totals never suffered.
-        "block_exclusions": [
-            {"reason": e["reason"],
-             "venues": sorted({(r.get("exchange") or "?") for r in _kept}),
-             "blocks": len(_kept),
-             "coin": round(sum(_num(r, "volume_coin") or 0 for r in _kept), 2)}
-            for e in _excluded
-            for _kept in [[r for r in e["rows"] if _would_have_counted(r, start_ms)]]
-            if _kept],
+        # What Block Flow ACTUALLY lost: the excluded rows run through the same
+        # aggregation and the same floor the totals use, so the count is the
+        # blocks that would have appeared, not the rows that were removed.
+        "block_exclusions": _lost_blocks(_excluded, start_ms, spot),
         "blocks_below_floor": block.get("trimmed", {}),
     }
 

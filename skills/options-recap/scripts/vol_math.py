@@ -821,8 +821,14 @@ def tape_block_key(row: dict):
     return row.get("BLOCK_TRADE_ID") or row.get("TRADE_ID")
 
 
+# The Block Flow floor, named once: recap.py reports what the floor removed, and
+# the two reading different literals is exactly the drift that made the
+# exclusion counts disagree with the totals they describe.
+MIN_BLOCK_NOTIONAL_USD = 250_000
+
+
 def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
-                      min_notional_usd: float = 250_000,
+                      min_notional_usd: float = MIN_BLOCK_NOTIONAL_USD,
                       extra_blocks: list[dict] | None = None) -> dict:
     """Group tape leg-rows into blocks and worked-order structures.
 
