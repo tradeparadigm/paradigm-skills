@@ -562,6 +562,24 @@ def test_partial_turnover_does_not_claim_all_venues():
           hot2["turnover_complete"])
 
 
+def test_exclusion_magnitudes_count_only_what_the_totals_lost():
+    """The dedupe gate looks wider than the window and _venue_tape_blocks drops
+    rows of its own, so the reported blocks/coin were not what Block Flow lost."""
+    rows = [{"exchange": "deribit", "block_id": "IN", "bucket_at": 2_000_000,
+             "volume_coin": 100.0},
+            {"exchange": "deribit", "block_id": "PRE", "bucket_at": 500_000,
+             "volume_coin": 100.0},
+            {"exchange": "deribit", "block_id": "", "bucket_at": 2_000_000,
+             "volume_coin": 100.0},
+            {"exchange": "deribit", "block_id": "NOCOIN", "bucket_at": 2_000_000,
+             "volume_coin": 0.0},
+            {"exchange": "deribit", "block_id": "NOSTAMP", "bucket_at": None,
+             "volume_coin": 100.0}]
+    kept = [r for r in rows if recap._would_have_counted(r, 1_000_000)]
+    check("only the in-window, priced, identified block counts",
+          [r["block_id"] for r in kept] == ["IN"], [r["block_id"] for r in kept])
+
+
 def test_activity_split_collapses_deribit_venues():
     # deribit + deribit-usdc share the "Deribit" display label, so the Activity line
     # must show ONE "Deribit" entry whose share includes BOTH venues' trades.

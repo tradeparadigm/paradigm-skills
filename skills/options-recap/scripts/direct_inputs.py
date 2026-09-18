@@ -471,7 +471,6 @@ def run(asset, window, start, end):
         tape_available = True
         try:
             tape_result = tape.result()
-            executions = calculation_rows(tape_result["rows"])
             # An uncovered tail is missing evidence, not a quiet tape.
             if not tape_result.get("coverage_complete", False):
                 gaps.append(
@@ -479,14 +478,22 @@ def run(asset, window, start, end):
                     + tape_result.get("coverage_note", "coverage incomplete")
                 )
         except Exception as exc:
+            # ONLY the read. read_executions raises when the partition is
+            # missing, unreadable or stale — a broken producer, not a quiet
+            # window — which is the one case where venue blocks have nothing to
+            # be deduped against.
             executions = []
-            # read_executions raises only when the partition is missing,
-            # unreadable or stale — a broken producer, not a quiet window. That
-            # is the one case where venue blocks have nothing to be deduped
-            # against, so it must not be confused with a tape that read fine
-            # and simply carried no Paradigm activity.
             tape_available = False
             gaps.append(f"Paradigm executions unavailable — {exc}")
+        else:
+            try:
+                executions = calculation_rows(tape_result["rows"])
+            except Exception as exc:
+                # Shaping the rows it read. One malformed leg among thousands
+                # used to land in the branch above, deleting the whole Paradigm
+                # tape from Block Flow and blaming a missing partition for it.
+                executions = []
+                gaps.append(f"Paradigm executions unusable — {exc}")
         deri = {}
         for key, future in (("closes_7d", closes), ("market", market)):
             try:
@@ -505,15 +512,22 @@ def run(asset, window, start, end):
     for excluded in result.pop("block_exclusions", []):
         venues = ", ".join(excluded["venues"])
         if excluded["reason"] == "paradigm_overlap_unverified":
+            # Two sub-cases reach this, and neither can double-count: the tape
+            # failed to read, or it read and carried no Paradigm blocks for this
+            # asset. Saying "may be counted twice" was arithmetically impossible
+            # on both — there is nothing in the pool to count twice.
+            why = ("could not be read" if not tape_available
+                   else "carried no Paradigm blocks for this asset")
             gaps.append(
                 f"Block Flow: {excluded['blocks']} {venues} block(s) included without a "
-                f"Paradigm cross-check — the execution tape is unavailable, so any "
-                f"Paradigm-brokered print among them may be counted twice")
+                f"Paradigm cross-check — the execution tape {why}, so a Paradigm-brokered "
+                f"print among them could not be identified as one")
         else:
             gaps.append(
                 f"Block Flow: {excluded['blocks']} {venues} block(s) excluded "
                 f"({excluded['coin']} coin) — {excluded['reason'].replace('_', ' ')}; "
-                f"the totals below do not include them")
+                f"the totals below do not include them, and the count is before "
+                f"the $250k floor")
     # A venue whose rows carry no index_price falls back to window-close spot,
     # so its blocks are ranked against trade-time-priced ones on a different
     # clock — the very thing this phase fixed. Uniform-close was at least

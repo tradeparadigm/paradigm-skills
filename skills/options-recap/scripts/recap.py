@@ -761,6 +761,18 @@ def _state(value):
     return value[0] if isinstance(value, (list, tuple)) else value
 
 
+def _would_have_counted(row: dict, start_ms: int) -> bool:
+    """Whether this row would have reached Block Flow but for the exclusion.
+
+    A null `bucket_at` is NOT in-window: coercing it to 0 dropped such a row from
+    Block Flow and from the note meant to say what was dropped, so it is named
+    here explicitly rather than by accident.
+    """
+    at = _num(row, "bucket_at")
+    return (at is not None and at >= start_ms
+            and bool(row.get("block_id")) and bool(_num(row, "volume_coin")))
+
+
 def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
     """Shape venue-tape block rows into the block dicts build_tape_blocks
     merges (source="venue"). The venue tape carries totals per block — no leg
@@ -1088,17 +1100,18 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "hot_horizon": hot_horizon,
         "stale_sources": stale or [],
         "warnings": list(WARNINGS),
-        # Re-filtered to the window: the dedupe gate deliberately looks WIDER
-        # than the window, so a pre-window block was inflating both the count
-        # and the coin of what this line claims the totals lost.
+        # Only rows that would otherwise have REACHED Block Flow. The dedupe
+        # gate looks deliberately wider than the window, and _venue_tape_blocks
+        # discards rows with no block id or no coin volume on its own — counting
+        # either here claimed a loss the totals never suffered.
         "block_exclusions": [
             {"reason": e["reason"],
-             "venues": sorted({(r.get("exchange") or "?") for r in _win}),
-             "blocks": len(_win),
-             "coin": round(sum(_num(r, "volume_coin") or 0 for r in _win), 2)}
+             "venues": sorted({(r.get("exchange") or "?") for r in _kept}),
+             "blocks": len(_kept),
+             "coin": round(sum(_num(r, "volume_coin") or 0 for r in _kept), 2)}
             for e in _excluded
-            for _win in [[r for r in e["rows"] if (_num(r, "bucket_at") or 0) >= start_ms]]
-            if _win],
+            for _kept in [[r for r in e["rows"] if _would_have_counted(r, start_ms)]]
+            if _kept],
         "blocks_below_floor": block.get("trimmed", {}),
     }
 
