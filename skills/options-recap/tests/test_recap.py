@@ -657,6 +657,14 @@ def test_exclusion_magnitudes_count_only_what_the_totals_lost():
     # rendered a real $682M exclusion as "68 ? block(s) ... 0 coin".
     check("the exclusion names the venue rather than ?",
           lost and lost[0]["venues"] != ["?"], lost)
+    # The floor clause itself: one block above it, one below, only the first is
+    # reported as lost. Nothing held this branch before.
+    mixed = [dict(priced[0], block_id="FAT", volume_coin=500.0),
+             dict(priced[0], block_id="THIN", volume_coin=0.01)]
+    split = recap._lost_blocks([{"reason": "id_space_unproven", "rows": mixed}],
+                               1_000_000, 100_000.0)
+    check("a below-floor block is not counted beside an above-floor one",
+          split and split[0]["blocks"] == 1, split)
     check("and carries the coin volume",
           lost and lost[0]["coin"] > 0, lost)
 

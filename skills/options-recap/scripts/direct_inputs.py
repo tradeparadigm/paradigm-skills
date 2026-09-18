@@ -368,9 +368,10 @@ def run(asset, window, start, end):
     gaps, specs, evidence, totals = [], {}, {}, {}
     # venue -> (state, detail); what was actually behind this window per venue.
     coverage = {}
-    # The bucket still being written, or None when this is not a live window.
-    in_progress = (f"{end:%Y%m%dT%H}"
-                   if (datetime.now(timezone.utc) - end) < timedelta(hours=1) else None)
+    # One clock for the whole run. The bucket still being written, or None when
+    # this is not a live window.
+    now = datetime.now(timezone.utc)
+    in_progress = f"{end:%Y%m%dT%H}" if (now - end) < timedelta(hours=1) else None
     # Partition reads get their own pool: they are the ones holding a window in
     # memory, so their concurrency is a memory budget, not a latency choice.
     readers = query_workers(end - start)
@@ -441,9 +442,12 @@ def run(asset, window, start, end):
                 # An absent trade hour is only a gap if the venue's continuous
                 # feed lost it too; otherwise the venue was simply quiet.
                 if source["status"] == "ok":
+                    # `now` is passed, not recomputed: two clocks a few
+                    # microseconds apart can straddle the hour boundary and
+                    # disagree about whether the final bucket is still open.
                     state, detail = coverage_verdict(
                         venue, asset, start, end,
-                        source["path_plan"].get("missing_hours", ()))
+                        source["path_plan"].get("missing_hours", ()), now=now)
                     coverage[venue] = (state, detail)
                     if state == "feed_gap":
                         lost = len(detail["lost_hours"])

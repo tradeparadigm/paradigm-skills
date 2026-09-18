@@ -54,12 +54,17 @@ detail names any venue that is not `complete`:
 - `unverified` — the companion listing could not be read or came back empty, so
   coverage could not be established either way.
 
-The last three, plus `READ FAILED`, mean that venue's trades are missing or
-unproven. Its share is then omitted from the Activity line entirely and the
-venue named after it — `(by trade count; Deribit unread — shares are of what
-was read)` — because the remaining percentages are shares of a denominator
-short by it. An unrecognised state renders `state not recognised` and counts as
-unread; it never raises.
+Exactly three of those mean the venue's trades are missing or unproven: `feed
+gap`, `READ FAILED` and `unverified`. `quiet hours` and `quote gap` do not —
+both describe a venue whose trades were read in full.
+
+A venue in one of those three is dropped from the Activity split and named after
+it instead — `(by trade count; Deribit unread — shares are of what was read)`.
+Its own share is unknowable, so it is not printed; and the remaining percentages
+are computed over the READ venues only, so they sum to 100 and the sentence is
+true. `N` in `Coverage N/M` counts by the same three, so the two lines always
+agree about the same venue. An unrecognised state renders `state not recognised`,
+counts as unread, and never raises.
 
 `ATM`, `25d RR` and `Fly` carry a trailing `*` when the value was reached by
 clamping to an endpoint of a thin chain rather than interpolated, and the Term
