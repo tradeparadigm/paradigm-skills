@@ -18,12 +18,17 @@ INSTALL aws;    LOAD aws;
 CREATE OR REPLACE SECRET s3_irsa (
   TYPE S3,
   PROVIDER CREDENTIAL_CHAIN,
-  REGION 'ap-northeast-1'
+  REGION 'ap-northeast-1',
+  ENDPOINT 's3.ap-northeast-1.amazonaws.com'
 );
 ```
 
 Both extensions are pre-installed in the terminal image, so `INSTALL` is a
 no-op after the first use and never hits the extension repository.
+
+`ENDPOINT` is pinned to the regional host so the S3 authority is deterministic:
+the global `s3.amazonaws.com` answers a cross-region request with a 307 redirect,
+which an exact-match egress allowlist inside the OC enclave cannot follow.
 
 ## Do not hand-roll the credentials
 
@@ -48,10 +53,34 @@ Do **not** read `$AWS_WEB_IDENTITY_TOKEN_FILE`, call STS with `curl`, scrape
 None of these exist when the credential step is a SQL statement inside the same
 `duckdb -c "…"` call as the query.
 
-(The same STS logic *is* fine inside a committed `.sh` file — e.g.
-`options-recap/scripts/run_recap.sh` — because `bash script.sh` is one process
-with normal shell state and a known interpreter. The rule here is about inline
-shell an agent assembles across `exec` calls.)
+(The same STS logic can be valid inside a committed `.sh` file because the
+script is one process with normal shell state and a known interpreter. The rule
+here is about inline shell an agent assembles across `exec` calls.)
+
+## The concurrent object reader
+
+`scripts/s3_async.py` lives here, beside `execution_tape.py`, because it is a
+shared reader rather than any one skill's: `read_objects(paths, columns)` signs
+and fetches every object through obstore outside the GIL and returns one Arrow
+table, which DuckDB then reads by replacement scan. Import it the way every
+cross-skill import in this repo works — insert `data-discovery/scripts` on
+`sys.path`, never reach sideways into another skill's `scripts/`.
+
+Two properties bind its callers:
+
+- **It pins the S3 endpoint.** The enclave's egress allowlist is exact-match and
+  cannot follow a 307, so `S3Store(...)` must carry `endpoint=`.
+  `options-recap/tests/test_run_recap.py` is the only thing that checks this,
+  which is why that workflow also watches this file.
+- **Peak memory is the whole window, and the caller usually holds it twice.**
+  `_concat` is zero-copy where the schemas match, so the concatenation itself
+  costs nothing; what costs is that every object's rows are resident at once,
+  and `CONCURRENCY` and `BATCH` bound only the raw bodies and the single batch
+  being parsed. The second copy is the caller's: `/recap` keeps the returned
+  table alive as a replacement scan while DuckDB materialises a result that, in
+  render mode, is every row. Cost scales with objects read, not with wall time —
+  a 30-day window peaks near 6 GiB against a 4 GiB production container.
+  Reducing per batch, rather than returning one table, is what would bound it.
 
 ## Token lifecycle
 
@@ -62,15 +91,15 @@ a read starts returning HTTP 400 `InvalidToken`.
 
 ## Verifying access
 
-The cheapest reachability check is a read of a known stable key — the hot
-surface, which is clobbered every 60 s and always present:
+Use a small non-hot source object to verify the credential and network path:
 
 ```sql
 INSTALL httpfs; LOAD httpfs;
 INSTALL aws;    LOAD aws;
-CREATE OR REPLACE SECRET s3_irsa (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1');
+CREATE OR REPLACE SECRET s3_irsa (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1', ENDPOINT 's3.ap-northeast-1.amazonaws.com');
 
-SELECT COUNT(*) FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet');
+SELECT COUNT(*)
+FROM read_csv_auto('s3://dt-paradigm-data/paradigm_data/paradigm_rfq_tape_slim.csv.gz');
 ```
 
 A non-zero count confirms credentials and network path are good.
@@ -82,12 +111,14 @@ mechanics.
 
 ## Coverage probe pattern
 
-The catalog's verified date ranges are point-in-time; the tapes grow forward.
-Confirm current coverage by reading the date column directly:
+The catalog's verified date ranges are point-in-time. Confirm coverage by
+reading the source's event-time column directly:
 
 ```sql
 SELECT min(DATE) AS earliest, max(DATE) AS latest
-FROM read_csv_auto('s3://dt-paradigm-data/paradigm_data/paradigm_trade_tape_slim.csv.gz');
+FROM read_csv_auto('s3://dt-paradigm-data/paradigm_data/paradigm_rfq_tape_slim.csv.gz');
 ```
 
-Use this before concluding "no data" for a recent date.
+For exchange landing data, inspect `max(CAST(timestamp AS TIMESTAMP))` in the
+narrow raw partition selected for the request. Use this before concluding
+"no data" for a recent date.
