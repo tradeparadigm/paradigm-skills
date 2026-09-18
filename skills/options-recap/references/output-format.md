@@ -27,7 +27,7 @@ RV 7d     [X]v        implied [CHEAP/RICH/IN LINE] vs realized
 VRP       [±X]v       vol [underpriced/overpriced/roughly fair] vs delivered
 Activity  [Nk]        trades — [Venue X% · Venue Y% · ...] (by trade count)
 Volume    $[X]M       observed valued trades · USD premium
-P/C       [X.Xx]      [descriptor] (observed trades · see coverage)
+P/C       [X.Xx]      [descriptor] (observed trades · see ⚠ lines)
 ```
 
 The `⚠` lines are the FIRST lines inside the fence, not above it: on

@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import types
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -42,6 +43,24 @@ def hook(name, *args):
     env = dict(os.environ, **{name: "1"})
     result = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True, env=env)
     return (result.stdout.strip() or result.stderr.strip()), result.returncode
+
+
+def calls(body, name):
+    """Argument lists for `name(...)`, paren-balanced. A regex stops at the
+    first `)`, so a two-level nested call failed to match at all and an
+    unpinned store inside one would have gone unseen."""
+    found = []
+    for match in re.finditer(rf"\b{name}\(", body):
+        depth = 0
+        for index in range(match.end() - 1, len(body)):
+            if body[index] == "(":
+                depth += 1
+            elif body[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    found.append(body[match.end():index])
+                    break
+    return found
 
 
 def test_arguments():
@@ -126,7 +145,10 @@ def test_streamed_queries_name_every_column_their_sql_reads():
         "and", "or", "not", "in", "is", "null", "nulls", "group", "by", "order",
         "asc", "desc", "limit", "union", "all", "case", "when", "then", "else",
         "end", "over", "partition", "filter", "cast", "try_cast", "timestamptz",
-        "timestamp", "last", "first", "least", "greatest", "lower", "upper",
+        # NOT `timestamp`: it is a real column in every venue and dvol schema
+        # and the window bound casts it, so exempting it let a projection drop
+        # it silently. `timestamptz` already covers the cast's type name.
+        "last", "first", "least", "greatest", "lower", "upper",
         "coalesce", "count", "sum", "min", "max", "avg", "abs", "round",
         "arg_min", "arg_max", "any_value", "row_number", "filename",
         "name",  # DuckDB's UNION ALL BY NAME
@@ -182,14 +204,15 @@ def test_s3_reads_pin_the_regional_endpoint():
                     if "endpoint_url" not in call:
                         unpinned.append(os.path.relpath(path, skills))
                 # The async reader does not go through boto3 for its GETs, so
-                # it carries the pin on its own store constructor.
-                # Match the constructor AND its argument list, like the
-                # client/resource guard above: checking the whole file let a
-                # second, unpinned store pass in a file that already had one.
-                # Markdown counts too — its examples are what agents copy — so
-                # prose is excluded by having no arguments rather than by suffix.
-                for call in re.findall(r"\bS3Store\((?:[^()]|\([^()]*\))*\)", body):
-                    if "=" in call and "endpoint=" not in call:
+                # it carries the pin on its own store constructor. Markdown
+                # counts too — its examples are what agents copy — so the one
+                # exemption is the bare ellipsis placeholder prose writes.
+                # bucket is obstore's only positional parameter, so requiring
+                # an `=` anywhere let a positional-bucket call through.
+                for arguments in calls(body, "S3Store"):
+                    if arguments.strip() in ("", "..."):
+                        continue
+                    if "endpoint=" not in arguments:
                         unpinned.append(os.path.relpath(path, skills))
     check("every S3 read pins the regional endpoint", not unpinned, unpinned)
 
@@ -224,6 +247,45 @@ def test_importing_collect_recap_makes_the_shared_reader_importable():
           result.returncode == 0
           and origin.endswith(os.path.join("data-discovery", "scripts", "s3_async.py")),
           origin or result.stderr.strip()[-200:])
+
+
+def test_connect_runs_the_session_prefix_and_the_tuning():
+    """The zone statement is tested on its own, but nothing asserted that
+    connect() still runs it — stubbing the call out left every lane green."""
+    executed = []
+    original = collector.duckdb
+    collector.duckdb = types.SimpleNamespace(
+        connect=lambda: types.SimpleNamespace(execute=executed.append))
+    try:
+        collector.connect()
+    finally:
+        collector.duckdb = original
+    check("connect runs the session prefix", collector.DUCKDB_PREFIX in executed, executed)
+    check("connect runs the tuning", collector.TUNING in executed, executed)
+
+
+def test_the_limit_is_read_from_this_cgroup_not_the_root():
+    """The ceiling test stubs container_memory_bytes, so the resolution itself
+    was unverified: in a nested layout the root file holds the no-limit
+    sentinel and only the process's own cgroup carries the real number."""
+    sentinel = str((1 << 63) - (1 << 12))
+    for version, proc_body, nested, top in (
+            ("v2", "0::/kubepods/podabc\n", "kubepods/podabc/memory.max", "memory.max"),
+            ("v1", "9:memory:/kubepods/podabc\n",
+             "memory/kubepods/podabc/memory.limit_in_bytes",
+             "memory/memory.limit_in_bytes")):
+        with tempfile.TemporaryDirectory() as root:
+            proc = os.path.join(root, "cgroup")
+            with open(proc, "w") as handle:
+                handle.write(proc_body)
+            for relative, value in ((top, sentinel), (nested, str(4 << 30))):
+                path = os.path.join(root, relative)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as handle:
+                    handle.write(value)
+            check(f"nested {version} limit is found",
+                  collector.container_memory_bytes(proc, root) == (4 << 30),
+                  collector.container_memory_bytes(proc, root))
 
 
 def test_the_window_ceiling_follows_the_container_not_the_tape():

@@ -140,9 +140,34 @@ def query_workers(width: dt.timedelta) -> int:
     return 3 if days <= 2 else 2 if days <= 10 else 1
 
 
-def container_memory_bytes() -> int | None:
-    for path in ("/sys/fs/cgroup/memory.max",
-                 "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+def cgroup_memory_files(proc: str = "/proc/self/cgroup",
+                        root: str = "/sys/fs/cgroup") -> list[str]:
+    """Limit files to try, most specific first.
+
+    In a nested layout the process sits below the root and only its own cgroup
+    carries the real limit; the root file reads the no-limit sentinel, so
+    reading it alone silently returns None and the window ceiling no-ops.
+    """
+    files = []
+    try:
+        lines = Path(proc).read_text().splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        fields = line.split(":", 2)
+        if len(fields) != 3 or not fields[2].strip("/"):
+            continue
+        hierarchy, controllers, relative = fields[0], fields[1], fields[2].strip("/")
+        if hierarchy == "0":
+            files.append(f"{root}/{relative}/memory.max")
+        elif "memory" in controllers.split(","):
+            files.append(f"{root}/memory/{relative}/memory.limit_in_bytes")
+    return files + [f"{root}/memory.max", f"{root}/memory/memory.limit_in_bytes"]
+
+
+def container_memory_bytes(proc: str = "/proc/self/cgroup",
+                           root: str = "/sys/fs/cgroup") -> int | None:
+    for path in cgroup_memory_files(proc, root):
         try:
             value = Path(path).read_text().strip()
         except OSError:
