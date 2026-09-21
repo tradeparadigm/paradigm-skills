@@ -315,7 +315,7 @@ ok(ac.structure_unit(fly_row) == 100.0, "a 100-lot fly is 100 flies, not 50")
 # Nothing in that string says which row is which leg, so this is NOT recovered —
 # the smallest row wins and the caller is told the size is inferred.
 clipped = [dict(ratio_rows[0], QTY=40), dict(ratio_rows[1], QTY=10), dict(ratio_rows[1], QTY=10)]
-ok(ac.structure_unit(clipped) == 40.0, "a clipped leg under a combined DESCRIPTION keeps the pre-PR size")
+ok(ac.structure_unit(clipped) == 10.0, "a clipped leg under a combined DESCRIPTION falls back to the smallest row")
 ok(not ac.package_size_certain(clipped), "and the caller is told so")
 per_leg = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 24 Jul 26 59000",
             "QTY": 40, "PRICE": 0.0023, "REF_PRICE": 0.0021, "SIDE": "BUY"},
@@ -335,7 +335,7 @@ ok(abs(ac.struct_net(clips, "PRICE") - 0.0122) < 1e-9,
 # clips from side and/or price was tried and mis-sized a different family of
 # equal-size structures each time — see the PR body.
 unkeyed = [dict(r, DESCRIPTION="C 7 May 26 84000") for r in clips]
-ok(ac.structure_unit(unkeyed) == 30.0, "an unresolvable DESCRIPTION keeps the pre-PR size")
+ok(ac.structure_unit(unkeyed) == 20.0, "an unresolvable DESCRIPTION falls back to the smallest row")
 ok(not ac.package_size_certain(unkeyed), "and says the size is inferred")
 # Put-call parity makes an at-the-forward straddle's two legs print the SAME
 # price, and its two rows the same side. Grouping on either merged them into one
@@ -345,7 +345,7 @@ straddle = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Straddle 25 Sep 26 6
 ok(ac.structure_unit(straddle) == 100.0, "a straddle's two same-priced legs are legs, not clips")
 ok(abs(ac.struct_net(straddle, "PRICE") + 0.0820) < 1e-9,
    "so its package premium is both legs, not one")
-ok(not ac.package_size_certain(straddle), "same side under one description is never certain")
+ok(ac.package_size_certain(straddle), "equal legs make the base a fact whatever the structure")
 # The same shape with a leg clipped is indistinguishable from it, which is the
 # whole reason nothing is inferred here.
 clipped_straddle = [straddle[0], dict(straddle[1], QTY=50), dict(straddle[1], QTY=50)]
@@ -354,13 +354,44 @@ ok(not ac.package_size_certain(clipped_straddle), "a clipped leg cannot be told 
 ok(ac.package_size_certain(clips), "per-instrument rows carry real identity")
 ok(ac.package_size_certain(ratio_rows), "distinct sides under one description are unambiguous")
 ok(ac.package_size_certain(fly_row), "a single row is never ambiguous")
-# The whole point of the fallback: an ambiguous block must never be sized worse
-# than it was before this PR. These are the shapes round 4 got wrong.
-_pre = lambda rows: ac._f(rows[0].get("QTY")) or 1.0
-for _rows, _name in ((clipped, "a clipped ratio leg"), (straddle, "a straddle"),
+# The base must not depend on the order rows arrive in. struct_net was always
+# order-independent; keying the shared base on the FIRST row made the premium
+# swing 4x on the same block depending on CSV order.
+for _perm in ([0, 1, 2], [1, 0, 2], [2, 1, 0]):
+    _shuffled = [clipped[i] for i in _perm]
+    ok(ac.structure_unit(_shuffled) == ac.structure_unit(clipped),
+       f"row order {_perm} does not move the size")
+    ok(abs(ac.struct_net(_shuffled, "PRICE") - ac.struct_net(clipped, "PRICE")) < 1e-12,
+       f"row order {_perm} does not move the premium")
+# Unequal legs with nothing stating their ratios: the smallest row is a guess,
+# and the guess must be declared. A 100/100/10 spread-with-a-tail and a 10:10:1
+# ratio are the same three numbers.
+for _rows, _name in ((clipped, "a clipped ratio leg"),
                      (clipped_straddle, "a clipped straddle"), (unkeyed, "bare clips")):
-    ok(ac.structure_unit(_rows) == _pre(_rows), f"{_name} keeps the pre-PR size")
     ok(not ac.package_size_certain(_rows), f"{_name} is declared inferred")
+tail = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": d, "QTY": q, "PRICE": p,
+         "REF_PRICE": p, "SIDE": sd} for d, q, p, sd in (
+    ("Call 24 Jul 26 60000", 100, 0.0100, "BUY"),
+    ("Call 24 Jul 26 70000", 100, 0.0090, "SELL"),
+    ("Call 24 Jul 26 90000", 10, 0.0010, "BUY"))]
+ok(not ac.package_size_certain(tail),
+   "a spread with a small tail cannot know its own base, and says so")
+
+# The per-leg `ratio` legs_from_rows sets is consumed by net_greeks, and nothing
+# held it: dropping it gave net delta 0.0, and passing the raw QTY gave 400.0,
+# against a correct 20.0 — both invisible to every other check here.
+_ratio_rows = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 24 Jul 26 59000",
+                "QTY": 40, "PRICE": 0.0023, "REF_PRICE": 0.0021, "SIDE": "BUY"},
+               {"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "Put 24 Jul 26 65000",
+                "QTY": 20, "PRICE": 0.0210, "REF_PRICE": 0.0212, "SIDE": "SELL"}]
+_legs = ac.legs_from_rows(_ratio_rows)
+ok([l["ratio"] for l in _legs] == [2.0, 1.0],
+   f"a 40/20 fill carries leg ratios 2:1 against the base {[l[chr(39)+chr(39)] if False else l['ratio'] for l in _legs]}")
+_greeks = {ac.leg_key(l): {"delta": 0.5, "vega": 1.0, "gamma": 0.0, "theta": 0.0} for l in _legs}
+_net = ac.net_greeks(_legs, _greeks, ac.structure_unit(_ratio_rows))
+# +2 x 0.5 - 1 x 0.5 = 0.5 per package, x20 packages = 10.
+ok(abs(_net["delta"] - 10.0) < 1e-9,
+   f"and the greeks are qty-weighted by them, not by a flat 1 {_net}")
 
 
 # ── the header itself: structure_unit reaching the rendered ×N ──────────────────

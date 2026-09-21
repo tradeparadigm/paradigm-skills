@@ -331,71 +331,97 @@ def _leg_identity(row: dict):
     return None
 
 
+def _stated_base(rows_and_qty) -> float | None:
+    """The package base implied by a DESCRIPTION that STATES its ratios.
+
+    `Cstm -2.00 Put 59000 / +1.00 Put 65000` filled 40/20 is 20 packages: each
+    leg's QTY over its stated ratio gives the same number, and that agreement is
+    what makes it a fact rather than a guess. Returns None when the ratios are
+    not stated, or when they disagree with the sizes.
+
+    This is the only shape where the base is knowable from unequal rows. Without
+    stated ratios a 100/100/10 spread-with-a-tail and a 10:10:1 ratio look
+    identical, and the smallest leg is the wrong answer for the first.
+    """
+    sized = list(rows_and_qty)
+    parsed = parse_description(sized[0][0].get("DESCRIPTION", ""))
+    legs = parsed["legs"]
+    if len(legs) < 2 or not all(leg.get("_explicit") for leg in legs):
+        return None
+    ratios = sorted(abs(leg.get("ratio") or 1.0) for leg in legs)
+    if len(sized) == 1:
+        # One row carrying the package: its QTY counts the widest leg.
+        return sized[0][1] / ratios[-1] if ratios[-1] else None
+    if len(sized) != len(legs):
+        return None
+    bases = {round(q / r, 6) for (_, q), r in zip(sorted(sized, key=lambda p: p[1]), ratios)}
+    return bases.pop() if len(bases) == 1 else None
+
+
 def _package(rows: list[dict]) -> tuple[list[dict], float, float]:
-    """(premium rows, weighting base, package size) — derived together so the
-    displayed size cannot drift from the base the premium is netted against.
+    """(premium rows, weighting base, package size) — one number, derived once.
 
     Perp/future rows are dropped: a delta hedge executes at spot and is not part
     of the option premium.
 
-    Rows are grouped ONLY on real identity — a DESCRIPTION that resolves to one
-    leg. That covers the multi-maker case, where one leg arrives as several rows
-    and their sizes add. When several rows share one COMBINED description,
-    nothing in that string says which row is which leg; inferring it from side
-    and/or price mis-sized a different family of equal-size structures each time
-    it was tried, so nothing is inferred and the pre-PR answer stands.
-    `package_size_certain` reports that, and analyze.py renders a ⚠.
+    The base is taken from the strongest evidence available, in order:
 
-    The one place base and size differ: a SINGLE row whose DESCRIPTION STATES
-    its ratios counts the widest leg in QTY while its PRICE is already the
-    package price, so it weights as 1 against a package of QTY/widest. Only Cstm
-    states them — a named structure's ratios are our own canonical geometry, and
-    a 100-lot CFly is 100 flies.
+    1. **Stated ratios.** `Cstm` writes them, and QTY/ratio agreeing across legs
+       settles the package outright.
+    2. **Per-instrument totals**, when every row's DESCRIPTION resolves to one
+       leg. Clips of one instrument add — 30+20 is one 50-lot leg.
+    3. **The smallest row.** Deterministic, and what `struct_net` used before
+       this change, so the premium stays order-independent. It is the right
+       answer only when the legs are equal-sized; `package_size_certain` says so
+       when they are not.
     """
     opt = [r for r in rows if parse_product(r.get("PRODUCT", "")).get("kind") == "OPTION"]
     prem = opt or rows
     sized = [(r, q) for r, q in ((r, _f(r.get("QTY"))) for r in prem) if q and q > 0]
     if not sized:
         return prem, 1.0, 1.0
-    if len(sized) == 1:
-        row, qty = sized[0]
-        legs = parse_description(row.get("DESCRIPTION", ""))["legs"]
-        if len(legs) > 1 and all(leg.get("_explicit") for leg in legs):
-            widest = max((leg.get("ratio") or 1.0 for leg in legs), default=1.0) or 1.0
-            return prem, qty, qty / widest
-        return prem, qty, qty
+    stated = _stated_base(sized)
+    if stated:
+        # The weighting base and the package size differ only here, and only for
+        # a single row: its PRICE is already the package price, so it weights as
+        # 1 against a package of QTY/widest-ratio.
+        return prem, (sized[0][1] if len(sized) == 1 else stated), stated
     identities = [_leg_identity(row) for row, _ in sized]
     if all(identity is not None for identity in identities):
         totals: dict = {}
         for identity, (_, qty) in zip(identities, sized):
             totals[identity] = totals.get(identity, 0.0) + qty
-        base = min(totals.values())
-    elif len({(r.get("SIDE") or "").upper() for r, _ in sized}) == len(sized):
-        # Every row a different side, so every row IS a leg and none can be a
-        # clip of another: the smallest is the package base. This is the ratio
-        # case the whole change is for — 40 BUY / 20 SELL is 20 packages.
-        base = min(qty for _, qty in sized)
-    else:
-        # Two rows share a side under one combined DESCRIPTION, so a clipped leg
-        # and a second leg on that side are indistinguishable. Keep the pre-PR
-        # answer — the first row — so an ambiguous block is never sized worse
-        # than before, and let `package_size_certain` make it visible instead.
-        base = sized[0][1]
+        return prem, min(totals.values()), min(totals.values())
+    # Deterministic by construction. Keying on the first row made the premium a
+    # function of CSV row order — a 4x swing on the same block — where
+    # `struct_net` had always been order-independent.
+    base = min(qty for _, qty in sized)
     return prem, base, base
 
 
 def package_size_certain(rows: list[dict]) -> bool:
-    """False when several rows share one combined DESCRIPTION and two of them
-    share a side, so a clip of one leg and two legs on that side are
-    indistinguishable. `structure_unit` then returns the smallest row, which is
-    right for two legs and too small for a clipped one — the caller warns."""
+    """Whether the package base is a FACT or the smallest row.
+
+    It is a fact when the DESCRIPTION states its ratios and they agree with the
+    sizes, or when every leg trades the same size (then the base is that size,
+    whatever the structure). Otherwise the legs are unequal and nothing in the
+    tape says which of them is the unit: a 100/100/10 spread with a tail and a
+    10:10:1 ratio are the same three numbers. The caller renders a warning.
+    """
     opt = [r for r in rows if parse_product(r.get("PRODUCT", "")).get("kind") == "OPTION"]
     prem = opt or rows
-    sized = [r for r in prem if (_f(r.get("QTY")) or 0) > 0]
-    if len(sized) < 2 or all(_leg_identity(r) is not None for r in sized):
+    sized = [(r, q) for r, q in ((r, _f(r.get("QTY"))) for r in prem) if q and q > 0]
+    if len(sized) < 2:
         return True
-    sides = [(r.get("SIDE") or "").upper() for r in sized]
-    return len(set(sides)) == len(sides)
+    if _stated_base(sized):
+        return True
+    identities = [_leg_identity(row) for row, _ in sized]
+    if all(identity is not None for identity in identities):
+        totals: dict = {}
+        for identity, (_, qty) in zip(identities, sized):
+            totals[identity] = totals.get(identity, 0.0) + qty
+        return len(set(totals.values())) == 1
+    return len({q for _, q in sized}) == 1
 
 
 def structure_unit(rows: list[dict]) -> float:
