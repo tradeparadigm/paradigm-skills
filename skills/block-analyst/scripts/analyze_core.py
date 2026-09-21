@@ -106,6 +106,13 @@ def parse_description(desc: str) -> dict:
             legs.append(lg)
         if re.search(r"Perp", raw, re.I):
             perp = True
+        # The pattern above REQUIRES a ratio token, so a leg written without one
+        # is dropped rather than parsed. Counting the legs the string actually
+        # contains catches that: a half-stated Cstm otherwise parsed to a single
+        # leg, sized off its own QTY, and reported the base as certain.
+        written = len(re.findall(_TYPE + r"\s+" + _DATE + r"\s+\d+", raw))
+        if written > len(legs):
+            legs = []
         return {"code": "CM", "legs": legs, "expiries": _uniq_exp(legs),
                 "perp": perp, "classified": bool(legs), "raw": raw}
 
@@ -255,6 +262,12 @@ def legs_from_rows(rows: list[dict]):
     the caller parses the combined DESCRIPTION instead)."""
     if not rows or len(rows) < 2:
         return None
+    # Each row's own QTY is the leg's ratio against the package base, the same
+    # base struct_net nets the premium against. A single-leg DESCRIPTION parses
+    # to ratio 1.0, so without this a 40/20 ratio reaches net_greeks as 20/20 —
+    # the header would claim a base unit the greeks do not honour. Perp/future
+    # hedge rows keep ratio 1.0: their QTY is in a different unit entirely.
+    base = structure_unit(rows)
     out = []
     for r in rows:
         pr = parse_product(r.get("PRODUCT", ""))
@@ -267,6 +280,7 @@ def legs_from_rows(rows: list[dict]):
         if d["classified"] and len(d["legs"]) == 1 and d["code"] in ("CL", "PL"):
             lg = d["legs"][0]
             lg["sign"] = sgn
+            lg["ratio"] = (_f(r.get("QTY")) or base) / base
             lg["_row"] = r
             out.append(lg)
         else:
@@ -302,10 +316,7 @@ def struct_net(rows: list[dict], field: str) -> float:
     so their net is unchanged. Perp/future legs are EXCLUDED — a delta hedge executes at
     spot and is not part of the option premium (including it leaked the perp price into
     'Paid'). Falls back to all rows if there are no option legs."""
-    opt = [r for r in rows if parse_product(r.get("PRODUCT", "")).get("kind") == "OPTION"]
-    prem = opt or rows
-    qs = [q for q in (_f(r.get("QTY")) for r in prem) if q and q > 0]
-    base = min(qs) if qs else 1.0
+    prem, base, _ = _package(rows)
     tot = 0.0
     for r in prem:
         v = _f(r.get(field))
@@ -315,6 +326,119 @@ def struct_net(rows: list[dict], field: str) -> float:
         w = (_f(r.get("QTY")) or base) / base
         tot += sgn * w * v
     return tot
+
+
+def _leg_identity(row: dict):
+    """The instrument a row trades, or None when its DESCRIPTION packs the whole
+    package (the tape repeats the combined string on every leg's row)."""
+    parsed = parse_description(row.get("DESCRIPTION", ""))
+    if parsed["classified"] and len(parsed["legs"]) == 1:
+        leg = parsed["legs"][0]
+        return (leg["cp"], leg["strike"], leg.get("expiry_c"))
+    return None
+
+
+def _stated_base(rows_and_qty) -> float | None:
+    """The package base implied by a DESCRIPTION that STATES its ratios.
+
+    `Cstm -2.00 Put 59000 / +1.00 Put 65000` filled 40/20 is 20 packages: each
+    leg's QTY over its stated ratio gives the same number, and that agreement is
+    what makes it a fact rather than a guess. Returns None when the ratios are
+    not stated, or when they disagree with the sizes.
+
+    This is the only shape where the base is knowable from unequal rows. Without
+    stated ratios a 100/100/10 spread-with-a-tail and a 10:10:1 ratio look
+    identical, and the smallest leg is the wrong answer for the first.
+    """
+    sized = list(rows_and_qty)
+    parsed = parse_description(sized[0][0].get("DESCRIPTION", ""))
+    legs = parsed["legs"]
+    if len(legs) < 2 or not all(leg.get("_explicit") for leg in legs):
+        return None
+    ratios = sorted(abs(leg.get("ratio") or 1.0) for leg in legs)
+    if len(sized) == 1:
+        # One row carrying the package: its QTY counts the widest leg.
+        return sized[0][1] / ratios[-1] if ratios[-1] else None
+    if len(sized) != len(legs):
+        return None
+    bases = {round(q / r, 6) for (_, q), r in zip(sorted(sized, key=lambda p: p[1]), ratios)}
+    return bases.pop() if len(bases) == 1 else None
+
+
+def _package(rows: list[dict]) -> tuple[list[dict], float, float]:
+    """(premium rows, weighting base, package size) — one number, derived once.
+
+    Perp/future rows are dropped: a delta hedge executes at spot and is not part
+    of the option premium.
+
+    The base is taken from the strongest evidence available, in order:
+
+    1. **Stated ratios.** `Cstm` writes them, and QTY/ratio agreeing across legs
+       settles the package outright.
+    2. **Per-instrument totals**, when every row's DESCRIPTION resolves to one
+       leg. Clips of one instrument add — 30+20 is one 50-lot leg.
+    3. **The smallest row.** Deterministic, and what `struct_net` used before
+       this change, so the premium stays order-independent. It is the right
+       answer only when the legs are equal-sized; `package_size_certain` says so
+       when they are not.
+    """
+    opt = [r for r in rows if parse_product(r.get("PRODUCT", "")).get("kind") == "OPTION"]
+    prem = opt or rows
+    sized = [(r, q) for r, q in ((r, _f(r.get("QTY"))) for r in prem) if q and q > 0]
+    if not sized:
+        return prem, 1.0, 1.0
+    stated = _stated_base(sized)
+    if stated:
+        # The weighting base and the package size differ only here, and only for
+        # a single row: its PRICE is already the package price, so it weights as
+        # 1 against a package of QTY/widest-ratio.
+        return prem, (sized[0][1] if len(sized) == 1 else stated), stated
+    identities = [_leg_identity(row) for row, _ in sized]
+    if all(identity is not None for identity in identities):
+        totals: dict = {}
+        for identity, (_, qty) in zip(identities, sized):
+            totals[identity] = totals.get(identity, 0.0) + qty
+        return prem, min(totals.values()), min(totals.values())
+    # Deterministic by construction. Keying on the first row made the premium a
+    # function of CSV row order — a 4x swing on the same block — where
+    # `struct_net` had always been order-independent.
+    base = min(qty for _, qty in sized)
+    return prem, base, base
+
+
+def package_size_certain(rows: list[dict]) -> bool:
+    """Whether the package base is a FACT or the smallest row.
+
+    It is a fact when the DESCRIPTION states its ratios and they agree with the
+    sizes, or when every leg trades the same size (then the base is that size,
+    whatever the structure). Otherwise the legs are unequal and nothing in the
+    tape says which of them is the unit: a 100/100/10 spread with a tail and a
+    10:10:1 ratio are the same three numbers. The caller renders a warning.
+    """
+    opt = [r for r in rows if parse_product(r.get("PRODUCT", "")).get("kind") == "OPTION"]
+    prem = opt or rows
+    sized = [(r, q) for r, q in ((r, _f(r.get("QTY"))) for r in prem) if q and q > 0]
+    if len(sized) < 2:
+        return True
+    if _stated_base(sized):
+        return True
+    identities = [_leg_identity(row) for row, _ in sized]
+    if all(identity is not None for identity in identities):
+        totals: dict = {}
+        for identity, (_, qty) in zip(identities, sized):
+            totals[identity] = totals.get(identity, 0.0) + qty
+        return len(set(totals.values())) == 1
+    return len({q for _, q in sized}) == 1
+
+
+def structure_unit(rows: list[dict]) -> float:
+    """How many packages the block is — the `xN` in the header.
+
+    struct_net weights each leg by QTY/base, so this must be that same base or
+    the header contradicts its own premium: a 2:1 put ratio filled 40/20 is 20
+    packages of (buy 2, sell 1), not 40 of anything.
+    """
+    return _package(rows)[2]
 
 
 def apply_orientation(parsed: dict, rows: list[dict]) -> tuple[list[dict], str, bool]:
