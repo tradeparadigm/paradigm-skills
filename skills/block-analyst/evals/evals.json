@@ -1,6 +1,6 @@
 {
   "skill_name": "paradigm-block-analyst",
-  "grading_note": "WHAT THESE MEASURE: relaying, not derivation. run_evals.py calls the model with NO tools, so the agent cannot run analyze.py; every case below injects the package figures the script computes deterministically (`context`) and asserts the model reports them unchanged. A regression in structure_unit(), struct_net() or the rendered header will NOT move this score — test_analyze_core.py is the guard for those. Read the percentage as reporting fidelity, not skill correctness.",
+  "grading_note": "WHAT THESE MEASURE. Cases 1 and 2 are RELAY tests: the package figures are injected in `context` and the assertions check the model reports them unchanged. Cases 3, 4 and 5 are DERIVATION tests: no figures are injected, so the model must net the legs, weight a ratio and compute the offset from the tape rows in the prompt alone. Cases 4 and 5 carry the qty-weighted ratio arithmetic, so they are the ones that must derive it — injecting it made them satisfiable by transcription. run_evals.py calls the model with NO tools, so nothing here exercises analyze.py; test_analyze_core.py is the guard for the script, including the rendered output contract.",
   "requires_auth": false,
   "evals": [
     {
@@ -57,7 +57,7 @@
         "Response gives the structure size as 100",
         "Response does not invent greeks, per-leg IV, history or live bid/ask — each is omitted or explicitly marked unavailable"
       ],
-      "context": "<analysis>\nPackage figures already computed deterministically by the bundled script from the tape rows in this prompt. Report them directly — do NOT recompute them, and never substitute a single leg's OFFSET_BPS for the package offset:\n{\n  \"structure_size\": 100,\n  \"taker\": \"Seller\",\n  \"premium\": {\n    \"verb\": \"Recd\",\n    \"net_package_price\": 0.0009\n  },\n  \"net_package_mark\": 0.0015,\n  \"package_offset_bps\": -6.0,\n  \"offset_direction\": \"below mark\"\n}\n\nGreeks, per-leg IV, trade history and live screen quotes are NOT supplied for this case. Omit those rows or mark them explicitly unavailable — never invent them, and never delay the execution answer waiting for them.\n</analysis>\n\n"
+      "context": "<analysis>\nGreeks, per-leg IV, trade history and live screen quotes are NOT supplied for this case. Omit those rows or mark them explicitly unavailable — never invent them, and never delay the execution answer waiting for them.\n</analysis>\n\n"
     },
     {
       "id": 5,
@@ -71,7 +71,21 @@
         "Response gives the structure's base unit as 20 (per-leg notation such as 20/40 is fine); it does not present 40 alone as the structure size",
         "Response does not invent greeks, per-leg IV, history or live bid/ask — each is omitted or explicitly marked unavailable"
       ],
-      "context": "<analysis>\nPackage figures already computed deterministically by the bundled script from the tape rows in this prompt. Report them directly — do NOT recompute them, and never substitute a single leg's OFFSET_BPS for the package offset:\n{\n  \"structure_size\": 20,\n  \"taker\": \"Seller\",\n  \"premium\": {\n    \"verb\": \"Recd\",\n    \"net_package_price\": 0.0164\n  },\n  \"net_package_mark\": 0.0170,\n  \"package_offset_bps\": -6.0,\n  \"offset_direction\": \"below mark\"\n}\n\nGreeks, per-leg IV, trade history and live screen quotes are NOT supplied for this case. Omit those rows or mark them explicitly unavailable — never invent them, and never delay the execution answer waiting for them.\n</analysis>\n\n"
+      "context": "<analysis>\nGreeks, per-leg IV, trade history and live screen quotes are NOT supplied for this case. Omit those rows or mark them explicitly unavailable — never invent them, and never delay the execution answer waiting for them.\n</analysis>\n\n"
+    },
+    {
+      "id": 6,
+      "prompt": "/analyze rfq_amb771 straddle 25 Sep\n\n(paradigm-data-discovery → paradigm_trade_tape_slim WHERE RFQ_ID='rfq_amb771' returned 3 rows: [{\"DATE\": \"2026-07-15\", \"TIME\": \"08:02:11\", \"AUCTION\": \"RFQ\", \"PRODUCT\": \"BTC OPTION - DBT\", \"DESCRIPTION\": \"Straddle  25 Sep 26  62000\", \"QTY\": 100, \"PRICE\": 0.0410, \"REF_PRICE\": 0.0405, \"SIDE\": \"SELL\", \"QUOTE_CURRENCY\": \"BTC\", \"RFQ_ID\": \"rfq_amb771\", \"TRADE_ID\": \"t_6a\", \"BLOCK_TRADE_ID\": \"b_6\"}, {\"DATE\": \"2026-07-15\", \"TIME\": \"08:02:11\", \"PRODUCT\": \"BTC OPTION - DBT\", \"DESCRIPTION\": \"Straddle  25 Sep 26  62000\", \"QTY\": 50, \"PRICE\": 0.0410, \"REF_PRICE\": 0.0405, \"SIDE\": \"SELL\", \"QUOTE_CURRENCY\": \"BTC\", \"RFQ_ID\": \"rfq_amb771\", \"TRADE_ID\": \"t_6b\", \"BLOCK_TRADE_ID\": \"b_6\"}, {\"DATE\": \"2026-07-15\", \"TIME\": \"08:02:11\", \"PRODUCT\": \"BTC OPTION - DBT\", \"DESCRIPTION\": \"Straddle  25 Sep 26  62000\", \"QTY\": 50, \"PRICE\": 0.0410, \"REF_PRICE\": 0.0405, \"SIDE\": \"SELL\", \"QUOTE_CURRENCY\": \"BTC\", \"RFQ_ID\": \"rfq_amb771\", \"TRADE_ID\": \"t_6c\", \"BLOCK_TRADE_ID\": \"b_6\"}])",
+      "expected_output": "A block analysis that RELAYS the script's ⚠ ×N INFERRED warning rather than resolving it. The legs are unequal (100/50/50) under one combined DESCRIPTION and nothing states their ratios, so the script cannot tell a clipped leg from a third leg. The reader must be told that ×N, Paid/Recd and the bps offset are unconfirmed together.",
+      "assertions": [
+        "Response surfaces the ⚠ ×N INFERRED warning to the reader rather than dropping it",
+        "Response states that the package size could not be determined from the tape rows",
+        "Response extends that doubt to the premium and the bps offset, not only to the size",
+        "Response does NOT silently pick a size and present it as confirmed",
+        "Response does not invent greeks, per-leg IV, history or live bid/ask",
+        "Response still gives the reader the rows it does have, rather than refusing outright"
+      ],
+      "context": "<analysis>\nBundled script output for this block. Relay it — do NOT resolve the ambiguity yourself:\n⚠ ×N INFERRED — the legs are unequal and nothing states their ratios, so which leg is the package unit cannot be read off the tape. ×N below is the smallest leg, and because the premium is netted against that same base, Paid/Recd and the bps offset are unconfirmed by the same factor. Check all three against the tape rows before quoting them.\n\n**BTC 25SEP26 62k/62k Straddle · ×50 | Seller | Recd 0.041 | +12 bps above mark**\n\nGreeks, per-leg IV, trade history and live screen quotes are NOT supplied for this case. Omit those rows or mark them explicitly unavailable — never invent them.\n</analysis>\n\n"
     }
   ],
   "trigger_evals": [
