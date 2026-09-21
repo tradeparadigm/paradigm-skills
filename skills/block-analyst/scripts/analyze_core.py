@@ -106,6 +106,13 @@ def parse_description(desc: str) -> dict:
             legs.append(lg)
         if re.search(r"Perp", raw, re.I):
             perp = True
+        # The pattern above REQUIRES a ratio token, so a leg written without one
+        # is dropped rather than parsed. Counting the legs the string actually
+        # contains catches that: a half-stated Cstm otherwise parsed to a single
+        # leg, sized off its own QTY, and reported the base as certain.
+        written = len(re.findall(_TYPE + r"\s+" + _DATE + r"\s+\d+", raw))
+        if written > len(legs):
+            legs = []
         return {"code": "CM", "legs": legs, "expiries": _uniq_exp(legs),
                 "perp": perp, "classified": bool(legs), "raw": raw}
 

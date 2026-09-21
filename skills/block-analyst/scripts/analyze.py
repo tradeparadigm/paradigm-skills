@@ -368,9 +368,11 @@ def render(r) -> str:
         # Visible, not a trailing comment: several rows share one combined
         # DESCRIPTION and two trade the same side, so a clipped leg and two legs
         # on that side read identically. The size below is the smallest row.
-        L.append("⚠ ×N INFERRED — these rows share one combined DESCRIPTION and two trade "
-                 "the same side, so a clipped leg cannot be told from a second leg. The size "
-                 "below is the smallest row; check it against the tape rows before quoting it.")
+        L.append("⚠ ×N INFERRED — the legs are unequal and nothing states their ratios, so "
+                 "which leg is the package unit cannot be read off the tape. ×N below is the "
+                 "smallest leg, and because the premium is netted against that same base, "
+                 "Paid/Recd and the bps offset are unconfirmed by the same factor. Check all "
+                 "three against the tape rows before quoting them.")
         L.append("")
     L.append(f"**{a} {exp} {strikes} {struct} · ×{r['qty']:g} | {r['side']} | "
              f"{verb} {fillabs:g} | {_offset_txt(r['offset'])}**")

@@ -436,6 +436,21 @@ for _rows, _want, _never, _label in (
 # An inferred size says so where the reader sees it, not in a trailing comment.
 _amb = _rendered(clipped)
 ok("⚠ ×N INFERRED" in _amb, f"an inferred size is declared in the body [{_amb[:110]}]")
+# The doubt covers the premium and the offset too, not just the size: they are
+# netted against the same base, so they are wrong by the same factor.
+ok("bps offset are unconfirmed" in _amb, "and the warning scopes the doubt to all three")
+
+# A Cstm whose second leg omits its ratio: the CSTM pattern requires one, so
+# that leg was dropped and the block sized off its own QTY as if it were a
+# single outright, reporting the base as certain. It must not classify.
+_half = [{"PRODUCT": "BTC OPTION - DBT", "QTY": 40, "PRICE": 0.01, "REF_PRICE": 0.01,
+          "SIDE": "BUY",
+          "DESCRIPTION": "Cstm  +2.00  Call  24 Jul 26  60000       Call  24 Jul 26  70000"}]
+ok(ac.parse_description(_half[0]["DESCRIPTION"])["classified"] is False,
+   "a Cstm that drops a leg does not classify")
+_out = _rendered(_half)
+ok("⚠ unmapped structure" in _out,
+   f"and the reader is told the structure was not mapped [{_out[:100]}]")
 ok(_rendered(ratio_rows).count("⚠ ×N INFERRED") == 0,
    "and an unambiguous one says nothing")
 
