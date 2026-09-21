@@ -65,10 +65,18 @@ def shaped(rows: list[dict]) -> list[dict]:
     row_type is still a live classification column and the reader applies no
     filter of its own, so keep the predicate the SQL had: any other row carries
     an rfq_id too, and would land in both fill and hist and inflate recurrence.
+
+    `WHERE row_type='paradigm_trade'` in SQL, which drops a NULL — three-valued
+    logic makes `NULL = 'x'` unknown, not true. Admitting NULL here inflated
+    recurrence in exactly the way the sentence above says this prevents. A
+    column absent from EVERY row is a different failure and is raised, not
+    silently treated as a match.
     """
+    if rows and not any("row_type" in row for row in rows):
+        raise KeyError("execution tape rows carry no row_type column")
     out = []
     for row in rows:
-        if row.get("row_type") not in (None, "paradigm_trade"):
+        if row.get("row_type") != "paradigm_trade":
             continue
         stamp = str(row.get("traded_at_iso") or "")
         date, _, time = stamp.replace("T", " ").partition(" ")
@@ -91,13 +99,39 @@ def write(path: Path, columns: tuple[str, ...], rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
+# One upstream sync interval. `coverage_complete` is exact — it wants the
+# watermark at `end_ms` to the millisecond — so with an hourly sync it is false
+# on every live run. Using it to choose between "not found" and "not found yet"
+# collapsed the two into the second: a mistyped id was answered with "retry
+# after the next sync", advice that is never right and never stops being given.
+SYNC_GRACE = dt.timedelta(minutes=90)
+
+
+def covers_recent(result: dict, now) -> bool:
+    """Whether the read reaches close enough to now for absence to mean absence."""
+    if result.get("coverage_complete"):
+        return True
+    watermark = result.get("source_watermark_ms")
+    if watermark is None:
+        return False
+    reached = dt.datetime.fromtimestamp(int(watermark) / 1000, dt.timezone.utc)
+    return (now - reached) <= SYNC_GRACE
+
+
 def collect(rfq_id: str, out_dir: Path, *, now=None, s3=None) -> dict:
     now = now or dt.datetime.now(dt.timezone.utc)
     result = read_executions(now - HORIZON, now, s3=s3, now=now)
     rows = shaped(result["rows"])
 
+    # An explicit namespace is honoured, matching execution_tape.read_executions.
+    # Stripping it unconditionally made the ambiguity message's own remediation
+    # ("re-run with the exact prefixed id") reproduce the ambiguity, leaving a
+    # block that exists in both namespaces permanently unanalysable.
     core = core_id(rfq_id)
-    wanted = {core, f"DRFQv2-{core}", f"GRFQ-{core}"}
+    if not core:
+        raise ValueError("empty rfq_id")
+    wanted = ({rfq_id} if rfq_id.startswith(("DRFQv2-", "GRFQ-"))
+              else {core, f"DRFQv2-{core}", f"GRFQ-{core}"})
     fill = [r for r in rows if r["RFQ_ID"] in wanted]
     if not fill:
         # The reader reports the hourly-sync tail as incomplete rather than
@@ -106,6 +140,7 @@ def collect(rfq_id: str, out_dir: Path, *, now=None, s3=None) -> dict:
         # evidence of absence.
         return {"fill": 0, "hist": 0, "blocks": 0,
                 "coverage_complete": bool(result.get("coverage_complete")),
+                "coverage_covers_recent": covers_recent(result, now),
                 "coverage_note": result.get("coverage_note")}
     namespaces = {r["RFQ_ID"] for r in fill}
     if len(namespaces) > 1:
@@ -122,8 +157,14 @@ def collect(rfq_id: str, out_dir: Path, *, now=None, s3=None) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     write(out_dir / "fill.csv", FILL_COLUMNS, fill)
     write(out_dir / "hist.csv", HIST_COLUMNS, hist)
+    # Coverage travels on BOTH paths. Reporting it only on a miss left
+    # recurrence — the one figure the uncovered tail actually moves — rendered
+    # as a fact while the same tail was being treated as decisive above.
     return {"fill": len(fill), "hist": len(hist),
-            "blocks": len({r["BLOCK_TRADE_ID"] for r in hist if r["BLOCK_TRADE_ID"]})}
+            "blocks": len({r["BLOCK_TRADE_ID"] for r in hist if r["BLOCK_TRADE_ID"]}),
+            "coverage_complete": bool(result.get("coverage_complete")),
+            "coverage_covers_recent": covers_recent(result, now),
+            "coverage_note": result.get("coverage_note")}
 
 
 def main() -> int:
@@ -143,13 +184,21 @@ def main() -> int:
         print(f"analyze: execution tape unavailable — {exc}", file=sys.stderr)
         return 4
     if not counts["fill"]:
-        if not counts.get("coverage_complete", True):
+        if not counts.get("coverage_covers_recent", True):
             print(f"analyze: {args.rfq_id} not found, but the tape's coverage is incomplete "
                   f"({counts.get('coverage_note') or 'no watermark'}) — absent from the read "
                   "is not absent from the market", file=sys.stderr)
             return 6
         print(f"analyze: {args.rfq_id} not found on the execution tape", file=sys.stderr)
         return 5
+    if not counts.get("coverage_covers_recent", True):
+        # Recurrence counts OTHER blocks of this structure over 30 days, so the
+        # uncovered tail lands on exactly that number. Saying the count is a
+        # floor is the same claim the not-found branch makes, on the path where
+        # it was previously dropped.
+        print(f"analyze: recurrence is a FLOOR — the tape's coverage is incomplete "
+              f"({counts.get('coverage_note') or 'no watermark'}), so blocks traded in the "
+              "uncovered tail are not counted", file=sys.stderr)
     print(f"fill={counts['fill']} hist={counts['hist']} blocks={counts['blocks']}")
     return 0
 

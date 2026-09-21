@@ -43,9 +43,13 @@ def ok(cond, msg):
 
 
 def tape_row(**over):
+    # row_type is set, as the real tape sets it: the SQL this replaces read
+    # `WHERE row_type='paradigm_trade'`, which drops a NULL rather than keeping
+    # it, so a fixture without one is not a row the query would have returned.
     row = {"traded_at_iso": "2026-09-10T11:22:33Z", "product": "BTC OPTION - DBT",
            "description": "Call 25 Sep 26 70000", "quantity": 10, "trade_price": 0.01,
            "mark_price": 0.011, "taker_side": "BUY", "asset": "BTC",
+           "row_type": "paradigm_trade",
            "instrument_name": "BTC-25SEP26-70000-C", "rfq_id": "DRFQv2-r_target",
            "trade_id": "t1", "block_trade_id": "b1"}
     row.update(over)
@@ -163,6 +167,93 @@ try:
     ok(c.get("coverage_note") == "sync trails by 40 min", "the note survives for the message")
 finally:
     ca.read_executions = real
+
+# --- main(): every exit code and message it introduces -------------------
+# main() had no executed lines: the subprocess uses above all exit before
+# Python runs. 17 mutations survived, including `return 4 -> return 5`, which
+# reports a dead producer as an unknown RFQ — the one substitution the module
+# docstring forbids.
+import io  # noqa: E402
+import contextlib  # noqa: E402
+
+
+def run_main(rfq, *, rows=None, raises=None, coverage=None, tmp=None):
+    """main() end to end with the reader stubbed. Returns (code, stdout, stderr)."""
+    real_read = ca.read_executions
+    real_argv = sys.argv
+
+    def fake(start, end, s3=None, now=None):
+        if raises is not None:
+            raise raises
+        base = {"rows": rows or [], "coverage_complete": True,
+                "source_watermark_ms": int(end.timestamp() * 1000)}
+        base.update(coverage or {})
+        return base
+
+    ca.read_executions = fake
+    sys.argv = ["collect_analysis.py", rfq, "--out-dir", str(tmp or tempfile.mkdtemp())]
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = ca.main()
+    finally:
+        ca.read_executions = real_read
+        sys.argv = real_argv
+    return code, out.getvalue(), err.getvalue()
+
+
+_code, _out, _err = run_main("r_target", rows=[tape_row()])
+ok(_code == 0, f"a found block exits 0 [{_code}]")
+ok("fill=1" in _out, f"and prints the counts on STDOUT [{_out.strip()}]")
+
+_code, _out, _err = run_main("r_missing", rows=[tape_row()])
+ok(_code == 5, f"an unknown id exits 5, not 0 [{_code}]")
+ok("not found on the execution tape" in _err, f"on stderr [{_err.strip()[:70]}]")
+ok(_out.strip() == "", "and prints nothing on stdout")
+
+_code, _out, _err = run_main("r_missing", rows=[tape_row()],
+                             coverage={"coverage_complete": False,
+                                       "source_watermark_ms": 0,
+                                       "coverage_note": "sync trails"})
+ok(_code == 6, f"an unknown id under a stale tail exits 6, not 5 [{_code}]")
+ok("coverage is incomplete" in _err, "and says so rather than blaming the id")
+
+_code, _out, _err = run_main("r_target", raises=RuntimeError("partition missing"))
+ok(_code == 4, f"a reader refusal exits 4, NOT 5 [{_code}]")
+ok("execution tape unavailable" in _err,
+   "a dead producer is never reported as an unknown RFQ")
+
+_amb = [tape_row(rfq_id="DRFQv2-r_dup", trade_id="t1"),
+        tape_row(rfq_id="GRFQ-r_dup", trade_id="t2")]
+_code, _out, _err = run_main("r_dup", rows=_amb)
+ok(_code == 3, f"an id in two namespaces exits 3 [{_code}]")
+# Following the remediation must RESOLVE it, not reproduce it.
+_code, _out, _err = run_main("GRFQ-r_dup", rows=_amb)
+ok(_code == 0, f"and the prefixed id it tells you to use then works [{_code}] {_err.strip()[:60]}")
+
+# Recurrence under a stale tail is a floor, on the path where a block WAS found.
+_code, _out, _err = run_main("r_target", rows=[tape_row()],
+                             coverage={"coverage_complete": False,
+                                       "source_watermark_ms": 0,
+                                       "coverage_note": "sync trails"})
+ok(_code == 0, "a found block under a stale tail still succeeds")
+ok("recurrence is a FLOOR" in _err,
+   f"but says the count is a floor [{_err.strip()[:70]}]")
+
+# --- the tape -> CSV field mapping ----------------------------------------
+# Swapping PRICE and REF_PRICE left all 176 tests green, which would invert
+# every bps offset the skill publishes.
+_mapped = ca.shaped([tape_row(quantity=7, trade_price=0.02, mark_price=0.011,
+                              taker_side="SELL", product="ETH OPTION - DBT",
+                              description="Put 25 Sep 26 3000")])[0]
+ok(_mapped["PRICE"] == 0.02, f"PRICE is the TRADE price [{_mapped['PRICE']}]")
+ok(_mapped["REF_PRICE"] == 0.011, f"REF_PRICE is the MARK price [{_mapped['REF_PRICE']}]")
+ok(_mapped["PRICE"] > _mapped["REF_PRICE"],
+   "so a fill above mark reads as above mark, not below")
+ok(_mapped["QTY"] == 7, f"QTY is the quantity [{_mapped['QTY']}]")
+ok(_mapped["SIDE"] == "SELL", f"SIDE is the TAKER side [{_mapped['SIDE']}]")
+ok(_mapped["PRODUCT"] == "ETH OPTION - DBT", "PRODUCT is the product")
+ok(_mapped["DESCRIPTION"] == "Put 25 Sep 26 3000", "DESCRIPTION is the description")
 
 # --- no skill file directs a read at a hot object or v_vol_surface ---------
 import re  # noqa: E402
