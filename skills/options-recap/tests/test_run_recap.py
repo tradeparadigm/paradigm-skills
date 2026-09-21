@@ -1,193 +1,323 @@
 #!/usr/bin/env python3
-"""
-Tests for run_recap.sh argument normalization — no creds, no network.
+"""Offline checks for the direct-data recap command and collector plan."""
 
-run_recap.sh resolves `<asset> <window>` from positional args and drops a stray
-"options"/"option" keyword that some users include (`/recap btc options 8h`).
-Left in, that token would land in the window slot and break the run
-(hot__recap_options.parquet doesn't exist; parse_window_ms raises). We invoke the
-REAL script with RECAP_PRINT_ARGS=1, which echoes the resolved "ASSET WIN" and
-exits 0 before any STS/DuckDB work — so this exercises the actual parsing in CI
-with no AWS creds and no S3.
-
-Run: python3 tests/test_run_recap.py
-"""
-
+import datetime as dt
+import importlib.util
 import os
+import re
 import subprocess
 import sys
-import time
+import tempfile
+import types
 
-SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts", "run_recap.sh")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPT = os.path.join(ROOT, "scripts", "run_recap.sh")
+COLLECTOR = os.path.join(ROOT, "scripts", "collect_recap.py")
 
-_passed = 0
-_failed = 0
+# collect_recap imports duckdb at module top. Stub it ONLY when it is genuinely
+# absent (the stdlib-only workflow); if this file is ever collected into a
+# pytest session alongside modules that need the real duckdb, a module-level
+# setdefault would leak this connect=None stub into them.
+if importlib.util.find_spec("duckdb") is None:
+    sys.modules["duckdb"] = types.SimpleNamespace(Error=Exception, connect=None)
+
+spec = importlib.util.spec_from_file_location("collect_recap", COLLECTOR)
+collector = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = collector
+spec.loader.exec_module(collector)
+
+passed = failed = 0
+_real_container_memory = collector.container_memory_bytes
 
 
-def check(name, cond, detail=""):
-    global _passed, _failed
-    if cond:
-        _passed += 1
+def check(name, condition, detail=""):
+    global passed, failed
+    if condition:
+        passed += 1
     else:
-        _failed += 1
+        failed += 1
         print(f"  ✗ {name}  {detail}")
 
 
-def resolve(*args):
-    """Run run_recap.sh with the print-args hook; return (stdout.strip(), rc)."""
-    env = dict(os.environ, RECAP_PRINT_ARGS="1")
-    r = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True,
-                       env=env, timeout=20)
-    return r.stdout.strip(), r.returncode
+def hook(name, *args):
+    env = dict(os.environ, **{name: "1"})
+    result = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True, env=env)
+    return (result.stdout.strip() or result.stderr.strip()), result.returncode
 
 
-def plan(*args):
-    """Run with the print-plan hook; return ("ASSET WIN SECS PRESET", rc). Also
-    surfaces stderr on non-zero rc so bad-window guards are checkable."""
-    env = dict(os.environ, RECAP_PRINT_PLAN="1")
-    r = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True,
-                       env=env, timeout=20)
-    return (r.stdout.strip() or r.stderr.strip()), r.returncode
+def calls(body, name):
+    """Argument lists for `name(...)`, paren-balanced. A regex stops at the
+    first `)`, so a two-level nested call failed to match at all and an
+    unpinned store inside one would have gone unseen."""
+    found = []
+    for match in re.finditer(rf"\b{name}\(", body):
+        depth = 0
+        for index in range(match.end() - 1, len(body)):
+            if body[index] == "(":
+                depth += 1
+            elif body[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    found.append(body[match.end():index])
+                    break
+    return found
 
 
-def sources(now_s, *args):
-    """Run with the print-sources hook and a pinned clock; return
-    "ASSET WIN START_MS VS_COLD|-". Exercises the real surface-open source
-    resolution (window-start date math → cold partition path) with no creds."""
-    env = dict(os.environ, RECAP_PRINT_SOURCES="1", RECAP_NOW_S=str(now_s))
-    r = subprocess.run(["bash", SCRIPT, *args], capture_output=True, text=True,
-                       env=env, timeout=20)
-    return r.stdout.strip()
+def test_arguments():
+    check("default is BTC 24h", hook("RECAP_PRINT_ARGS")[0] == "BTC 24h")
+    check("options token is ignored", hook("RECAP_PRINT_ARGS", "eth", "options", "8h")[0] == "ETH 8h")
+    check("1d normalizes to 24h", hook("RECAP_PRINT_ARGS", "btc", "1d")[0] == "BTC 24h")
+    check("window-first invocation", hook("RECAP_PRINT_ARGS", "8h", "options", "eth")[0] == "ETH 8h")
+    check("window-only invocation", hook("RECAP_PRINT_ARGS", "8h")[0] == "BTC 8h")
 
 
-def test_plain_args():
-    out, rc = resolve("BTC", "8h")
-    check("BTC 8h passes through", out == "BTC 8h", out)
-    check("exit 0", rc == 0, rc)
+def test_windows_are_not_capped_but_are_bounded():
+    """The 24h clamp is gone — partitions serve any window — but not unbounded:
+    beyond 30 days the execution tape has nothing and the glob spans every hour
+    of every venue."""
+    check("2d remains 2d", hook("RECAP_PRINT_PLAN", "eth", "2d") == ("ETH 2d 172800 direct", 0))
+    check("7d remains 7d", hook("RECAP_PRINT_PLAN", "btc", "7d") == ("BTC 7d 604800 direct", 0))
+    check("30d is allowed", hook("RECAP_PRINT_PLAN", "btc", "30d")[1] == 0)
+    output, code = hook("RECAP_PRINT_PLAN", "btc", "31d")
+    check("31d is refused before any read", code == 2, output)
+    check("refusal names the limit", "30d" in output, output)
+    # The relay follows script output more closely than a rule it read earlier;
+    # twice it explained the refusal and then ran 30d anyway.
+    check("refusal tells the relay not to substitute", "Do not re-run at 30d" in output, output)
 
 
-def test_asset_uppercased():
-    out, _ = resolve("btc", "4h")
-    check("lowercase asset uppercased", out == "BTC 4h", out)
+def test_bad_arguments_fail_before_data_access():
+    for value in ("0h", "3x", "-2h", "foo"):
+        output, code = hook("RECAP_PRINT_PLAN", "btc", value)
+        check(f"{value} exits 2", code == 2, output)
+    check("unsafe asset exits 2", hook("RECAP_PRINT_PLAN", "BTC';", "8h")[1] == 2)
 
 
-def test_strips_options_keyword():
-    out, rc = resolve("btc", "options", "8h")
-    check("'options' dropped → BTC 8h", out == "BTC 8h", out)
-    check("exit 0 (not the break path)", rc == 0, rc)
+def test_partition_plan_is_explicit_and_hot_free():
+    start = dt.datetime(2026, 8, 30, 10, 30, tzinfo=dt.timezone.utc)
+    end = dt.datetime(2026, 8, 30, 12, 0, tzinfo=dt.timezone.utc)
+    queries = collector.build_queries("BTC", start, end)
+    paths = [path for query in queries for path in query.paths]
+    check("collector exposes venue-isolated evidence groups", len(queries) == 19, [q.name for q in queries])
+    check("every path is direct", all("/raw/" in p or "/normalized/" in p or "/meta/" in p for p in paths))
+    check("no hot path", all("/hot/" not in p and "hot__" not in p for p in paths))
+    check("hours are explicit", all("hour=*" not in p for p in paths))
+    check("exclusive end covers two UTC hours",
+          queries[0].expected_hours == ("20260830T10", "20260830T11"), queries[0].expected_hours)
+    # One listing per day, not per hour: the same objects for 1/24 of the S3 calls.
+    check("one glob per day, not per hour", len(queries[0].paths) == 1, queries[0].paths)
+    surface_sql = next(query.sql for query in queries if query.name == "option_surface_deribit")
+    check("surface samples every expiry and type independently", "PARTITION BY observation, expirationDate, optionType, target_delta" in surface_sql)
 
 
-def test_strips_options_case_insensitive():
-    check("OPTIONS dropped", resolve("BTC", "OPTIONS", "8h")[0] == "BTC 8h")
-    check("singular 'option' dropped", resolve("eth", "option", "4h")[0] == "ETH 4h")
 
 
-def test_options_with_1d_window():
-    # 1d→24h normalization still applies after the keyword is stripped.
-    out, _ = resolve("eth", "options", "1d")
-    check("eth options 1d → ETH 24h", out == "ETH 24h", out)
+
+def test_render_queries_keep_their_coverage_expectations():
+    """The render path rebuilds each Query; dropping a field there silently
+    disabled hour-level coverage on the one path /recap actually runs."""
+    start = dt.datetime(2026, 8, 30, 10, 0, tzinfo=dt.timezone.utc)
+    end = dt.datetime(2026, 8, 30, 13, 0, tzinfo=dt.timezone.utc)
+    plain = {q.name: q for q in collector.build_queries("BTC", start, end)}
+    for rendered in collector.build_queries("BTC", start, end, render=True):
+        check(f"{rendered.name} keeps expected_hours",
+              rendered.expected_hours == plain[rendered.name].expected_hours,
+              rendered.name)
+        check(f"{rendered.name} keeps its reader",
+              rendered.stream == plain[rendered.name].stream, rendered.name)
+        check(f"{rendered.name} keeps its projection",
+              rendered.columns == plain[rendered.name].columns, rendered.name)
 
 
-def test_defaults():
-    check("no args → BTC 8h", resolve()[0] == "BTC 8h")
-    check("asset only → BTC 8h", resolve("btc")[0] == "BTC 8h")
+def test_streamed_queries_name_every_column_their_sql_reads():
+    """The async reader projects to Query.columns, so a column the SQL uses but
+    the tuple omits is silently absent at query time."""
+    start = dt.datetime(2026, 8, 30, 10, 0, tzinfo=dt.timezone.utc)
+    end = dt.datetime(2026, 8, 30, 12, 0, tzinfo=dt.timezone.utc)
+    streamed = [q for q in collector.build_queries("BTC", start, end) if q.stream]
+    # The identifiers the reader must hand DuckDB are exactly the ones named
+    # before FROM read_parquet(...) — read them off the SQL rather than testing
+    # a hardcoded tuple, which compared nothing.
+    # SQL words and built-ins are not columns. A future query using a keyword
+    # absent from this set fails loudly here, which is the safe direction.
+    keywords = {
+        "with", "as", "materialized", "select", "distinct", "from", "where",
+        "and", "or", "not", "in", "is", "null", "nulls", "group", "by", "order",
+        "asc", "desc", "limit", "union", "all", "case", "when", "then", "else",
+        "end", "over", "partition", "filter", "cast", "try_cast", "timestamptz",
+        # NOT `timestamp`: it is a real column in every venue and dvol schema
+        # and the window bound casts it, so exempting it let a projection drop
+        # it silently. `timestamptz` already covers the cast's type name.
+        "last", "first", "least", "greatest", "lower", "upper",
+        "coalesce", "count", "sum", "min", "max", "avg", "abs", "round",
+        "arg_min", "arg_max", "any_value", "row_number", "filename",
+        "name",  # DuckDB's UNION ALL BY NAME
+    }
+    for query in streamed:
+        check(f"{query.name} declares its columns", bool(query.columns), query.name)
+        # The whole statement, not just the select list: a column used only in
+        # WHERE or GROUP BY is as absent from a projection that omits it. Strip
+        # read_parquet's own arguments, comments and string literals first —
+        # none of those name a column.
+        sql = re.sub(r"read_parquet\([^)]*\)", " ", query.sql)
+        sql = re.sub(r"--[^\n]*", " ", sql)
+        sql = re.sub(r"'[^']*'", " ", sql)
+        skip = set(re.findall(r"\bAS\s+([a-z_][a-z0-9_]*)", sql, re.I))
+        skip |= set(re.findall(
+            r"(?:WITH|,)\s*([a-z_][a-z0-9_]*)\s+AS\s*(?:NOT\s+)?(?:MATERIALIZED\s*)?\(",
+            sql, re.I))
+        named = set(re.findall(r"\b[a-z_][a-z0-9_]*\b", sql.lower())) - keywords - skip
+        missing = named - set(query.columns)
+        check(f"{query.name} projects every source column its SQL names",
+              not missing, sorted(missing))
 
 
-# ── Dynamic-window parsing + preset gating (RECAP_PRINT_PLAN) ────────────────
-# The old preset `case` silently defaulted any non-preset window (e.g. 3h) to
-# 8h, so surface deltas were computed against the wrong window-open and the
-# hot__recap_<win>.parquet read missed. Windows are now parsed generically.
-
-def test_preset_window_plan():
-    # Preset: SECS from the window, PRESET=1 (label only — same rolling-file path).
-    check("8h → 28800s, preset", plan("btc", "8h") == ("BTC 8h 28800 1", 0))
-    check("1h → 3600s, preset", plan("btc", "1h") == ("BTC 1h 3600 1", 0))
 
 
-def test_dynamic_window_resolves_correctly():
-    # The bug: 3h must resolve to 10800s (not the old 8h/28800 default), PRESET=0.
-    check("3h → 10800s, non-preset", plan("btc", "3h") == ("BTC 3h 10800 0", 0))
-    check("90m → 5400s, non-preset", plan("btc", "90m") == ("BTC 90m 5400 0", 0))
-    check("6h → 21600s, non-preset", plan("btc", "6h") == ("BTC 6h 21600 0", 0))
+def test_s3_reads_pin_the_regional_endpoint():
+    """#37 pinned ENDPOINT so the S3 authority stays deterministic: the global
+    host answers cross-region with a 307 that the enclave's exact-match egress
+    allowlist cannot follow. Rewriting run_recap.sh dropped it once already."""
+    skills = os.path.dirname(ROOT)
+    unpinned = []
+    for skill in ("data-discovery", "options-recap"):
+        for directory, _, names in os.walk(os.path.join(skills, skill)):
+            for name in names:
+                if not name.endswith((".py", ".sh", ".md")):
+                    continue
+                path = os.path.join(directory, name)
+                with open(path, encoding="utf-8") as handle:
+                    body = handle.read()
+                # Require the argument list: a bare prose mention of the phrase
+                # would otherwise start a match that swallows the next real
+                # statement, hiding an unpinned one.
+                for statement in re.findall(
+                        r"CREATE (?:OR REPLACE )?(?:PERSISTENT )?SECRET\s+\w+\s*\([^)]*\)", body):
+                    if "CREDENTIAL_CHAIN" in statement and "ENDPOINT" not in statement:
+                        unpinned.append(os.path.relpath(path, skills))
+                # boto3 resolves its own endpoint, and AWS_ENDPOINT_URL or a
+                # profile setting overrides that resolution. Match on the
+                # constructor and its first argument, so boto3.resource,
+                # session.client and a bare client() are all covered.
+                for call in re.findall(
+                        r"\b(?:client|resource)\(\s*[\'\"]s3[\'\"][^)]*\)", body):
+                    if "endpoint_url" not in call:
+                        unpinned.append(os.path.relpath(path, skills))
+                # The async reader does not go through boto3 for its GETs, so
+                # it carries the pin on its own store constructor. Markdown
+                # counts too — its examples are what agents copy — so the one
+                # exemption is the bare ellipsis placeholder prose writes.
+                # bucket is obstore's only positional parameter, so requiring
+                # an `=` anywhere let a positional-bucket call through.
+                for arguments in calls(body, "S3Store"):
+                    if arguments.strip() in ("", "..."):
+                        continue
+                    if "endpoint=" not in arguments:
+                        unpinned.append(os.path.relpath(path, skills))
+    check("every S3 read pins the regional endpoint", not unpinned, unpinned)
 
 
-def test_1d_normalizes_to_preset():
-    # 1d → 24h happens before parsing, so it stays on the fast preset path.
-    check("1d → 24h, 86400s, preset", plan("btc", "1d") == ("BTC 24h 86400 1", 0))
+def test_importing_collect_recap_makes_the_shared_reader_importable():
+    """s3_async lives in data-discovery now. Every other test either stubs it in
+    sys.modules or loads it by path, so nothing would notice if the module-scope
+    sys.path insert went away — and every stream=True query would degrade to
+    "unavailable" in production only."""
+    # find_spec resolves the path without executing it, so this stays stdlib-only:
+    # s3_async imports obstore and pyarrow, which this lane does not install.
+    # No sys.path seeding: spec_from_file_location resolves collect_recap by
+    # path, and seeding would pre-plant the sideways scripts/ entry the module
+    # under test is supposed to add for itself.
+    program = (
+        "import sys, types, importlib.util as u;"
+        "sys.modules.setdefault('duckdb', types.SimpleNamespace(Error=Exception, connect=None));"
+        f"spec = u.spec_from_file_location('collect_recap', {COLLECTOR!r});"
+        "mod = u.module_from_spec(spec);"
+        "sys.modules['collect_recap'] = mod;"
+        "spec.loader.exec_module(mod);"
+        "found = u.find_spec('s3_async');"
+        "print(found.origin if found else 'NOT FOUND')"
+    )
+    # -P drops the script directory and -E ignores PYTHONPATH: both sit ahead of
+    # the insert under test, so without them the child could resolve s3_async
+    # from its own cwd and pass with the insert deleted.
+    result = subprocess.run([sys.executable, "-P", "-E", "-c", program],
+                            capture_output=True, text=True)
+    origin = result.stdout.strip()
+    check("importing collect_recap puts the shared reader on the path",
+          result.returncode == 0
+          and origin.endswith(os.path.join("data-discovery", "scripts", "s3_async.py")),
+          origin or result.stderr.strip()[-200:])
 
 
-def test_windows_beyond_24h_cap():
-    # Every flow source retains only ~24h, so longer windows clamp to 24h (the
-    # live path also prepends a disclosure banner). 24h itself is NOT capped.
-    check("2d caps to 24h", plan("eth", "2d") == ("ETH 24h 86400 1", 0))
-    check("48h caps to 24h", plan("btc", "48h") == ("BTC 24h 86400 1", 0))
-    check("25h caps to 24h", plan("btc", "25h") == ("BTC 24h 86400 1", 0))
-    check("24h itself not capped", plan("btc", "24h") == ("BTC 24h 86400 1", 0))
-    check("1440m (=24h) not capped", plan("btc", "1440m") == ("BTC 1440m 86400 0", 0))
-    # Regression: the old substring 1d→24h substitution turned 31d into "324h"
-    # (13.5 days); exact-match normalization + the cap now yield a plain 24h.
-    check("31d caps to 24h (not 324h)", plan("btc", "31d") == ("BTC 24h 86400 1", 0))
+def test_connect_runs_the_session_prefix_and_the_tuning():
+    """The zone statement is tested on its own, but nothing asserted that
+    connect() still runs it — stubbing the call out left every lane green."""
+    executed = []
+    original = collector.duckdb
+    collector.duckdb = types.SimpleNamespace(
+        connect=lambda: types.SimpleNamespace(execute=executed.append))
+    try:
+        collector.connect()
+    finally:
+        collector.duckdb = original
+    check("connect runs the session prefix", collector.DUCKDB_PREFIX in executed, executed)
+    check("connect runs the tuning", collector.TUNING in executed, executed)
 
 
-# ── Surface-open source resolution (RECAP_PRINT_SOURCES) ────────────────────
-# ΔATM/ΔRR/ΔFly need a window-open surface. Windows ≤1h read it from _hot only
-# (VS_COLD "-"); >1h windows also target the cold hour-partition containing
-# window-start. The bash date math must be UTC and zero-padded on both GNU and
-# BSD date — a wrong partition path silently degrades every Δ column to n/a,
-# which is exactly the bug that shipped when the cold store was empty.
-
-COLD_FMT = ("s3://dt-paradigm-data/paradigm_data/v_vol_surface/"
-            "base={a}/year={t.tm_year:04d}/month={t.tm_mon:02d}/day={t.tm_mday:02d}/"
-            "hour={t.tm_hour:02d}/v_vol_surface.parquet")
-
-
-def expect(asset, win, now_s, secs, cold):
-    start = now_s - secs
-    c = COLD_FMT.format(a=asset, t=time.gmtime(start)) if cold else "-"
-    return f"{asset} {win} {start * 1000} {c}"
-
-
-def test_sources_hot_only_up_to_1h():
-    now = 1_784_536_200  # 2026-07-20 08:30:00 UTC
-    check("30m stays on _hot", sources(now, "btc", "30m") == expect("BTC", "30m", now, 1800, False))
-    check("1h stays on _hot", sources(now, "btc", "1h") == expect("BTC", "1h", now, 3600, False))
-
-
-def test_sources_cold_partition_over_1h():
-    now = 1_784_536_200  # 2026-07-20 08:30:00 UTC
-    out = sources(now, "btc", "8h")
-    check("8h resolves cold partition", out == expect("BTC", "8h", now, 28800, True), out)
-    check("8h cold path zero-padded/UTC",
-          "base=BTC/year=2026/month=07/day=20/hour=00/" in out, out)
-    out = sources(now, "eth", "90m")
-    check("90m (61–120min) also targets cold", out == expect("ETH", "90m", now, 5400, True), out)
+def test_the_limit_is_read_from_this_cgroup_not_the_root():
+    """The ceiling test stubs container_memory_bytes, so the resolution itself
+    was unverified: in a nested layout the root file holds the no-limit
+    sentinel and only the process's own cgroup carries the real number."""
+    sentinel = str((1 << 63) - (1 << 12))
+    for version, proc_body, nested, top in (
+            ("v2", "0::/kubepods/podabc\n", "kubepods/podabc/memory.max", "memory.max"),
+            ("v1", "9:memory:/kubepods/podabc\n",
+             "memory/kubepods/podabc/memory.limit_in_bytes",
+             "memory/memory.limit_in_bytes")):
+        with tempfile.TemporaryDirectory() as root:
+            proc = os.path.join(root, "cgroup")
+            with open(proc, "w") as handle:
+                handle.write(proc_body)
+            for relative, value in ((top, sentinel), (nested, str(4 << 30))):
+                path = os.path.join(root, relative)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w") as handle:
+                    handle.write(value)
+            check(f"nested {version} limit is found",
+                  collector.container_memory_bytes(proc, root) == (4 << 30),
+                  collector.container_memory_bytes(proc, root))
 
 
-def test_sources_day_boundary():
-    # Window-start crosses midnight UTC: day/hour must roll back correctly.
-    now = 1_784_514_600  # 2026-07-20 02:30:00 UTC
-    out = sources(now, "btc", "8h")
-    check("8h across midnight → day=19 hour=18",
-          "year=2026/month=07/day=19/hour=18/" in out, out)
-    check("8h across midnight full line", out == expect("BTC", "8h", now, 28800, True), out)
-
-
-def test_bad_window_exits_2():
-    for w in ("3x", "foo", "0h", "h", "-2h"):
-        out, rc = plan("btc", w)
-        check(f"bad window '{w}' exits 2", rc == 2, f"rc={rc}")
-        check(f"bad window '{w}' names it", "bad window" in out, out)
+def test_the_window_ceiling_follows_the_container_not_the_tape():
+    """30d fits in 8GiB and OOMs at 4Gi, and an OOM kills the process rather
+    than failing the query — so the refusal has to track the container."""
+    for gib, expected in ((8, 30), (6, 21), (4, 14), (2, 7), (1, 1)):
+        collector.container_memory_bytes = lambda g=gib: int(g * (1 << 30))
+        check(f"{gib}GiB allows {expected}d",
+              collector.window_ceiling() == dt.timedelta(days=expected),
+              collector.window_ceiling())
+    collector.container_memory_bytes = lambda: int(4 * (1 << 30))
+    try:
+        collector.parse_window("30d")
+        check("4GiB refuses 30d", False, "no error")
+    except ValueError as exc:
+        check("4GiB refuses 30d", "14d or less" in str(exc), str(exc))
+    check("4GiB still allows 14d", collector.parse_window("14d") == dt.timedelta(days=14))
+    # No cgroup limit is a workstation: the tape's 30 days is the only bound.
+    collector.container_memory_bytes = lambda: None
+    check("unbounded container allows 30d",
+          collector.parse_window("30d") == dt.timedelta(days=30))
+    collector.container_memory_bytes = _real_container_memory
 
 
 def main():
-    tests = [v for k, v in sorted(globals().items())
-             if k.startswith("test_") and callable(v)]
-    print(f"Running {len(tests)} test functions...")
-    for t in tests:
-        t()
-    print(f"\n{_passed} checks passed, {_failed} failed")
-    sys.exit(1 if _failed else 0)
+    for name, function in sorted(globals().items()):
+        if name.startswith("test_") and callable(function):
+            function()
+    print(f"{passed} checks passed, {failed} failed")
+    raise SystemExit(1 if failed else 0)
 
 
 if __name__ == "__main__":
     main()
+

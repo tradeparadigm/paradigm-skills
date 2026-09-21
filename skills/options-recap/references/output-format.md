@@ -1,9 +1,9 @@
 # Output Format — FIXED
 
-This is the exact rendering contract for the recap. **In the live path you do
-not need this file** — `run_recap.sh` already emits this shape and you relay its
-stdout verbatim. Read this only in the **injected-data** and **simulate** modes,
-where you render the four sections yourself.
+This is the existing rendering contract, now backed by non-hot inputs. The live
+script renders it; consult it directly only for supplied/injected evidence.
+Never fabricate a value to fill the template; state a specific field or section
+as unavailable when the selected data cannot establish it.
 
 Four sections, this exact order, every recap. Never reorder, add, or drop
 sections. **Do not emit Themes, Dealer positioning, or a Bottom Line.** Work
@@ -20,18 +20,81 @@ would read as a zero-length window. Intraday windows stay HH:MM-only.
 **Snapshot**
 
 ```yaml
-Spot      $[X]        [up/down X%] (from $[Y], low $[Z])
+⚠ [one line per gap, when there are any]
+Coverage  [N]/[M] venues  [per-venue state, or "all venue feeds complete"]
+Spot      $[X]        [up/down X%, or flat] (from $[Y], low $[Z])
 DVOL      [X]v        [flat/rising/falling] ([open] -> [close])
 RV 7d     [X]v        implied [CHEAP/RICH/IN LINE] vs realized
 VRP       [±X]v       vol [underpriced/overpriced/roughly fair] vs delivered
 Activity  [Nk]        trades — [Venue X% · Venue Y% · ...] (by trade count)
-Volume    $[X]M       all venues
-P/C       [X.Xx]      [descriptor] (all venues, by trades)
+Volume    $[X]M       observed valued trades · USD premium
+P/C       [X.Xx]      [descriptor] (observed trades · see ⚠ lines)
 ```
 
-The Volume note reads `all venues` when the cross-venue `turnover_usd` sum
-drove the number; on a pre-upgrade recap file it falls back to the old
-Deribit-scoped calc and the note reads `Deribit only`.
+The `⚠` lines are the FIRST lines inside the fence, not above it: on
+2026-09-08 a relaying model kept every figure in the fence and deleted all
+three warning lines that sat outside it. `RV 7d` and `VRP` print
+`unavailable` when the Deribit close history cannot be fetched, rather than
+being dropped.
+
+`Coverage` leads the figures because every one of them is a function of how
+much of the window was read, and that cannot be inferred from the figures. `M`
+counts venues by DISPLAY LABEL, the same folding the Activity line uses, so the
+two lines always agree; `N` is those whose trade data was read and proven. The
+detail names any venue that is not `complete`:
+
+- `quiet hours` — the venue's continuous `option_summary` feed covered every
+  hour, and some of those hours carried no prints. NOT "this venue never
+  traded": it is a claim about hours, and a venue can be 40% of the tape and
+  still have quiet hours.
+- `feed gap` — hours missing from BOTH feeds, so trade data was genuinely lost.
+- `quote gap` — hours missing only from `option_summary`. The trade tape covered
+  them, so nothing below is understated; only the coverage proof is short.
+- `READ FAILED` — the trade read itself failed.
+- `unverified` — the companion listing could not be read or came back empty, so
+  coverage could not be established either way.
+
+Exactly three of those mean the venue's trades are missing or unproven: `feed
+gap`, `READ FAILED` and `unverified`. `quiet hours` and `quote gap` do not —
+both describe a venue whose trades were read in full.
+
+A venue in one of those three is dropped from the Activity split and named after
+it instead — `(by trade count; Deribit unread — shares are of what was read)`.
+Its own share is unknowable, so it is not printed; and the remaining percentages
+are computed over the READ venues only, so they sum to 100 and the sentence is
+true. `N` in `Coverage N/M` counts by the same three, so the two lines always
+agree about the same venue. An unrecognised state renders `state not recognised`,
+counts as unread, and never raises.
+
+`ATM`, `25d RR` and `Fly` carry a trailing `*` when the value was reached by
+clamping to an endpoint of a thin chain rather than interpolated, and the Term
+label carries one when any expiry's ATM was. `Fly` is `(c25 + p25)/2 - atm`, so
+it takes the star if EITHER input was clamped.
+
+Every `⚠` line names venues with the SAME words the Snapshot uses — `Bybit`,
+`OKX`, `Deribit`, `Deribit USDC`, `Bullish` — never the raw partition id
+(`okex-options`). The two Deribit ids stay apart in a `⚠` line, which describes
+one venue, and fold together in Coverage and Activity, which describe shares.
+Money in a `⚠` line is `$X.XXM`, the same unit as the Block Flow header.
+
+Block Flow states every exclusion with its size, because the section's subject is
+how much flow there was:
+
+- blocks excluded for an unprovable Paradigm overlap, with their notional and
+  coin — these are real prints withheld rather than absent;
+- blocks below the $250k floor, with their combined notional;
+- blocks dropped for want of event-time unit metadata, with how many of the
+  venue's blocks remain;
+- Bybit, which publishes a block flag with no group id and so can never appear.
+
+`Spot` is normally Deribit's own index. When that feed is unreachable it falls
+back to the venue tape's last trade-time index and says so in a `⚠` line; treat
+`Spot` and any block priced without its own index as approximate on that run.
+
+Volume is the valued subset, not a market total: trades whose USD premium
+cannot be proven are counted in a gap line instead of being estimated into the
+number. Never write `all venues` — a venue's trade source can be a gap — and
+never combine `amount_native` across venues.
 
 **Biggest Print**
 
@@ -39,24 +102,16 @@ Deribit-scoped calc and the note reads `Deribit only`.
 [DDMMMYY] [structure]   [Nx]   $[X]M   [HH:MM] UTC   via Paradigm/[Venue] ([Buy/Sell, ][IV]v avg)
 ```
 
-The single largest **block** in the window, by summed per-leg USD notional,
-from two sources ranked together: the Paradigm block tape (one
-`BLOCK_TRADE_ID` = one block; every venue Paradigm brokers —
-Deribit/Paradex/Bullish/…) and the exchanges' own venue tapes for venues
-Paradigm does NOT broker (OKX today, via the hot recap file's option `block`
-rows) — the only venues with zero Paradigm-tape overlap, so nothing
-double-counts. (Widening to every venue via exact id-dedupe is deferred to the
-Snowflake-off migration; see the maintainer README.)
-The `via …` tag names the source and scopes the line: `via Paradigm/[Venue]`
-for a Paradigm-brokered block, `via venue tape` for a venue-tape one. A
-venue-tape winner has no leg geometry, so it renders as
+The single largest **proven block** in the window, ranked by underlying USD
+notional, as in Block Flow. Snapshot Volume is USD premium turnover: never
+substitute one measure for the other. Group legs only on a real venue block/OTC id. The
+`via …` tag names the source and venue. A raw venue block without provable leg
+geometry renders as
 `[Venue] Block   [Nx]   $[X]M   ~[HH:MM] UTC   via venue tape`
 (`~` = 5-min bucket resolution; `[Nx]` is its total coin size). The side word appears only when
 the whole block is one-directional (Buy/Sell); mixed-direction structures (any
 spread) carry no side tag — never write "two-way" here. The `[IV]v avg` appears
-only for Deribit blocks (IV is looked up from the vol surface, which is
-Deribit-scoped); venue-tape blocks carry per-trade IV where their venue
-publishes it (OKX does); other venues show no IV tag.
+only when the direct venue rows publish or support the IV calculation.
 
 `[Nx]` is the structure UNIT size — the base (ratio-1) leg count of the
 package, e.g. a 4×63-lot iron fly is `63x`, a 600-per-leg calendar is `600x`.
@@ -81,10 +136,9 @@ the Detail column.
 …
 ```
 
-Venue-tape rows (venues Paradigm never brokers — OKX today) rank in the same
-pool and count toward the header totals. Their tape has no leg geometry, so
-the structure label is `[Venue] Block`, the detail carries a `(venue tape)`
-note, and they count as one block each.
+Raw venue blocks rank in the same pool and count toward the header totals. When
+their rows do not prove leg geometry, use `[Venue] Block`, carry a
+`(venue tape)` note, and count the real venue block id once.
 
 The Structure column has a 27-char floor but stretches to the longest label in
 the window (a typed cross-expiry label like `24JUL26/31JUL26 Call Diagonal`
@@ -124,6 +178,11 @@ Expiry     ATM      ΔATM     25d RR    ΔRR      Fly     ΔFly
 …
 ```
 
+`*` marks a figure reached by extrapolating past the listed chain rather than
+interpolating within it — on the ATM column as well as the wings, since a thin
+chain clamps ATM to an endpoint and that value also drives the term-structure
+label.
+
 Formatting rules: ATM/RR/Fly are current (close) values, `X.Xv` precision. The Δ
 columns are the window-over-window change (current − window-open), signed `+X.Xv`;
 `flat` when the change rounds to zero, `n/a` when no window-open surface was
@@ -135,4 +194,7 @@ extrapolated wings (e.g. `-4.0v*`).
 
 ## Thin Window
 
-(< 2h, no blocks) — output all four sections; mark empty ones `No data`.
+(< 2h, no blocks) — output all four sections. An empty one states a specific
+source and reason — `Unavailable — no block cleared the $250k floor in this
+window` — never a bare `No data`, which reads as a quiet market when it may be a
+missing feed.
