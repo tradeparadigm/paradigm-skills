@@ -406,7 +406,7 @@ def _run_once(monkeypatch, *, coverage=("feed_gap", {"lost_hours": ["20260916T10
                                                     "expected": 3, "quiet_hours": []}),
               missing_hours=("20260916T10",), status="ok",
               query_name="option_trades_deribit", end=None, pattern_count=4,
-              coverage_patch=True):
+              coverage_patch=True, now=None):
     """Drive `run()` through ONE real venue read, so the loop body executes.
 
     Stubbing build_queries to [] emptied the loop, which left coverage_verdict,
@@ -453,7 +453,11 @@ def _run_once(monkeypatch, *, coverage=("feed_gap", {"lost_hours": ["20260916T10
 
     monkeypatch.setattr(direct, "inputs", fake_inputs)
     window_end = end or COV_END
-    result = direct.run("BTC", "24h", window_end - timedelta(hours=3), window_end)
+    # Pin the clock to the window these fixtures describe. Letting run() read the
+    # wall clock made every live-window assertion pass on the day it was written
+    # and fail on every day after it.
+    result = direct.run("BTC", "24h", window_end - timedelta(hours=3), window_end,
+                        now=now or window_end)
     return calls, captured, result
 
 
@@ -575,6 +579,18 @@ def test_the_read_gap_denominator_matches_the_plan(monkeypatch):
             missing_hours=("20260918T03",), pattern_count=(24 if end.minute == 0 else 25))
         line = [g for g in captured["gaps"] if g.startswith("venue_blocks_deribit:")]
         assert line and expected in line[0], (end.isoformat(), captured["gaps"])
+
+
+def test_a_replayed_window_counts_its_final_hour_in_the_denominator(monkeypatch):
+    """The other direction of the same rule, pinned explicitly so it cannot pass
+    by accident of today's date: when the window is NOT live, its final hour is
+    genuinely due and must stay in the `N of M`."""
+    end = datetime(2026, 9, 18, 12, 30, tzinfo=UTC)
+    _, captured, _ = _run_once(
+        monkeypatch, query_name="venue_blocks_deribit", end=end,
+        missing_hours=("20260918T03",), pattern_count=25, now=end + timedelta(days=2))
+    line = [g for g in captured["gaps"] if g.startswith("venue_blocks_deribit:")]
+    assert line and "of 25" in line[0], captured["gaps"]
 
 
 def test_the_run_passes_one_clock_to_the_coverage_check(monkeypatch):

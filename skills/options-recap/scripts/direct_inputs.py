@@ -357,7 +357,7 @@ _EXCLUSION_REASONS = {
 }
 
 
-def run(asset, window, start, end):
+def run(asset, window, start, end, now=None):
     recap.WARNINGS.clear()
     queries = build_queries(asset, start, end, render=True)
     end_ms, start_ms = int(end.timestamp() * 1000), int(start.timestamp() * 1000)
@@ -369,8 +369,10 @@ def run(asset, window, start, end):
     # venue -> (state, detail); what was actually behind this window per venue.
     coverage = {}
     # One clock for the whole run. The bucket still being written, or None when
-    # this is not a live window.
-    now = datetime.now(timezone.utc)
+    # this is not a live window. Injectable so a test can pin the window it
+    # describes: reading the wall clock here made every in-progress-hour test
+    # pass on the day it was written and fail on every day after it.
+    now = now or datetime.now(timezone.utc)
     in_progress = f"{end:%Y%m%dT%H}" if (now - end) < timedelta(hours=1) else None
     hour_aligned = not (end.minute or end.second or end.microsecond)
     # Partition reads get their own pool: they are the ones holding a window in
