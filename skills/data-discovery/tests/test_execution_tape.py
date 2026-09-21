@@ -214,8 +214,29 @@ def test_old_metadata_contract_is_rejected():
             obj["Metadata"]["coverage_end_ms"] = obj["Metadata"].pop("build_window_end_ms")
             return obj
 
-    with pytest.raises(KeyError, match="build_window_start_ms"):
+    # RuntimeError naming the object, not a bare KeyError: in production this
+    # reached the reader as the recap line "Paradigm executions unavailable —
+    # 'generated_at_ms'", which names neither the object nor the problem.
+    with pytest.raises(RuntimeError, match="build_window_start_ms"):
         reader.read_executions(NOW - timedelta(hours=2), NOW, s3=OldMetadata(), now=NOW)
+
+
+def test_a_partition_without_its_provenance_names_the_object():
+    """Seen in production on 2026-09-18: one object in the window carried no
+    generated_at_ms, and the whole Paradigm tape was reported unavailable with
+    the key name as the entire explanation."""
+    class NoProvenance(S3):
+        def get_object(self, **kwargs):
+            obj = super().get_object(**kwargs)
+            obj["Metadata"].pop("generated_at_ms")
+            return obj
+
+    with pytest.raises(RuntimeError) as caught:
+        reader.read_executions(NOW - timedelta(hours=2), NOW, s3=NoProvenance(), now=NOW)
+    message = str(caught.value)
+    assert "generated_at_ms" in message
+    assert "paradigm_trade_tape" in message, message
+    assert "freshness" in message, message
 
 
 def test_ambiguous_bare_id_fails_but_qualified_id_preserves_legs():

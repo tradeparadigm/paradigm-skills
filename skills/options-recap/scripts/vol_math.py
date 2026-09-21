@@ -821,8 +821,14 @@ def tape_block_key(row: dict):
     return row.get("BLOCK_TRADE_ID") or row.get("TRADE_ID")
 
 
+# The Block Flow floor, named once: recap.py reports what the floor removed, and
+# the two reading different literals is exactly the drift that made the
+# exclusion counts disagree with the totals they describe.
+MIN_BLOCK_NOTIONAL_USD = 250_000
+
+
 def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
-                      min_notional_usd: float = 250_000,
+                      min_notional_usd: float = MIN_BLOCK_NOTIONAL_USD,
                       extra_blocks: list[dict] | None = None) -> dict:
     """Group tape leg-rows into blocks and worked-order structures.
 
@@ -852,8 +858,14 @@ def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
     blocks = [_block_from_rows(bid, brows, iv_lookup)
               for bid, brows in by_block.items()]
     blocks += [dict(b) for b in (extra_blocks or [])]
+    below = [b for b in blocks if b["notional_usd"] < min_notional_usd]
     blocks = [b for b in blocks if b["notional_usd"] >= min_notional_usd]
     blocks.sort(key=lambda b: b["notional_usd"], reverse=True)
+    # The floor keeps Block Flow readable, but it removes real prints from the
+    # header totals; a reader cannot tell a quiet window from a trimmed one.
+    trimmed = ({"blocks": len(below),
+                "notional_usd": round(sum(b["notional_usd"] for b in below))}
+               if below else {})
     n_venue = sum(1 for b in blocks if b.get("source") == "venue")
 
     biggest = None
@@ -890,7 +902,7 @@ def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
         "total_m": round(sum(b["notional_usd"] for b in blocks) / 1e6, 1),
         "n_blocks": len(blocks), "n_structures": len(structures),
         "n_venue_blocks": n_venue,
-        "rows": out_rows, "biggest_print": biggest,
+        "rows": out_rows, "biggest_print": biggest, "trimmed": trimmed,
     }
 
 
@@ -972,6 +984,11 @@ def compute_vol_surface(tickers: dict[str, dict], spot: float | None = None,
             "rr_25d": rr,
             "fly_25d": fly,
             "wings_extrapolated": bool(c25_ex or p25_ex),
+            # _interp already says whether it had to clamp to an endpoint; for
+            # ATM that answer was computed and dropped, so a thin chain rendered
+            # a clamped IV as the ATM figure with nothing to say it was reached
+            # by extrapolation — and it drives front/back ATM and the term label.
+            "atm_extrapolated": bool(atm_ex),
         })
 
     # Chronological order (unknown expiry_ms sorts last).

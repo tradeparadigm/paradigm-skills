@@ -93,6 +93,18 @@ def read_executions(start, end, *, rfq_id=None, asset=None, s3=None, now=None):
         )
         obj = s3.get_object(Bucket=BUCKET, Key=key)
         metadata = obj["Metadata"]
+        # Named, not indexed. A bare KeyError surfaces as the recap line
+        # "Paradigm executions unavailable — 'generated_at_ms'", which names
+        # neither the object nor what is wrong with it, and reads as a broken
+        # skill rather than an object written without its provenance.
+        missing = [name for name in ("generated_at_ms", "build_window_start_ms",
+                                     "build_window_end_ms") if name not in metadata]
+        if missing:
+            raise RuntimeError(
+                f"execution partition carries no {', '.join(missing)} — its freshness "
+                f"and window cannot be established, so it is not trusted: "
+                f"s3://{BUCKET}/{key}"
+            )
         published = datetime.fromtimestamp(
             int(metadata["generated_at_ms"]) / 1000, timezone.utc
         )
