@@ -376,6 +376,12 @@ tail = [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": d, "QTY": q, "PRICE": p,
     ("Call 24 Jul 26 90000", 10, 0.0010, "BUY"))]
 ok(not ac.package_size_certain(tail),
    "a spread with a small tail cannot know its own base, and says so")
+# Recorded as a KNOWN-WRONG answer, not an aspiration: the real package here is
+# 100, the script says 10, and it cannot do better because a 100/100/10 spread
+# with a tail and a 10:10:1 ratio are the same three numbers. What it owes the
+# reader is the ⚠, and that the premium is wrong by the same factor.
+ok(ac.structure_unit(tail) == 10.0,
+   f"the inferred size on that shape is the smallest leg, wrong by 10x {ac.structure_unit(tail)}")
 
 # The per-leg `ratio` legs_from_rows sets is consumed by net_greeks, and nothing
 # held it: dropping it gave net delta 0.0, and passing the raw QTY gave 400.0,
@@ -438,7 +444,13 @@ _amb = _rendered(clipped)
 ok("⚠ ×N INFERRED" in _amb, f"an inferred size is declared in the body [{_amb[:110]}]")
 # The doubt covers the premium and the offset too, not just the size: they are
 # netted against the same base, so they are wrong by the same factor.
-ok("bps offset are unconfirmed" in _amb, "and the warning scopes the doubt to all three")
+ok("bps offset are wrong by the same factor" in _amb,
+   "and the warning scopes the error to all three")
+_tail_out = _rendered(tail)
+ok("⚠ ×N INFERRED" in _tail_out and "wrong by a whole multiple" in _tail_out,
+   f"and the warning says the size is wrong, not merely unconfirmed [{_tail_out[:90]}]")
+ok("bps offset are wrong by the same factor" in _tail_out,
+   "and that the offset is wrong with it")
 
 # A Cstm whose second leg omits its ratio: the CSTM pattern requires one, so
 # that leg was dropped and the block sized off its own QTY as if it were a

@@ -369,10 +369,12 @@ def render(r) -> str:
         # DESCRIPTION and two trade the same side, so a clipped leg and two legs
         # on that side read identically. The size below is the smallest row.
         L.append("⚠ ×N INFERRED — the legs are unequal and nothing states their ratios, so "
-                 "which leg is the package unit cannot be read off the tape. ×N below is the "
-                 "smallest leg, and because the premium is netted against that same base, "
-                 "Paid/Recd and the bps offset are unconfirmed by the same factor. Check all "
-                 "three against the tape rows before quoting them.")
+                 "which leg is the package unit cannot be read off the tape: a 100/100/10 "
+                 "spread with a tail and a 10:10:1 ratio are the same three numbers. ×N below "
+                 "is the SMALLEST leg, which on the first of those is wrong by a whole "
+                 "multiple, and the premium nets against that same base — so Paid/Recd and the "
+                 "bps offset are wrong by the same factor. Read the leg sizes off the tape rows "
+                 "below and say so, rather than repeating ×N as though it were confirmed.")
         L.append("")
     L.append(f"**{a} {exp} {strikes} {struct} · ×{r['qty']:g} | {r['side']} | "
              f"{verb} {fillabs:g} | {_offset_txt(r['offset'])}**")
