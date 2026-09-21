@@ -227,6 +227,9 @@ _amb = [tape_row(rfq_id="DRFQv2-r_dup", trade_id="t1"),
         tape_row(rfq_id="GRFQ-r_dup", trade_id="t2")]
 _code, _out, _err = run_main("r_dup", rows=_amb)
 ok(_code == 3, f"an id in two namespaces exits 3 [{_code}]")
+ok("ambiguous" in _err or "namespaces" in _err,
+   f"and says why, on STDERR so it cannot be relayed as the analysis [{_err.strip()[:60]}]")
+ok(_out.strip() == "", "with nothing on stdout")
 # Following the remediation must RESOLVE it, not reproduce it.
 _code, _out, _err = run_main("GRFQ-r_dup", rows=_amb)
 ok(_code == 0, f"and the prefixed id it tells you to use then works [{_code}] {_err.strip()[:60]}")
@@ -239,6 +242,23 @@ _code, _out, _err = run_main("r_target", rows=[tape_row()],
 ok(_code == 0, "a found block under a stale tail still succeeds")
 ok("recurrence is a FLOOR" in _err,
    f"but says the count is a floor [{_err.strip()[:70]}]")
+
+# A NULL row_type is DROPPED, as `WHERE row_type='paradigm_trade'` drops it.
+# Keeping it put the same rfq_id in both fill and hist and inflated recurrence.
+_null_rt = dict(tape_row(trade_id="t_null"))
+_null_rt.pop("row_type")
+_mixed = ca.shaped([tape_row(trade_id="t_real"), _null_rt])
+ok([r["TRADE_ID"] for r in _mixed] == ["t_real"],
+   f"a row with no row_type is dropped, as the SQL dropped it {[r['TRADE_ID'] for r in _mixed]}")
+# A column absent from EVERY row is a different failure — a schema change —
+# and must raise rather than silently return nothing.
+try:
+    ca.shaped([_null_rt])
+    ok(False, "a tape with no row_type column at all raises")
+except KeyError:
+    ok(True, "a tape with no row_type column at all raises")
+_counts, _ = collect([tape_row(trade_id="t1"), _null_rt])
+ok(_counts["hist"] == 1, f"recurrence counts only classified rows [{_counts}]")
 
 # --- the tape -> CSV field mapping ----------------------------------------
 # Swapping PRICE and REF_PRICE left all 176 tests green, which would invert
