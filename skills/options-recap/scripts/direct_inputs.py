@@ -298,6 +298,18 @@ def inputs(totals, evidence, specs, gaps, coverage=None):
 # warning /recap emitted was a false alarm. Measured over 30 days: Bullish
 # traded in 341 of 720 hours and was reported as 53% missing, while its quote
 # feed was 720/720 intact.
+# A window is LIVE while its final hour is still being written. Producers write
+# into that bucket a few minutes late, so it is legitimately absent from every
+# feed — but only on a live run: on a replay the same hour is genuinely due.
+# One definition, because the two callers below had a copy each and "one clock"
+# is a property of the data flow, not of the threshold.
+LIVE_WINDOW = timedelta(hours=1)
+
+
+def is_live(now, end) -> bool:
+    return (now - end) < LIVE_WINDOW
+
+
 COMPANION = "option_summary"
 
 
@@ -329,7 +341,7 @@ def coverage_verdict(venue, asset, start, end, missing_trade_hours, now=None):
     # The final bucket is the hour still being written, but ONLY on a live run:
     # deriving it from `end` alone hid a genuinely dead final hour on a replay.
     now = now or datetime.now(timezone.utc)
-    live = (now - end) < timedelta(hours=1)
+    live = is_live(now, end)
     in_progress = f"{end:%Y%m%dT%H}" if live else None
     if in_progress:
         expected = tuple(h for h in expected if h != in_progress)
@@ -357,7 +369,7 @@ _EXCLUSION_REASONS = {
 }
 
 
-def run(asset, window, start, end):
+def run(asset, window, start, end, now=None):
     recap.WARNINGS.clear()
     queries = build_queries(asset, start, end, render=True)
     end_ms, start_ms = int(end.timestamp() * 1000), int(start.timestamp() * 1000)
@@ -369,9 +381,11 @@ def run(asset, window, start, end):
     # venue -> (state, detail); what was actually behind this window per venue.
     coverage = {}
     # One clock for the whole run. The bucket still being written, or None when
-    # this is not a live window.
-    now = datetime.now(timezone.utc)
-    in_progress = f"{end:%Y%m%dT%H}" if (now - end) < timedelta(hours=1) else None
+    # this is not a live window. Injectable so a test can pin the window it
+    # describes: reading the wall clock here made every in-progress-hour test
+    # pass on the day it was written and fail on every day after it.
+    now = now or datetime.now(timezone.utc)
+    in_progress = f"{end:%Y%m%dT%H}" if is_live(now, end) else None
     hour_aligned = not (end.minute or end.second or end.microsecond)
     # Partition reads get their own pool: they are the ones holding a window in
     # memory, so their concurrency is a memory budget, not a latency choice.
