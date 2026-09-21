@@ -42,7 +42,8 @@ if [ "$status" -ne 0 ]; then
     6) echo "rfq_id not found, but the tape's coverage is incomplete — this is missing" \
             "evidence, not a missing trade. Retry after the next sync." ;;
     *) echo "execution tape unavailable — the analysis cannot run. This is a data" \
-            "pipeline failure, not an unknown RFQ; see SKILL.md for the manual fallback." ;;
+            "pipeline failure, not an unknown RFQ. Report it as a data outage — do NOT use the" \
+            "not-resolved line, which blames the trade." ;;
   esac
   exit "$status"
 fi

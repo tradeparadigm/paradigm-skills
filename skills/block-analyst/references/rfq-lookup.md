@@ -103,7 +103,7 @@ Notes:
   note the rest as strike-level context, not prints.
 - The tape is the **executed** tape. For RFQ-level context (fill rate, unfilled,
   lifespan) the sibling dataset is `paradigm_rfq_tape_slim` (same `RFQ_ID` key).
-- **Auth:** the STS block above assumes the IRSA role directly; no external file
+- **Auth:** `collect_analysis.py` uses the shared reader's credential chain; no STS block, no external file
   read needed. If the credentials / DuckDB tool are unavailable, fall back below.
 
 **Self-test (regression guard — bare id must resolve a prefixed row):** given a
@@ -173,3 +173,22 @@ decide the structure; every one of those comes from the resolved `FILL` row (`PR
   fall back to "parse the structure from the description" — if the id doesn't resolve and the
   asset therefore isn't known, report the RFQ unresolved (Step 7); do not fabricate an
   asset/strike/structure or default to BTC.
+
+## `collect_analysis.py` exit codes
+
+One line on STDERR, relayed verbatim and nothing else. The codes are deliberately
+distinct — substituting one for another is the failure this script exists to stop.
+
+| code | meaning | what to say |
+|---|---|---|
+| `0` | resolved | the rendered block |
+| `2` | malformed or missing `rfq_id` | ask for the id |
+| `3` | the id exists in BOTH namespaces | re-run with the exact `DRFQv2-`/`GRFQ-` id the message names; that form is honoured, so it resolves |
+| `4` | **execution tape unavailable** | a data-pipeline outage. Report it as one. **Never** use the "RFQ not resolved" line — that blames the trade for a producer failure |
+| `5` | not on the tape, coverage complete | genuinely not found |
+| `6` | not found, coverage incomplete | absent from the read is not absent from the market; say the read was short |
+
+Exit `0` can still carry a STDERR line: `recurrence is a FLOOR — the tape's
+coverage is incomplete`. The block is sound; the 30-day recurrence count is a
+lower bound because the hourly sync tail is not in the read. Relay it beside the
+block rather than presenting the count as exact.

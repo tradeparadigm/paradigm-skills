@@ -67,6 +67,8 @@ greeks").
 `exec`/`uv`/S3 aren't available, skip the script** and render the block directly from that data via
 Steps 1–7. Otherwise use the script:
 
+**On failure: one STDERR line, non-zero exit — relay it and stop.** Exit `4` is a tape outage, not an unknown RFQ — never answer it with the not-resolved line; codes in `references/rfq-lookup.md`.
+
 **Run one command and relay its stdout as your entire reply:**
 
 ```bash
