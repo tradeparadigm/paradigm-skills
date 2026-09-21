@@ -451,6 +451,18 @@ ok(ac.parse_description(_half[0]["DESCRIPTION"])["classified"] is False,
 _out = _rendered(_half)
 ok("⚠ unmapped structure" in _out,
    f"and the reader is told the structure was not mapped [{_out[:100]}]")
+
+# The rendered contract itself. The eval rewrite dropped 11 of 13 format
+# assertions, and nothing here checked the shape either — deleting the whole
+# bracket block from SKILL.md left both gates green.
+_shape = _rendered(ratio_rows)
+_lines = [l for l in _shape.splitlines() if l.strip()]
+ok(_lines[0].startswith("**") and " | " in _lines[0],
+   f"line 1 is the pipe-delimited header [{_lines[0][:80]}]")
+ok(_lines[1].startswith("Spot "), f"line 2 is the view line [{_lines[1][:60]}]")
+ok("```yaml" in _shape, "the bracket rows sit in a yaml block")
+for _row in ("[Greeks]", "[Fair]", "[History]", "[Live]"):
+    ok(_row in _shape, f"{_row} is rendered")
 ok(_rendered(ratio_rows).count("⚠ ×N INFERRED") == 0,
    "and an unambiguous one says nothing")
 
