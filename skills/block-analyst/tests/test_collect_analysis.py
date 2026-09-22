@@ -294,6 +294,17 @@ for _padded in (" r_target ", "\tDRFQv2-r_target\n"):
     _code, _out, _err = run_main(_padded, rows=[tape_row()])
     ok(_code == 0, f"a padded id {_padded!r} resolves [{_code}] {_err.strip()[:50]}")
 
+# `blocks` counts DISTINCT block ids. Every other fixture is one leg per block,
+# which is not the multi-leg case this skill exists for, so `len({ids})` ->
+# `len(hist)` survived: a two-leg straddle sharing b1 would count as two.
+_two_leg = [tape_row(trade_id="t1", block_trade_id="b1",
+                     description="Call 25 Sep 26 70000"),
+            tape_row(trade_id="t2", block_trade_id="b1",
+                     description="Call 25 Sep 26 70000")]
+_counts, _ = collect(_two_leg)
+ok(_counts["hist"] == 2, f"both legs land in hist [{_counts}]")
+ok(_counts["blocks"] == 1, f"but they are ONE block, not two [{_counts}]")
+
 # The 30-day window is the skill's documented horizon and nothing pinned it —
 # the reader is stubbed everywhere, so HORIZON 30->7 passed unnoticed.
 _window = {}
