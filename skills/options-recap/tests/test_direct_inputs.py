@@ -406,7 +406,8 @@ def _run_once(monkeypatch, *, coverage=("feed_gap", {"lost_hours": ["20260916T10
                                                     "expected": 3, "quiet_hours": []}),
               missing_hours=("20260916T10",), status="ok",
               query_name="option_trades_deribit", end=None, pattern_count=4,
-              coverage_patch=True, now=None):
+              coverage_patch=True, now=None, blocks=(), venue_total=None,
+              build_extra=None):
     """Drive `run()` through ONE real venue read, so the loop body executes.
 
     Stubbing build_queries to [] emptied the loop, which left coverage_verdict,
@@ -430,7 +431,9 @@ def _run_once(monkeypatch, *, coverage=("feed_gap", {"lost_hours": ["20260916T10
                    blocks, **kwargs):
         calls["tape_available"] = kwargs.get("tape_available")
         calls["venue_coverage"] = snapshot.get("venue_coverage")
-        return {"snapshot": snapshot, "source_gaps": [], "hot_horizon": None}
+        calls["blocks"] = blocks
+        return {"snapshot": snapshot, "source_gaps": [], "hot_horizon": None,
+                **(build_extra or {})}
 
     monkeypatch.setattr(recap, "build", fake_build)
     monkeypatch.setattr(recap, "render_md", lambda result: result)
@@ -439,7 +442,8 @@ def _run_once(monkeypatch, *, coverage=("feed_gap", {"lost_hours": ["20260916T10
     monkeypatch.setattr(direct, "metadata", lambda *a, **k: pl.DataFrame())
     if coverage_patch:
         monkeypatch.setattr(direct, "coverage_verdict", lambda *a, **k: coverage)
-    monkeypatch.setattr(direct, "aggregate_trades", lambda *a, **k: dict(direct.EMPTY_TOTAL))
+    monkeypatch.setattr(direct, "aggregate_trades",
+                        lambda *a, **k: dict(direct.EMPTY_TOTAL, **(venue_total or {})))
     monkeypatch.setattr(direct, "read_executions",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no partition")))
     monkeypatch.setattr(recap, "fetch_7d_closes", lambda *a, **k: [])
@@ -449,7 +453,8 @@ def _run_once(monkeypatch, *, coverage=("feed_gap", {"lost_hours": ["20260916T10
     def fake_inputs(totals, evidence, specs, gaps, coverage=None):
         captured["gaps"] = list(gaps)
         captured["coverage"] = coverage
-        return {"trades_total": 1, "venue_coverage": coverage}, [], 0.0
+        captured["totals"] = totals
+        return {"trades_total": 1, "venue_coverage": coverage}, list(blocks), 0.0
 
     monkeypatch.setattr(direct, "inputs", fake_inputs)
     window_end = end or COV_END
@@ -580,6 +585,61 @@ def test_the_read_gap_denominator_matches_the_plan(monkeypatch):
         line = [g for g in captured["gaps"] if g.startswith("venue_blocks_deribit:")]
         assert line and expected in line[0], (end.isoformat(), captured["gaps"])
 
+
+
+def _flow_lines(result):
+    """The Block Flow ⚠ lines run() appends after `inputs()` has been called,
+    which is why `captured["gaps"]` (snapshotted inside it) cannot see them."""
+    return [g for g in result["source_gaps"] if g.startswith("Block Flow:")]
+
+
+def test_a_block_priced_at_close_says_it_is_on_another_clock(monkeypatch):
+    """Ranking a close-priced block against trade-time-priced ones is the
+    mixing this phase set out to stop hiding. The line was unreachable: no
+    fixture ever handed `run()` a block without an `index_px`."""
+    _, _, result = _run_once(
+        monkeypatch,
+        blocks=({"exchange": "bullish", "premium_usd": 1.0},
+                {"exchange": "deribit", "index_px": 76000.0, "premium_usd": 1.0}))
+    line = [g for g in _flow_lines(result) if "closing spot" in g]
+    assert line, result["source_gaps"]
+    # Only the venue that actually fell back is named.
+    assert "Bullish" in line[0] and "Deribit" not in line[0], line[0]
+
+    # Control: every block trade-time priced, so there is nothing to say.
+    _, _, priced = _run_once(
+        monkeypatch, blocks=({"exchange": "deribit", "index_px": 76000.0},))
+    assert not [g for g in _flow_lines(priced) if "closing spot" in g], priced["source_gaps"]
+
+
+def test_an_active_bybit_says_its_blocks_cannot_be_shown(monkeypatch):
+    """Bybit's block flag carries no group id, so its blocks are absent from
+    Block Flow however active it was — which reads as "Bybit did no blocks"."""
+    _, _, result = _run_once(
+        monkeypatch, query_name="option_trades_bybit-options",
+        venue_total={"count": 43_137})
+    line = [g for g in _flow_lines(result) if "Bybit" in g]
+    assert line and "block flag with no group id" in line[0], result["source_gaps"]
+
+    # A venue that read nothing makes no claim about its blocks.
+    _, _, quiet = _run_once(
+        monkeypatch, query_name="option_trades_bybit-options", venue_total={"count": 0})
+    assert not [g for g in _flow_lines(quiet) if "Bybit" in g], quiet["source_gaps"]
+
+
+def test_blocks_dropped_by_the_floor_are_declared(monkeypatch):
+    """A $250k floor that silently removes blocks understates Block Flow. The
+    count and the notional both come from the line, so both are asserted."""
+    _, _, result = _run_once(
+        monkeypatch,
+        build_extra={"blocks_below_floor": {"blocks": 40, "notional_usd": 1_342_463.0}})
+    line = [g for g in _flow_lines(result) if "$250k floor" in g]
+    assert line, result["source_gaps"]
+    assert "40 block(s)" in line[0] and "$1.34M" in line[0], line[0]
+
+    # Nothing trimmed, nothing said.
+    _, _, none = _run_once(monkeypatch, build_extra={"blocks_below_floor": {}})
+    assert not [g for g in _flow_lines(none) if "$250k floor" in g], none["source_gaps"]
 
 def test_the_live_boundary_is_exclusive_at_exactly_one_hour():
     """The threshold itself, which only became testable once `now` was

@@ -1797,6 +1797,41 @@ def test_build_passes_the_tape_to_the_dedupe():
     check("and they are the tape rows, not the venue rows",
           any((r or {}).get("VENUE_BLOCK_TRADE_ID") == "BLOCK-1" for r in (seen.get("tape") or [])),
           seen.get("tape"))
+    # The VALUE, not just the argument: `tape_available = True` in place of
+    # `bool(block_rows)` passed every check here, and that default is what
+    # decides whether an unreadable tape deletes brokered blocks or keeps them.
+    check("tape rows present ⇒ the tape is available", seen.get("tape_available") is True, seen)
+
+
+def test_build_reads_the_tape_signal_off_the_rows_it_was_given():
+    """Unset `tape_available` means "derive it", and the derivation is what
+    tells _dedupe_venue_blocks whether the tape is unreadable or merely empty.
+    Hard-coding it True kept every other check green while restoring the
+    silent deletion this default exists to prevent."""
+    seen = {}
+    orig = recap._dedupe_venue_blocks
+
+    def spy(venue_rows, tape_rows=None, tape_available=True):
+        seen["tape_available"] = tape_available
+        return orig(venue_rows, tape_rows, tape_available=tape_available)
+
+    venue_rows = [{"exchange": "deribit", "block_id": "BLOCK-1", "volume_coin": "1",
+                   "premium_usd": "10", "leg_count": "1"}]
+    recap._dedupe_venue_blocks = spy
+    try:
+        # No Paradigm rows at all: the tape could not be read, so the brokered
+        # blocks must be KEPT with reason `tape_unreadable`.
+        out = build("BTC", "8h", 1_000_000, 2_000_000,
+                    {"closes_7d": [], "market": None}, {"spot_close": 100000.0},
+                    [], venue_rows)
+        check("no tape rows ⇒ the tape is not available",
+              seen.get("tape_available") is False, seen)
+        excluded = out.get("blocks_excluded") or []
+        check("and the brokered blocks are kept, not deleted",
+              not excluded or all(e.get("reason") != "id_space_unproven" for e in excluded),
+              excluded)
+    finally:
+        recap._dedupe_venue_blocks = orig
 
 
 
