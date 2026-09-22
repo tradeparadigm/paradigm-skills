@@ -45,9 +45,16 @@ err="$OUT/.collect.err"
 uv run "$DIR/scripts/collect_analysis.py" "$RAW" --out-dir "$OUT" >/dev/null 2>"$err"
 status=$?
 note=$(grep '^analyze: ' "$err" 2>/dev/null)
-rm -f "$err"
 if [ "$status" -ne 0 ]; then
-  [ -n "$note" ] && printf '%s\n' "$note"
+  if [ -n "$note" ]; then
+    printf '%s\n' "$note"
+  else
+    # collect died before it could speak (import error, uv, argparse): the filter
+    # alone would leave stdout empty, so say so and relay the tail minus uv chatter.
+    printf 'analyze: collect_analysis.py failed (exit %s) before reporting:\n' "$status"
+    grep -vE '^ *(Installed|Uninstalled|Downloading|Downloaded|Resolved|Prepared|Audited) ' \
+      "$err" 2>/dev/null | tail -n 5
+  fi
   exit "$status"
 fi
 # Exit 0 can still carry a note — `recurrence is a FLOOR`. It is part of the

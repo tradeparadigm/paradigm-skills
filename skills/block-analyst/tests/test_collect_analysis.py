@@ -408,22 +408,41 @@ ok("recurrence is a FLOOR" in _out,
 # CORE instead reinstates the ambiguity defect closed in round 2: the prefixed
 # id the error message tells you to re-run with would stop being honoured.
 _seen = Path(tempfile.mkdtemp()) / "argv"
-def run_sh_argv(rfq):
+def run_sh_argv(rfq, code=4):
+    """argv of each `uv` call, in order; `code` is what every call exits with."""
     with tempfile.TemporaryDirectory() as bin_dir:
         stub = Path(bin_dir) / "uv"
         out = Path(bin_dir) / "argv.txt"
         stub.write_text("#!/bin/sh\n"
-                        f"for a in \"$@\"; do printf '%s\\n' \"$a\"; done > {shlex.quote(str(out))}\n"
-                        "exit 4\n")
+                        f"for a in \"$@\"; do printf '%s\\n' \"$a\"; done >> {shlex.quote(str(out))}\n"
+                        f"echo --- >> {shlex.quote(str(out))}\n"
+                        f"exit {code}\n")
         stub.chmod(0o755)
         env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}")
         subprocess.run(["bash", str(SH), rfq], capture_output=True, text=True, env=env)
-        return out.read_text().splitlines() if out.exists() else []
+        text = out.read_text() if out.exists() else ""
+        return [call.strip().splitlines() for call in text.split("---\n") if call.strip()]
 
-_argv = run_sh_argv("DRFQv2-r_target")
+_argv = run_sh_argv("DRFQv2-r_target")[0]
 ok("DRFQv2-r_target" in _argv,
    f"analyze.sh hands collect the id as given, not the stripped core {_argv}")
 ok("r_target" not in _argv, f"and not the bare core {_argv}")
+
+# The render call's flags decide the reply: without --render analyze.py prints
+# json.dumps(result), and SKILL.md relays stdout verbatim.
+_calls = run_sh_argv("r_target", code=0)
+ok(len(_calls) == 2, f"a clean resolve goes on to call analyze.py [{len(_calls)} calls]")
+ok(_calls[-1][:2] == ["run", "scripts/analyze.py"] and "--render" in _calls[-1]
+   and "--csv-dir" in _calls[-1], f"and asks it for the rendered block {_calls[-1:]}")
+
+# A failure collect never got to author — import error, uv, argparse — carries no
+# `analyze:` line. Filtering alone left both streams empty; the reply was nothing.
+_rc, _out, _ = run_sh(1, note="ModuleNotFoundError: No module named 'execution_tape'")
+ok(_rc == 1, f"an unauthored failure keeps its exit code [{_rc}]")
+ok("ModuleNotFoundError" in _out and "exit 1" in _out,
+   f"and says what died on stdout [{_out.strip()[:80]}]")
+ok("Installed 13 packages" not in _out, f"without uv's chatter [{_out.strip()[:80]}]")
+ok("REACHED_ANALYZE_PY" not in _out, "and stops before analyze.py")
 
 # uv's own chatter must never reach stdout: SKILL.md tells the model stdout is
 # its entire reply, so a cold cache would have put "Installed 13 packages in
