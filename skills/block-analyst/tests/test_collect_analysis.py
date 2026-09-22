@@ -247,6 +247,16 @@ ok("recurrence is a FLOOR" in _err,
 # Keeping it put the same rfq_id in both fill and hist and inflated recurrence.
 _null_rt = dict(tape_row(trade_id="t_null"))
 _null_rt.pop("row_type")
+# The guard must fire on the regression that actually happens: polars keeps the
+# key when the value is NULL or the column is renamed, so a key-presence test
+# passes while shaped() returns nothing and every id reports as never traded.
+for _broken in ({"row_type": None}, {"row_type": "paradigm_trade_v2"}):
+    try:
+        ca.shaped([tape_row(**_broken)])
+        ok(False, f"a tape whose row_type is {_broken['row_type']!r} raises")
+    except KeyError:
+        ok(True, f"a tape whose row_type is {_broken['row_type']!r} raises")
+
 _mixed = ca.shaped([tape_row(trade_id="t_real"), _null_rt])
 ok([r["TRADE_ID"] for r in _mixed] == ["t_real"],
    f"a row with no row_type is dropped, as the SQL dropped it {[r['TRADE_ID'] for r in _mixed]}")
@@ -274,6 +284,31 @@ ok(_mapped["QTY"] == 7, f"QTY is the quantity [{_mapped['QTY']}]")
 ok(_mapped["SIDE"] == "SELL", f"SIDE is the TAKER side [{_mapped['SIDE']}]")
 ok(_mapped["PRODUCT"] == "ETH OPTION - DBT", "PRODUCT is the product")
 ok(_mapped["DESCRIPTION"] == "Put 25 Sep 26 3000", "DESCRIPTION is the description")
+
+import datetime as dt  # noqa: E402
+
+# The coverage predicate, at the watermarks that actually occur. Both earlier
+# fixtures used a 1970 watermark — the one value where every candidate threshold
+# agrees, and one the real reader can never emit (execution_tape.py:117 maps
+# falsy to None).
+_recent = int((dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=40)).timestamp() * 1000)
+ok(ca.coverage_edge({"coverage_complete": False, "source_watermark_ms": _recent}) != "",
+   "a 40-minute-old watermark is still a short read, and says so")
+ok("covers through" in ca.coverage_edge(
+       {"coverage_complete": False, "source_watermark_ms": _recent}),
+   "naming the boundary rather than judging which side of it the trade is on")
+ok(ca.coverage_edge({"coverage_complete": True}) == "",
+   "a complete read names no boundary")
+# A single partition predating the watermark field makes the whole read unknown.
+_unknown = ca.coverage_edge({"coverage_complete": False, "source_watermark_ms": None})
+ok("unknown" in _unknown, f"a missing watermark is UNKNOWN coverage, not complete [{_unknown}]")
+ok(_unknown != "", "and still routes to exit 6 rather than a confident not-found")
+
+# A malformed id is exit 2, the code the table documents — not the outage code.
+for _bad in ("DRFQv2-", "GRFQ-", "   "):
+    _code, _out, _err = run_main(_bad, rows=[tape_row()])
+    ok(_code == 2, f"a malformed id {_bad!r} exits 2, not 4 [{_code}]")
+    ok("invalid rfq_id" in _err, f"and says so rather than blaming the tape [{_err.strip()[:50]}]")
 
 # --- analyze.sh's failure dispatch, driven end to end ----------------------
 # The suite only grepped this file, so five of six mutations survived the gate:
