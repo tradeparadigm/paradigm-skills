@@ -240,9 +240,9 @@ def test_a_partition_without_its_provenance_names_the_object():
 
 
 def test_metadata_names_are_matched_without_regard_to_case():
-    """iron-proxy relays S3 through Go's HTTP client, which canonicalises
-    x-amz-meta-generated_at_ms to X-Amz-Meta-Generated_at_ms; botocore keeps that
-    casing, so a proxied pod reported every healthy partition as unstamped."""
+    """Header names are case-insensitive, and any HTTP intermediary may re-case
+    them — Go's net/http turns x-amz-meta-generated_at_ms into
+    X-Amz-Meta-Generated_at_ms. An exact-case lookup refused every partition."""
     class GoCanonicalised(S3):
         def get_object(self, **kwargs):
             obj = super().get_object(**kwargs)

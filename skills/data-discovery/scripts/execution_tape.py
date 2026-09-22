@@ -92,8 +92,8 @@ def read_executions(start, end, *, rfq_id=None, asset=None, s3=None, now=None):
             f"paradigm_trade_tape__{day:%Y%m%d}.parquet"
         )
         obj = s3.get_object(Bucket=BUCKET, Key=key)
-        # botocore keeps metadata names as they arrive, and a Go proxy canonicalises
-        # them (generated_at_ms -> Generated_at_ms). Header names are case-insensitive.
+        # Metadata arrives as HTTP headers, whose names are case-insensitive (RFC 9110)
+        # and may be re-cased in transit; botocore keeps whatever casing arrived.
         metadata = {name.lower(): value for name, value in obj["Metadata"].items()}
         # Named, not indexed. A bare KeyError surfaces as the recap line
         # "Paradigm executions unavailable — 'generated_at_ms'", which names
