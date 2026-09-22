@@ -323,9 +323,18 @@ SH = Path(HERE).parent / "scripts" / "analyze.sh"
 def run_sh(code, note="analyze: stub said so", rfq="r_target"):
     """Drive analyze.sh with `uv` stubbed to a chosen exit code and stderr."""
     with tempfile.TemporaryDirectory() as bin_dir:
+        # The stub distinguishes its two callers. analyze.sh runs `uv` twice —
+        # collect first, then analyze.py — and a stub returning the same code
+        # for both hides whether the script actually STOPPED on the failure.
         stub = Path(bin_dir) / "uv"
+        marker = Path(bin_dir) / "second-call"
         stub.write_text(
             "#!/bin/sh\n"
+            f"if [ -f {shlex.quote(str(marker))} ]; then\n"
+            f"  echo REACHED_ANALYZE_PY\n"
+            "  exit 0\n"
+            "fi\n"
+            f"touch {shlex.quote(str(marker))}\n"
             f"printf '%s\\n' {shlex.quote(note)} >&2\n"
             f"exit {code}\n")
         stub.chmod(0o755)
@@ -343,10 +352,15 @@ for _code in (3, 4, 5, 6, 127):
     ok(_rc == _code, f"analyze.sh propagates exit {_code} [{_rc}]")
     ok("stub said so" in _out,
        f"and relays collect's own message on stdout for {_code} [{_out.strip()[:50]}]")
+    # The point of the gate: a failed resolve must not go on to render a block
+    # from an empty directory.
+    ok("REACHED_ANALYZE_PY" not in _out,
+       f"and stops before analyze.py on exit {_code}")
 
 # The FLOOR case: exit 0 WITH a note. The note is part of the answer.
 _rc, _out, _ = run_sh(0, note="analyze: recurrence is a FLOOR — the read covers through X")
 ok(_rc == 0, f"a successful run still exits 0 [{_rc}]")
+ok("REACHED_ANALYZE_PY" in _out, "and DOES go on to render the block")
 ok("recurrence is a FLOOR" in _out,
    f"and its note reaches stdout, not just stderr [{_out.strip()[:60]}]")
 
