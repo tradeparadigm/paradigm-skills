@@ -33,3 +33,13 @@ For supply-chain integrity when distributing skills outside of git:
 - The git commit hash is the authoritative content identifier for this repository.
 - For external distribution (zip, registry), generate a SHA-256 hash of the SKILL.md body and store it as a sidecar file (`SKILL.md.sha256`) or in a distribution manifest. The hash should cover the **Markdown body only** (after the `---` frontmatter delimiter), so the hash remains stable when only metadata changes.
 - There is no standardised `content_hash` field in the AgentSkills spec as of May 2026. Integrity is typically handled at the distribution layer (package registry signatures, Sigstore, or git provenance) rather than inside the file itself — embedding the hash creates a chicken-and-egg problem: the hash changes the file, which changes the hash.
+
+## HTTP Header Names
+
+Header names are case-insensitive ([RFC 9110 §5.1](https://www.rfc-editor.org/rfc/rfc9110#section-5.1)), and servers, CDNs, HTTP/2 and intermediaries all change their casing in transit. Never compare a header name exactly:
+
+- Read headers through the HTTP library's own lookup (`resp.headers["x-foo"]` in `requests`/`httpx`), never through a plain `dict` copy of them.
+- S3 user metadata arrives as `x-amz-meta-*` headers, and boto3 returns `Metadata` as a plain `dict` keyed exactly as received — lowercase the keys before any lookup.
+- In shell, match header lines with `grep -i`.
+
+A missed match is rarely an error: a plain-dict `.get(name, 0)` returns the default, so a rate-limit header silently reads as zero.
