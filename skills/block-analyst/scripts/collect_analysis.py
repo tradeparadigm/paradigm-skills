@@ -30,8 +30,8 @@ from execution_tape import AmbiguousRfqError, read_executions  # noqa: E402
 HORIZON = dt.timedelta(days=30)
 FILL_COLUMNS = ("PRODUCT", "DESCRIPTION", "QTY", "PRICE", "REF_PRICE", "SIDE",
                 "QUOTE_CURRENCY", "RFQ_ID", "TRADE_ID", "BLOCK_TRADE_ID")
-HIST_COLUMNS = ("DATE", "TIME", "PRODUCT", "DESCRIPTION", "QTY", "PRICE",
-                "REF_PRICE", "SIDE", "BLOCK_TRADE_ID")
+HIST_COLUMNS = ("PRODUCT", "DESCRIPTION", "QTY", "PRICE", "REF_PRICE", "SIDE",
+                "BLOCK_TRADE_ID")
 
 
 def core_id(value: str) -> str:
@@ -83,10 +83,7 @@ def shaped(rows: list[dict]) -> list[dict]:
     for row in rows:
         if row.get("row_type") != "paradigm_trade":
             continue
-        stamp = str(row.get("traded_at_iso") or "")
-        date, _, time = stamp.replace("T", " ").partition(" ")
         out.append({
-            "DATE": date, "TIME": time[:8],
             "PRODUCT": row.get("product"), "DESCRIPTION": row.get("description"),
             "QTY": row.get("quantity"), "PRICE": row.get("trade_price"),
             "REF_PRICE": row.get("mark_price"), "SIDE": row.get("taker_side"),
@@ -163,8 +160,7 @@ def collect(rfq_id: str, out_dir: Path, *, now=None, s3=None) -> dict:
     # Recurrence is about OTHER blocks of the same structure, so match on the
     # structure, not on the RFQ.
     structures = {(r["PRODUCT"], r["_DESC_N"]) for r in fill}
-    hist = sorted((r for r in rows if (r["PRODUCT"], r["_DESC_N"]) in structures),
-                  key=lambda r: (r["DATE"], r["TIME"]), reverse=True)
+    hist = [r for r in rows if (r["PRODUCT"], r["_DESC_N"]) in structures]
 
     out_dir.mkdir(parents=True, exist_ok=True)
     write(out_dir / "fill.csv", FILL_COLUMNS, fill)

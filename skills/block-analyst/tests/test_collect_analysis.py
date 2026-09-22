@@ -46,7 +46,7 @@ def tape_row(**over):
     # row_type is set, as the real tape sets it: the SQL this replaces read
     # `WHERE row_type='paradigm_trade'`, which drops a NULL rather than keeping
     # it, so a fixture without one is not a row the query would have returned.
-    row = {"traded_at_iso": "2026-09-10T11:22:33Z", "product": "BTC OPTION - DBT",
+    row = {"product": "BTC OPTION - DBT",
            "description": "Call 25 Sep 26 70000", "quantity": 10, "trade_price": 0.01,
            "mark_price": 0.011, "taker_side": "BUY", "asset": "BTC",
            "row_type": "paradigm_trade",
@@ -83,8 +83,7 @@ ok(ca.quote_currency(tape_row(instrument_name=None)) == "USDC",
 ok(ca.quote_currency(tape_row(asset="SOL")) == "USDC", "an asset outside BTC/ETH -> USDC")
 
 # --- hist is OTHER blocks of the same structure ---------------------------
-same = tape_row(rfq_id="DRFQv2-r_other", trade_id="t2", block_trade_id="b2",
-                traded_at_iso="2026-09-02T08:00:00Z")
+same = tape_row(rfq_id="DRFQv2-r_other", trade_id="t2", block_trade_id="b2")
 other = tape_row(rfq_id="DRFQv2-r_third", trade_id="t3", block_trade_id="b3",
                  description="Put 25 Sep 26 50000")
 counts, out = collect([tape_row(), same, other])
@@ -93,7 +92,12 @@ ok(counts["hist"] == 2, "hist holds the fill plus the other block of that struct
 ok(counts["blocks"] == 2, "recurrence counts distinct blocks, not rows")
 ok({r["BLOCK_TRADE_ID"] for r in out["hist"]} == {"b1", "b2"},
    "a different structure is excluded from hist")
-ok(out["hist"][0]["DATE"] == "2026-09-10", "hist is newest first")
+# The tape's own casing is not a contract: a structure written "30Oct26" in one
+# block and "30OCT26" in another is the same structure.
+recased = tape_row(rfq_id="DRFQv2-r_fourth", trade_id="t4", block_trade_id="b4")
+recased["description"] = recased["description"].lower()
+counts, _ = collect([tape_row(), recased])
+ok(counts["blocks"] == 2, f"a description differing only in case is the same structure [{counts['blocks']}]")
 
 # --- the CSV contract analyze.py reads ------------------------------------
 ok(list(out["fill"][0]) == list(ca.FILL_COLUMNS), "fill.csv header matches the contract")
@@ -443,6 +447,18 @@ ok("ModuleNotFoundError" in _out and "exit 1" in _out,
    f"and says what died on stdout [{_out.strip()[:80]}]")
 ok("Installed 13 packages" not in _out, f"without uv's chatter [{_out.strip()[:80]}]")
 ok("REACHED_ANALYZE_PY" not in _out, "and stops before analyze.py")
+
+# The CSVs are a trader's fills; they must not outlive the run, on success or
+# on any failure.
+for _code in (0, 5):
+    with tempfile.TemporaryDirectory() as _tmp, tempfile.TemporaryDirectory() as _bin:
+        _stub = Path(_bin) / "uv"
+        _stub.write_text(f"#!/bin/sh\nexit {_code}\n")
+        _stub.chmod(0o755)
+        subprocess.run(["bash", str(SH), "r_target"], capture_output=True, text=True,
+                       env=dict(os.environ, PATH=f"{_bin}:{os.environ['PATH']}", TMPDIR=_tmp))
+        _left = list(Path(_tmp).iterdir())
+        ok(not _left, f"analyze.sh leaves no temp files behind on exit {_code} {_left}")
 
 # uv's own chatter must never reach stdout: SKILL.md tells the model stdout is
 # its entire reply, so a cold cache would have put "Installed 13 packages in
