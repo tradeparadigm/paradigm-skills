@@ -11,6 +11,7 @@ import argparse
 import concurrent.futures
 import datetime as dt
 import json
+import os
 import re
 import sys
 import tempfile
@@ -140,6 +141,36 @@ CREATE OR REPLACE SECRET dime_s3 (
 );
 """
 
+# Where the pod's own trust store lives: public roots with the egress proxy's CA
+# folded in, written at pod start by the chart's install-proxy-ca init container.
+SYSTEM_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
+
+
+def ca_statements(bundle: str | None = None) -> str:
+    """The trust duckdb has no other way to acquire, or "" off the pod.
+
+    duckdb reads NO CA environment variable and not the OS trust store either:
+    its httpfs extension carries a compiled-in CA list that only `ca_cert_file`
+    displaces. On the agent pod every 443 connection terminates at a certificate
+    the egress proxy minted for the host asked for, so without these two
+    statements every S3 read fails as "SSL peer certificate or SSH remote key
+    was not OK" — which names neither the proxy nor a certificate file, and
+    looks like a network fault. The CLI gets the same two lines from a mounted
+    ~/.duckdbrc; this module is the reason they are repeated here, because the
+    Python duckdb module reads no rc file.
+
+    The bundle is DECLARED, never sniffed: SSL_CERT_FILE is what the pod
+    publishes it as, and the Debian path is the fallback for a host that
+    publishes nothing. A missing file means a laptop or a CI runner, which has
+    no proxy in front of it and keeps duckdb's own list.
+    """
+    path = bundle or os.environ.get("SSL_CERT_FILE") or SYSTEM_CA_BUNDLE
+    if not os.path.isfile(path):
+        return ""
+    return ("SET ca_cert_file='%s';\n"
+            "SET enable_server_cert_verification=true;\n" % path.replace("'", "''"))
+
+
 MAX_READ_THREADS = 64
 
 
@@ -225,6 +256,11 @@ TUNING = tuning_statements()
 def connect() -> duckdb.DuckDBPyConnection:
     connection = duckdb.connect()
     connection.execute(DUCKDB_PREFIX)
+    # Its own execute rather than part of the prefix: the prefix is a constant
+    # and this is resolved per host.
+    ca = ca_statements()
+    if ca:
+        connection.execute(ca)
     connection.execute(TUNING)
     return connection
 
