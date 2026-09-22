@@ -184,14 +184,15 @@ def main() -> int:
     parser.add_argument("rfq_id")
     parser.add_argument("--out-dir", required=True)
     args = parser.parse_args()
-    if not core_id(args.rfq_id.strip()):
+    rfq_id = args.rfq_id.strip()
+    if not core_id(rfq_id):
         # Exit 2 is the documented code for a malformed id. Leaving it to raise
         # inside collect() sent it to the catch-all below, which answers a typo
         # with "execution tape unavailable" — a dead pipeline that is not dead.
         print(f"analyze: invalid rfq_id {args.rfq_id!r}", file=sys.stderr)
         return 2
     try:
-        counts = collect(args.rfq_id, Path(args.out_dir))
+        counts = collect(rfq_id, Path(args.out_dir))
     except AmbiguousRfqError as exc:
         print(f"analyze: {exc}", file=sys.stderr)
         return 3
@@ -204,11 +205,11 @@ def main() -> int:
     if not counts["fill"]:
         edge = counts.get("coverage_edge") or ""
         if edge:
-            print(f"analyze: {args.rfq_id} not found — {edge}. A block traded after that "
+            print(f"analyze: {rfq_id} not found — {edge}. A block traded after that "
                   "boundary would not be in this read, so absence here is not absence from "
                   "the market.", file=sys.stderr)
             return 6
-        print(f"analyze: {args.rfq_id} not found on the execution tape, whose read covered "
+        print(f"analyze: {rfq_id} not found on the execution tape, whose read covered "
               "the full requested window", file=sys.stderr)
         return 5
     if counts.get("coverage_edge"):

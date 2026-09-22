@@ -37,8 +37,15 @@ trap 'rm -rf "$OUT"' EXIT
 # rewritten to stop saying exactly that. One author, one sentence.
 # `status=$?` after `if ! cmd` reads the NEGATION's result (always 0), which
 # would send every failure to the default branch. Capture, then test.
-note=$(uv run "$DIR/scripts/collect_analysis.py" "$RAW" --out-dir "$OUT" 2>&1 >/dev/null)
+# collect's stderr goes to a FILE, not through `2>&1 >/dev/null`: that captures
+# uv's stderr too, so a cold package cache put "Installed 13 packages in 106ms"
+# on stdout above the block — and SKILL.md tells the model stdout is its entire
+# reply. Only lines collect_analysis.py itself authored are relayed.
+err="$OUT/.collect.err"
+uv run "$DIR/scripts/collect_analysis.py" "$RAW" --out-dir "$OUT" >/dev/null 2>"$err"
 status=$?
+note=$(grep '^analyze: ' "$err" 2>/dev/null)
+rm -f "$err"
 if [ "$status" -ne 0 ]; then
   [ -n "$note" ] && printf '%s\n' "$note"
   exit "$status"

@@ -59,11 +59,14 @@ SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS DATE,
        rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID,
        UPPER(REPLACE(description,' ','')) AS DESC_N
 FROM read_parquet(
-       's3://dt-exchange-venue-data/paradigm_trade_tape/year=2026/month=09/day=*/*.parquet',
+       's3://dt-exchange-venue-data/paradigm_trade_tape/year=*/month=*/day=*/*.parquet',
        hive_partitioning=true, union_by_name=true)
 WHERE row_type='paradigm_trade';
--- Widen to the adjacent month with a second pattern in the list when the 30d
--- HIST horizon crosses a month boundary.
+-- The glob is year=*/month=*, NOT a pinned month: a hardcoded `year=2026/
+-- month=09` silently reads an empty set from 1 October and answers every id
+-- "not found". The prefix holds ~31 days of objects, so scanning all of it IS
+-- the 30-day horizon; narrow by `traded_at` in the WHERE clause, never by
+-- guessing the partition.
 -- (a) the cleared block — authoritative for every field. Asset ← PRODUCT (never assume BTC),
 -- structure ← DESCRIPTION. Offsets precomputed: OFFSET_BPS (×10000) for COIN-quoted premiums
 -- (BTC/ETH); OFFSET_PCT (% of mark) for USD/USDC-quoted premiums (SOL/alts — dollar prices,

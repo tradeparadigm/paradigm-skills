@@ -287,6 +287,33 @@ ok(_mapped["DESCRIPTION"] == "Put 25 Sep 26 3000", "DESCRIPTION is the descripti
 
 import datetime as dt  # noqa: E402
 
+# main() stripped the id for the VALIDITY check and then passed the unstripped
+# one to collect(), so a padded id reported "not found … covered the full
+# requested window" — the substitution this module exists to prevent.
+for _padded in (" r_target ", "\tDRFQv2-r_target\n"):
+    _code, _out, _err = run_main(_padded, rows=[tape_row()])
+    ok(_code == 0, f"a padded id {_padded!r} resolves [{_code}] {_err.strip()[:50]}")
+
+# The 30-day window is the skill's documented horizon and nothing pinned it —
+# the reader is stubbed everywhere, so HORIZON 30->7 passed unnoticed.
+_window = {}
+
+
+def _capture_window(start, end, s3=None, now=None):
+    _window["days"] = round((end - start).total_seconds() / 86400)
+    return {"rows": [], "coverage_complete": True}
+
+
+_real_read = ca.read_executions
+ca.read_executions = _capture_window
+try:
+    with tempfile.TemporaryDirectory() as _d:
+        ca.collect("r_x", Path(_d))
+finally:
+    ca.read_executions = _real_read
+ok(_window.get("days") == 30,
+   f"collect reads the documented 30-day horizon [{_window.get('days')}]")
+
 # The coverage predicate, at the watermarks that actually occur. Both earlier
 # fixtures used a 1970 watermark — the one value where every candidate threshold
 # agrees, and one the real reader can never emit (execution_tape.py:117 maps
@@ -335,6 +362,8 @@ def run_sh(code, note="analyze: stub said so", rfq="r_target"):
             "  exit 0\n"
             "fi\n"
             f"touch {shlex.quote(str(marker))}\n"
+            # uv's OWN stderr, which a cold package cache really does emit.
+            "printf 'Installed 13 packages in 106ms\\n' >&2\n"
             f"printf '%s\\n' {shlex.quote(note)} >&2\n"
             f"exit {code}\n")
         stub.chmod(0o755)
@@ -364,6 +393,35 @@ ok("REACHED_ANALYZE_PY" in _out, "and DOES go on to render the block")
 ok("recurrence is a FLOOR" in _out,
    f"and its note reaches stdout, not just stderr [{_out.strip()[:60]}]")
 
+# analyze.sh must pass the id AS GIVEN. Handing collect the namespace-stripped
+# CORE instead reinstates the ambiguity defect closed in round 2: the prefixed
+# id the error message tells you to re-run with would stop being honoured.
+_seen = Path(tempfile.mkdtemp()) / "argv"
+def run_sh_argv(rfq):
+    with tempfile.TemporaryDirectory() as bin_dir:
+        stub = Path(bin_dir) / "uv"
+        out = Path(bin_dir) / "argv.txt"
+        stub.write_text("#!/bin/sh\n"
+                        f"for a in \"$@\"; do printf '%s\\n' \"$a\"; done > {shlex.quote(str(out))}\n"
+                        "exit 4\n")
+        stub.chmod(0o755)
+        env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}")
+        subprocess.run(["bash", str(SH), rfq], capture_output=True, text=True, env=env)
+        return out.read_text().splitlines() if out.exists() else []
+
+_argv = run_sh_argv("DRFQv2-r_target")
+ok("DRFQv2-r_target" in _argv,
+   f"analyze.sh hands collect the id as given, not the stripped core {_argv}")
+ok("r_target" not in _argv, f"and not the bare core {_argv}")
+
+# uv's own chatter must never reach stdout: SKILL.md tells the model stdout is
+# its entire reply, so a cold cache would have put "Installed 13 packages in
+# 106ms" at the top of a block analysis.
+for _c in (0, 5):
+    _rc, _out, _ = run_sh(_c)
+    ok("Installed 13 packages" not in _out,
+       f"uv's own stderr is not relayed on exit {_c} [{_out.strip()[:60]}]")
+
 # No note, no noise.
 _rc, _out, _ = run_sh(0, note="")
 ok(_rc == 0 and "analyze:" not in _out, f"a clean run adds nothing [{_out.strip()[:40]}]")
@@ -371,8 +429,17 @@ ok(_rc == 0 and "analyze:" not in _out, f"a clean run adds nothing [{_out.strip(
 # --- no skill file directs a read at a hot object or v_vol_surface ---------
 import re  # noqa: E402
 
+SKILL_DOCS = (sorted(Path(HERE).parent.glob("*.md"))
+              + sorted((Path(HERE).parent / "references").glob("*.md")))
+
+# rfq-lookup.md's manual fallback hardcoded year=2026/month=09; from 1 October
+# that reads an empty set and answers every id "not found".
+for doc in SKILL_DOCS:
+    pinned = re.findall(r"year=\d{4}/month=\d{2}", doc.read_text())
+    ok(not pinned, f"{doc.name} pins no calendar month in a read path: {pinned}")
+
 SKILL = Path(HERE).parent
-for doc in sorted(SKILL.glob("*.md")) + sorted((SKILL / "references").glob("*.md")):
+for doc in SKILL_DOCS:
     text = doc.read_text()
     # A prohibition names the object to forbid it; a READ puts it in a path.
     reads = re.findall(r"s3://\S*(?:hot/|hot__|v_vol_surface)\S*", text)
