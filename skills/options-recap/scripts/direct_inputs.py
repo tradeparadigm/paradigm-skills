@@ -7,7 +7,6 @@ from io import BytesIO
 from pathlib import Path
 import sys
 
-import boto3
 import polars as pl
 
 import recap
@@ -16,6 +15,7 @@ from collect_recap import (VENUES, build_queries, connect, hours_present,
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "data-discovery" / "scripts"))
 from execution_tape import S3_ENDPOINT, calculation_rows, read_executions
+from http_client import s3_client
 
 
 SPEC_COLUMNS = ["symbol", "captured_at", "iv_unit", "oi_unit",
@@ -24,7 +24,7 @@ SPEC_COLUMNS = ["symbol", "captured_at", "iv_unit", "oi_unit",
 
 def metadata(venue, asset, start, end):
     """One predecessor snapshot plus snapshots within the requested window."""
-    s3 = boto3.client("s3", region_name="ap-northeast-1", endpoint_url=S3_ENDPOINT)
+    s3 = s3_client(region_name="ap-northeast-1", endpoint_url=S3_ENDPOINT)
     prefix = f"meta/instruments/exchange={venue}/currency={asset.lower()}/"
     objects = []
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket="dt-exchange-venue-data", Prefix=prefix):

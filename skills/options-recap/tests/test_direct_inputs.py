@@ -145,8 +145,7 @@ def test_metadata_keeps_every_spec_change_not_every_snapshot(monkeypatch):
             captured_at, size = snapshots[Key]
             return instrument_object(captured_at, size)
 
-    monkeypatch.setattr(direct, "boto3",
-                        type("Stub", (), {"client": staticmethod(lambda *a, **k: Client())}))
+    monkeypatch.setattr(direct, "s3_client", lambda **_: Client())
     specs = direct.metadata("deribit", "BTC",
                             datetime(2026, 8, 31, tzinfo=timezone.utc),
                             datetime(2026, 9, 6, tzinfo=timezone.utc))
@@ -175,8 +174,8 @@ def test_one_stray_object_does_not_cost_a_venue_its_units(monkeypatch):
         def get_object(self, Bucket, Key):
             return instrument_object(snapshots[Key])
 
-    # Patch the module under test, not the real boto3 every other module shares.
-    monkeypatch.setattr(direct, "boto3", type("Stub", (), {"client": staticmethod(lambda *a, **k: Client())}))
+    # Patch the module under test, not the shared client factory.
+    monkeypatch.setattr(direct, "s3_client", lambda **_: Client())
     specs = direct.metadata("deribit", "BTC", START, END)
     # Both snapshots carry the same spec, so one row covers the window; what
     # matters is that the stray objects did not take the venue's units with them.

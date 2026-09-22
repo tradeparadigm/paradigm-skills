@@ -3,8 +3,9 @@
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
-import boto3
 import polars as pl
+
+from http_client import s3_client
 
 BUCKET = "dt-exchange-venue-data"
 # Pinned for the same reason as the DuckDB secret: AWS_ENDPOINT_URL or a
@@ -83,7 +84,7 @@ def read_executions(start, end, *, rfq_id=None, asset=None, s3=None, now=None):
     oldest = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=30)
     if start < oldest or end > now:
         raise ValueError("execution tape supports the trailing 30 days only")
-    s3 = s3 or boto3.client("s3", region_name="ap-northeast-1", endpoint_url=S3_ENDPOINT)
+    s3 = s3 or s3_client(region_name="ap-northeast-1", endpoint_url=S3_ENDPOINT)
     day = start.replace(hour=0, minute=0, second=0, microsecond=0)
     frames, sources = [], []
     while day < end:
@@ -92,9 +93,7 @@ def read_executions(start, end, *, rfq_id=None, asset=None, s3=None, now=None):
             f"paradigm_trade_tape__{day:%Y%m%d}.parquet"
         )
         obj = s3.get_object(Bucket=BUCKET, Key=key)
-        # Metadata arrives as HTTP headers, whose names are case-insensitive (RFC 9110)
-        # and may be re-cased in transit; botocore keeps whatever casing arrived.
-        metadata = {name.lower(): value for name, value in obj["Metadata"].items()}
+        metadata = obj["Metadata"]
         # Named, not indexed. A bare KeyError surfaces as the recap line
         # "Paradigm executions unavailable — 'generated_at_ms'", which names
         # neither the object nor what is wrong with it, and reads as a broken

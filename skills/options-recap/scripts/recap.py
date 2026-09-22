@@ -46,13 +46,13 @@ import json
 import os
 import subprocess
 import sys
-import urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from urllib.parse import urlencode
 
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data-discovery", "scripts"))
+from http_client import get  # noqa: E402
 from vol_math import (  # noqa: E402
     realized_vs_implied,
     build_tape_blocks,
@@ -110,9 +110,7 @@ def parse_window_ms(window: str) -> int:
 # ── Deribit (public API, no auth) ───────────────────────────────────────────
 
 def _get(path: str, params: dict, timeout: int = 15) -> dict:
-    url = f"{DERIBIT}/{path}?{urlencode(params)}"
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        data = json.loads(r.read())
+    data = get(f"{DERIBIT}/{path}", params, timeout=timeout).json()
     if "error" in data:
         raise RuntimeError(f"Deribit {path}: {data['error']}")
     return data["result"]

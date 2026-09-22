@@ -2,12 +2,14 @@
 
 import importlib.util
 import io
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import polars as pl
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 spec = importlib.util.spec_from_file_location(
     "execution_tape", Path(__file__).resolve().parents[1] / "scripts/execution_tape.py"
 )
@@ -239,19 +241,13 @@ def test_a_partition_without_its_provenance_names_the_object():
     assert "freshness" in message, message
 
 
-def test_metadata_names_are_matched_without_regard_to_case():
-    """Header names are case-insensitive, and any HTTP intermediary may re-case
-    them — Go's net/http turns x-amz-meta-generated_at_ms into
-    X-Amz-Meta-Generated_at_ms. An exact-case lookup refused every partition."""
-    class GoCanonicalised(S3):
-        def get_object(self, **kwargs):
-            obj = super().get_object(**kwargs)
-            obj["Metadata"] = {k[0].upper() + k[1:]: v for k, v in obj["Metadata"].items()}
-            return obj
-
-    result = reader.read_executions(NOW - timedelta(hours=2), NOW, s3=GoCanonicalised(), now=NOW)
-    assert result["coverage_complete"] is True
-    assert result["source_watermark_ms"] == int(NOW.timestamp() * 1000)
+def test_the_default_client_is_the_shared_case_insensitive_one(monkeypatch):
+    """Metadata casing is handled by http_client.s3_client; a raw boto3 client
+    here would put exact-case lookups back on every partition."""
+    built = []
+    monkeypatch.setattr(reader, "s3_client", lambda **kw: built.append(kw) or S3())
+    reader.read_executions(NOW - timedelta(hours=2), NOW, now=NOW)
+    assert built and built[0]["endpoint_url"] == reader.S3_ENDPOINT
 
 
 def test_ambiguous_bare_id_fails_but_qualified_id_preserves_legs():
