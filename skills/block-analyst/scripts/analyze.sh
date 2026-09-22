@@ -31,22 +31,21 @@ trap 'rm -rf "$OUT"' EXIT
 # Resolve FIRST and stop on failure. analyze.py reports a missing fill.csv as
 # "RFQ not resolved (not on Paradigm tape)", which would blame the trade for a
 # producer outage — so a reader refusal has to surface as itself, here.
+# collect's own stderr IS the message, relayed onto stdout unchanged. Re-wording
+# it here produced two differently worded lines for one failure — and the arm for
+# exit 6 still said "Retry after the next sync" after collect_analysis.py had been
+# rewritten to stop saying exactly that. One author, one sentence.
 # `status=$?` after `if ! cmd` reads the NEGATION's result (always 0), which
 # would send every failure to the default branch. Capture, then test.
-uv run "$DIR/scripts/collect_analysis.py" "$RAW" --out-dir "$OUT" >/dev/null
+note=$(uv run "$DIR/scripts/collect_analysis.py" "$RAW" --out-dir "$OUT" 2>&1 >/dev/null)
 status=$?
 if [ "$status" -ne 0 ]; then
-  case "$status" in
-    3) echo "ambiguous rfq_id — re-run with the exact DRFQv2- or GRFQ- prefix" ;;
-    5) echo "rfq_id not found on the execution tape for the trailing 30 days" ;;
-    6) echo "rfq_id not found, but the tape's coverage is incomplete — this is missing" \
-            "evidence, not a missing trade. Retry after the next sync." ;;
-    *) echo "execution tape unavailable — the analysis cannot run. This is a data" \
-            "pipeline failure, not an unknown RFQ. Report it as a data outage — do NOT use the" \
-            "not-resolved line, which blames the trade." ;;
-  esac
+  [ -n "$note" ] && printf '%s\n' "$note"
   exit "$status"
 fi
+# Exit 0 can still carry a note — `recurrence is a FLOOR`. It is part of the
+# answer, so it goes to stdout with the block rather than being swallowed.
+[ -n "$note" ] && printf '%s\n' "$note"
 
 # No exec — the EXIT trap must survive to clean the CSVs after the render.
 cd "$DIR" && uv run scripts/analyze.py --csv-dir "$OUT" --render

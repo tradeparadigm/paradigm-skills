@@ -184,11 +184,11 @@ distinct — substituting one for another is the failure this script exists to s
 | `0` | resolved | the rendered block |
 | `2` | malformed or missing `rfq_id` | ask for the id |
 | `3` | the id exists in BOTH namespaces | re-run with the exact `DRFQv2-`/`GRFQ-` id the message names; that form is honoured, so it resolves |
-| `4` | **execution tape unavailable** | a data-pipeline outage. Report it as one. **Never** use the "RFQ not resolved" line — that blames the trade for a producer failure |
-| `5` | not on the tape, coverage complete | genuinely not found |
-| `6` | not found, coverage incomplete | absent from the read is not absent from the market; say the read was short |
+| `4` | **execution tape unavailable**, or the environment failed it (unwritable `--out-dir`) | a pipeline or environment failure. Report it as one. **Never** use the "RFQ not resolved" line — that blames the trade |
+| `5` | not found, and the read covered the full window | genuinely not found |
+| `6` | not found, and the read stopped short | relay the boundary it names — a block traded after it would not be in the read, so this is not evidence of absence |
 
-Exit `0` can still carry a STDERR line: `recurrence is a FLOOR — the tape's
-coverage is incomplete`. The block is sound; the 30-day recurrence count is a
+Exit `0` can still carry a line: `recurrence is a FLOOR — the read covers
+through <time>`. `analyze.sh` puts it on stdout with the block. The block is sound; the 30-day recurrence count is a
 lower bound because the hourly sync tail is not in the read. Relay it beside the
 block rather than presenting the count as exact.

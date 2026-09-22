@@ -67,7 +67,7 @@ greeks").
 `exec`/`uv`/S3 aren't available, skip the script** and render the block directly from that data via
 Steps 1–7. Otherwise use the script:
 
-**On failure: one STDERR line, non-zero exit — relay it and stop.** Exit `4` is a tape outage, not an unknown RFQ — never answer it with the not-resolved line; codes in `references/rfq-lookup.md`.
+**Any `analyze:` line it prints is part of the answer — relay it verbatim, first.** On a non-zero exit that line is the whole reply; on exit `0` it qualifies the block (`recurrence is a FLOOR` means the 30d count is a lower bound). Exit `4` is a tape or environment failure, never an unknown RFQ — do not answer it with the not-resolved line. Codes in `references/rfq-lookup.md`.
 
 **Run one command and relay its stdout as your entire reply:**
 

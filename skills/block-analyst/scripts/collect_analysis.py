@@ -72,8 +72,13 @@ def shaped(rows: list[dict]) -> list[dict]:
     column absent from EVERY row is a different failure and is raised, not
     silently treated as a match.
     """
-    if rows and not any("row_type" in row for row in rows):
-        raise KeyError("execution tape rows carry no row_type column")
+    # The VALUE, not the key: polars materialises every column, so a NULL or
+    # renamed row_type keeps the key and this guard would pass while `shaped`
+    # returned nothing — every id on the tape reporting as never traded.
+    if rows and not any(row.get("row_type") == "paradigm_trade" for row in rows):
+        raise KeyError(
+            "no execution tape row carries row_type='paradigm_trade' — the column is "
+            "renamed, NULL or gone; refusing to report every id as never traded")
     out = []
     for row in rows:
         if row.get("row_type") != "paradigm_trade":
@@ -104,18 +109,25 @@ def write(path: Path, columns: tuple[str, ...], rows: list[dict]) -> None:
 # on every live run. Using it to choose between "not found" and "not found yet"
 # collapsed the two into the second: a mistyped id was answered with "retry
 # after the next sync", advice that is never right and never stops being given.
-SYNC_GRACE = dt.timedelta(minutes=90)
+def coverage_edge(result: dict) -> str:
+    """How far the read actually reaches, as a sentence — or "" when it reaches
+    the requested end.
 
-
-def covers_recent(result: dict, now) -> bool:
-    """Whether the read reaches close enough to now for absence to mean absence."""
+    Deliberately NOT a verdict. A watermark cannot tell a trade that has not
+    synced yet from one that never happened (execution_tape.py:74-77), so a
+    threshold on it only moves the wrong answer: exact completeness said "retry
+    after the next sync" to a typo, and a 90-minute grace said "not found" to a
+    block traded 20 minutes ago. Naming the boundary answers both without the
+    code guessing which case it is in.
+    """
     if result.get("coverage_complete"):
-        return True
+        return ""
     watermark = result.get("source_watermark_ms")
     if watermark is None:
-        return False
+        # One partition predating the field is enough (execution_tape.py:169).
+        return "the read's coverage is unknown — a partition predates the watermark"
     reached = dt.datetime.fromtimestamp(int(watermark) / 1000, dt.timezone.utc)
-    return (now - reached) <= SYNC_GRACE
+    return f"the read covers through {reached:%Y-%m-%d %H:%M}Z only"
 
 
 def collect(rfq_id: str, out_dir: Path, *, now=None, s3=None) -> dict:
@@ -140,7 +152,7 @@ def collect(rfq_id: str, out_dir: Path, *, now=None, s3=None) -> dict:
         # evidence of absence.
         return {"fill": 0, "hist": 0, "blocks": 0,
                 "coverage_complete": bool(result.get("coverage_complete")),
-                "coverage_covers_recent": covers_recent(result, now),
+                "coverage_edge": coverage_edge(result),
                 "coverage_note": result.get("coverage_note")}
     namespaces = {r["RFQ_ID"] for r in fill}
     if len(namespaces) > 1:
@@ -163,7 +175,7 @@ def collect(rfq_id: str, out_dir: Path, *, now=None, s3=None) -> dict:
     return {"fill": len(fill), "hist": len(hist),
             "blocks": len({r["BLOCK_TRADE_ID"] for r in hist if r["BLOCK_TRADE_ID"]}),
             "coverage_complete": bool(result.get("coverage_complete")),
-            "coverage_covers_recent": covers_recent(result, now),
+            "coverage_edge": coverage_edge(result),
             "coverage_note": result.get("coverage_note")}
 
 
@@ -172,6 +184,12 @@ def main() -> int:
     parser.add_argument("rfq_id")
     parser.add_argument("--out-dir", required=True)
     args = parser.parse_args()
+    if not core_id(args.rfq_id.strip()):
+        # Exit 2 is the documented code for a malformed id. Leaving it to raise
+        # inside collect() sent it to the catch-all below, which answers a typo
+        # with "execution tape unavailable" — a dead pipeline that is not dead.
+        print(f"analyze: invalid rfq_id {args.rfq_id!r}", file=sys.stderr)
+        return 2
     try:
         counts = collect(args.rfq_id, Path(args.out_dir))
     except AmbiguousRfqError as exc:
@@ -184,21 +202,22 @@ def main() -> int:
         print(f"analyze: execution tape unavailable — {exc}", file=sys.stderr)
         return 4
     if not counts["fill"]:
-        if not counts.get("coverage_covers_recent", True):
-            print(f"analyze: {args.rfq_id} not found, but the tape's coverage is incomplete "
-                  f"({counts.get('coverage_note') or 'no watermark'}) — absent from the read "
-                  "is not absent from the market", file=sys.stderr)
+        edge = counts.get("coverage_edge") or ""
+        if edge:
+            print(f"analyze: {args.rfq_id} not found — {edge}. A block traded after that "
+                  "boundary would not be in this read, so absence here is not absence from "
+                  "the market.", file=sys.stderr)
             return 6
-        print(f"analyze: {args.rfq_id} not found on the execution tape", file=sys.stderr)
+        print(f"analyze: {args.rfq_id} not found on the execution tape, whose read covered "
+              "the full requested window", file=sys.stderr)
         return 5
-    if not counts.get("coverage_covers_recent", True):
+    if counts.get("coverage_edge"):
         # Recurrence counts OTHER blocks of this structure over 30 days, so the
         # uncovered tail lands on exactly that number. Saying the count is a
         # floor is the same claim the not-found branch makes, on the path where
         # it was previously dropped.
-        print(f"analyze: recurrence is a FLOOR — the tape's coverage is incomplete "
-              f"({counts.get('coverage_note') or 'no watermark'}), so blocks traded in the "
-              "uncovered tail are not counted", file=sys.stderr)
+        print(f"analyze: recurrence is a FLOOR — {counts['coverage_edge']}, so blocks "
+              "traded after that boundary are not counted", file=sys.stderr)
     print(f"fill={counts['fill']} hist={counts['hist']} blocks={counts['blocks']}")
     return 0
 

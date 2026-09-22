@@ -216,7 +216,7 @@ _code, _out, _err = run_main("r_missing", rows=[tape_row()],
                                        "source_watermark_ms": 0,
                                        "coverage_note": "sync trails"})
 ok(_code == 6, f"an unknown id under a stale tail exits 6, not 5 [{_code}]")
-ok("coverage is incomplete" in _err, "and says so rather than blaming the id")
+ok("not absence from" in _err, f"and says so rather than blaming the id [{_err.strip()[:70]}]")
 
 _code, _out, _err = run_main("r_target", raises=RuntimeError("partition missing"))
 ok(_code == 4, f"a reader refusal exits 4, NOT 5 [{_code}]")
@@ -274,6 +274,50 @@ ok(_mapped["QTY"] == 7, f"QTY is the quantity [{_mapped['QTY']}]")
 ok(_mapped["SIDE"] == "SELL", f"SIDE is the TAKER side [{_mapped['SIDE']}]")
 ok(_mapped["PRODUCT"] == "ETH OPTION - DBT", "PRODUCT is the product")
 ok(_mapped["DESCRIPTION"] == "Put 25 Sep 26 3000", "DESCRIPTION is the description")
+
+# --- analyze.sh's failure dispatch, driven end to end ----------------------
+# The suite only grepped this file, so five of six mutations survived the gate:
+# `exit "$status"` -> `exit 0`, the whole case deleted, arms swapped, `-ne` ->
+# `-eq`, and a revert of the exit-4 message. A stub `uv` on PATH exercises the
+# real script with no production change.
+import subprocess  # noqa: E402
+
+SH = Path(HERE).parent / "scripts" / "analyze.sh"
+
+
+def run_sh(code, note="analyze: stub said so", rfq="r_target"):
+    """Drive analyze.sh with `uv` stubbed to a chosen exit code and stderr."""
+    with tempfile.TemporaryDirectory() as bin_dir:
+        stub = Path(bin_dir) / "uv"
+        stub.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' {shlex.quote(note)} >&2\n"
+            f"exit {code}\n")
+        stub.chmod(0o755)
+        env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}")
+        done = subprocess.run(["bash", str(SH), rfq], capture_output=True,
+                              text=True, env=env)
+        return done.returncode, done.stdout, done.stderr
+
+
+import shlex  # noqa: E402
+import os  # noqa: E402
+
+for _code in (3, 4, 5, 6, 127):
+    _rc, _out, _ = run_sh(_code)
+    ok(_rc == _code, f"analyze.sh propagates exit {_code} [{_rc}]")
+    ok("stub said so" in _out,
+       f"and relays collect's own message on stdout for {_code} [{_out.strip()[:50]}]")
+
+# The FLOOR case: exit 0 WITH a note. The note is part of the answer.
+_rc, _out, _ = run_sh(0, note="analyze: recurrence is a FLOOR — the read covers through X")
+ok(_rc == 0, f"a successful run still exits 0 [{_rc}]")
+ok("recurrence is a FLOOR" in _out,
+   f"and its note reaches stdout, not just stderr [{_out.strip()[:60]}]")
+
+# No note, no noise.
+_rc, _out, _ = run_sh(0, note="")
+ok(_rc == 0 and "analyze:" not in _out, f"a clean run adds nothing [{_out.strip()[:40]}]")
 
 # --- no skill file directs a read at a hot object or v_vol_surface ---------
 import re  # noqa: E402
