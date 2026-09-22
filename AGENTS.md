@@ -40,4 +40,6 @@ Every HTTP and S3 call in a skill script goes through `skills/data-discovery/scr
 
 The reason is header names. They are case-insensitive ([RFC 9110 §5.1](https://www.rfc-editor.org/rfc/rfc9110#section-5.1)), and servers, CDNs, HTTP/2 and proxies all change their casing in transit — the same exchange can hand one client `Timenow` and another `timenow`. `http_client` returns every header map, and every S3 object's user `Metadata`, as a case-insensitive `Headers`: `headers["Retry-After"]`, `headers["retry-after"]` and `headers.get("RETRY-AFTER")` are one lookup, and copies and iteration always carry lowercase names. The failure it prevents is usually silent — a plain-dict `.get(name, 0)` misses and returns the default, so a rate-limit header reads as zero.
 
+In the Dime Terminal runtime, response header names currently arrive lowercase. Do not rely on that: it is a property of the runtime, not a contract, and a skill tested anywhere else sees whatever casing the origin sent. Read headers through `http_client` and the casing never matters.
+
 Nothing can normalise what never runs through a script. When a SKILL.md has the agent read headers itself — with `web_fetch`, or `curl -i` in an example — tell it to match header names case-insensitively (`grep -i`).
