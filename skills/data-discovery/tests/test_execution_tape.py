@@ -239,6 +239,21 @@ def test_a_partition_without_its_provenance_names_the_object():
     assert "freshness" in message, message
 
 
+def test_metadata_names_are_matched_without_regard_to_case():
+    """iron-proxy relays S3 through Go's HTTP client, which canonicalises
+    x-amz-meta-generated_at_ms to X-Amz-Meta-Generated_at_ms; botocore keeps that
+    casing, so a proxied pod reported every healthy partition as unstamped."""
+    class GoCanonicalised(S3):
+        def get_object(self, **kwargs):
+            obj = super().get_object(**kwargs)
+            obj["Metadata"] = {k[0].upper() + k[1:]: v for k, v in obj["Metadata"].items()}
+            return obj
+
+    result = reader.read_executions(NOW - timedelta(hours=2), NOW, s3=GoCanonicalised(), now=NOW)
+    assert result["coverage_complete"] is True
+    assert result["source_watermark_ms"] == int(NOW.timestamp() * 1000)
+
+
 def test_ambiguous_bare_id_fails_but_qualified_id_preserves_legs():
     class Namespaces(S3):
         def get_object(self, **kwargs):
