@@ -7,7 +7,7 @@
 analyze.py — single-call orchestrator for the block analyst.
 
 ONE invocation does everything after the tape resolve: it reads the FILL/HIST
-CSVs the DuckDB step wrote (from analyze.sh), parses the structure, fetches every
+CSVs collect_analysis.py wrote (from analyze.sh), parses the structure, fetches every
 leg's Deribit ticker + 30d trade buckets CONCURRENTLY, computes net greeks /
 direction / fill-offset / recurrence, and prints the finished block (--render).
 

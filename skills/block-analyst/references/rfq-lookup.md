@@ -43,9 +43,12 @@ INSTALL httpfs; LOAD httpfs;
 INSTALL aws;    LOAD aws;
 CREATE OR REPLACE SECRET s3_irsa (TYPE S3, PROVIDER CREDENTIAL_CHAIN, REGION 'ap-northeast-1');
 -- single scan → temp table holding the target RFQ + 30d matching structures.
--- Source is the Snowflake-free hot paradigm_trade tape (trailing 30 days,
--- leg grain — exactly the HIST horizon), aliased to the legacy tape column
--- names so everything downstream is unchanged.
+-- Source is the execution tape's DAILY partitions, aliased to the legacy tape
+-- column names so everything downstream is unchanged. This is the manual
+-- fallback; scripts/analyze.sh reads the same partitions through
+-- data-discovery's shared reader, which also refuses a stale publication.
+-- Bound the glob to the days you need — never scan the prefix unbounded, and
+-- do not infer retention from old keys that happen to remain.
 CREATE TEMP TABLE tape AS
 SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS DATE,
        strftime(CAST(traded_at_iso AS TIMESTAMP), '%H:%M:%S') AS TIME,
@@ -55,8 +58,15 @@ SELECT strftime(CAST(traded_at_iso AS TIMESTAMP), '%Y-%m-%d') AS DATE,
        CASE WHEN upper(trim(split_part(coalesce(product,''), ' - ', 2))) = 'DBT' AND upper(coalesce(asset,'')) IN ('BTC','ETH') AND instrument_name IS NOT NULL AND upper(instrument_name) NOT LIKE '%USDC%' THEN upper(asset) ELSE 'USDC' END AS QUOTE_CURRENCY, notional_volume_usd AS NOTIONAL_VOLUME_USD,
        rfq_id AS RFQ_ID, trade_id AS TRADE_ID, block_trade_id AS BLOCK_TRADE_ID,
        UPPER(REPLACE(description,' ','')) AS DESC_N
-FROM read_parquet('s3://dt-exchange-venue-data/hot/hot__paradigm_trade_tape_30d.parquet')
+FROM read_parquet(
+       's3://dt-exchange-venue-data/paradigm_trade_tape/year=*/month=*/day=*/*.parquet',
+       hive_partitioning=true, union_by_name=true)
 WHERE row_type='paradigm_trade';
+-- The glob is year=*/month=*, NOT a pinned month: a hardcoded `year=2026/
+-- month=09` silently reads an empty set from 1 October and answers every id
+-- "not found". The prefix holds ~31 days of objects, so scanning all of it IS
+-- the 30-day horizon; narrow by `traded_at` in the WHERE clause, never by
+-- guessing the partition.
 -- (a) the cleared block — authoritative for every field. Asset ← PRODUCT (never assume BTC),
 -- structure ← DESCRIPTION. Offsets precomputed: OFFSET_BPS (×10000) for COIN-quoted premiums
 -- (BTC/ETH); OFFSET_PCT (% of mark) for USD/USDC-quoted premiums (SOL/alts — dollar prices,
@@ -96,7 +106,7 @@ Notes:
   note the rest as strike-level context, not prints.
 - The tape is the **executed** tape. For RFQ-level context (fill rate, unfilled,
   lifespan) the sibling dataset is `paradigm_rfq_tape_slim` (same `RFQ_ID` key).
-- **Auth:** the STS block above assumes the IRSA role directly; no external file
+- **Auth:** `collect_analysis.py` uses the shared reader's credential chain; no STS block, no external file
   read needed. If the credentials / DuckDB tool are unavailable, fall back below.
 
 **Self-test (regression guard — bare id must resolve a prefixed row):** given a
@@ -166,3 +176,22 @@ decide the structure; every one of those comes from the resolved `FILL` row (`PR
   fall back to "parse the structure from the description" — if the id doesn't resolve and the
   asset therefore isn't known, report the RFQ unresolved (Step 7); do not fabricate an
   asset/strike/structure or default to BTC.
+
+## `collect_analysis.py` exit codes
+
+One line on STDERR, relayed verbatim and nothing else. The codes are deliberately
+distinct — substituting one for another is the failure this script exists to stop.
+
+| code | meaning | what to say |
+|---|---|---|
+| `0` | resolved | the rendered block |
+| `2` | malformed or missing `rfq_id` | ask for the id |
+| `3` | the id exists in BOTH namespaces | re-run with the exact `DRFQv2-`/`GRFQ-` id the message names; that form is honoured, so it resolves |
+| `4` | **execution tape unavailable**, or the environment failed it (unwritable `--out-dir`) | a pipeline or environment failure. Report it as one. **Never** use the "RFQ not resolved" line — that blames the trade |
+| `5` | not found, and the read covered the full window | genuinely not found |
+| `6` | not found, and the read stopped short | relay the boundary it names — a block traded after it would not be in the read, so this is not evidence of absence |
+
+Exit `0` can still carry a line: `recurrence is a FLOOR — the read covers
+through <time>`. `analyze.sh` puts it on stdout with the block. The block is sound; the 30-day recurrence count is a
+lower bound because the hourly sync tail is not in the read. Relay it beside the
+block rather than presenting the count as exact.
