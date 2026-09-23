@@ -365,10 +365,12 @@ VERDICT_TOOL = {
             },
             "reason": {
                 "type": "string",
-                "description": "One sentence. Required when the verdict is fail.",
+                "description": "One sentence saying why. For a pass, what satisfied it.",
             },
         },
-        "required": ["verdict"],
+        # Both: a verdict with no reason reads as a bare "FAIL" in the report,
+        # which says nothing to whoever has to act on it.
+        "required": ["verdict", "reason"],
     },
 }
 
@@ -424,11 +426,13 @@ Reason as much as you need, then record your verdict with `record_verdict`."""
     verdict = (call.input.get("verdict") or "").strip().lower()
     if verdict not in ("pass", "fail"):
         raise GraderRefused(f"grader recorded {verdict!r} for {assertion!r}")
-    reason = (call.input.get("reason") or "").strip()
+    # A schema-required field can still come back empty, and the report reads
+    # better saying so than printing a bare verdict word.
+    reason = (call.input.get("reason") or "").strip() or "(no reason recorded)"
     return {
         "assertion": assertion,
         "passed": verdict == "pass",
-        "verdict": f"{verdict.upper()}{': ' + reason if reason else ''}",
+        "verdict": f"{verdict.upper()}: {reason}",
     }
 
 

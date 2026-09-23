@@ -68,6 +68,12 @@ ok(_graded(_text("FAIL: the header disagrees"), _tool_use(verdict="pass"))["pass
 ok(_graded(_tool_use(verdict="PASS"))["passed"] is True, "case does not matter")
 ok(_graded(_tool_use(verdict="fail", reason="no size"))["verdict"] == "FAIL: no size",
    "the reason is kept for the report")
+ok(_graded(_tool_use(verdict="fail"))["verdict"] == "FAIL: (no reason recorded)",
+   "a verdict with no reason says so, rather than printing a bare FAIL")
+ok(_graded(_tool_use(verdict="pass", reason=" "))["verdict"] == "PASS: (no reason recorded)",
+   "whitespace is not a reason")
+ok(VERDICT_TOOL["input_schema"]["required"] == ["verdict", "reason"],
+   "the schema asks for both")
 
 # ── a grader that records nothing is loud ─────────────────────────────────────
 refused = False
