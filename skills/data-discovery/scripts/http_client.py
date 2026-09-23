@@ -1,7 +1,7 @@
-"""The one way skill scripts make HTTP and S3 calls (enforced by
-.github/scripts/check_http_access.py). Header names are case-insensitive and
-change casing in transit, so every header map returned here — and every S3
-object's user Metadata — is a `Headers`: any casing finds the same entry."""
+"""The one way skill scripts make HTTP and S3 calls. Header names are
+case-insensitive and change casing in transit, so every header map returned
+here — and every S3 object's user Metadata — is a `Headers`: any casing finds
+the same entry."""
 
 import json
 import urllib.error

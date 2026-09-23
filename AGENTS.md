@@ -36,7 +36,7 @@ For supply-chain integrity when distributing skills outside of git:
 
 ## HTTP Calls
 
-Every HTTP and S3 call in a skill script goes through `skills/data-discovery/scripts/http_client.py`: `get()` for HTTP, `s3_client()` for S3. The `http access check` workflow fails on any other HTTP client import, a directly built boto3 client, or `curl`/`wget` in a script.
+Every HTTP and S3 call in a skill script goes through `skills/data-discovery/scripts/http_client.py`: `get()` for HTTP, `s3_client()` for S3. Shell that fetches credentials rather than data — the STS `curl` in `block-analyst/scripts/analyze.sh` — is the exception, since it reads no response headers.
 
 The reason is header names. They are case-insensitive ([RFC 9110 §5.1](https://www.rfc-editor.org/rfc/rfc9110#section-5.1)), and servers, CDNs, HTTP/2 and proxies all change their casing in transit — the same exchange can hand one client `Timenow` and another `timenow`. `http_client` returns every header map, and every S3 object's user `Metadata`, as a case-insensitive `Headers`: `headers["Retry-After"]`, `headers["retry-after"]` and `headers.get("RETRY-AFTER")` are one lookup, and copies and iteration always carry lowercase names. The failure it prevents is usually silent — a plain-dict `.get(name, 0)` misses and returns the default, so a rate-limit header reads as zero.
 
