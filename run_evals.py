@@ -352,6 +352,26 @@ def run_agent(client, model: str, skill_md: str, prompt: str, simulate: bool) ->
     return response.content[0].text, timing
 
 
+def verdict_passed(verdict: str) -> bool:
+    """Whether a grader's answer says PASS, read from its LAST verdict line.
+
+    A grader asked to commit before reasoning sometimes reasons its way to the
+    opposite answer and says so — "Wait, let me reconsider… Correction: the
+    response does report −6 bps in both places". Read from the first line, that
+    self-correction was discarded and a passing response scored FAIL, which is
+    how the same assertions flipped between runs of identical code.
+
+    No verdict line at all is a FAIL: a grader that never answered has not
+    passed anything.
+    """
+    lines = [ln.strip() for ln in verdict.splitlines() if ln.strip()]
+    decisive = next(
+        (ln for ln in reversed(lines) if ln.upper().startswith(("PASS", "FAIL"))),
+        "",
+    )
+    return decisive.upper().startswith("PASS")
+
+
 def grade_assertion(client, model: str, assertion: str, output: str, prompt: str) -> dict:
     grading_prompt = f"""Grade an AI agent's response against one assertion.
 
@@ -362,8 +382,8 @@ Agent response:
 
 Assertion: {assertion}
 
-Put your verdict on the FIRST line — exactly `PASS` or `FAIL: <one-sentence reason>` —
-with nothing before it. You may add reasoning on later lines if helpful."""
+Reason first if it helps, then END with the verdict on its own FINAL line —
+exactly `PASS` or `FAIL: <one-sentence reason>`, with nothing after it."""
 
     with _API_GATE:
         response = client.messages.create(
@@ -375,11 +395,7 @@ with nothing before it. You may add reasoning on later lines if helpful."""
             messages=[{"role": "user", "content": grading_prompt}],
         )
     verdict = response.content[0].text.strip()
-    # Parse the first non-empty line (the verdict), not the raw blob — robust to
-    # a model that emits a leading blank line or trails reasoning afterwards.
-    first_line = next((ln.strip() for ln in verdict.splitlines() if ln.strip()), "")
-    passed = first_line.upper().startswith("PASS")
-    return {"assertion": assertion, "passed": passed, "verdict": verdict}
+    return {"assertion": assertion, "passed": verdict_passed(verdict), "verdict": verdict}
 
 
 CASE_PARALLELISM = 8
