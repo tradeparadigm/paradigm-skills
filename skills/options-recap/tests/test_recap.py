@@ -205,6 +205,34 @@ def _full_hot_deltas(d):
 
 # ── parse_window_ms ─────────────────────────────────────────────────────────
 
+def test_deribit_calls_go_through_the_shared_client():
+    """Every other test stubs `_get`, so nothing exercises what `_get` calls.
+    A revert to raw urllib would leave them green and lose the case-insensitive
+    headers the client exists for."""
+    import http_client
+
+    assert recap.get is http_client.get
+
+    calls = []
+
+    class _Response:
+        @staticmethod
+        def json():
+            return {"result": [1.0, 2.0]}
+
+    def fake_get(url, params=None, timeout=None):
+        calls.append((url, params))
+        return _Response()
+
+    saved = recap.get
+    recap.get = fake_get
+    try:
+        assert recap._get("ticker", {"instrument_name": "BTC-PERPETUAL"}) == [1.0, 2.0]
+    finally:
+        recap.get = saved
+    assert calls and calls[0][0].endswith("/ticker")
+
+
 def test_parse_window():
     check("8h", parse_window_ms("8h") == 8 * 3600_000)
     check("1h", parse_window_ms("1h") == 3600_000)
