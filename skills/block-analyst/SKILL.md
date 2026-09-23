@@ -15,9 +15,8 @@ description: >
   execution. Covers outright calls/puts (CL/PL), strangles (SN), straddles (ST),
   butterflies (BF), condors (CO), calendars (CA), risk reversals (RR), covered
   calls, and custom multi-leg combos (CM). Also handles perp combos.
-compatibility: Resolves the rfq_id by searching the Paradigm trade tape (the
-  hot__paradigm_trade_tape_30d rows) through
-  the paradigm-data-discovery skill — see
+compatibility: Resolves the rfq_id against the Paradigm execution tape's daily
+  partitions through the paradigm-data-discovery skill's shared reader — see
   references/rfq-lookup.md; falls back to injected block-trade context or the
   Deribit tape. Trade-tape reads use that skill's S3/IRSA credentials. Market
   data needs no auth — deribit__get_ticker MCP (if available), web_fetch, or any
@@ -68,14 +67,16 @@ greeks").
 `exec`/`uv`/S3 aren't available, skip the script** and render the block directly from that data via
 Steps 1–7. Otherwise use the script:
 
+**Any `analyze:` line it prints is part of the answer — relay it verbatim, first.** On a non-zero exit that line is the whole reply; on exit `0` it qualifies the block (`recurrence is a FLOOR` means the 30d count is a lower bound). Exit `4` is a tape or environment failure, never an unknown RFQ — do not answer it with the not-resolved line. Codes in `references/rfq-lookup.md`.
+
 **Run one command and relay its stdout as your entire reply:**
 
 ```bash
 bash scripts/analyze.sh <rfq_id>      # the id only; ignore any description after it
 ```
 
-`analyze.sh` does everything — STS bootstrap, the single DuckDB tape scan (resolve the
-`FILL` row by `RFQ_ID` + the 30d same-structure `HIST`, ID-authoritative), then `analyze.py`
+`analyze.sh` does everything — `collect_analysis.py` resolves the `FILL` legs by `RFQ_ID` plus
+the 30d same-structure `HIST` off the execution tape (ID-authoritative), then `analyze.py`
 (concurrent Deribit fetch of every leg's ticker + 30d trades, net greeks, fill-vs-mark offset
 in the right unit, recurrence) and prints the finished block. **Do not** re-fetch, reformat,
 recompute, add commentary, or run extra steps — its stdout already is the analysis. Deterministic
@@ -202,20 +203,18 @@ convention reasoning.
 > Deribit ticker/greeks. Steps 2a/2b apply on the manual fallback only (script
 > unavailable / injected data), or when filling in a `⚠ UNMAPPED` block.
 
-**Step 2a — surface anchor (one DuckDB read).** Read the hot snapshot
-for the current ATM IV per venue + recent block activity before
-hitting per-leg endpoints:
-`s3://dt-exchange-venue-data/hot/hot__market_signals_1m.parquet`.
-See `paradigm-data-discovery` Dataset 6 for the schema. Use to anchor
-each leg's IV against the venue's current ATM (rich/cheap framing) and
-to surface recent block activity (`signal_type = 'block_summary'`,
-covering deribit/okex/bullish) that may contextualise the trade. For the
-full per-strike surface (Step 5 vol-surface impact), read the consolidated
-`v_vol_surface` store at
-`s3://dt-paradigm-data/paradigm_data/v_vol_surface/_hot.parquet`
-(per-strike `mark_iv`/`delta`, keyed by instrument `symbol`; see
-`paradigm-data-discovery`) instead of fetching it.
-The snapshot does NOT replace per-leg fetches — block-analyst still needs
+**Step 2a — surface anchor (one DuckDB read).** Anchor each leg's IV against
+its venue's current ATM (rich/cheap framing) from the normalized
+`option_summary` per-period aggregates — NOT a `hot__*` object:
+`normalized/exchange=<venue>/data_type=option_summary/currency=<ccy>/level=1m/
+…/*__agg__*.parquet`. One row per `(exchange, symbol, period)` carrying
+`markIV_close`, `delta_close` and `openInterest_close`, so ATM is the row
+nearest 50 delta: `ORDER BY abs(abs(delta_close) - 0.5)`. The same files serve
+the full per-strike surface for Step 5. Read with `union_by_name=true`, glob
+per UTC day, and see `paradigm-data-discovery`'s `references/exchange-raw.md`
+for the layout and the unit rules. For recent block activity that may
+contextualise the trade, read the raw venue block-trade rows per venue.
+These aggregates do NOT replace per-leg fetches — block-analyst still needs
 specific instrument marks for fill benchmarking.
 
 **Step 2b — per-leg fetches.** For each leg, fetch its current mark from the venues below in
@@ -273,8 +272,9 @@ or conviction taker, not random flow.
   matching blocks, size range, most recent (date + level + side), and whether one-sided (single
   taker building) or two-way. Rows that share the strike/expiry but are a *different* structure
   are strike-level context, not recurrence of this structure.
-- **If the tape read failed** (no credentials / DuckDB unavailable): say so in one line and fall
-  back to identifying Paradigm-routed prints on the Deribit tape (see 3b). Never fabricate counts.
+- **If the tape read failed**: say so in one line and fall back to Paradigm-routed prints on the
+  Deribit tape (3b); never fabricate counts. `analyze.sh` separates the cases — a reader refusal
+  is a stale PRODUCER, a pipeline failure, never "this trade is not on the tape".
 
 ### 3b — Deribit tape, always fetch (public, no auth)
 **Fetch and aggregate in ONE `exec`** — never `web_fetch` 1000 raw trades into context and
