@@ -352,24 +352,51 @@ def run_agent(client, model: str, skill_md: str, prompt: str, simulate: bool) ->
     return response.content[0].text, timing
 
 
+# A verdict line: the word itself, after an optional label and any markdown the
+# grader dressed it in — `PASS`, `FINAL: PASS`, `**PASS**`, `Verdict: FAIL: …`.
+# Measured on one CI run: 17 of 21 recorded failures were graders answering
+# `FINAL: PASS`, which a stricter read scored as failures.
+_VERDICT_LINE = re.compile(
+    r"^[\s*_#>-]*(?:final|verdict|answer|result|conclusion)?[\s*_:.-]*(PASS|FAIL)(?:ED)?\b",
+    re.IGNORECASE,
+)
+
+
 def verdict_passed(verdict: str) -> bool:
     """Whether a grader's answer says PASS, read from its LAST verdict line.
 
-    A grader asked to commit before reasoning sometimes reasons its way to the
-    opposite answer and says so — "Wait, let me reconsider… Correction: the
-    response does report −6 bps in both places". Read from the first line, that
-    self-correction was discarded and a passing response scored FAIL, which is
-    how the same assertions flipped between runs of identical code.
+    Two graders' habits decide a score here. One is reasoning past a verdict it
+    already committed to — "Wait, let me reconsider… Correction: the response
+    does report −6 bps in both places" — so the LAST verdict wins, not the
+    first. The other is labelling it (`FINAL: PASS`), so a label is allowed
+    before the word.
 
-    No verdict line at all is a FAIL: a grader that never answered has not
-    passed anything.
+    No verdict line at all is a FAIL: a grader that never answered — usually one
+    that reasoned past its token budget — has not passed anything.
     """
-    lines = [ln.strip() for ln in verdict.splitlines() if ln.strip()]
-    decisive = next(
-        (ln for ln in reversed(lines) if ln.upper().startswith(("PASS", "FAIL"))),
-        "",
+    for line in reversed([ln.strip() for ln in verdict.splitlines() if ln.strip()]):
+        found = _VERDICT_LINE.match(line)
+        if found:
+            return found.group(1).upper() == "PASS"
+    return False
+
+
+def _ask(client, model: str, content: str, max_tokens: int) -> str:
+    with _API_GATE:
+        response = client.messages.create(
+            model=model, max_tokens=max_tokens,
+            messages=[{"role": "user", "content": content}],
+        )
+    return response.content[0].text.strip()
+
+
+def _has_verdict(verdict: str) -> bool:
+    """Whether the grader answered at all, either way."""
+    return any(
+        _VERDICT_LINE.match(ln.strip())
+        for ln in verdict.splitlines()
+        if ln.strip()
     )
-    return decisive.upper().startswith("PASS")
 
 
 def grade_assertion(client, model: str, assertion: str, output: str, prompt: str) -> dict:
@@ -385,16 +412,18 @@ Assertion: {assertion}
 Reason first if it helps, then END with the verdict on its own FINAL line —
 exactly `PASS` or `FAIL: <one-sentence reason>`, with nothing after it."""
 
-    with _API_GATE:
-        response = client.messages.create(
-            model=model,
-            # Generous budget: a tight cap (e.g. 120) truncates graders that
-            # reason before answering, so the verdict never lands and the result
-            # silently defaults to FAIL — a spurious failure, not a real one.
-            max_tokens=512,
-            messages=[{"role": "user", "content": grading_prompt}],
+    verdict = _ask(client, model, grading_prompt, max_tokens=1024)
+    if not _has_verdict(verdict):
+        # It reasoned past its budget and never answered. Asking again for the
+        # verdict alone costs one small call and is worth it: read as a silent
+        # FAIL, a grader that ran long marks a passing response wrong.
+        retry = _ask(
+            client, model,
+            f"{grading_prompt}\n\nAnswer with the verdict ONLY: `PASS`, or "
+            "`FAIL: <one-sentence reason>`. No reasoning.",
+            max_tokens=128,
         )
-    verdict = response.content[0].text.strip()
+        verdict = f"{verdict}\n\n[re-asked for the verdict alone]\n{retry}".strip()
     return {"assertion": assertion, "passed": verdict_passed(verdict), "verdict": verdict}
 
 

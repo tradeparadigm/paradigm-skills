@@ -9,7 +9,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from run_evals import verdict_passed  # noqa: E402
+from run_evals import _has_verdict, grade_assertion, verdict_passed  # noqa: E402
 
 _p = _f = 0
 
@@ -49,8 +49,66 @@ ok(verdict_passed(
 ok(verdict_passed("Let me work through the [Fair] row line by line.") is False,
    "no verdict line at all is a failure")
 ok(verdict_passed("") is False, "an empty answer is a failure")
-ok(verdict_passed("passed: it reports both figures") is True,
-   "case and punctuation do not matter")
+ok(verdict_passed("pass") is True, "case does not matter")
+ok(verdict_passed("**PASS**") is True, "markdown around the verdict is fine")
+
+# The shapes a grader actually used, counted from one CI run: 17 of that run's
+# 21 recorded failures were graders answering `FINAL: PASS`, scored as failures
+# because the line did not START with the word.
+ok(verdict_passed("The header and the [Fair] row agree.\n\nFINAL: PASS") is True,
+   "FINAL: PASS is a pass")
+ok(verdict_passed("Both figures match.\nFINAL PASS") is True, "FINAL PASS is a pass")
+ok(verdict_passed("Verdict: FAIL: the size is absent") is False,
+   "a labelled FAIL is a failure")
+
+# Prose is not a verdict: the word has to stand alone, or a grader narrating
+# "the response passed the first half" decides the score.
+ok(verdict_passed("The response passed on greeks but invented an IV.") is False,
+   "prose containing the word is not a verdict")
+ok(verdict_passed("PASSED: both figures are reported") is True, "PASSED is a verdict")
+ok(verdict_passed("FAILED: the size is absent") is False, "FAILED is a verdict")
+# The word has to BE the verdict, not start one: a grader whose last line reads
+# "Passes the offset check" has commented, not answered.
+ok(verdict_passed("Passes the offset check but not the size one") is False,
+   "a word merely beginning with the verdict is not one")
+ok(verdict_passed("It passes the first check.\nFAIL: it invents live bid/ask") is False,
+   "the real verdict wins over prose above it")
+
+# ── a grader that never answers is asked once more, for the verdict alone ─────
+class _Say:
+    """A stand-in client: each call returns the next scripted answer."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.asked = []
+        self.messages = self
+
+    def create(self, model, max_tokens, messages):
+        self.asked.append(messages[0]["content"])
+
+        class _Block:
+            text = self.answers.pop(0)
+
+        class _Reply:
+            content = [_Block()]
+
+        return _Reply()
+
+
+ok(_has_verdict("Let me think about the [Fair] row.") is False, "no verdict line")
+ok(_has_verdict("reasoning\nFINAL: PASS") is True, "a labelled verdict counts")
+
+_client = _Say("I need to weigh the header against the [Fair] row, and", "PASS")
+_graded = grade_assertion(_client, "m", "the offset matches", "a response", "a prompt")
+ok(_graded["passed"] is True, "a grader that ran long is re-asked and its answer used")
+ok(len(_client.asked) == 2, "re-asked exactly once")
+ok("No reasoning." in _client.asked[1], "the second ask is for the verdict alone")
+ok("[re-asked for the verdict alone]" in _graded["verdict"],
+   "the record shows both answers")
+
+_client = _Say("reasoning first\nFINAL: PASS")
+_graded = grade_assertion(_client, "m", "the offset matches", "a response", "a prompt")
+ok(len(_client.asked) == 1, "a grader that answered is not re-asked")
 
 print(f"\n{_p} passed, {_f} failed")
 sys.exit(1 if _f else 0)
