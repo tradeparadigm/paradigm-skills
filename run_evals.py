@@ -877,6 +877,13 @@ def main() -> None:
 
     print_summary(all_results, verbose=args.verbose)
 
+    # Written BEFORE the threshold check: the run that fails is the one whose
+    # responses and verdicts are worth keeping, and exiting first left the CI
+    # artifact empty on exactly those runs.
+    if args.output:
+        Path(args.output).write_text(json.dumps(all_results, indent=2))
+        print(f"Results written to {args.output}\n")
+
     if args.fail_below is not None:
         evaluated = [r for r in all_results if r.get("status") not in ("error", "skipped")]
         below = [r for r in evaluated if r["score"] < args.fail_below]
@@ -885,10 +892,6 @@ def main() -> None:
             print(f"\nFAIL: {len(below)} skill(s) scored below {args.fail_below * 100:.0f}%: {names}",
                   file=sys.stderr)
             sys.exit(1)
-
-    if args.output:
-        Path(args.output).write_text(json.dumps(all_results, indent=2))
-        print(f"Results written to {args.output}\n")
 
 
 if __name__ == "__main__":
