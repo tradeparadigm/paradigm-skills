@@ -352,54 +352,40 @@ def run_agent(client, model: str, skill_md: str, prompt: str, simulate: bool) ->
     return response.content[0].text, timing
 
 
-# A verdict line: the word itself, after an optional label and any markdown the
-# grader dressed it in — `PASS`, `FINAL: PASS`, `**PASS**`, `Verdict: FAIL: …`.
-# Measured on one CI run: 17 of 21 recorded failures were graders answering
-# `FINAL: PASS`, which a stricter read scored as failures.
-_VERDICT_LINE = re.compile(
-    r"^[\s*_#>-]*(?:final|verdict|answer|result|conclusion)?[\s*_:.-]*(PASS|FAIL)(?:ED)?\b",
-    re.IGNORECASE,
-)
+VERDICT_TOOL = {
+    "name": "record_verdict",
+    "description": "Record whether the agent's response satisfies the assertion.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "verdict": {
+                "type": "string",
+                "enum": ["pass", "fail"],
+                "description": "pass if the response satisfies the assertion, else fail.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "One sentence. Required when the verdict is fail.",
+            },
+        },
+        "required": ["verdict"],
+    },
+}
 
 
-def verdict_passed(verdict: str) -> bool:
-    """Whether a grader's answer says PASS, read from its LAST verdict line.
-
-    Two graders' habits decide a score here. One is reasoning past a verdict it
-    already committed to — "Wait, let me reconsider… Correction: the response
-    does report −6 bps in both places" — so the LAST verdict wins, not the
-    first. The other is labelling it (`FINAL: PASS`), so a label is allowed
-    before the word.
-
-    No verdict line at all is a FAIL: a grader that never answered — usually one
-    that reasoned past its token budget — has not passed anything.
-    """
-    for line in reversed([ln.strip() for ln in verdict.splitlines() if ln.strip()]):
-        found = _VERDICT_LINE.match(line)
-        if found:
-            return found.group(1).upper() == "PASS"
-    return False
-
-
-def _ask(client, model: str, content: str, max_tokens: int) -> str:
-    with _API_GATE:
-        response = client.messages.create(
-            model=model, max_tokens=max_tokens,
-            messages=[{"role": "user", "content": content}],
-        )
-    return response.content[0].text.strip()
-
-
-def _has_verdict(verdict: str) -> bool:
-    """Whether the grader answered at all, either way."""
-    return any(
-        _VERDICT_LINE.match(ln.strip())
-        for ln in verdict.splitlines()
-        if ln.strip()
-    )
+class GraderRefused(RuntimeError):
+    """The grader answered without recording a verdict."""
 
 
 def grade_assertion(client, model: str, assertion: str, output: str, prompt: str) -> dict:
+    """Grade one assertion, reading the verdict from a tool call.
+
+    The verdict is a field, not prose. Parsing prose is what made this harness
+    unreliable: a grader answering `FINAL: PASS` after reasoning was read from
+    its first line and scored FAIL — 17 of one run's 21 recorded failures. A
+    forced tool call removes the reading entirely, and lets the grader reason
+    as long as it likes first, since only the call counts.
+    """
     grading_prompt = f"""Grade an AI agent's response against one assertion.
 
 User prompt: {prompt}
@@ -409,22 +395,41 @@ Agent response:
 
 Assertion: {assertion}
 
-Reason first if it helps, then END with the verdict on its own FINAL line —
-exactly `PASS` or `FAIL: <one-sentence reason>`, with nothing after it."""
+Reason as much as you need, then record your verdict with `record_verdict`."""
 
-    verdict = _ask(client, model, grading_prompt, max_tokens=1024)
-    if not _has_verdict(verdict):
-        # It reasoned past its budget and never answered. Asking again for the
-        # verdict alone costs one small call and is worth it: read as a silent
-        # FAIL, a grader that ran long marks a passing response wrong.
-        retry = _ask(
-            client, model,
-            f"{grading_prompt}\n\nAnswer with the verdict ONLY: `PASS`, or "
-            "`FAIL: <one-sentence reason>`. No reasoning.",
-            max_tokens=128,
+    with _API_GATE:
+        response = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            tools=[VERDICT_TOOL],
+            tool_choice={"type": "tool", "name": VERDICT_TOOL["name"]},
+            messages=[{"role": "user", "content": grading_prompt}],
         )
-        verdict = f"{verdict}\n\n[re-asked for the verdict alone]\n{retry}".strip()
-    return {"assertion": assertion, "passed": verdict_passed(verdict), "verdict": verdict}
+
+    call = next(
+        (b for b in response.content
+         if getattr(b, "type", None) == "tool_use"
+         and getattr(b, "name", None) == VERDICT_TOOL["name"]),
+        None,
+    )
+    if call is None:
+        # Loud, not a silent FAIL. A grader that records nothing has judged
+        # nothing, and scoring that as a failure is the bug this replaced.
+        said = " ".join(getattr(b, "text", "") for b in response.content).strip()
+        raise GraderRefused(
+            f"grader recorded no verdict for {assertion!r}"
+            + (f" — it said: {said[:200]}" if said else "")
+        )
+
+    verdict = (call.input.get("verdict") or "").strip().lower()
+    if verdict not in ("pass", "fail"):
+        raise GraderRefused(f"grader recorded {verdict!r} for {assertion!r}")
+    reason = (call.input.get("reason") or "").strip()
+    return {
+        "assertion": assertion,
+        "passed": verdict == "pass",
+        "verdict": f"{verdict.upper()}{': ' + reason if reason else ''}",
+    }
 
 
 CASE_PARALLELISM = 8
@@ -540,6 +545,21 @@ def run_skill(client, skill_name: str, agent_model: str, grader_model: str,
     if not evals_path.exists():
         return {"skill": skill_name, "status": "error", "reason": "evals/evals.json not found"}
 
+    try:
+        return _run_skill_cases(
+            client, skill_name, skill_dir, agent_model, grader_model,
+            force_simulate, live_mcp, smoke, with_baseline, on_progress,
+        )
+    except GraderRefused as refusal:
+        # The run is not scoreable, and an unscoreable run must not read as a
+        # pass — `main` exits non-zero on any errored skill.
+        return {"skill": skill_name, "status": "error", "reason": str(refusal)}
+
+
+def _run_skill_cases(client, skill_name: str, skill_dir, agent_model: str, grader_model: str,
+                     force_simulate: bool, live_mcp: bool, smoke: bool,
+                     with_baseline: bool, on_progress) -> dict:
+    evals_path = skill_dir / "evals" / "evals.json"
     skill_md, evals_data = load_skill(skill_dir)
     requires_auth = evals_data.get("requires_auth", False)
     has_key = bool(os.environ.get("PARADEX_ACCOUNT_PRIVATE_KEY"))
@@ -912,6 +932,16 @@ def main() -> None:
     if args.output:
         Path(args.output).write_text(json.dumps(all_results, indent=2))
         print(f"Results written to {args.output}\n")
+
+    errored = [r for r in all_results if r.get("status") == "error"]
+    if errored:
+        for r in errored:
+            print(f"\nERROR: {r['skill']} could not be scored: {r.get('reason', 'unknown')}",
+                  file=sys.stderr)
+        # Before the threshold check, and regardless of it: a skill that could
+        # not be scored is excluded from `evaluated` below, so a silent exit
+        # here would read as a pass.
+        sys.exit(1)
 
     if args.fail_below is not None:
         evaluated = [r for r in all_results if r.get("status") not in ("error", "skipped")]
