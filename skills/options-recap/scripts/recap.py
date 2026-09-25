@@ -1425,9 +1425,9 @@ def render_md(r: dict) -> str:
     else:
         # output-format.md: name the source and reason rather than going blank.
         # True whichever way the pool emptied — no blocks at all, all excluded by
-        # the Paradigm dedupe, or all below the floor. The gaps above say which.
+        # the Paradigm dedupe, or all below the floor. The Block Flow warnings say which.
         L.append("Unavailable — no qualifying block in this window; any blocks "
-                 "excluded from the totals are listed above.")
+                 "excluded from the totals are listed under Block Flow.")
     n_struct = bf.get("n_structures", len(bf["rows"]))
     struct_word = "structure" if n_struct == 1 else "structures"
     block_word = "block" if bf["n_blocks"] == 1 else "blocks"

@@ -1563,6 +1563,38 @@ def test_stale_banner_leads_and_states_the_outcome():
     check("discloses truncated volume", "UNDERSTATE" in md, lines[:5])
 
 
+def test_each_warning_reads_as_one_line_under_its_section():
+    r = _minimal_result([{"source": "recap_aggregates", "status": "stale",
+                          "lag_s": 25 * 86400, "limit_s": 2700, "retained": False,
+                          "retained_groups": []}])
+    r["source_gaps"] = ["Block Flow: 3 blocks under $250k left out ($0.4M)",
+                        "Vol Surface (latest): 2 of 90 strikes dropped for want of IV units"]
+    r["snapshot"]["activity_scope"] = "venue A | venue B"
+    md = render_md(r)
+    lines = md.splitlines()
+    warns = [ln for ln in lines if ln.startswith("- ⚠ ")]
+    stale = [ln for ln in warns if "recap_aggregates" in ln]
+    check("a banner and its continuation lines are one warning",
+          len(stale) == 1 and "re-sourced live from Deribit" in stale[0], warns)
+    flow = lines.index(next(ln for ln in lines if ln.startswith("**Block Flow")))
+    surface = lines.index("**Vol Surface**")
+    floor = next(i for i, ln in enumerate(lines) if "under $250k" in ln)
+    check("a block warning prints under Block Flow, without repeating its heading",
+          flow < floor < surface and lines[floor] == "- ⚠ 3 blocks under $250k left out ($0.4M)",
+          lines[flow:surface])
+    check("a surface warning prints under the Vol Surface",
+          any("strikes dropped" in ln for ln in lines[surface:]), lines[surface:])
+    check("with no qualifying block, Block Flow says so instead of an empty table",
+          "No block cleared the $250k floor in this window." in lines[flow:surface],
+          lines[flow:surface])
+    check("the Biggest Print fallback points at where the left-out blocks are listed",
+          any("listed under Block Flow" in ln for ln in lines[:flow]), lines[:flow])
+    pc = _row(md, "P/C")
+    check("a | inside a cell does not split it", len(_cells(pc.replace("\\|", "¦"))) == 3, pc)
+    rule = next(ln for ln in lines if ln.startswith("| ---"))
+    check("the Snapshot figures are right-aligned", rule == "| --- | ---: | --- |", rule)
+
+
 def test_banner_distinguishes_a_failed_divert():
     r = _minimal_result([{"source": "recap_aggregates", "status": "stale",
                           "lag_s": 3 * 86400, "limit_s": 2700, "retained": True,

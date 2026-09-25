@@ -408,7 +408,7 @@ def render(r) -> str:
                       for l in legs if l["cp"] != "FUT" and l.get("tkr"))
     rows.append(("Live", live))
     L += ["|  | Detail |", "| --- | --- |"]
-    L += [f"| {label} | {text.replace('|', chr(92) + '|')} |" for label, text in rows]
+    L += [f"| {label} | {text} |" for label, text in rows]
     if r["warnings"]:
         L.append(f"<!-- warnings: {'; '.join(r['warnings'])} -->")
     return "\n".join(L)
