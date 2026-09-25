@@ -1,6 +1,7 @@
 """Non-hot inputs for the existing recap calculator and renderer."""
 
 import gc
+import math
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -217,6 +218,25 @@ def aggregate_trades(venue, rows, spec, gaps):
     return total
 
 
+def share(part, whole):
+    """A percentage that never rounds a real share down to 0%."""
+    pct = 100 * part / whole
+    return f"{pct:.1f}%" if 0 < pct < 1 else f"{pct:.0f}%"
+
+
+def tape_coverage_gap(tape_result):
+    """The ⚠ line for a Paradigm tape that stops short of the window's end."""
+    if tape_result.get("coverage_complete", False):
+        return None
+    shortfall = tape_result.get("coverage_shortfall_seconds")
+    if shortfall is None:
+        return ("Paradigm executions: coverage unknown — the tape predates its "
+                "watermark field, so a quiet tape proves nothing")
+    return (f"Paradigm executions: the last {max(1, math.ceil(shortfall / 60))} min of the window are not "
+            f"on the tape yet (hourly upstream sync) — blocks printed then are missing "
+            f"from Block Flow, not absent")
+
+
 def inputs(totals, evidence, specs, gaps, coverage=None):
     snapshot = {"trades_by_venue": {}, "trades_total": 0, "put_trades": 0, "call_trades": 0}
     turnover, missing_values, unclassified = 0.0, 0, 0
@@ -249,7 +269,7 @@ def inputs(totals, evidence, specs, gaps, coverage=None):
         # noise, while "bybit-options 32%" points at one venue's instrument
         # metadata not covering the symbols its own tape traded.
         detail = "; ".join(
-            f"{recap.venue_name(venue)} {count:,} of {rows:,} ({100 * count / rows:.0f}%) across {symbols:,} symbols"
+            f"{recap.venue_name(venue)} {count:,} of {rows:,} ({share(count, rows)}) across {symbols:,} symbols"
             for venue, count, rows, symbols in sorted(unvalued_by_venue, key=lambda v: -v[1]))
         gaps.append(f"Volume: {missing_values:,} trades lack a provable USD premium — "
                     f"{detail}; shown sum is the valued subset")
@@ -416,7 +436,7 @@ def run(asset, window, start, end, now=None):
         # passing that historical instant here made every replayed read fail
         # the publication gate as "future-dated" (published > now).
         tape = pool.submit(read_executions, start, end, asset=asset)
-        closes = pool.submit(recap.fetch_7d_closes, asset, end_ms)
+        closes = pool.submit(recap.fetch_rv_closes, asset, end_ms)
         # Same Deribit perpetual-price proxy and realized-vol definition as before.
         market = pool.submit(recap._fetch_market_fallback, asset, start_ms, end_ms, want_surface=False)
         def spec_for(venue):
@@ -531,11 +551,9 @@ def run(asset, window, start, end, now=None):
         try:
             tape_result = tape.result()
             # An uncovered tail is missing evidence, not a quiet tape.
-            if not tape_result.get("coverage_complete", False):
-                gaps.append(
-                    "Paradigm executions: "
-                    + tape_result.get("coverage_note", "coverage incomplete")
-                )
+            tail = tape_coverage_gap(tape_result)
+            if tail:
+                gaps.append(tail)
         except Exception as exc:
             # ONLY the read. read_executions raises when the partition is
             # missing, unreadable or stale — a broken producer, not a quiet
@@ -554,7 +572,7 @@ def run(asset, window, start, end, now=None):
                 executions = []
                 gaps.append(f"Paradigm executions unusable — {exc}")
         deri = {}
-        for key, future in (("closes_7d", closes), ("market", market)):
+        for key, future in (("closes", closes), ("market", market)):
             try:
                 deri[key] = future.result()
             except Exception as exc:
@@ -596,7 +614,7 @@ def run(asset, window, start, end, now=None):
     # so its blocks are ranked against trade-time-priced ones on a different
     # clock — the very thing this phase fixed. Uniform-close was at least
     # internally consistent; silent mixing is not.
-    fallback = sorted({recap.venue_name(b["exchange"]) for b in blocks if not b.get("index_px")})
+    fallback = result.pop("close_priced_venues", [])
     # Unconditional: gating on "some venue still has a trade-time index" went
     # silent in the WORST case, where every venue block falls back to close
     # while Paradigm blocks stay trade-time — the exact mixing this targets.

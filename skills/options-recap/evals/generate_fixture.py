@@ -135,7 +135,7 @@ def compute_ground_truth(snapshot: dict) -> dict:
         if ticker and "mark_iv" in ticker:
             surface[inst_name] = round(ticker["mark_iv"], 1)
 
-    # Realized vol (#1) — from the trailing 7d spot history, vs DVOL (implied)
+    # Realized vol (#1) — from the trailing 30d spot history, vs DVOL (implied)
     rv = snapshot.get("realized_vol") or {}
     rv_value = rv.get("annualized_vol")
     vrp = None          # vol risk premium: implied − realized
@@ -298,7 +298,7 @@ def main() -> None:
     })
     spot_price = spot_ohlcv["close"][-1] if spot_ohlcv.get("close") else None
 
-    # Fetch trailing 7d spot for realized vol (#1) — a longer, fixed lookback
+    # Fetch trailing 30d spot for realized vol (#1) — a longer, fixed lookback
     # than the recap window: RV-vs-implied is a slow statistic and needs a
     # stable sample, not the 8h window (which would annualize one trending
     # afternoon into noise).

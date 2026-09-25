@@ -10,14 +10,14 @@ for offline fixtures.
 
 recap.py — single-call orchestrator for the prior options recap implementation.
 
-ONE invocation does the entire recap: it fetches the Deribit 7d closes (the
+ONE invocation does the entire recap: it fetches the Deribit 30d closes (the
 realized-vol input), ingests the DuckDB-written CSVs (hot surface + the
 multi-venue block tape), runs the vol math (realized-vs-implied, block
 ranking/rollup, vol-surface skew/term), and prints ONE JSON object whose fields
 map 1:1 to the four output sections.
 
 Pipeline (concurrent where independent):
-  • Deribit 7d hourly closes        → realized vol (no non-Deribit source)
+  • Deribit 30d hourly closes       → realized vol (no non-Deribit source)
   • blocks.csv (DuckDB, tape)       → Biggest Print + Block Flow, across ALL
                                       venues Paradigm brokers (Deribit/Paradex/
                                       Bullish/…), notional already in USD per leg
@@ -28,7 +28,7 @@ Hot CSVs are authoritative for DVOL/spot/$Volume/activity/P-C/surface. Biggest
 Print + Block Flow come from the Paradigm block tape (paradigm_trade_tape_slim)
 — multi-venue, S3-sourced, no live exchange API. The tape carries no IV, so the
 top blocks' IV is looked up from the vol surface (Deribit legs only). Deribit
-still supplies the 7d realized-vol closes; nothing else hits an exchange API.
+still supplies the 30d realized-vol closes; nothing else hits an exchange API.
 
 Usage:
     uv run scripts/recap.py --asset btc --window 8h --csv-dir /tmp/recap
@@ -116,7 +116,7 @@ def _get(path: str, params: dict, timeout: int = 15) -> dict:
     return data["result"]
 
 
-def fetch_7d_closes(asset: str, end_ms: int) -> list[float]:
+def fetch_rv_closes(asset: str, end_ms: int) -> list[float]:
     start_ms = end_ms - RV_LOOKBACK_DAYS * 86400_000
     res = _get("get_tradingview_chart_data", {
         "instrument_name": f"{asset}-PERPETUAL", "resolution": "60",
@@ -126,15 +126,15 @@ def fetch_7d_closes(asset: str, end_ms: int) -> list[float]:
 
 
 def fetch_deribit(asset: str, start_ms: int, end_ms: int, want_market: bool) -> dict:
-    """Always: 7d closes (the realized-vol input; no non-Deribit source). If
+    """Always: RV closes (the realized-vol input; no non-Deribit source). If
     want_market (no S3), also DVOL, spot OHLC and a vol-surface ticker set so the
     pipeline runs end-to-end. Block flow no longer comes from here — it's the
     multi-venue Paradigm tape (blocks.csv), so no window-trade fetch."""
-    res: dict = {"closes_7d": [], "market": None}
+    res: dict = {"closes": [], "market": None}
     try:
-        res["closes_7d"] = fetch_7d_closes(asset, end_ms)
+        res["closes"] = fetch_rv_closes(asset, end_ms)
     except Exception as e:
-        warn(f"deribit 7d closes failed: {e}")
+        warn(f"deribit RV closes failed: {e}")
     if want_market:
         try:
             res["market"] = _fetch_market_fallback(asset, start_ms, end_ms)
@@ -853,7 +853,7 @@ def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
             # hence the "~" prefix (the Paradigm tape has exact times).
             "time_utc": f"~{fmt_hhmm(int(bucket_ms))}" if bucket_ms else "",
             "detail": detail, "leg_count": legs,
-            "source": "venue",
+            "source": "venue", "close_priced": not _price_at(r),
         })
     return out
 
@@ -967,7 +967,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         # this recap travels as a gap line.
         spot_from_venue_tape = True
 
-    rv = realized_vs_implied(deri.get("closes_7d") or [], dvol_close)
+    rv = realized_vs_implied(deri.get("closes") or [], dvol_close)
 
     # Volume ($): the upstream turnover_usd sum is a true cross-venue USD total
     # (per-trade, priced at trade time). On a recap file that predates the column
@@ -1098,7 +1098,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "dvol_low": round(dvol_low, 1) if dvol_low is not None else None,
         "dvol_high": round(dvol_high, 1) if dvol_high is not None else None,
         "dvol_label": dvol_label(dvol_open, dvol_close),
-        "rv_7d": rv.get("value"), "vrp": rv.get("vrp"), "vrp_label": rv.get("vrp_label"),
+        "rv": rv.get("value"), "vrp": rv.get("vrp"), "vrp_label": rv.get("vrp_label"),
         "volume_usd_m": round(vol_usd / 1e6) if vol_usd else None,
         "volume_scope": volume_scope,
         "activity_trades": tt,
@@ -1154,6 +1154,10 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "block_exclusions": _lost_blocks(_excluded, start_ms, spot),
         "blocks_below_floor": block.get("trimmed", {}),
         "spot_from_venue_tape": spot_from_venue_tape,
+        # Only blocks ranked at the closing spot: a venue whose blocks were all
+        # excluded, unpriced or under the floor never was.
+        "close_priced_venues": sorted({b["venue"] for b in venue_blocks if b["close_priced"]
+                                       and b["notional_usd"] >= MIN_BLOCK_NOTIONAL_USD}),
     }
 
 
@@ -1332,8 +1336,8 @@ def render_md(r: dict) -> str:
     vrp = s.get("vrp")
     rich = ("unavailable" if vrp is None else "CHEAP" if vrp is not None and vrp < -1 else
             "RICH" if vrp is not None and vrp > 1 else "IN LINE")
-    rv = f"{s['rv_7d']}v" if s.get("rv_7d") is not None else "n/a"
-    L.append(f"{'RV 7d':<9} {rv:<11} implied {rich} vs realized")
+    rv = f"{s['rv']}v" if s.get("rv") is not None else "n/a"
+    L.append(f"{f'RV {RV_LOOKBACK_DAYS}d':<9} {rv:<11} implied {rich} vs realized")
 
     vrp_txt = f"{vrp:+}v" if vrp is not None else "n/a"
     # Same ±1v dead-band as the RV line above — otherwise a VRP in (0,1] prints
@@ -1397,7 +1401,7 @@ def render_md(r: dict) -> str:
     # venue isn't a column — the Biggest Print line's via Paradigm/<venue> tag
     # is where the venue shows.
     sw = max([27] + [len(row["structure"]) + 2 for row in bf["rows"]])
-    L += ["```", "", f"**Block Flow — ${bf['total_m']}M / {bf['n_blocks']} {block_word} / "
+    L += ["```", "", f"**Block Flow — ${bf['total_m']}M notional / {bf['n_blocks']} {block_word} / "
           f"{n_struct} {struct_word}{trunc}**",
           "", "```yaml",
           f"{'#':<3}{'Structure':<{sw}}{'Notl':<9}{'Blocks':<8}Detail (+ taker bought, - taker sold)",
@@ -1476,7 +1480,7 @@ def main() -> None:
         hot = {"tickers": {}}
         deri = fetch_deribit(ASSET, start_ms, now_ms, want_market=True)
     else:
-        # Parallelize the DuckDB read (hot CSVs + block tape) with the Deribit 7d
+        # Parallelize the DuckDB read (hot CSVs + block tape) with the Deribit 30d
         # closes fetch (the realized-vol input) — both are network-bound.
         with ThreadPoolExecutor(max_workers=2) as ex:
             duck_fut = ex.submit(run_duckdb, args.duckdb_sql) if args.duckdb_sql else None

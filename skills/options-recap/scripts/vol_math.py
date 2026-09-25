@@ -15,7 +15,7 @@ from collections import defaultdict
 
 # Crypto trades 24/7, so the calendar annualization factor is √(24×365).
 HOURS_PER_YEAR = 24 * 365  # 8760
-RV_LOOKBACK_DAYS = 7        # paired with DVOL's 30-day implied; desk standard
+RV_LOOKBACK_DAYS = 30       # the same tenor as DVOL's 30-day implied it is compared with
 
 _MONTHS = {m: i for i, m in enumerate(
     ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",

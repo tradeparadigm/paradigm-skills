@@ -7,10 +7,10 @@
   "derived": {
     "note": "Pre-computed reads \u2014 use these directly; do not recompute.",
     "realized_vol": {
-      "value": 53.9,
-      "lookback_days": 7,
-      "vrp": -5.7,
-      "vrp_label": "implied cheap vs realized \u2014 vol underpriced vs delivered"
+      "value": 37.8,
+      "lookback_days": 30,
+      "vrp": 10.4,
+      "vrp_label": "implied rich vs realized \u2014 vol overpriced vs delivered"
     },
     "flow_greeks": {
       "net_customer_vega": 8988,
@@ -28,7 +28,7 @@
         "structure": "Risk Reversal",
         "size_btc": 200.0,
         "notional_usd": 12334650,
-        "side": "Two-way",
+        "side": "Mixed",
         "avg_iv": 49.1,
         "expiry": "26JUN26",
         "strike": "55000",
@@ -76,7 +76,7 @@
         "structure": "Put Spread",
         "size_btc": 84.6,
         "notional_usd": 5226775,
-        "side": "Two-way",
+        "side": "Mixed",
         "avg_iv": 491.2,
         "expiry": "5JUN26",
         "strike": "73000",
@@ -88,7 +88,7 @@
         "structure": "Put Spread",
         "size_btc": 60.0,
         "notional_usd": 3712546,
-        "side": "Two-way",
+        "side": "Mixed",
         "avg_iv": 564.7,
         "expiry": "5JUN26",
         "strike": "63000",
@@ -100,7 +100,7 @@
         "structure": "Put Spread",
         "size_btc": 50.0,
         "notional_usd": 3072046,
-        "side": "Two-way",
+        "side": "Mixed",
         "avg_iv": 44.3,
         "expiry": "26JUN26",
         "strike": "64000",
@@ -112,7 +112,7 @@
         "structure": "Put Spread",
         "size_btc": 50.0,
         "notional_usd": 3071349,
-        "side": "Two-way",
+        "side": "Mixed",
         "avg_iv": 44.8,
         "expiry": "26JUN26",
         "strike": "64000",
@@ -285,9 +285,9 @@
   },
   "spot_price_at_fetch": 61973.5,
   "realized_vol": {
-    "annualized_vol": 53.9,
-    "candles": 169,
-    "lookback_days": 7,
+    "annualized_vol": 37.8,
+    "candles": 721,
+    "lookback_days": 30,
     "method": "close-to-close log returns \u00b7 sample stdev \u00b7 \u00d7\u221a8760 (24/7) \u00b7 \u00d7100"
   },
   "trades": [

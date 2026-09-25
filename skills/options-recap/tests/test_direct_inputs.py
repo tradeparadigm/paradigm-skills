@@ -441,7 +441,7 @@ def _run_once(monkeypatch, *, coverage=("feed_gap", {"lost_hours": ["20260916T10
     monkeypatch.setattr(direct, "aggregate_trades", lambda *a, **k: dict(direct.EMPTY_TOTAL))
     monkeypatch.setattr(direct, "read_executions",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no partition")))
-    monkeypatch.setattr(recap, "fetch_7d_closes", lambda *a, **k: [])
+    monkeypatch.setattr(recap, "fetch_rv_closes", lambda *a, **k: [])
     monkeypatch.setattr(recap, "_fetch_market_fallback", lambda *a, **k: None)
     captured = {}
 
@@ -729,3 +729,24 @@ def test_leg_ivs_convert_units_and_report_a_failed_read(monkeypatch):
                         lambda q: ({"status": "unavailable", "error": "403"}, pl.DataFrame()))
     assert direct.leg_ivs("BTC", [("BTC-30OCT26-90000-C", 1)], {"deribit": unit}, gaps) == {}
     assert gaps == ["Block Flow: leg IVs unavailable — 403"]
+
+
+def test_a_small_unvalued_share_is_not_printed_as_zero():
+    gaps = []
+    totals = {"bybit-options": dict(direct.EMPTY_TOTAL, count=46_597, missing=95, missing_symbols=8)}
+    direct.inputs(totals, {}, {}, gaps)
+    assert "Bybit 95 of 46,597 (0.2%) across 8 symbols" in gaps[0]
+
+
+def test_the_tape_tail_gap_states_a_fact_not_an_instruction():
+    line = direct.tape_coverage_gap({"coverage_complete": False,
+                                     "coverage_shortfall_seconds": 95 * 60})
+    assert line == ("Paradigm executions: the last 95 min of the window are not on the tape "
+                    "yet (hourly upstream sync) — blocks printed then are missing from "
+                    "Block Flow, not absent")
+    unknown = direct.tape_coverage_gap({"coverage_complete": False,
+                                        "coverage_shortfall_seconds": None})
+    assert "coverage unknown" in unknown
+    assert direct.tape_coverage_gap({"coverage_complete": True}) is None
+    assert "the last 1 min" in direct.tape_coverage_gap({"coverage_complete": False,
+                                                         "coverage_shortfall_seconds": 12})

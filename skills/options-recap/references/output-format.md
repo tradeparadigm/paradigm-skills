@@ -24,7 +24,7 @@ would read as a zero-length window. Intraday windows stay HH:MM-only.
 Coverage  [N]/[M] venues  [per-venue state, or "all venue feeds complete"]
 Spot      $[X]        [up/down X%, or flat] (from $[Y], low $[Z])
 DVOL      [X]v        [flat/rising/falling] ([open] -> [close])
-RV 7d     [X]v        implied [CHEAP/RICH/IN LINE] vs realized
+RV 30d    [X]v        implied [CHEAP/RICH/IN LINE] vs realized
 VRP       [±X]v       vol [underpriced/overpriced/roughly fair] vs delivered
 Activity  [Nk]        trades — [Venue X% · Venue Y% · ...] (by trade count)
 Volume    $[X]M       observed valued trades · USD premium
@@ -33,7 +33,7 @@ P/C       [X.Xx]      [descriptor] (observed trades · see ⚠ lines)
 
 The `⚠` lines are the FIRST lines inside the fence, not above it: on
 2026-09-08 a relaying model kept every figure in the fence and deleted all
-three warning lines that sat outside it. `RV 7d` and `VRP` print
+three warning lines that sat outside it. `RV 30d` and `VRP` print
 `unavailable` when the Deribit close history cannot be fetched, rather than
 being dropped.
 
@@ -135,7 +135,7 @@ ARE the complete expiry set (calendar, diagonal), `near→far` when interior
 tenors are elided (3+ expiries) — each leg's own expiry always appears in
 the Detail column.
 
-**Block Flow — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)]**
+**Block Flow — $[X]M notional / [N] blocks / [M] structures[ (top 8 by notional)]**
 
 ```yaml
 #  Structure                  Notl     Blocks  Detail (+ taker bought, - taker sold)
