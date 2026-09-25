@@ -65,7 +65,7 @@ if you need to reproduce the math offline.
 
 Never echo, log, or commit these values. If the user asks "what's my
 key?", refuse and point at the MCP config or the upstream key portal
-at `app.paradigm.co`.
+at `app.paradigm.trade`.
 
 [OneCLI](https://onecli.sh) can substitute the placeholder `Bearer`
 header via `HTTPS_PROXY` regardless of whether you're on the MCP or
@@ -76,8 +76,8 @@ from the `sign()` helper above.
 
 | Env | REST | WS |
 |---|---|---|
-| Prod | `https://api.prod.paradigm.co` | `wss://ws.api.prod.paradigm.trade/v2/drfq/` |
-| Testnet | `https://api.testnet.paradigm.co` | `wss://ws.api.testnet.paradigm.trade/v2/drfq/` |
+| Prod | `https://api.prod.paradigm.trade` | `wss://ws.api.prod.paradigm.trade/v2/drfq/` |
+| Testnet | `https://api.testnet.paradigm.trade` | `wss://ws.api.testnet.paradigm.trade/v2/drfq/` |
 
 WS auth does not use HMAC — pass the access key as the `api-key` query
 parameter on the connection URL.
