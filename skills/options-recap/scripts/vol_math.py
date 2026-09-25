@@ -1037,8 +1037,32 @@ def _call_delta(inst: str, delta: float) -> float | None:
     return None
 
 
+# How many Vol Surface rows the recap shows, chosen by _tenor_rows.
+MAX_SURFACE_ROWS = 5
+
+
+def _tenor_rows(expiries: list[dict], limit: int) -> list[dict]:
+    """The front expiry, the next Friday after it, then month-end Fridays (the
+    monthlies and quarterlies), so weekend dailies do not crowd out the months."""
+    from datetime import datetime, timedelta, timezone
+
+    def day(e):
+        return datetime.fromtimestamp(e["expiry_ms"] / 1000, timezone.utc)
+
+    dated = [e for e in expiries if e["expiry_ms"] is not None]
+    if not dated:
+        return expiries[:limit]
+    rows = [dated[0]]
+    weekly = next((e for e in dated[1:] if day(e).weekday() == 4), None)
+    if weekly:
+        rows.append(weekly)
+    rows += [e for e in dated if e not in rows and day(e).weekday() == 4
+             and (day(e) + timedelta(days=7)).month != day(e).month]
+    return sorted(rows, key=lambda e: e["expiry_ms"])[:limit]
+
+
 def compute_vol_surface(tickers: dict[str, dict], spot: float | None = None,
-                        max_expiries: int | None = None) -> dict:
+                        max_expiries: int | None = None, as_of_ms: int | None = None) -> dict:
     """Derive per-expiry ATM IV, 25-delta risk reversal (skew), 25-delta
     butterfly (wings), and the cross-expiry term-structure read from raw
     per-strike tickers (each carrying `mark_iv` and `delta`).
@@ -1047,9 +1071,10 @@ def compute_vol_surface(tickers: dict[str, dict], spot: float | None = None,
     delta 0.75 (same strike, put delta −0.25), ATM = 0.50. Metrics whose
     target delta falls outside the strike range are flagged `extrapolated`.
 
-    `max_expiries` truncates the (chronologically sorted) curve before the
-    term read — pass the display cap so the term label describes the tenors
-    the reader actually sees, not invisible back-month ones.
+    `as_of_ms` leaves out an expiry settling on that UTC date: hours from
+    settlement its IV is pin noise, and it would drive the front, the skew and
+    the term label. `max_expiries` picks that many rows by tenor (_tenor_rows)
+    before the term read, so the label describes the rows the reader sees.
     """
     # Build per-expiry { call_delta: iv } (call & put at a strike share mark_iv).
     by_exp: dict[str, dict[float, float]] = defaultdict(dict)
@@ -1090,8 +1115,12 @@ def compute_vol_surface(tickers: dict[str, dict], spot: float | None = None,
 
     # Chronological order (unknown expiry_ms sorts last).
     expiries.sort(key=lambda e: (e["expiry_ms"] is None, e["expiry_ms"] or 0))
+    if as_of_ms is not None:
+        today = as_of_ms // 86_400_000
+        expiries = [e for e in expiries
+                    if e["expiry_ms"] is None or e["expiry_ms"] // 86_400_000 > today]
     if max_expiries:
-        expiries = expiries[:max_expiries]
+        expiries = _tenor_rows(expiries, max_expiries)
 
     front = expiries[0] if expiries else None
 
@@ -1122,9 +1151,13 @@ def compute_vol_surface(tickers: dict[str, dict], spot: float | None = None,
         else:
             peak = max(atm_pts, key=lambda e: e["atm_iv"])
             trough = min(atm_pts, key=lambda e: e["atm_iv"])
-            if peak is not atm_pts[0] and peak is not atm_pts[-1]:
+            ends = (atm_pts[0], atm_pts[-1])
+            # Whichever interior extreme strays further from the ends is the shape.
+            rise = peak["atm_iv"] - max(atms[0], atms[-1]) if peak not in ends else 0
+            fall = min(atms[0], atms[-1]) - trough["atm_iv"] if trough not in ends else 0
+            if rise > 0 and rise >= fall:
                 term = f"humped — peak at {peak['expiry']}"
-            elif trough is not atm_pts[0] and trough is not atm_pts[-1]:
+            elif fall > 0:
                 term = f"dished — trough at {trough['expiry']}"
             else:
                 term = "mixed"

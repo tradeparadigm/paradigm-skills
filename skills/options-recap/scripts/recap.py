@@ -61,14 +61,12 @@ from vol_math import (  # noqa: E402
     tape_block_key,
     _TAPE_VENUE as _VOL_MATH_VENUE_CODES,
     RV_LOOKBACK_DAYS,
+    MAX_SURFACE_ROWS,
 )
 
 DERIBIT = "https://www.deribit.com/api/v2/public"
 WARNINGS: list[str] = []
 
-# Vol-surface table caps to the front N expiries (chronological). The v_vol_surface
-# store carries the full curve (~12 expiries); the recap only shows the near tenors.
-MAX_SURFACE_ROWS = 5
 
 # ── Freshness gate ──────────────────────────────────────────────────────────
 # How far behind the clock each HEARTBEAT source may fall before the recap stops
@@ -1038,8 +1036,8 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     tickers = vs_now or hot.get("tickers") or (mkt or {}).get("tickers") or {}
     # Cap the "now" surface at the display limit so the term-structure label
     # describes exactly the tenors the table shows (not invisible back months).
-    surf = (compute_vol_surface(tickers, surf_spot, max_expiries=MAX_SURFACE_ROWS)
-            if tickers else None)
+    surf = (compute_vol_surface(tickers, surf_spot, max_expiries=MAX_SURFACE_ROWS,
+                                as_of_ms=end_ms) if tickers else None)
     surf_open = compute_vol_surface(vs_open, surf_spot) if vs_open else None
 
     # Biggest Print + Block Flow: the multi-venue Paradigm block tape (blocks.csv),
@@ -1119,7 +1117,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
             return round(curr - prev, 1) if (curr is not None and prev is not None) else None
 
         rows = []
-        for e in surf.get("expiries", [])[:MAX_SURFACE_ROWS]:
+        for e in surf.get("expiries", []):
             o = open_by_exp.get(e["expiry"])
             rows.append({
                 "expiry": e["expiry"], "atm": e["atm_iv"],

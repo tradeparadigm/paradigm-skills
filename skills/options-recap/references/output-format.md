@@ -171,10 +171,18 @@ Detail: the legs as traded (see Biggest Print). The column header reads
 **Vol Surface**
 Skew: front 25Δ RR [±X]v → [puts bid / calls bid / flat] · Term: [front]v → [back]v → [contango / flat / backwardation / humped — peak at [DDMMMYY] / dished — trough at [DDMMMYY] / mixed]
 
-Term reads the whole listed curve, front to last expiry — monotonic (±0.2v
-tolerance) with >1v span is contango/backwardation; non-monotonic curves are
-humped/dished and name the interior peak/trough, or `mixed` when the shape is
-neither cleanly humped nor dished. `[back]` is the LAST listed
+Rows are chosen by tenor, up to five: the front expiry, the next Friday
+after it, then month-end Fridays (the monthlies and quarterlies), so weekend
+dailies never crowd out the months. Other dailies and weeklies are not shown,
+so fewer than five rows can appear. With a single row the Term slot reads
+`n/a`. An expiry settling on the window's end
+date is left out entirely — hours from settlement its IV is pin noise — so the
+front row, the skew line and the term label start at the next expiry.
+
+Term reads those rows, front to last — monotonic (±0.2v tolerance) with >1v
+span is contango/backwardation; non-monotonic curves are humped/dished, named
+by whichever interior extreme strays further from the two ends, or `mixed`
+when neither does. `[back]` is the LAST listed
 expiry's ATM, not the second. The skew side word is the RR's sign (negative →
 puts bid, positive → calls bid, zero → flat); extrapolated wings put a `*` on
 the RR figure (`+1.3v*`), never prose. These slots take exactly these tokens —

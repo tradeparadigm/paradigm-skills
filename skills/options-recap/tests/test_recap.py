@@ -908,8 +908,9 @@ def test_delta_fmt():
 
 
 def test_surface_caps_to_max_rows():
-    # 6 expiries in the now snapshot → table caps to MAX_SURFACE_ROWS (front).
-    exps = ["3JUL26", "10JUL26", "17JUL26", "24JUL26", "31JUL26", "28AUG26"]
+    # 8 expiries in the now snapshot → MAX_SURFACE_ROWS of them, chosen by tenor.
+    exps = ["3JUL26", "10JUL26", "17JUL26", "24JUL26", "31JUL26", "28AUG26",
+            "25SEP26", "30OCT26"]
     lines = ["symbol,mark_iv,delta"]
     for e in exps:
         lines += [f"BTC-{e}-60000-C,45.0,0.50",
@@ -923,6 +924,9 @@ def test_surface_caps_to_max_rows():
                     {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
     n = len(res["vol_surface"]["rows"])
     check(f"rows capped to {MAX_SURFACE_ROWS}", n == MAX_SURFACE_ROWS, n)
+    shown = [r["expiry"] for r in res["vol_surface"]["rows"]]
+    check("front, next weekly, then monthlies",
+          shown == ["3JUL26", "10JUL26", "31JUL26", "28AUG26", "25SEP26"], shown)
 
 
 # ── load_hot: missing files degrade, don't crash ────────────────────────────

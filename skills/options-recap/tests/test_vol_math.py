@@ -483,6 +483,41 @@ def _atm_only_tickers(exp_atms):
             for exp, iv in exp_atms}
 
 
+AS_OF_SEP25 = 1790315700000   # 2026-09-25 05:55Z, two hours before 25SEP26 settles
+
+
+def test_an_expiry_settling_today_does_not_read_as_the_front():
+    s = compute_vol_surface(_atm_only_tickers([
+        ("25SEP26", 32.4), ("26SEP26", 32.9), ("2OCT26", 32.5)]), spot=84000,
+        as_of_ms=AS_OF_SEP25)
+    check("0DTE expiry left out", [e["expiry"] for e in s["expiries"]] == ["26SEP26", "2OCT26"],
+          s["expiries"])
+    check("front ATM is the next expiry", s["front_atm"] == 32.9, s["front_atm"])
+    after = compute_vol_surface(_atm_only_tickers([("26SEP26", 32.9)]), spot=84000,
+                                as_of_ms=AS_OF_SEP25 + 3 * 3600_000)   # 08:55, 23h to go
+    check("tomorrow's daily stays after today's settlement",
+          [e["expiry"] for e in after["expiries"]] == ["26SEP26"], after["expiries"])
+
+
+def test_surface_rows_are_chosen_by_tenor():
+    chain = [("26SEP26", 32.9), ("27SEP26", 26.8), ("28SEP26", 26.2), ("2OCT26", 32.5),
+             ("9OCT26", 33.0), ("16OCT26", 33.4), ("30OCT26", 34.0), ("27NOV26", 35.0),
+             ("25DEC26", 36.0), ("26MAR27", 38.0)]
+    s = compute_vol_surface(_atm_only_tickers(chain), spot=84000, max_expiries=5,
+                            as_of_ms=AS_OF_SEP25)
+    check("front, next weekly, then monthlies",
+          [e["expiry"] for e in s["expiries"]] == ["26SEP26", "2OCT26", "30OCT26", "27NOV26", "25DEC26"],
+          [e["expiry"] for e in s["expiries"]])
+
+
+def test_a_deeper_trough_outranks_a_shallow_peak():
+    s = compute_vol_surface(_atm_only_tickers([
+        ("15JUL26", 32.4), ("16JUL26", 32.9), ("17JUL26", 26.8), ("18JUL26", 26.2),
+        ("24JUL26", 32.5)]), spot=60000)
+    check("the 6-vol trough names the shape", s["term_structure"] == "dished — trough at 18JUL26",
+          s["term_structure"])
+
+
 def test_surface_term_structure_reads_whole_curve():
     # The reported bug: 33.3 → 35.6 → 35.1 → 35.2 → 33.7 rises then falls.
     # A front-vs-next comparison called this "contango"; it is humped.
