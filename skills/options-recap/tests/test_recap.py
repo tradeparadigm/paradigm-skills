@@ -58,12 +58,16 @@ def _cells(line):
 
 
 def _first_fenced(md):
-    """First row of the Snapshot table, as its non-empty cells joined. Warnings
-    lead there; they used to sit above the header, and the relaying model kept
-    the figures while dropping everything above them (2026-09-08)."""
+    """The first warning under the Snapshot table. Warnings print under the
+    figures they qualify; above the header, a relay once dropped them all
+    (2026-09-08)."""
     lines = md.splitlines()
     rule = next(i for i, ln in enumerate(lines) if ln.startswith("| ---"))
-    return " ".join(c for c in _cells(lines[rule + 1]) if c)
+    return next(ln for ln in lines[rule:] if ln.startswith("- ⚠ ")).removeprefix("- ")
+
+
+def _plain(text):
+    return text.replace("\u00a0", " ")
 
 
 def _row(md, label):
@@ -452,7 +456,7 @@ def test_venue_blocks_merge_into_block_flow():
     check("biggest source venue", bp.get("source") == "venue", bp)
     md = render_md(res)
     check("biggest line names venue in label", "OKX Block" in md, "render")
-    check("biggest line says via venue tape", "| venue tape |" in md, "render")
+    check("biggest line says via venue tape", "· venue tape" in md, "render")
     check("title stays plain (no source scope tag)", "**Block Flow — $" in md, "render")
     check("the total says it is notional", re.search(r"\*\*Block Flow — \$[\d.]+M notional / ", md), md)
     check("~time rendered (5m resolution)", "~" in md, "render")
@@ -466,7 +470,7 @@ def test_block_flow_unchanged_without_venue_blocks():
     md = render_md(res)
     check("plain title", "**Block Flow — $" in md, "render")
     check("no venue-tape traces", "venue tape" not in md, "render")
-    check("biggest still via Paradigm", "| Paradigm/Deribit |" in md, "render")
+    check("biggest still via Paradigm", "· Paradigm/Deribit" in md, "render")
 
 
 # ── load_hot/build: cross-venue turnover_usd ($ Volume) ──────────────────────
@@ -1000,7 +1004,7 @@ def test_block_flow_multi_venue_and_notional_floor():
                     "vol_surface": None, "hot_horizon": None, "warnings": []})
     # No per-row Venue column — the Biggest Print line is where the venue shows.
     check("no Venue column in table", "Venue" not in md, md)
-    check("biggest print names the venue", "| Paradigm/Bullish |" in md, md)
+    check("biggest print names the venue", "· Paradigm/Bullish" in md, md)
 
 
 def test_pc_descriptor_bands():
@@ -1095,10 +1099,11 @@ def test_biggest_print_shows_legs_as_traded():
                     "snapshot": {}, "biggest_print": bp,
                     "block_flow": bf, "vol_surface": None, "hot_horizon": None,
                     "warnings": []})
-    line = next(l for l in md.splitlines() if "| Paradigm/" in l)
+    line = next(l for l in md.splitlines() if "· Paradigm/" in l)
+    legs = next(l for l in md.splitlines() if l.startswith("Legs (+ bought, - sold):"))
     check("biggest print names the ratio", "Call Ratio Diagonal" in line, line)
     check("biggest print lists signed legs",
-          _cells(line)[-1] == "-500 25SEP26 80KC / +1000 30OCT26 90KC", line)
+          legs.endswith("-500 25SEP26 80KC / +1000 30OCT26 90KC"), legs)
     check("no unit-size column", "500x" not in line, line)
 
 
@@ -1144,7 +1149,7 @@ def test_render_four_sections():
     check("render multi-venue Activity line", "Activity" in md and "Bybit" in md, "activity render")
     check("render P/C 0.9x", "0.9x" in md)
     check("render biggest Risk Reversal (from tape)", "26JUN26 Risk Reversal" in md)
-    check("biggest print via Paradigm/Deribit", "| Paradigm/Deribit |" in md, md)
+    check("biggest print via Paradigm/Deribit", "· Paradigm/Deribit" in md, md)
     # Vol-surface delta columns are always present in the header; with no
     # window-open surface (this fixture has none) the delta cells read n/a.
     check("delta columns present", "ΔATM" in md and "ΔRR" in md and "ΔFly" in md, md)
@@ -1152,8 +1157,8 @@ def test_render_four_sections():
     # Dropped/forbidden output must not reappear.
     check("no Themes", "Themes" not in md)
     check("no Dealer positioning", "Dealer positioning" not in md)
-    check("four tables and no code fences",
-          sum(ln.startswith("| ---") for ln in md.splitlines()) == 4 and "```" not in md,
+    check("three tables and no code fences",
+          sum(ln.startswith("| ---") for ln in md.splitlines()) == 3 and "```" not in md,
           md)
 
 
@@ -1655,7 +1660,7 @@ def test_main_wires_the_gate_end_to_end():
         out, calls = _run_main(d, market=_LIVE_MARKET)
     # gate detected -> banner rendered (kills: stale=[], stale=[] into build(),
     # and the check_freshness call being bypassed)
-    check("banner present", "| ⚠ |  | recap_aggregates" in out, out.splitlines()[:3])
+    check("banner present", "- ⚠ recap_aggregates" in out, out.splitlines()[:3])
     check("banner leads the Snapshot fence", _first_fenced(out).startswith("⚠ recap_aggregates"),
           out.splitlines()[:8])
     # divert actually happened (kills: stale_snapshot=False, _SNAPSHOT_SOURCES
@@ -2019,7 +2024,7 @@ def test_unknown_freshness_reaches_the_divert_through_main():
     check("stale hot DVOL not rendered", "38.2" not in out, out.splitlines()[:14])
 
 
-def test_warning_banners_render_inside_snapshot_fence():
+def test_warnings_print_under_the_section_they_qualify():
     # 2026-09-08, live: a relaying model kept the Snapshot fence verbatim and
     # deleted every ⚠ line printed above the header (Bullish partial, a 66-min
     # Paradigm coverage shortfall, 13k unvalued trades). The lines that say what
@@ -2040,12 +2045,12 @@ def test_warning_banners_render_inside_snapshot_fence():
     check("source gaps rendered", sum("coverage ends 66 min" in ln for ln in lines) == 1
           and sum("bullish: 4/9" in ln for ln in lines) == 1, lines[:14])
     check("no ⚠ line above the header", all(i > header for i in warns), lines[:header + 1])
-    check("every ⚠ is a leading row of the Snapshot table",
-          warns == list(range(rule + 1, rule + 1 + len(warns)))
-          and all(lines[i].startswith("| ⚠ |") for i in warns),
-          lines[rule:rule + 4])
-    check("the figures follow the warnings in the same table",
-          lines[max(warns) + 1].startswith("| Spot |"), lines[rule:rule + 5])
+    block_flow = next(i for i, ln in enumerate(lines) if ln.startswith("**Block Flow"))
+    tape = next(i for i, ln in enumerate(lines) if "coverage ends 66 min" in ln)
+    bullish = next(i for i, ln in enumerate(lines) if "bullish: 4/9" in ln)
+    check("a Paradigm tape gap prints under Block Flow", tape > block_flow, lines[block_flow:])
+    check("a venue read gap prints under the Snapshot table",
+          rule < bullish < block_flow and lines[bullish].startswith("- ⚠ "), lines[rule:block_flow])
 
 
 def test_absent_paradigm_tape_keeps_the_venues_own_blocks():
@@ -2098,7 +2103,7 @@ def test_coverage_leads_the_snapshot_and_names_unread_venues():
     check("it is the first row of the Snapshot table",
           bool(cov) and rule is not None and cov[0] == rule + 1, lines[:14])
     check("an unreadable venue is not counted as read",
-          bool(cov) and "2/3 venues" in lines[cov[0]], lines[cov[0]] if cov else None)
+          bool(cov) and "2/3 venues" in _plain(lines[cov[0]]), lines[cov[0]] if cov else None)
     check("it distinguishes quiet hours from a failed read",
           bool(cov) and "Bullish quiet hours" in lines[cov[0]]
           and "READ FAILED" in lines[cov[0]], lines[cov[0]] if cov else None)
@@ -2123,7 +2128,7 @@ def test_coverage_leads_the_snapshot_and_names_unread_venues():
          "trades_by_venue": {"deribit": 8, "deribit-usdc": 2},
          "venue_coverage": {"deribit": ("complete", {}), "deribit-usdc": ("stale_feed", {})}}))
     check("an unknown state degrades instead of raising", "Coverage" in odd, odd[:120])
-    check("and does not count as read", "0/1 venues" in odd,
+    check("and does not count as read", "0/1 venues" in _plain(odd),
           next((l for l in odd.splitlines() if l.startswith("| Coverage |")), ""))
     # Coverage and Activity must not contradict each other on adjacent lines.
     both = render_md(build(
@@ -2134,7 +2139,7 @@ def test_coverage_leads_the_snapshot_and_names_unread_venues():
     cline = next((l for l in both.splitlines() if l.startswith("| Coverage |")), "")
     aline = next((l for l in both.splitlines() if l.startswith("| Activity |")), "")
     check("a feed_gap venue is unread on BOTH lines",
-          "1/2 venues" in cline and "Deribit unread" in aline, (cline, aline))
+          "1/2 venues" in _plain(cline) and "Deribit unread" in aline, (cline, aline))
     # An all-unread window must not render a dangling separator.
     none_read = render_md(build(
         "BTC", "24h", 1_000_000, 2_000_000, {"closes": [], "market": None},

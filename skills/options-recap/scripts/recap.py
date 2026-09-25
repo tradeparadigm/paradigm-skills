@@ -1204,17 +1204,30 @@ def _table(headers: list[str], rows: list[list], right: tuple = ()) -> list[str]
             + [f"| {' | '.join(_cell(c) for c in row)} |" for row in rows])
 
 
-def _warning_rows(banner: list[str]) -> list[list[str]]:
-    """Banner lines as Snapshot rows: an indented line continues the ⚠ above it."""
-    rows: list[list[str]] = []
+def _warnings(banner: list[str]) -> list[str]:
+    """Banner lines as whole warnings: an indented line continues the one above."""
+    out: list[str] = []
     for line in banner:
         if not line.strip():
             continue
-        if line.startswith(" ") and rows:
-            rows[-1][2] += " " + line.strip()
+        if line.startswith(" ") and out:
+            out[-1] += " " + line.strip()
         else:
-            rows.append(["⚠", "", line.removeprefix("⚠").strip()])
-    return rows
+            out.append(line.removeprefix("⚠").strip())
+    return out
+
+
+def _section_of(gap: str) -> str:
+    """Which section a source gap qualifies, so it prints under those figures."""
+    if gap.startswith(("Block Flow", "Paradigm executions")):
+        return "blocks"
+    if gap.startswith(("Vol Surface", "option_surface")):
+        return "surface"
+    return "snapshot"
+
+
+def _notes(items: list[str]) -> list[str]:
+    return ["", *[f"- ⚠ {item}" for item in items]] if items else []
 
 
 def render_md(r: dict) -> str:
@@ -1223,10 +1236,10 @@ def render_md(r: dict) -> str:
     h, s, bp, bf, vs = (r["header"], r["snapshot"], r["biggest_print"],
                         r["block_flow"], r["vol_surface"])
     L: list[str] = []
+    warnings_at = {"snapshot": [], "blocks": [], "surface": []}
     for gap in r.get("source_gaps", []):
-        L.append(f"⚠ {gap}")
-    if r.get("source_gaps"):
-        L.append("")
+        section = _section_of(gap)
+        warnings_at[section].append(gap.removeprefix("Block Flow: ") if section == "blocks" else gap)
 
     # STALENESS FIRST. This banner outranks the others because it is the only
     # one that says the numbers below may be WRONG rather than missing — a
@@ -1295,15 +1308,15 @@ def render_md(r: dict) -> str:
                  f"horizon); Block Flow and surface span the full {hh}h.")
         L.append("")
 
-    # Everything appended so far is a warning banner. On 2026-09-08 a relay
-    # kept every Snapshot figure and deleted the ⚠ lines printed above them,
-    # so the warnings are the first rows OF the Snapshot table: they cannot be
-    # dropped without dropping Snapshot.
+    # Everything appended so far is a warning banner. Each warning prints
+    # directly under the figures it qualifies rather than above the recap: on
+    # 2026-09-08 a relay kept every figure and deleted the ⚠ lines above them.
     banner, L = L, []
+    warnings_at["snapshot"] = _warnings(banner) + warnings_at["snapshot"]
     L.append(f"**{h['asset']} Options · {h['window']} Recap · "
              f"{h['start_utc']}–{h['end_utc']} UTC**")
     L += ["", "**Snapshot**", ""]
-    snap = _warning_rows(banner)
+    snap = []
 
     # Coverage leads the Snapshot: every figure below is a function of how much
     # of the window was actually read, and a reader cannot infer that from the
@@ -1394,7 +1407,10 @@ def render_md(r: dict) -> str:
     pc = f"{s['pc_ratio']}x" if s.get("pc_ratio") is not None else "n/a"
     pc_desc = f"{s['pc_descriptor']} " if s.get("pc_descriptor") else ""
     snap.append(["P/C", pc, f"{pc_desc}({s.get('activity_scope', 'all venues, by trades')})"])
-    L += _table(["", "Value", "Read"], snap, right=(1,))
+    # A figure stays on one line; only the Read column wraps.
+    L += _table(["", "Value", "Read"], [[label, str(value).replace(" ", "\u00a0"), read]
+                                          for label, value, read in snap], right=(1,))
+    L += _notes(warnings_at["snapshot"])
     L += ["", "**Biggest Print**", ""]
 
     if bp:
@@ -1404,8 +1420,8 @@ def render_md(r: dict) -> str:
                else f"Paradigm/{bp.get('venue') or '?'}")
         label = f"{bp['expiry']} {bp['structure']}".strip()  # venue blocks have no expiry
         detail = (bp.get("detail") or "").replace(" (venue tape)", "")
-        L += _table(["Structure", "Notional", "Time (UTC)", "Source", "Legs (+ bought, - sold)"],
-                    [[label, f"${bp['notional_m']}M", bp["time_utc"], via, detail]], right=(1,))
+        L += [f"**{label}** · ${bp['notional_m']}M · {bp['time_utc']} UTC · {via}", "",
+              f"Legs (+ bought, - sold): {detail}"]
     else:
         # output-format.md: name the source and reason rather than going blank.
         # True whichever way the pool emptied — no blocks at all, all excluded by
@@ -1425,6 +1441,7 @@ def render_md(r: dict) -> str:
                       row["detail"]] for row in bf["rows"]], right=(0, 2, 3))
     else:
         L.append("No block cleared the $250k floor in this window.")
+    L += _notes(warnings_at["blocks"])
     L += ["", "**Vol Surface**", ""]
 
     if vs and vs.get("rows"):
@@ -1461,6 +1478,7 @@ def render_md(r: dict) -> str:
         # than going blank. "No data" reads as a quiet market; it never was one.
         L.append("Unavailable — no vol surface could be built from the window's "
                  "option_summary snapshots.")
+    L += _notes(warnings_at["surface"])
     return "\n".join(L)
 
 

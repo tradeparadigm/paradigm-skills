@@ -22,7 +22,6 @@ would read as a zero-length window. Intraday windows stay HH:MM-only.
 ```
 |  | Value | Read |
 | --- | ---: | --- |
-| ⚠ |  | [one row per gap, when there are any] |
 | Coverage | [N]/[M] venues | [per-venue state, or "all venue feeds complete"] |
 | Spot | $[X] | [up/down X%, or flat] (from $[Y], low $[Z]) |
 | DVOL | [X]v | [flat/rising/falling] ([open] -> [close]) |
@@ -31,12 +30,18 @@ would read as a zero-length window. Intraday windows stay HH:MM-only.
 | Activity | [Nk] | trades — [Venue X% · Venue Y% · ...] (by trade count) |
 | Volume | $[X]M | observed valued trades · USD premium |
 | P/C | [X.Xx] | [descriptor] (observed trades · see ⚠ lines) |
+
+- ⚠ [one line per gap that qualifies these figures]
 ```
 
-Every section is a markdown pipe table, which the terminal draws as a real
-table; nothing is in a code fence. The `⚠` rows are the FIRST rows of the
-Snapshot table, not lines above it: on 2026-09-08 a relaying model kept every
-figure and deleted all three warning lines that sat outside them. `RV 30d` and `VRP` print
+Snapshot, Block Flow and the Vol Surface are markdown pipe tables, which the
+terminal draws as real tables; nothing is in a code fence. Values never wrap.
+
+Each `⚠` line prints directly under the section it qualifies: Paradigm-tape
+and block gaps under Block Flow, surface gaps under the Vol Surface, and the
+rest (coverage, volume, spot, stale feeds) under the Snapshot. They are never
+printed above the recap: on 2026-09-08 a relaying model kept every figure and
+deleted all three warning lines that sat above them. `RV 30d` and `VRP` print
 `unavailable` when the Deribit close history cannot be fetched, rather than
 being dropped.
 
@@ -102,18 +107,18 @@ never combine `amount_native` across venues.
 **Biggest Print**
 
 ```
-| Structure | Notional | Time (UTC) | Source | Legs (+ bought, - sold) |
-| --- | ---: | --- | --- | --- |
-| [DDMMMYY] [structure] | $[X]M | [HH:MM] | Paradigm/[Venue] | [legs] |
+**[DDMMMYY] [structure]** · $[X]M · [HH:MM] UTC · Paradigm/[Venue]
+
+Legs (+ bought, - sold): [legs]
 ```
 
 The single largest **proven block** in the window, ranked by underlying USD
 notional, as in Block Flow. Snapshot Volume is USD premium turnover: never
 substitute one measure for the other. Group legs only on a real venue block/OTC id. The
-Source cell names the source and venue. `[legs]` is the same leg list the
+source tag names the source and venue. `[legs]` is the same leg list the
 Block Flow Legs column shows. A raw venue block without provable leg
 geometry renders as
-`| [Venue] Block | $[X]M | ~[HH:MM] | venue tape | x[coin] — [n] legs |`
+`**[Venue] Block** · $[X]M · ~[HH:MM] UTC · venue tape` with `x[coin] — [n] legs` as its legs
 (`~` = 5-min bucket resolution; `x[coin]` is its total coin size).
 
 Legs are listed as traded, one per instrument: `[±size] [expiry] [K][C/P] [IV]v`,
@@ -153,7 +158,7 @@ Raw venue blocks rank in the same pool and count toward the header totals. When
 their rows do not prove leg geometry, use `[Venue] Block`, carry a
 `(venue tape)` note, and count the real venue block id once.
 
-There is no per-row venue column — the Biggest Print Source cell is where
+There is no per-row venue column — the Biggest Print source tag is where
 the venue shows, and a venue-tape row carries its venue in the structure
 label (`OKX Block`). With no qualifying block the table is replaced by
 `No block cleared the $250k floor in this window.`

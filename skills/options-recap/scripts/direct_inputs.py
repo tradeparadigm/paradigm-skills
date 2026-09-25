@@ -230,11 +230,9 @@ def tape_coverage_gap(tape_result):
         return None
     shortfall = tape_result.get("coverage_shortfall_seconds")
     if shortfall is None:
-        return ("Paradigm executions: coverage unknown — the tape predates its "
-                "watermark field, so a quiet tape proves nothing")
-    return (f"Paradigm executions: the last {max(1, math.ceil(shortfall / 60))} min of the window are not "
-            f"on the tape yet (hourly upstream sync) — blocks printed then are missing "
-            f"from Block Flow, not absent")
+        return ("Paradigm executions: coverage unknown — a quiet tape here proves nothing")
+    return (f"Paradigm executions: last {max(1, math.ceil(shortfall / 60))} min not on the tape "
+            f"yet (hourly sync) — blocks then are missing, not absent")
 
 
 def inputs(totals, evidence, specs, gaps, coverage=None):
@@ -269,10 +267,10 @@ def inputs(totals, evidence, specs, gaps, coverage=None):
         # noise, while "bybit-options 32%" points at one venue's instrument
         # metadata not covering the symbols its own tape traded.
         detail = "; ".join(
-            f"{recap.venue_name(venue)} {count:,} of {rows:,} ({share(count, rows)}) across {symbols:,} symbols"
+            f"{recap.venue_name(venue)} {count:,} of {rows:,} ({share(count, rows)})"
             for venue, count, rows, symbols in sorted(unvalued_by_venue, key=lambda v: -v[1]))
-        gaps.append(f"Volume: {missing_values:,} trades lack a provable USD premium — "
-                    f"{detail}; shown sum is the valued subset")
+        gaps.append(f"Volume: {missing_values:,} trades have no provable USD premium and are "
+                    f"left out — {detail}")
     if unclassified:
         gaps.append(f"P/C: {unclassified:,} trades carry no recognisable option type in their "
                     f"symbol ({', '.join(unclassified_venues)}) and are excluded from the ratio")
@@ -400,8 +398,7 @@ def leg_ivs(asset, requests, specs, gaps):
 
 # What each dedupe outcome means to a reader, in words.
 _EXCLUSION_REASONS = {
-    "id_space_unproven": ("the Paradigm tape carries no venue block ids for them, so a "
-                          "Paradigm-brokered print among them cannot be ruled out"),
+    "id_space_unproven": "may duplicate Paradigm prints (no venue block id to check)",
 }
 
 
@@ -607,9 +604,8 @@ def run(asset, window, start, end, now=None):
             why = _EXCLUSION_REASONS.get(
                 excluded["reason"], excluded["reason"].replace("_", " "))
             gaps.append(
-                f"Block Flow: {excluded['blocks']} {venues} block(s) excluded "
-                f"(${excluded['notional_m']:.2f}M, {excluded['coin']} coin) — "
-                f"{why}; the totals below do not include them")
+                f"Block Flow: {excluded['blocks']} {venues} blocks left out "
+                f"(${excluded['notional_m']:,.0f}M) — {why}")
     # A venue whose rows carry no index_price falls back to window-close spot,
     # so its blocks are ranked against trade-time-priced ones on a different
     # clock — the very thing this phase fixed. Uniform-close was at least
@@ -620,9 +616,8 @@ def run(asset, window, start, end, now=None):
     # while Paradigm blocks stay trade-time — the exact mixing this targets.
     if fallback:
         gaps.append(
-            f"Block Flow: {', '.join(fallback)} block(s) priced at the window's "
-            f"closing spot — those venues publish no trade-time index, so their "
-            f"notional is ranked against others valued when they printed")
+            f"Block Flow: {', '.join(fallback)} blocks priced at closing spot — "
+            f"no trade-time index on that tape")
 
     # Bybit publishes is_block_trade as a flag with no group id, so its blocks
     # cannot be reconstructed at all — 43,137 trades yielded 0 blocks in a real
@@ -630,9 +625,7 @@ def run(asset, window, start, end, now=None):
     # its absence from Block Flow reads as "Bybit did no blocks".
     if totals.get("bybit-options", {}).get("count"):
         gaps.append(
-            "Block Flow: Bybit blocks cannot be shown — the venue publishes a "
-            "block flag with no group id, so its blocks are absent from the "
-            "totals however active it was")
+            "Block Flow: Bybit blocks can't be shown — its tape has no block id")
     if result.pop("spot_from_venue_tape", False):
         gaps.append(
             "Spot: taken from the venue tape's own trade-time index — the Deribit "
@@ -641,8 +634,8 @@ def run(asset, window, start, end, now=None):
     trimmed = result.pop("blocks_below_floor", {})
     if trimmed:
         gaps.append(
-            f"Block Flow: {trimmed['blocks']} block(s) below the $250k floor "
-            f"(${trimmed['notional_usd'] / 1e6:.2f}M) are excluded from the totals")
+            f"Block Flow: {trimmed['blocks']} blocks under $250k left out "
+            f"(${trimmed['notional_usd'] / 1e6:.1f}M)")
     # Direct inputs cover the requested window, not the retired 24h rollup.
     result["hot_horizon"] = None
     result["snapshot"]["volume_usd_m"] = round(known_turnover / 1e6, 2)

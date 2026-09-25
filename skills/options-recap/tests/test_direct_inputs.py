@@ -66,7 +66,7 @@ def test_unavailable_metadata_does_not_default_contract_size():
     snapshot, blocks, turnover = reduce(trades(trade()), None, gaps)
     assert not snapshot["turnover_complete"]
     assert not blocks and turnover == 0
-    assert any("lack a provable USD premium" in gap for gap in gaps)
+    assert any("no provable USD premium" in gap for gap in gaps)
 
 
 def test_existing_usd_turnover_is_not_scaled_twice():
@@ -551,7 +551,7 @@ def test_unvalued_trades_name_the_venue_whose_metadata_is_short():
     direct.inputs(totals, {}, {}, gaps)
     volume = [g for g in gaps if g.startswith("Volume:")]
     assert volume, gaps
-    assert "Bybit 2 of 2 (100%) across 2 symbols" in volume[0]
+    assert "Bybit 2 of 2 (100%)" in volume[0]
 
 
 def test_an_hour_aligned_window_does_not_discount_a_bucket_it_never_had():
@@ -646,7 +646,7 @@ def test_an_exclusion_reason_reads_as_a_sentence():
     "id space unproven"."""
     assert "id_space_unproven" in direct._EXCLUSION_REASONS
     said = direct._EXCLUSION_REASONS["id_space_unproven"]
-    assert "_" not in said and said.startswith("the "), said
+    assert "_" not in said and said.startswith("may duplicate Paradigm prints"), said
 
 
 def test_every_venue_named_in_a_gap_uses_the_snapshot_vocabulary():
@@ -735,18 +735,18 @@ def test_a_small_unvalued_share_is_not_printed_as_zero():
     gaps = []
     totals = {"bybit-options": dict(direct.EMPTY_TOTAL, count=46_597, missing=95, missing_symbols=8)}
     direct.inputs(totals, {}, {}, gaps)
-    assert "Bybit 95 of 46,597 (0.2%) across 8 symbols" in gaps[0]
+    assert "Bybit 95 of 46,597 (0.2%)" in gaps[0]
 
 
 def test_the_tape_tail_gap_states_a_fact_not_an_instruction():
     line = direct.tape_coverage_gap({"coverage_complete": False,
                                      "coverage_shortfall_seconds": 95 * 60})
-    assert line == ("Paradigm executions: the last 95 min of the window are not on the tape "
-                    "yet (hourly upstream sync) — blocks printed then are missing from "
-                    "Block Flow, not absent")
+    assert line == ("Paradigm executions: last 95 min not on the tape yet (hourly sync) — "
+                    "blocks then are missing, not absent")
+    assert "Report" not in line and "NOT" not in line
     unknown = direct.tape_coverage_gap({"coverage_complete": False,
                                         "coverage_shortfall_seconds": None})
     assert "coverage unknown" in unknown
     assert direct.tape_coverage_gap({"coverage_complete": True}) is None
-    assert "the last 1 min" in direct.tape_coverage_gap({"coverage_complete": False,
+    assert "last 1 min" in direct.tape_coverage_gap({"coverage_complete": False,
                                                          "coverage_shortfall_seconds": 12})
