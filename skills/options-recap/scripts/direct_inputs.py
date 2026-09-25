@@ -12,7 +12,7 @@ import polars as pl
 
 import recap
 from collect_recap import (VENUES, build_queries, connect, hours_present,
-                           query_workers, run_query, set_budget)
+                           print_surface_query, query_workers, run_query, set_budget)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "data-discovery" / "scripts"))
 from execution_tape import S3_ENDPOINT, calculation_rows, read_executions
@@ -176,9 +176,6 @@ def aggregate_trades(venue, rows, spec, gaps):
     identifier = pl.col("block_id").cast(pl.String)
     identified = valued.filter(pl.col("block_id").is_not_null() & (identifier != ""))
     if identified.height:
-        iv, iv_unit = pl.col("iv"), pl.col("iv_unit")
-        usable = iv.is_not_null() & iv_unit.is_in(["decimal", "vol_points"])
-        points = iv * pl.when(iv_unit == "decimal").then(100).otherwise(1)
         # maintain_order + first() reproduces the setdefault this replaced: the
         # block takes its bucket from the earliest leg, because with_units has
         # already sorted the rows by event time.
@@ -200,8 +197,6 @@ def aggregate_trades(venue, rows, spec, gaps):
                             (pl.col("index_price") * pl.col("coin")).filter(_PRICED).sum()
                             / pl.col("coin").filter(_PRICED).sum()
                         ).otherwise(None),
-                        iv_sum=points.filter(usable).sum(),
-                        iv_count=iv.filter(usable).len(),
                         leg_count=pl.len(),
                         bucket_at=pl.col("event_at").dt.timestamp("ms").first(),
                         complete=pl.col("coin").is_not_null().all()))
@@ -360,6 +355,27 @@ def coverage_verdict(venue, asset, start, end, missing_trade_hours, now=None):
         # below is understated, so this must not render as a feed gap.
         return "companion_gap", dict(detail, lost_hours=sorted(companion_missing))
     return ("quiet" if quiet else "complete"), detail
+
+
+def leg_ivs(asset, requests, specs, gaps):
+    """{(instrument, print ms): mark IV in vol points} from Deribit's snapshot at
+    each print. A failed read costs the legs their IV and says so."""
+    if "deribit" not in specs:
+        gaps.append("Block Flow: leg IVs unavailable — no Deribit unit metadata")
+        return {}
+    source, rows = run_query(print_surface_query(asset, requests))
+    if source["status"] != "ok" or not rows.height:
+        gaps.append(f"Block Flow: leg IVs unavailable — {source.get('error') or 'no snapshot at the print times'}")
+        return {}
+    found = {}
+    for r in with_units(rows, specs["deribit"]).to_dicts():
+        scale = {"decimal": 100, "vol_points": 1}.get(r.get("iv_unit"))
+        if scale and r.get("markIV") is not None:
+            found[(r["symbol"], r["at_ms"])] = r["markIV"] * scale
+    if len(found) < len(requests):
+        gaps.append(f"Block Flow: {len(requests) - len(found)} of {len(requests)} Deribit legs "
+                    f"show no IV — no usable snapshot or IV unit at their print time")
+    return found
 
 
 # What each dedupe outcome means to a reader, in words.
@@ -549,7 +565,8 @@ def run(asset, window, start, end, now=None):
     if not snapshot["trades_total"] and not (surface_rows is not None and surface_rows.height):
         raise RuntimeError("recap: no usable core direct-data source; " + "; ".join(gaps))
     result = recap.build(asset, window, start_ms, end_ms, deri, snapshot, executions,
-                         blocks, tape_available=tape_available)
+                         blocks, tape_available=tape_available,
+                         leg_ivs=lambda requests: leg_ivs(asset, requests, specs, gaps))
     # Blocks removed from the totals are reported, never dropped in silence —
     # the whole point of the section is how much flow there was.
     for excluded in result.pop("block_exclusions", []):

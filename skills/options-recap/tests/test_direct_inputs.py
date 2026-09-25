@@ -57,7 +57,6 @@ def test_event_time_units_not_latest_metadata():
     snapshot, blocks, turnover = reduce(trades(trade()), spec(), gaps)
     assert turnover == 800.0  # 100 contracts * 0.01 BTC * 0.01 premium * 80k
     assert blocks[0]["volume_coin"] == 1.0
-    assert blocks[0]["iv_sum"] == 40.0
     assert snapshot["put_trades"] == 1
     assert not gaps
 
@@ -689,3 +688,44 @@ def test_the_scope_labels_match_the_documented_template():
     source = Path(direct.__file__).read_text(encoding="utf-8")
     for label in re.findall(r'\["(?:volume|activity)_scope"\] = "([^"]+)"', source):
         assert label in template, label
+
+
+def test_leg_iv_is_the_snapshot_nearest_the_print(tmp_path):
+    """The mark IV comes from the bucket holding the print, not the window's end."""
+    import duckdb
+    snaps = tmp_path / "summary.parquet"
+    at = datetime(2026, 9, 24, 15, 45, 10, tzinfo=UTC)
+    pl.DataFrame({
+        "symbol": ["BTC-30OCT26-90000-C"] * 3 + ["BTC-25SEP26-80000-C"],
+        "timestamp": ["2026-09-24T15:45:00Z", "2026-09-24T15:49:00Z",
+                      "2026-09-24T15:50:00Z", "2026-09-24T15:46:00Z"],
+        "markIV": [0.44, 0.45, 0.60, 0.61],
+    }).write_parquet(snaps)
+    ms = int(at.timestamp() * 1000)
+    query = collector.print_surface_query("BTC", [("BTC-30OCT26-90000-C", ms),
+                                                  ("BTC-25SEP26-80000-C", ms)])
+    assert query.paths == [collector.bucket_pattern("deribit", "btc", at.replace(second=0))]
+    got = duckdb.sql(query.sql.replace("__PATHS__", f"['{snaps}']")).pl()
+    marks = dict(zip(got["symbol"], got["markIV"]))
+    assert marks == {"BTC-30OCT26-90000-C": 0.44, "BTC-25SEP26-80000-C": 0.61}
+
+
+def test_leg_ivs_convert_units_and_report_a_failed_read(monkeypatch):
+    unit = pl.DataFrame({"symbol": ["BTC-30OCT26-90000-C"], "captured_at": [START],
+                         "iv_unit": ["decimal"], "oi_unit": ["coin"], "contract_size": [1.0],
+                         "price_unit": ["coin"]})
+    rows = pl.DataFrame({"symbol": ["BTC-30OCT26-90000-C"], "at_ms": [1],
+                         "markIV": [0.44], "timestamp": ["2026-09-08T08:30:00Z"]})
+    monkeypatch.setattr(direct, "run_query", lambda q: ({"status": "ok"}, rows))
+    gaps = []
+    found = direct.leg_ivs("BTC", [("BTC-30OCT26-90000-C", 1)], {"deribit": unit}, gaps)
+    assert found == {("BTC-30OCT26-90000-C", 1): pytest.approx(44.0)}
+    assert not gaps
+    direct.leg_ivs("BTC", [("BTC-30OCT26-90000-C", 1), ("BTC-25SEP26-80000-C", 1)],
+                   {"deribit": unit}, gaps)
+    assert gaps == ["Block Flow: 1 of 2 Deribit legs show no IV — no usable snapshot or IV unit at their print time"]
+    gaps.clear()
+    monkeypatch.setattr(direct, "run_query",
+                        lambda q: ({"status": "unavailable", "error": "403"}, pl.DataFrame()))
+    assert direct.leg_ivs("BTC", [("BTC-30OCT26-90000-C", 1)], {"deribit": unit}, gaps) == {}
+    assert gaps == ["Block Flow: leg IVs unavailable — 403"]

@@ -839,15 +839,10 @@ def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
         vol = _num(r, "volume_coin")
         if not vol or not r.get("block_id"):
             continue
-        iv_sum, iv_count = _num(r, "iv_sum"), _num(r, "iv_count")
-        avg_iv = round(iv_sum / iv_count, 1) if iv_sum is not None and iv_count else None
         legs = int(_num(r, "leg_count") or 0)
         bucket_ms = _num(r, "bucket_at")
         venue = _venue_label(r.get("exchange"))
-        detail = f"x{vol:g}"
-        if avg_iv is not None:
-            detail += f" {avg_iv}v"
-        detail += f" — {legs or '?'} legs (venue tape)"
+        detail = f"x{vol:g} — {legs or '?'} legs (venue tape)"
         out.append({
             "block_trade_id": r.get("block_id"),
             "rfq_id": r.get("block_id"),  # its own structure
@@ -855,7 +850,7 @@ def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
             "venue": venue,
             "notional_usd": round(vol * (_price_at(r) or spot)),
             "unit_size": round(vol, 1),  # total coin size — legs unknown
-            "side": "", "avg_iv": avg_iv,
+            "side": "",
             # bucket_at is the block's first 5m bucket — ~5-min resolution,
             # hence the "~" prefix (the Paradigm tape has exact times).
             "time_utc": f"~{fmt_hhmm(int(bucket_ms))}" if bucket_ms else "",
@@ -923,7 +918,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
           deri: dict, hot: dict, block_rows: list[dict] | None = None,
           venue_block_rows: list[dict] | None = None,
           stale: list[dict] | None = None,
-          tape_available: bool | None = None) -> dict:
+          tape_available: bool | None = None, leg_ivs=None) -> dict:
     asset = asset.upper()
     # Defaulting to True silently kept the pre-PR deletion on whichever caller
     # forgot to pass it. Unset now means "read it off the rows you handed me",
@@ -1049,13 +1044,8 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
 
     # Biggest Print + Block Flow: the multi-venue Paradigm block tape (blocks.csv),
     # ranked/rolled-up in vol_math. Notional is USD per leg on the tape, so this path
-    # does no cross-venue normalization. IV isn't on the tape, so annotate the top
-    # blocks from the vol surface — Deribit legs only (the surface is Deribit-scoped);
-    # non-Deribit venues show IV n/a.
-    def iv_lookup(cp: str, strike: int, expiry_c: str):
-        t = (vs_now or {}).get(f"{asset}-{expiry_c}-{int(strike)}-{cp}")
-        return t.get("mark_iv") if t else None
-
+    # does no cross-venue normalization. Leg IVs come from `leg_ivs`, the surface
+    # at each block's print time; without it the legs carry none.
     # Defense in depth: the DuckDB query already scopes blocks.csv to this asset,
     # but drop any stray other-asset row (PRODUCT '<ASSET> OPTION - …') before
     # ranking — a leaked ETH row must never win a BTC recap's Biggest Print.
@@ -1084,7 +1074,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     _in_window = [r for r in _deduped
                   if (_num(r, "bucket_at") or 0) >= start_ms]
     venue_blocks = _venue_tape_blocks(_in_window, spot)
-    block = build_tape_blocks(own_blocks, iv_lookup=iv_lookup,
+    block = build_tape_blocks(own_blocks, leg_ivs=leg_ivs,
                               extra_blocks=venue_blocks)
 
     # >24h flag: Volume/Activity/P-C/DVOL/spot come from the ~24h hot rollup, so a

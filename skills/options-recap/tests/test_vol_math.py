@@ -704,17 +704,34 @@ def test_build_tape_blocks_biggest_vs_rfq_rollup():
     check("Call row notional Σ clips $1.9M", call_row["notl_m"] == 1.9, call_row)
 
 
-def test_build_tape_blocks_iv_lookup_deribit_only():
-    rows = [
-        _trow("Call 26 Dec 25 104000", "BUY", 1_000_000, "bD", "rD"),          # Deribit
-        _trow("Call 26 Dec 25 104000", "BUY", 1_000_000, "bP", "rP", prod="BTC OPTION - PRDX"),
-    ]
-    iv = lambda cp, k, e: 42.5 if (cp == "C" and k == 104000 and e == "26DEC25") else None
-    res = build_tape_blocks(rows, iv_lookup=iv, min_notional_usd=100_000)
-    by_venue = {r["venue"]: r for r in res["rows"]}
-    check("Deribit block gets IV", by_venue["Deribit"]["avg_iv"] == 42.5, by_venue["Deribit"])
-    check("Paradex block IV n/a (surface is Deribit-only)", by_venue["Paradex"]["avg_iv"] is None,
-          by_venue["Paradex"])
+def test_leg_ivs_are_read_at_each_blocks_print_time():
+    """Each leg shows its own mark IV at the print, not an average of the legs at
+    the window's end."""
+    rows = (_diag("a", "r1") + _diag("b", "r2")
+            + [_tape_leg("Call 25 Sep 26 84000", "BUY", 100, 8_000_000, "p", rfq="r3")])
+    rows[2]["TIME"] = rows[3]["TIME"] = "16:00:00"
+    rows[-1]["PRODUCT"] = "BTC OPTION - PRDX"
+    at_a = 1790264710000   # 2026-09-24 15:45:10Z
+    at_b = 1790265600000   # 2026-09-24 16:00:00Z
+    calls = []
+
+    def leg_ivs(requests):
+        calls.append(requests)
+        return {("BTC-25SEP26-80000-C", at_a): 60.0, ("BTC-30OCT26-90000-C", at_a): 40.0,
+                ("BTC-25SEP26-80000-C", at_b): 70.0, ("BTC-30OCT26-90000-C", at_b): 42.0}
+
+    res = build_tape_blocks(rows, leg_ivs=leg_ivs)
+    check("one batched lookup", len(calls) == 1, calls)
+    check("only Deribit legs are requested, at their own print times",
+          calls and set(calls[0]) == {("BTC-25SEP26-80000-C", at_a), ("BTC-30OCT26-90000-C", at_a),
+                                      ("BTC-25SEP26-80000-C", at_b), ("BTC-30OCT26-90000-C", at_b)},
+          calls)
+    diag = next(r for r in res["rows"] if "Diagonal" in r["structure"])
+    check("each leg carries its own IV, weighted across the row's blocks",
+          diag["detail"] == "-1000 25SEP26 80KC 65.0v / +2000 30OCT26 90KC 41.0v", diag["detail"])
+    other = next(r for r in res["rows"] if r["venue"] == "Paradex")
+    check("a non-Deribit leg carries no IV", other["detail"] == "+100 84KC", other["detail"])
+    check("no averaged IV field", "avg_iv" not in diag and "avg_iv" not in res["biggest_print"], diag)
 
 
 def _tape_leg(desc, side, qty, notl, bid, rfq="r1", t="15:45:10"):

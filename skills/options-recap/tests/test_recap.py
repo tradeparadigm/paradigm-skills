@@ -402,7 +402,7 @@ def test_venue_tape_blocks_priced_by_coin_volume_not_premium():
     check("notional = volume_coin × spot", big["notional_usd"] == 300 * 60468,
           big["notional_usd"])
     check("premium never the notional", big["notional_usd"] != 90000, big["notional_usd"])
-    check("avg_iv from components (62.5)", big["avg_iv"] == 62.5, big["avg_iv"])
+    check("no leg-averaged IV in the detail", "62.5v" not in big["detail"], big["detail"])
     check("source tagged venue", big["source"] == "venue", big)
     check("time approximate (~HH:MM)", big["time_utc"].startswith("~"), big["time_utc"])
     # Venue lives in the structure label — there is no per-row venue column.

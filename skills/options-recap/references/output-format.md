@@ -108,11 +108,16 @@ substitute one measure for the other. Group legs only on a real venue block/OTC 
 `via …` tag names the source and venue. `[legs]` is the same leg list the
 Block Flow Detail column shows. A raw venue block without provable leg
 geometry renders as
-`[Venue] Block   $[X]M   ~[HH:MM] UTC   via venue tape   x[coin] [IV]v — [n] legs`
+`[Venue] Block   $[X]M   ~[HH:MM] UTC   via venue tape   x[coin] — [n] legs`
 (`~` = 5-min bucket resolution; `x[coin]` is its total coin size).
 
-Legs are listed as traded, one per instrument: `[±size] [expiry] [K][C/P]`,
-e.g. `-500 25SEP26 80KC / +1000 30OCT26 90KC`. The sign is the taker's side
+Legs are listed as traded, one per instrument: `[±size] [expiry] [K][C/P] [IV]v`,
+e.g. `-500 25SEP26 80KC 61.0v / +1000 30OCT26 90KC 44.0v`. The IV is Deribit's
+mark IV for that leg in the 5-minute snapshot holding the print, weighted by
+size across a row's blocks; non-Deribit legs, and legs with no snapshot at the
+print (a `⚠` line counts them), carry none. There is no averaged IV.
+
+The sign is the taker's side
 (`+` bought, `-` sold) and the size is that instrument's net quantity in the
 block, so a ratio is visible in the sizes. A leg whose side the tape does not
 carry prints its size unsigned. The expiry prefix appears only on multi-expiry
@@ -135,8 +140,8 @@ the Detail column.
 ```yaml
 #  Structure                  Notl     Blocks  Detail (+ taker bought, - taker sold)
 -  -------------------------  -------  ------  -----------------------------------
-1  [structure]                $[X]M    [n]     [±size] [K1][C/P] / [±size] [K2][C/P] [IV]v
-2  OKX Block                  $[X]M    1       x[size] [IV]v — [n] legs (venue tape)
+1  [structure]                $[X]M    [n]     [±size] [K1][C/P] [IV]v / [±size] [K2][C/P] [IV]v
+2  OKX Block                  $[X]M    1       x[size] — [n] legs (venue tape)
 …
 ```
 
@@ -160,8 +165,7 @@ structures and `#` numbers them; the Blocks column carries each row's block
 count, so it sums to the header `[N]` and the row count equals `[M]`. When more
 than 8 structures qualify, the header gains the `(top 8 by notional)` suffix.
 
-Detail: the legs as traded (see Biggest Print), then the average `[IV]v`
-(Deribit blocks only). The column header reads
+Detail: the legs as traded (see Biggest Print). The column header reads
 `Detail (+ taker bought, - taker sold)`.
 
 **Vol Surface**

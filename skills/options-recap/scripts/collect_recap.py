@@ -113,14 +113,44 @@ def snapshot_patterns(venue: str, currency: str, start: dt.datetime,
                                         second=0, microsecond=0)
     open_point = floor(start)
     points = sorted({open_point, max(open_point, floor(end) - dt.timedelta(minutes=10))})
-    patterns = []
-    for point in points:
-        patterns.append(
-            f"{BUCKET}/normalized/exchange={venue}/data_type=option_summary/currency={currency}/"
+    return [bucket_pattern(venue, currency, point) for point in points]
+
+
+def bucket_pattern(venue: str, currency: str, point: dt.datetime) -> str:
+    """The option_summary objects for one five-minute bucket."""
+    return (f"{BUCKET}/normalized/exchange={venue}/data_type=option_summary/currency={currency}/"
             f"level=5m/year={point:%Y}/month={point:%m}/day={point:%d}/hour={point:%H}/"
-            f"start_minute={point:%M}/*__rows__*.parquet"
-        )
-    return patterns
+            f"start_minute={point:%M}/*__rows__*.parquet")
+
+
+def print_surface_query(asset: str, requests: list[tuple[str, int]]) -> Query:
+    """Deribit mark IV for each (instrument, print time in ms), read from the
+    snapshot bucket containing the print and taken from the row nearest to it."""
+    stamps = {ms: dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc) for _, ms in requests}
+    buckets = sorted({at.replace(minute=at.minute - at.minute % 5, second=0, microsecond=0)
+                      for at in stamps.values()})
+    wanted = ",\n".join(
+        f"('{symbol.replace(chr(39), chr(39) * 2)}', {ms}, TIMESTAMPTZ '{stamps[ms].isoformat()}')"
+        for symbol, ms in requests)
+    symbols = sorted({symbol for symbol, _ in requests})
+    return Query("print_surface_deribit",
+                 [bucket_pattern("deribit", asset.lower(), point) for point in buckets], f"""
+      WITH wanted(symbol, at_ms, print_at) AS (VALUES {wanted}),
+      snaps AS (
+        SELECT symbol, timestamp, markIV, TRY_CAST(timestamp AS TIMESTAMPTZ) AS ts
+        FROM read_parquet(__PATHS__, union_by_name=true, hive_partitioning=true)
+        WHERE list_contains({sql_list(symbols)}, symbol)
+      )
+      SELECT w.symbol, w.at_ms,
+             arg_min(s.markIV, abs(epoch(s.ts) - epoch(w.print_at))) AS markIV,
+             arg_min(s.timestamp, abs(epoch(s.ts) - epoch(w.print_at))) AS timestamp
+      FROM wanted w JOIN snaps s
+        ON s.symbol = w.symbol
+       AND s.ts >= time_bucket(INTERVAL 5 MINUTE, w.print_at)
+       AND s.ts < time_bucket(INTERVAL 5 MINUTE, w.print_at) + INTERVAL 5 MINUTE
+      WHERE s.markIV IS NOT NULL
+      GROUP BY w.symbol, w.at_ms
+    """, {"markIV": "venue-native; convert using event-applicable instrument metadata"})
 
 
 def sql_list(values: list[str]) -> str:
