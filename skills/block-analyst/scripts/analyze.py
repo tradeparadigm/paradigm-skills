@@ -12,7 +12,7 @@ leg's Deribit ticker + 30d trade buckets CONCURRENTLY, computes net greeks /
 direction / fill-offset / recurrence, and prints the finished block (--render).
 
 The agent runs `bash scripts/analyze.sh <rfq_id>` and relays stdout. The only
-piece it may finalise itself is the [Greeks] net line when the structure's signs
+piece it may finalise itself is the Greeks row when the structure's signs
 aren't reliably derivable from the tape (risk reversals, calendars, exotics) —
 those rows are printed as per-leg greeks with a `⚠ net: confirm signs` marker and
 all the numbers it needs are right there.
@@ -387,30 +387,28 @@ def render(r) -> str:
     L.append("")
     # tag legs with expiry only when the structure spans >1 expiry (calendars/diagonals)
     multi_exp = len({l.get("expiry") for l in legs if l["cp"] != "FUT" and l.get("expiry")}) > 1
-    L.append("```yaml")
-    # [Greeks]
+    # A pipe table, which the terminal draws as a real table.
+    rows = []
     ng = r["net_greeks"]
     if ng and r["reliable_signs"]:
-        L.append(f"[Greeks]   Δ {ng['delta']:+.2f} {a} · Vega {ng['vega']:+,.0f}/v · "
-                 f"Γ {ng['gamma']:+.4f} · Θ {ng['theta']:+,.0f}/d")
+        rows.append(("Greeks", f"Δ {ng['delta']:+.2f} {a} · Vega {ng['vega']:+,.0f}/v · "
+                               f"Γ {ng['gamma']:+.4f} · Θ {ng['theta']:+,.0f}/d"))
     else:
         per = " · ".join(
             f"{_leg_lbl(l, multi_exp)} Δ{(l['tkr'] or {}).get('delta')}"
             for l in legs if l["cp"] != "FUT" and l.get("tkr"))
-        L.append(f"[Greeks]   ⚠ net: confirm signs — per-leg: {per}")
-    # [Fair]
+        rows.append(("Greeks", f"⚠ net: confirm signs — per-leg: {per}"))
     ivs = " / ".join(f"{_leg_lbl(l, multi_exp)} {(l['tkr'] or {}).get('iv')}v"
                      for l in legs if l["cp"] != "FUT" and l.get("tkr"))
-    L.append(f"[Fair]     {_offset_txt(r['offset'])} · {ivs}")
-    # [History]
+    rows.append(("Fair", f"{_offset_txt(r['offset'])} · {ivs}"))
     d30 = sum((l["trades"] or {}).get("30d", (0, 0, 0))[1] for l in legs if l.get("trades"))
-    L.append(f"[History]  {r['recurrence_blocks']} same-structure block(s) on Paradigm 30d · "
-             f"Deribit leg blocks 30d: {d30}")
-    # [Live]
+    rows.append(("History", f"{r['recurrence_blocks']} same-structure block(s) on Paradigm 30d · "
+                            f"Deribit leg blocks 30d: {d30}"))
     live = " · ".join(f"{_leg_lbl(l, multi_exp)} {(l['tkr'] or {}).get('bid')}/{(l['tkr'] or {}).get('ask')}"
                       for l in legs if l["cp"] != "FUT" and l.get("tkr"))
-    L.append(f"[Live]     {live}")
-    L.append("```")
+    rows.append(("Live", live))
+    L += ["|  | Detail |", "| --- | --- |"]
+    L += [f"| {label} | {text.replace('|', chr(92) + '|')} |" for label, text in rows]
     if r["warnings"]:
         L.append(f"<!-- warnings: {'; '.join(r['warnings'])} -->")
     return "\n".join(L)

@@ -1191,6 +1191,32 @@ def _delta_fmt(d, star: str = "") -> str:
     return f"{d:+}v{star}"
 
 
+def _cell(text) -> str:
+    """One table cell: a `|` would end the cell early."""
+    return str(text).replace("|", "\\|")
+
+
+def _table(headers: list[str], rows: list[list], right: tuple = ()) -> list[str]:
+    """A GFM pipe table, which the terminal draws as a real table. `right` names
+    the column indexes to right-align (figures)."""
+    rule = ["---:" if i in right else "---" for i in range(len(headers))]
+    return ([f"| {' | '.join(_cell(h) for h in headers)} |", f"| {' | '.join(rule)} |"]
+            + [f"| {' | '.join(_cell(c) for c in row)} |" for row in rows])
+
+
+def _warning_rows(banner: list[str]) -> list[list[str]]:
+    """Banner lines as Snapshot rows: an indented line continues the ⚠ above it."""
+    rows: list[list[str]] = []
+    for line in banner:
+        if not line.strip():
+            continue
+        if line.startswith(" ") and rows:
+            rows[-1][2] += " " + line.strip()
+        else:
+            rows.append(["⚠", "", line.removeprefix("⚠").strip()])
+    return rows
+
+
 def render_md(r: dict) -> str:
     """Render the final four-section recap markdown so the agent relays it
     verbatim — no field-mapping reasoning, fully deterministic output."""
@@ -1269,22 +1295,15 @@ def render_md(r: dict) -> str:
                  f"horizon); Block Flow and surface span the full {hh}h.")
         L.append("")
 
-    # Everything appended so far is a warning banner. It used to sit ABOVE the
-    # header, outside any fence — and the relaying model demonstrably copies
-    # fenced blocks verbatim and drops the prose around them: on 2026-09-08 a
-    # /recap relay kept every Snapshot figure and deleted all three ⚠ lines
-    # (Bullish partial, a 66-minute Paradigm coverage shortfall, 13k unvalued
-    # trades). The lines that say what NOT to trust must travel with the
-    # numbers they qualify, so they are emitted as the first lines INSIDE the
-    # Snapshot fence, where they cannot be dropped without dropping Snapshot.
+    # Everything appended so far is a warning banner. On 2026-09-08 a relay
+    # kept every Snapshot figure and deleted the ⚠ lines printed above them,
+    # so the warnings are the first rows OF the Snapshot table: they cannot be
+    # dropped without dropping Snapshot.
     banner, L = L, []
-    while banner and banner[-1] == "":
-        banner.pop()
     L.append(f"**{h['asset']} Options · {h['window']} Recap · "
              f"{h['start_utc']}–{h['end_utc']} UTC**")
-    L += ["", "**Snapshot**", "", "```yaml"]
-    if banner:
-        L += banner + [""]
+    L += ["", "**Snapshot**", ""]
+    snap = _warning_rows(banner)
 
     # Coverage leads the Snapshot: every figure below is a function of how much
     # of the window was actually read, and a reader cannot infer that from the
@@ -1315,7 +1334,7 @@ def render_md(r: dict) -> str:
                  for label, st in by_label.items()
                  if st not in _WORDS or _WORDS[st]]
         detail = " · ".join(notes) if notes else "all venue feeds complete"
-        L.append(f"{'Coverage':<9} {f'{read}/{len(by_label)} venues':<11} {detail}")
+        snap.append(["Coverage", f"{read}/{len(by_label)} venues", detail])
 
     spot = f"${s['spot']:,}" if s.get("spot") else "n/a"
     chg = s.get("spot_change_pct")
@@ -1326,25 +1345,25 @@ def render_md(r: dict) -> str:
     if s.get("spot_low"):
         extra.append(f"low ${s['spot_low']:,}")
     extra_txt = f" ({', '.join(extra)})" if extra else ""
-    L.append(f"{'Spot':<9} {spot:<11} {chg_txt}{extra_txt}")
+    snap.append(["Spot", spot, f"{chg_txt}{extra_txt}"])
 
     dvol = f"{s['dvol']}v" if s.get("dvol") is not None else "n/a"
     dv = (f" ({round(s['dvol_open'], 1)} -> {round(s['dvol_close'], 1)})"
           if s.get("dvol_open") is not None and s.get("dvol_close") is not None else "")
-    L.append(f"{'DVOL':<9} {dvol:<11} {s.get('dvol_label') or ''}{dv}")
+    snap.append(["DVOL", dvol, f"{s.get('dvol_label') or ''}{dv}"])
 
     vrp = s.get("vrp")
     rich = ("unavailable" if vrp is None else "CHEAP" if vrp is not None and vrp < -1 else
             "RICH" if vrp is not None and vrp > 1 else "IN LINE")
     rv = f"{s['rv']}v" if s.get("rv") is not None else "n/a"
-    L.append(f"{f'RV {RV_LOOKBACK_DAYS}d':<9} {rv:<11} implied {rich} vs realized")
+    snap.append([f"RV {RV_LOOKBACK_DAYS}d", rv, f"implied {rich} vs realized"])
 
     vrp_txt = f"{vrp:+}v" if vrp is not None else "n/a"
     # Same ±1v dead-band as the RV line above — otherwise a VRP in (0,1] prints
     # "IN LINE" and "overpriced" on adjacent lines.
     upo = ("unavailable" if vrp is None else "underpriced" if vrp is not None and vrp < -1 else
            "overpriced" if vrp is not None and vrp > 1 else "roughly fair")
-    L.append(f"{'VRP':<9} {vrp_txt:<11} vol {upo} vs delivered")
+    snap.append(["VRP", vrp_txt, f"vol {upo} vs delivered"])
 
     # Activity always renders — an empty window reads n/a like Volume/P-C do;
     # silently dropping the line makes the Snapshot shape depend on the data.
@@ -1363,29 +1382,30 @@ def render_md(r: dict) -> str:
                 f"by trade count; {', '.join(unread)} unread — shares are of what was read")
         # An all-unread window leaves `split` empty; the separator would dangle.
         body = f"trades — {split} ({note})" if split else f"trades ({note})"
-        L.append(f"{'Activity':<9} {tnum:<11} {body}")
+        snap.append(["Activity", tnum, body])
     else:
-        L.append(f"{'Activity':<9} {'n/a':<11} trades (by trade count)")
+        snap.append(["Activity", "n/a", "trades (by trade count)"])
     vol = f"${s['volume_usd_m']}M" if s.get("volume_usd_m") else "n/a"
     # "all venues" when the cross-venue turnover_usd sum drove the number;
     # the Deribit-scoped label survives only on the pre-upgrade fallback.
     vol_note = ("all venues" if s.get("volume_scope") == "all" else
                 "Deribit only" if s.get("volume_scope") == "deribit" else s.get("volume_scope", "unavailable"))
-    L.append(f"{'Volume':<9} {vol:<11} {vol_note}")
+    snap.append(["Volume", vol, vol_note])
     pc = f"{s['pc_ratio']}x" if s.get("pc_ratio") is not None else "n/a"
     pc_desc = f"{s['pc_descriptor']} " if s.get("pc_descriptor") else ""
-    L.append(f"{'P/C':<9} {pc:<11} {pc_desc}({s.get('activity_scope', 'all venues, by trades')})")
-    L += ["```", "", "**Biggest Print**", "", "```yaml"]
+    snap.append(["P/C", pc, f"{pc_desc}({s.get('activity_scope', 'all venues, by trades')})"])
+    L += _table(["", "Value", "Read"], snap, right=(1,))
+    L += ["", "**Biggest Print**", ""]
 
     if bp:
         # The detail is the same leg list Block Flow shows: each leg's size and
         # taker side, so the line never needs a separate size or side slot.
-        via = ("via venue tape" if bp.get("source") == "venue"
-               else f"via Paradigm/{bp.get('venue') or '?'}")
+        via = ("venue tape" if bp.get("source") == "venue"
+               else f"Paradigm/{bp.get('venue') or '?'}")
         label = f"{bp['expiry']} {bp['structure']}".strip()  # venue blocks have no expiry
         detail = (bp.get("detail") or "").replace(" (venue tape)", "")
-        L.append(f"{label}   ${bp['notional_m']}M   {bp['time_utc']} UTC   "
-                 f"{via}   {detail}".rstrip())
+        L += _table(["Structure", "Notional", "Time (UTC)", "Source", "Legs (+ bought, - sold)"],
+                    [[label, f"${bp['notional_m']}M", bp["time_utc"], via, detail]], right=(1,))
     else:
         # output-format.md: name the source and reason rather than going blank.
         # True whichever way the pool emptied — no blocks at all, all excluded by
@@ -1396,21 +1416,16 @@ def render_md(r: dict) -> str:
     struct_word = "structure" if n_struct == 1 else "structures"
     block_word = "block" if bf["n_blocks"] == 1 else "blocks"
     trunc = f" (top {len(bf['rows'])} by notional)" if n_struct > len(bf["rows"]) else ""
-    # Structure column stretches to the longest label in this window (typed
-    # labels like "24JUL26/31JUL26 Call Diagonal" overflow a fixed 27). Per-row
-    # venue isn't a column — the Biggest Print line's via Paradigm/<venue> tag
-    # is where the venue shows.
-    sw = max([27] + [len(row["structure"]) + 2 for row in bf["rows"]])
-    L += ["```", "", f"**Block Flow — ${bf['total_m']}M notional / {bf['n_blocks']} {block_word} / "
-          f"{n_struct} {struct_word}{trunc}**",
-          "", "```yaml",
-          f"{'#':<3}{'Structure':<{sw}}{'Notl':<9}{'Blocks':<8}Detail (+ taker bought, - taker sold)",
-          f"{'-':<3}{'-' * (sw - 2):<{sw}}{'-' * 7:<9}{'-' * 6:<8}{'-' * 44}"]
-    for row in bf["rows"]:
-        notl = f"${row['notl_m']}M"
-        L.append(f"{str(row['rank']):<3}{row['structure']:<{sw}}{notl:<9}"
-                 f"{str(row.get('blocks', 1)):<8}{row['detail']}")
-    L += ["```", "", "**Vol Surface**"]
+    L += ["", f"**Block Flow — ${bf['total_m']}M notional / {bf['n_blocks']} {block_word} / "
+          f"{n_struct} {struct_word}{trunc}**", ""]
+    if bf["rows"]:
+        # The taker's side is on each leg, so the header carries the key.
+        L += _table(["#", "Structure", "Notional", "Blocks", "Legs (+ taker bought, - taker sold)"],
+                    [[row["rank"], row["structure"], f"${row['notl_m']}M", row.get("blocks", 1),
+                      row["detail"]] for row in bf["rows"]], right=(0, 2, 3))
+    else:
+        L.append("No block cleared the $250k floor in this window.")
+    L += ["", "**Vol Surface**", ""]
 
     if vs and vs.get("rows"):
         fa, ba, term = vs.get("front_atm"), vs.get("back_atm"), vs.get("term_line")
@@ -1421,9 +1436,8 @@ def render_md(r: dict) -> str:
         term_txt = (f"{fa}v → {ba}v → {term}{term_star}" if fa is not None and ba is not None
                     and term else (term or "n/a"))
         L.append(f"Skew: {vs.get('skew_line') or 'n/a'} · Term: {term_txt}")
-        L += ["", "```yaml",
-              f"{'Expiry':<11}{'ATM':<9}{'ΔATM':<9}{'25d RR':<10}{'ΔRR':<9}{'Fly':<8}ΔFly",
-              f"{'-' * 9:<11}{'-' * 6:<9}{'-' * 6:<9}{'-' * 8:<10}{'-' * 6:<9}{'-' * 5:<8}{'-' * 6}"]
+        L.append("")
+        surface_rows = []
         for e in vs["rows"]:
             star = "*" if e.get("extrapolated") else ""
             # The ATM column gets its own star: a thin chain reaches ATM by
@@ -1439,8 +1453,9 @@ def render_md(r: dict) -> str:
             datm = _delta_fmt(e.get("d_atm"), atm_star)
             drr = _delta_fmt(e.get("d_rr"), star)
             dfly = _delta_fmt(e.get("d_fly"), fly_star)
-            L.append(f"{e['expiry']:<11}{atm:<9}{datm:<9}{rr:<10}{drr:<9}{fly:<8}{dfly}")
-        L.append("```")
+            surface_rows.append([e["expiry"], atm, datm, rr, drr, fly, dfly])
+        L += _table(["Expiry", "ATM", "ΔATM", "25d RR", "ΔRR", "Fly", "ΔFly"], surface_rows,
+                    right=(1, 2, 3, 4, 5, 6))
     else:
         # output-format.md: a section states a specific source and reason rather
         # than going blank. "No data" reads as a quiet market; it never was one.
