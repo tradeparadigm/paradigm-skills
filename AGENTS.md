@@ -33,3 +33,13 @@ For supply-chain integrity when distributing skills outside of git:
 - The git commit hash is the authoritative content identifier for this repository.
 - For external distribution (zip, registry), generate a SHA-256 hash of the SKILL.md body and store it as a sidecar file (`SKILL.md.sha256`) or in a distribution manifest. The hash should cover the **Markdown body only** (after the `---` frontmatter delimiter), so the hash remains stable when only metadata changes.
 - There is no standardised `content_hash` field in the AgentSkills spec as of May 2026. Integrity is typically handled at the distribution layer (package registry signatures, Sigstore, or git provenance) rather than inside the file itself — embedding the hash creates a chicken-and-egg problem: the hash changes the file, which changes the hash.
+
+## HTTP Calls
+
+Every HTTP and S3 call in a skill script goes through `skills/data-discovery/scripts/http_client.py`: `get()` for HTTP, `s3_client()` for S3. No script fetches over HTTP from shell today, and none should start: `curl` hands back headers as text, which is where the casing bugs live.
+
+The reason is header names. They are case-insensitive ([RFC 9110 §5.1](https://www.rfc-editor.org/rfc/rfc9110#section-5.1)), and servers, CDNs, HTTP/2 and proxies all change their casing in transit — the same exchange can hand one client `Timenow` and another `timenow`. `http_client` returns every header map, and every S3 object's user `Metadata`, as a case-insensitive `Headers`: `headers["Retry-After"]`, `headers["retry-after"]` and `headers.get("RETRY-AFTER")` are one lookup, and copies and iteration always carry lowercase names. The failure it prevents is usually silent — a plain-dict `.get(name, 0)` misses and returns the default, so a rate-limit header reads as zero.
+
+In the Dime Terminal runtime, response header names currently arrive lowercase. Do not rely on that: it is a property of the runtime, not a contract, and a skill tested anywhere else sees whatever casing the origin sent. Read headers through `http_client` and the casing never matters.
+
+Nothing can normalise what never runs through a script. When a SKILL.md has the agent read headers itself — with `web_fetch`, or `curl -i` in an example — tell it to match header names case-insensitively (`grep -i`).

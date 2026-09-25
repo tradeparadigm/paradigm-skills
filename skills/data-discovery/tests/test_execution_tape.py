@@ -2,12 +2,14 @@
 
 import importlib.util
 import io
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import polars as pl
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 spec = importlib.util.spec_from_file_location(
     "execution_tape", Path(__file__).resolve().parents[1] / "scripts/execution_tape.py"
 )
@@ -237,6 +239,15 @@ def test_a_partition_without_its_provenance_names_the_object():
     assert "generated_at_ms" in message
     assert "paradigm_trade_tape" in message, message
     assert "freshness" in message, message
+
+
+def test_the_default_client_is_the_shared_case_insensitive_one(monkeypatch):
+    """Metadata casing is handled by http_client.s3_client; a raw boto3 client
+    here would put exact-case lookups back on every partition."""
+    built = []
+    monkeypatch.setattr(reader, "s3_client", lambda **kw: built.append(kw) or S3())
+    reader.read_executions(NOW - timedelta(hours=2), NOW, now=NOW)
+    assert built and built[0]["endpoint_url"] == reader.S3_ENDPOINT
 
 
 def test_ambiguous_bare_id_fails_but_qualified_id_preserves_legs():

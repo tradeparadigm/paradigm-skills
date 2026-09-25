@@ -25,12 +25,12 @@ import json
 import os
 import re
 import sys
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlencode
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data-discovery", "scripts"))
 import analyze_core as ac  # noqa: E402
+from http_client import get  # noqa: E402
 
 DERIBIT = "https://www.deribit.com/api/v2/public"
 WARN: list[str] = []
@@ -48,9 +48,7 @@ def _read_csv(path):
 
 
 def _get(path, params, timeout=15):
-    url = f"{DERIBIT}/{path}?{urlencode(params)}"
-    with urllib.request.urlopen(url, timeout=timeout) as r:
-        d = json.loads(r.read())
+    d = get(f"{DERIBIT}/{path}", params, timeout=timeout).json()
     if "error" in d:
         raise RuntimeError(d["error"])
     return d["result"]

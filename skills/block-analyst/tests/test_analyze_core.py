@@ -478,5 +478,35 @@ for _row in ("[Greeks]", "[Fair]", "[History]", "[Live]"):
 ok(_rendered(ratio_rows).count("⚠ ×N INFERRED") == 0,
    "and an unambiguous one says nothing")
 
+# ── Deribit calls go through the shared client ────────────────────────────────
+# Stubbing az._get (as the render tests do) never exercises what _get itself
+# calls, so a revert to raw urllib would leave those tests green and lose the
+# case-insensitive headers the client exists for.
+import http_client as _hc  # noqa: E402
+
+ok(az.get is _hc.get, "analyze.get is http_client.get, not a raw HTTP call")
+_calls = []
+
+
+def _fake_get(url, params=None, timeout=None):
+    _calls.append(url)
+
+    class _R:
+        @staticmethod
+        def json():
+            return {"result": {"mark_price": 1.0}}
+
+    return _R()
+
+
+_saved_get = az.get
+az.get = _fake_get
+try:
+    ok(az._get("ticker", {"instrument_name": "BTC-PERPETUAL"}) == {"mark_price": 1.0},
+       "_get returns the client's parsed result")
+    ok(_calls and _calls[0].endswith("/ticker"), "_get asks the client for the Deribit path")
+finally:
+    az.get = _saved_get
+
 print(f"\n{_p} passed, {_f} failed")
 sys.exit(1 if _f else 0)
