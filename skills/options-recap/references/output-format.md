@@ -19,21 +19,29 @@ would read as a zero-length window. Intraday windows stay HH:MM-only.
 
 **Snapshot**
 
-```yaml
-⚠ [one line per gap, when there are any]
-Coverage  [N]/[M] venues  [per-venue state, or "all venue feeds complete"]
-Spot      $[X]        [up/down X%, or flat] (from $[Y], low $[Z])
-DVOL      [X]v        [flat/rising/falling] ([open] -> [close])
-RV 30d    [X]v        implied [CHEAP/RICH/IN LINE] vs realized
-VRP       [±X]v       vol [underpriced/overpriced/roughly fair] vs delivered
-Activity  [Nk]        trades — [Venue X% · Venue Y% · ...] (by trade count)
-Volume    $[X]M       observed valued trades · USD premium
-P/C       [X.Xx]      [descriptor] (observed trades · see ⚠ lines)
+```
+|  | Value | Read |
+| --- | ---: | --- |
+| Coverage | [N]/[M] venues | [per-venue state, or "all venue feeds complete"] |
+| Spot | $[X] | [up/down X%, or flat] (from $[Y], low $[Z]) |
+| DVOL | [X]v | [flat/rising/falling] ([open] -> [close]) |
+| RV 30d | [X]v | implied [CHEAP/RICH/IN LINE] vs realized |
+| VRP | [±X]v | vol [underpriced/overpriced/roughly fair] vs delivered |
+| Activity | [Nk] | trades — [Venue X% · Venue Y% · ...] (by trade count) |
+| Volume | $[X]M | observed valued trades · USD premium |
+| P/C | [X.Xx] | [descriptor] (observed trades · see ⚠ lines) |
+
+- ⚠ [one line per gap that qualifies these figures]
 ```
 
-The `⚠` lines are the FIRST lines inside the fence, not above it: on
-2026-09-08 a relaying model kept every figure in the fence and deleted all
-three warning lines that sat outside it. `RV 30d` and `VRP` print
+Snapshot, Block Flow and the Vol Surface are markdown pipe tables, which the
+terminal draws as real tables; nothing is in a code fence. Values never wrap.
+
+Each `⚠` line prints directly under the section it qualifies: Paradigm-tape
+and block gaps under Block Flow, surface gaps under the Vol Surface, and the
+rest (coverage, volume, spot, stale feeds) under the Snapshot. They are never
+printed above the recap: on 2026-09-08 a relaying model kept every figure and
+deleted all three warning lines that sat above them. `RV 30d` and `VRP` print
 `unavailable` when the Deribit close history cannot be fetched, rather than
 being dropped.
 
@@ -98,17 +106,19 @@ never combine `amount_native` across venues.
 
 **Biggest Print**
 
-```yaml
-[DDMMMYY] [structure]   $[X]M   [HH:MM] UTC   via Paradigm/[Venue]   [legs]
+```
+**[DDMMMYY] [structure]** · $[X]M · [HH:MM] UTC · Paradigm/[Venue]
+
+Legs (+ bought, - sold): [legs]
 ```
 
 The single largest **proven block** in the window, ranked by underlying USD
 notional, as in Block Flow. Snapshot Volume is USD premium turnover: never
 substitute one measure for the other. Group legs only on a real venue block/OTC id. The
-`via …` tag names the source and venue. `[legs]` is the same leg list the
-Block Flow Detail column shows. A raw venue block without provable leg
+source tag names the source and venue. `[legs]` is the same leg list the
+Block Flow Legs column shows. A raw venue block without provable leg
 geometry renders as
-`[Venue] Block   $[X]M   ~[HH:MM] UTC   via venue tape   x[coin] — [n] legs`
+`**[Venue] Block** · $[X]M · ~[HH:MM] UTC · venue tape` with `x[coin] — [n] legs` as its legs
 (`~` = 5-min bucket resolution; `x[coin]` is its total coin size).
 
 Legs are listed as traded, one per instrument: `[±size] [expiry] [K][C/P] [IV]v`,
@@ -133,28 +143,25 @@ stay raw (`1875`, `2000` — never `2K`), so one table never mixes conventions.
 Multi-expiry structure labels are chronological: `near/far` when those two
 ARE the complete expiry set (calendar, diagonal), `near→far` when interior
 tenors are elided (3+ expiries) — each leg's own expiry always appears in
-the Detail column.
+the Legs column.
 
 **Block Flow — $[X]M notional / [N] blocks / [M] structures[ (top 8 by notional)]**
 
-```yaml
-#  Structure                  Notl     Blocks  Detail (+ taker bought, - taker sold)
--  -------------------------  -------  ------  -----------------------------------
-1  [structure]                $[X]M    [n]     [±size] [K1][C/P] [IV]v / [±size] [K2][C/P] [IV]v
-2  OKX Block                  $[X]M    1       x[size] — [n] legs (venue tape)
-…
+```
+| # | Structure | Notional | Blocks | Legs (+ taker bought, - taker sold) |
+| ---: | --- | ---: | ---: | --- |
+| 1 | [structure] | $[X]M | [n] | [±size] [K1][C/P] [IV]v / [±size] [K2][C/P] [IV]v |
+| 2 | OKX Block | $[X]M | 1 | x[size] — [n] legs (venue tape) |
 ```
 
 Raw venue blocks rank in the same pool and count toward the header totals. When
 their rows do not prove leg geometry, use `[Venue] Block`, carry a
 `(venue tape)` note, and count the real venue block id once.
 
-The Structure column has a 27-char floor but stretches to the longest label in
-the window (a typed cross-expiry label like `24JUL26/31JUL26 Call Diagonal`
-runs past 27), so the header and rows stay aligned to whatever width the widest
-structure needs. There is no per-row venue column — the Biggest Print line's
-`via Paradigm/<venue>` tag is where the venue shows, and a venue-tape row
-carries its venue in the structure label (`OKX Block`).
+There is no per-row venue column — the Biggest Print source tag is where
+the venue shows, and a venue-tape row carries its venue in the structure
+label (`OKX Block`). With no qualifying block the table is replaced by
+`No block cleared the $250k floor in this window.`
 
 Two granularities, both always stated: tape **blocks** (`BLOCK_TRADE_ID`s, the
 industry term for the individual prints) and **structures** (blocks with the
@@ -165,10 +172,11 @@ structures and `#` numbers them; the Blocks column carries each row's block
 count, so it sums to the header `[N]` and the row count equals `[M]`. When more
 than 8 structures qualify, the header gains the `(top 8 by notional)` suffix.
 
-Detail: the legs as traded (see Biggest Print). The column header reads
-`Detail (+ taker bought, - taker sold)`.
+Legs: the legs as traded (see Biggest Print). The column header reads
+`Legs (+ taker bought, - taker sold)`.
 
 **Vol Surface**
+
 Skew: front 25Δ RR [±X]v → [puts bid / calls bid / flat] · Term: [front]v → [back]v → [contango / flat / backwardation / humped — peak at [DDMMMYY] / dished — trough at [DDMMMYY] / mixed]
 
 Rows are chosen by tenor, up to five: the front expiry, the next Friday
@@ -188,11 +196,10 @@ puts bid, positive → calls bid, zero → flat); extrapolated wings put a `*` o
 the RR figure (`+1.3v*`), never prose. These slots take exactly these tokens —
 no suffixes like "downside skew", "(35.2v)", or "non-monotonic".
 
-```yaml
-Expiry     ATM      ΔATM     25d RR    ΔRR      Fly     ΔFly
----------  ------   ------   --------  ------   -----   ------
-[DDMMMYY]  [X.X]v   [±X.X]v  [±X.X]v   [±X.X]v  [X.X]v  [±X.X]v
-…
+```
+| Expiry | ATM | ΔATM | 25d RR | ΔRR | Fly | ΔFly |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| [DDMMMYY] | [X.X]v | [±X.X]v | [±X.X]v | [±X.X]v | [X.X]v | [±X.X]v |
 ```
 
 `*` marks a figure reached by extrapolating past the listed chain rather than

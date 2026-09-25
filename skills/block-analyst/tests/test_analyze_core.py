@@ -3,7 +3,7 @@
 Unit tests for analyze_core.py — no network, no deps.  Run: python3 tests/test_analyze_core.py
 
 These pin the parsing + sign/orientation conventions against REAL resolved trades
-captured from the tape, so the script can never ship a wrong [Greeks] sign or a
+captured from the tape, so the script can never ship a wrong Greeks sign or a
 mis-parsed structure. If a convention here is wrong, this fails before it ships.
 """
 import os
@@ -472,9 +472,9 @@ _lines = [l for l in _shape.splitlines() if l.strip()]
 ok(_lines[0].startswith("**") and " | " in _lines[0],
    f"line 1 is the pipe-delimited header [{_lines[0][:80]}]")
 ok(_lines[1].startswith("Spot "), f"line 2 is the view line [{_lines[1][:60]}]")
-ok("```yaml" in _shape, "the bracket rows sit in a yaml block")
-for _row in ("[Greeks]", "[Fair]", "[History]", "[Live]"):
-    ok(_row in _shape, f"{_row} is rendered")
+ok("```" not in _shape and "|  | Detail |" in _shape, "the rows sit in a table, not a code fence")
+for _row in ("Greeks", "Fair", "History", "Live"):
+    ok(f"\n| {_row} | " in _shape, f"the {_row} row is rendered")
 ok(_rendered(ratio_rows).count("⚠ ×N INFERRED") == 0,
    "and an unambiguous one says nothing")
 
