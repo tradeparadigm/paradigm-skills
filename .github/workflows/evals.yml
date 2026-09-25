@@ -18,6 +18,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The harness decides every score, and the Bedrock job below cannot run on
+      # a fork or without credentials — so what can be tested without them is.
+      - name: Test the eval harness
+        run: python3 tests/test_run_evals.py
+
       - name: Validate all skills
         run: |
           python3 - <<'EOF'
@@ -107,7 +112,21 @@ jobs:
           # The script's inline metadata declares only anthropic[bedrock], so this
           # resolves fast — no local-model source builds. Skills run concurrently,
           # bounded by EVAL_MAX_CONCURRENCY above; -v prints per-assertion detail.
+          # --trials 3: the agent is a model and slips on single runs; each
+          # assertion is the majority of three, the fewest that can outvote one.
           uv run run_evals.py \
-            --simulate --fail-below 0.8 -v \
+            --simulate --trials 3 --fail-below 0.8 -v \
+            --output eval-results.json \
             --agent-model eu.anthropic.claude-sonnet-4-6 \
             --grader-model eu.anthropic.claude-opus-4-8
+
+      # The agent's answers and every grader verdict, kept whether the job
+      # passed or failed: the log prints which assertion failed but not what the
+      # agent said, so a failure is otherwise only reproducible by re-running.
+      - name: Keep the responses and verdicts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: eval-results.json
+          if-no-files-found: warn

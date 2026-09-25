@@ -352,7 +352,42 @@ def run_agent(client, model: str, skill_md: str, prompt: str, simulate: bool) ->
     return response.content[0].text, timing
 
 
+VERDICT_TOOL = {
+    "name": "record_verdict",
+    "description": "Record whether the agent's response satisfies the assertion.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "verdict": {
+                "type": "string",
+                "enum": ["pass", "fail"],
+                "description": "pass if the response satisfies the assertion, else fail.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "One sentence saying why. For a pass, what satisfied it.",
+            },
+        },
+        # Both: a verdict with no reason reads as a bare "FAIL" in the report,
+        # which says nothing to whoever has to act on it.
+        "required": ["verdict", "reason"],
+    },
+}
+
+
+class GraderRefused(RuntimeError):
+    """The grader answered without recording a verdict."""
+
+
 def grade_assertion(client, model: str, assertion: str, output: str, prompt: str) -> dict:
+    """Grade one assertion, reading the verdict from a tool call.
+
+    The verdict is a field, not prose. Parsing prose is what made this harness
+    unreliable: a grader answering `FINAL: PASS` after reasoning was read from
+    its first line and scored FAIL — 17 of one run's 21 recorded failures. A
+    forced tool call removes the reading entirely, and lets the grader reason
+    as long as it likes first, since only the call counts.
+    """
     grading_prompt = f"""Grade an AI agent's response against one assertion.
 
 User prompt: {prompt}
@@ -362,41 +397,51 @@ Agent response:
 
 Assertion: {assertion}
 
-Put your verdict on the FIRST line — exactly `PASS` or `FAIL: <one-sentence reason>` —
-with nothing before it. You may add reasoning on later lines if helpful."""
+Reason as much as you need, then record your verdict with `record_verdict`."""
 
     with _API_GATE:
         response = client.messages.create(
             model=model,
-            # Generous budget: a tight cap (e.g. 120) truncates graders that
-            # reason before answering, so the verdict never lands and the result
-            # silently defaults to FAIL — a spurious failure, not a real one.
-            max_tokens=512,
+            max_tokens=1024,
+            tools=[VERDICT_TOOL],
+            tool_choice={"type": "tool", "name": VERDICT_TOOL["name"]},
             messages=[{"role": "user", "content": grading_prompt}],
         )
-    verdict = response.content[0].text.strip()
-    # Parse the first non-empty line (the verdict), not the raw blob — robust to
-    # a model that emits a leading blank line or trails reasoning afterwards.
-    first_line = next((ln.strip() for ln in verdict.splitlines() if ln.strip()), "")
-    passed = first_line.upper().startswith("PASS")
-    return {"assertion": assertion, "passed": passed, "verdict": verdict}
+
+    call = next(
+        (b for b in response.content
+         if getattr(b, "type", None) == "tool_use"
+         and getattr(b, "name", None) == VERDICT_TOOL["name"]),
+        None,
+    )
+    if call is None:
+        # Loud, not a silent FAIL. A grader that records nothing has judged
+        # nothing, and scoring that as a failure is the bug this replaced.
+        said = " ".join(getattr(b, "text", "") for b in response.content).strip()
+        raise GraderRefused(
+            f"grader recorded no verdict for {assertion!r}"
+            + (f" — it said: {said[:200]}" if said else "")
+        )
+
+    verdict = (call.input.get("verdict") or "").strip().lower()
+    if verdict not in ("pass", "fail"):
+        raise GraderRefused(f"grader recorded {verdict!r} for {assertion!r}")
+    # A schema-required field can still come back empty, and the report reads
+    # better saying so than printing a bare verdict word.
+    reason = (call.input.get("reason") or "").strip() or "(no reason recorded)"
+    return {
+        "assertion": assertion,
+        "passed": verdict == "pass",
+        "verdict": f"{verdict.upper()}: {reason}",
+    }
 
 
 CASE_PARALLELISM = 8
 
 
-def _run_one_case(client, agent_model: str, grader_model: str,
-                  skill_md: str | None, case: dict, simulate: bool,
-                  skill_dir: Path | None = None) -> dict:
-    """Agent call + assertion grading for a single case. Thread-safe."""
-    context = resolve_context(case, skill_dir) if skill_dir else ""
-    prompt = context + case["prompt"] if context else case["prompt"]
-    # Fixture cases carry real data, so suppress simulate mode for them — the
-    # agent must read the injected values, not fabricate (and not disclaim).
-    # SIMULATE_SUFFIX says "use plausible example values", which is a direct
-    # instruction to do the very thing their do-not-invent assertions penalise.
-    effective_simulate = simulate and not context
-    output, timing = run_agent(client, agent_model, skill_md or "", prompt, effective_simulate)
+def _run_one_trial(client, agent_model: str, grader_model: str, skill_md: str | None,
+                   case: dict, prompt: str, simulate: bool) -> dict:
+    output, timing = run_agent(client, agent_model, skill_md or "", prompt, simulate)
     assertions = case["assertions"]
     graded: list = [None] * len(assertions)
     if assertions:
@@ -411,7 +456,39 @@ def _run_one_case(client, agent_model: str, grader_model: str,
         else:
             for ai, a in enumerate(assertions):
                 graded[ai] = grade_assertion(client, grader_model, a, output, case["prompt"])
-    passed = sum(1 for r in graded if r and r["passed"])
+    return {"output": output, "timing": timing, "assertions": graded}
+
+
+def _majority(votes: list[dict]) -> dict:
+    """One assertion's verdict across trials: it passes when most trials pass
+    it, and reports the reason of a trial that agrees with the outcome."""
+    passed = sum(v["passed"] for v in votes) * 2 > len(votes)
+    agreeing = next(v for v in votes if v["passed"] == passed)
+    return dict(agreeing, passed=passed,
+                votes=f"{sum(v['passed'] for v in votes)}/{len(votes)}")
+
+
+def _run_one_case(client, agent_model: str, grader_model: str,
+                  skill_md: str | None, case: dict, simulate: bool,
+                  skill_dir: Path | None = None, trials: int = 1) -> dict:
+    """Agent call + assertion grading for a single case, `trials` times. Thread-safe.
+
+    The agent under test is a model too: the same prompt can be answered right
+    on one run and wrong on the next, and a single slip on a 5-assertion case
+    moves a skill 20 points. Each assertion is decided by majority across the
+    trials, so a slip is outvoted and a real defect, which repeats, is not."""
+    context = resolve_context(case, skill_dir) if skill_dir else ""
+    prompt = context + case["prompt"] if context else case["prompt"]
+    # Fixture cases carry real data, so suppress simulate mode for them — the
+    # agent must read the injected values, not fabricate (and not disclaim).
+    # SIMULATE_SUFFIX says "use plausible example values", which is a direct
+    # instruction to do the very thing their do-not-invent assertions penalise.
+    effective_simulate = simulate and not context
+    runs = [_run_one_trial(client, agent_model, grader_model, skill_md, case, prompt,
+                           effective_simulate) for _ in range(trials)]
+    graded = [_majority([run["assertions"][ai] for run in runs])
+              for ai in range(len(case["assertions"]))]
+    passed = sum(1 for r in graded if r["passed"])
     total = len(graded)
     return {
         "id": case["id"],
@@ -423,14 +500,22 @@ def _run_one_case(client, agent_model: str, grader_model: str,
         "total": total,
         "score": round(passed / total, 3) if total else 0,
         "assertions": graded,
-        "output": output,
-        "timing": timing,
+        "trials": runs,
     }
+
+
+def parse_trials(value: str) -> int:
+    """argparse type for --trials: a positive odd count, so a vote cannot tie."""
+    n = int(value)
+    if n < 1 or n % 2 == 0:
+        raise argparse.ArgumentTypeError("--trials must be a positive odd number")
+    return n
 
 
 def run_cases(client, agent_model: str, grader_model: str,
               skill_md: str | None, cases: list, simulate: bool,
-              on_progress=None, tag: str = "", skill_dir: Path | None = None) -> list:
+              on_progress=None, tag: str = "", skill_dir: Path | None = None,
+              trials: int = 1) -> list:
     """
     Run cases for a skill.
 
@@ -455,7 +540,7 @@ def run_cases(client, agent_model: str, grader_model: str,
     if not getattr(client, "parallel", True):
         # Local model: sequential execution, no thread overhead
         for i, case in enumerate(cases):
-            results[i] = _run_one_case(client, agent_model, grader_model, skill_md, case, simulate, skill_dir)
+            results[i] = _run_one_case(client, agent_model, grader_model, skill_md, case, simulate, skill_dir, trials)
             done += 1
             if on_progress:
                 on_progress(f"{tag}cases {done}/{n}")
@@ -463,7 +548,7 @@ def run_cases(client, agent_model: str, grader_model: str,
 
     start = 0
     if _PRIME_CACHE and n > 1:
-        results[0] = _run_one_case(client, agent_model, grader_model, skill_md, cases[0], simulate, skill_dir)
+        results[0] = _run_one_case(client, agent_model, grader_model, skill_md, cases[0], simulate, skill_dir, trials)
         done = start = 1
         if on_progress:
             on_progress(f"{tag}cases {done}/{n}")
@@ -472,7 +557,7 @@ def run_cases(client, agent_model: str, grader_model: str,
         with ThreadPoolExecutor(max_workers=min(CASE_PARALLELISM, n - start)) as pool:
             futures = {
                 pool.submit(_run_one_case, client, agent_model, grader_model,
-                            skill_md, cases[i], simulate, skill_dir): i
+                            skill_md, cases[i], simulate, skill_dir, trials): i
                 for i in range(start, n)
             }
             for fut in as_completed(futures):
@@ -486,7 +571,7 @@ def run_cases(client, agent_model: str, grader_model: str,
 
 def run_skill(client, skill_name: str, agent_model: str, grader_model: str,
               force_simulate: bool, live_mcp: bool, smoke: bool,
-              with_baseline: bool = False, on_progress=None) -> dict:
+              with_baseline: bool = False, on_progress=None, trials: int = 1) -> dict:
     skill_dir = SKILLS_DIR / skill_name
     if not skill_dir.exists():
         return {"skill": skill_name, "status": "error", "reason": f"directory not found: {skill_dir}"}
@@ -495,6 +580,21 @@ def run_skill(client, skill_name: str, agent_model: str, grader_model: str,
     if not evals_path.exists():
         return {"skill": skill_name, "status": "error", "reason": "evals/evals.json not found"}
 
+    try:
+        return _run_skill_cases(
+            client, skill_name, skill_dir, agent_model, grader_model,
+            force_simulate, live_mcp, smoke, with_baseline, on_progress, trials,
+        )
+    except GraderRefused as refusal:
+        # The run is not scoreable, and an unscoreable run must not read as a
+        # pass — `main` exits non-zero on any errored skill.
+        return {"skill": skill_name, "status": "error", "reason": str(refusal)}
+
+
+def _run_skill_cases(client, skill_name: str, skill_dir, agent_model: str, grader_model: str,
+                     force_simulate: bool, live_mcp: bool, smoke: bool,
+                     with_baseline: bool, on_progress, trials: int = 1) -> dict:
+    evals_path = skill_dir / "evals" / "evals.json"
     skill_md, evals_data = load_skill(skill_dir)
     requires_auth = evals_data.get("requires_auth", False)
     has_key = bool(os.environ.get("PARADEX_ACCOUNT_PRIVATE_KEY"))
@@ -523,7 +623,7 @@ def run_skill(client, skill_name: str, agent_model: str, grader_model: str,
 
     # With-skill run
     case_results = run_cases(client, agent_model, grader_model, skill_md, cases_to_run, simulate,
-                             on_progress=on_progress, skill_dir=skill_dir)
+                             on_progress=on_progress, skill_dir=skill_dir, trials=trials)
 
     overall_passed = sum(c["passed"] for c in case_results)
     overall_total = sum(c["total"] for c in case_results)
@@ -546,7 +646,8 @@ def run_skill(client, skill_name: str, agent_model: str, grader_model: str,
     # Optional baseline (without skill)
     if with_baseline:
         baseline_results = run_cases(client, agent_model, grader_model, None, cases_to_run, simulate,
-                                     on_progress=on_progress, tag="baseline ", skill_dir=skill_dir)
+                                     on_progress=on_progress, tag="baseline ", skill_dir=skill_dir,
+                                     trials=trials)
         bl_passed = sum(c["passed"] for c in baseline_results)
         bl_total = sum(c["total"] for c in baseline_results)
         result["baseline"] = {
@@ -619,7 +720,9 @@ def print_summary(results: list[dict], verbose: bool) -> None:
                     a_text = a["assertion"]
                     if isinstance(a_text, dict):
                         a_text = a_text.get("name") or a_text.get("description") or ""
-                    print(f"{mark}  {a_text[:68]}{bl_tag}")
+                    votes = a.get("votes", "")
+                    vote_tag = f"  ({votes} trials)" if votes and not votes.endswith("/1") else ""
+                    print(f"{mark}  {a_text[:68]}{vote_tag}{bl_tag}")
                     if not a["passed"]:
                         reason = a["verdict"].replace("FAIL:", "").strip()
                         print(f"         ↳ {reason}")
@@ -687,6 +790,9 @@ def main() -> None:
                         metavar="MODEL", help=f"Model for the agent (default: {DEFAULT_AGENT_MODEL})")
     parser.add_argument("--grader-model", default=DEFAULT_GRADER_MODEL,
                         metavar="MODEL", help=f"Model for grading assertions (default: {DEFAULT_GRADER_MODEL})")
+    parser.add_argument("--trials", type=parse_trials, default=1, metavar="N",
+                        help="Run each case N times (odd) and decide each assertion by majority. "
+                             "The agent is a model; one slip on a small case moves a skill 20 points")
     parser.add_argument("--fail-below", type=float, default=None, metavar="THRESHOLD",
                         help="Exit 1 if any skill scores below THRESHOLD (0.0–1.0). E.g. --fail-below 0.8")
     parser.add_argument("--local", action="store_true",
@@ -814,7 +920,7 @@ def main() -> None:
             client, name,
             args.agent_model, args.grader_model,
             args.simulate, args.live_mcp, args.smoke,
-            with_baseline=args.with_baseline,
+            with_baseline=args.with_baseline, trials=args.trials,
         )
 
     all_results: list = [None] * n_skills
@@ -852,7 +958,7 @@ def main() -> None:
                 client, name,
                 args.agent_model, args.grader_model,
                 args.simulate, args.live_mcp, args.smoke,
-                with_baseline=args.with_baseline,
+                with_baseline=args.with_baseline, trials=args.trials,
                 on_progress=on_progress,
             )
             all_results[skill_idx] = result
@@ -860,6 +966,23 @@ def main() -> None:
             print(f"\r{prefix}{result_label(result):<32}".rstrip())
 
     print_summary(all_results, verbose=args.verbose)
+
+    # Written BEFORE the threshold check: the run that fails is the one whose
+    # responses and verdicts are worth keeping, and exiting first left the CI
+    # artifact empty on exactly those runs.
+    if args.output:
+        Path(args.output).write_text(json.dumps(all_results, indent=2))
+        print(f"Results written to {args.output}\n")
+
+    errored = [r for r in all_results if r.get("status") == "error"]
+    if errored:
+        for r in errored:
+            print(f"\nERROR: {r['skill']} could not be scored: {r.get('reason', 'unknown')}",
+                  file=sys.stderr)
+        # Before the threshold check, and regardless of it: a skill that could
+        # not be scored is excluded from `evaluated` below, so a silent exit
+        # here would read as a pass.
+        sys.exit(1)
 
     if args.fail_below is not None:
         evaluated = [r for r in all_results if r.get("status") not in ("error", "skipped")]
@@ -869,10 +992,6 @@ def main() -> None:
             print(f"\nFAIL: {len(below)} skill(s) scored below {args.fail_below * 100:.0f}%: {names}",
                   file=sys.stderr)
             sys.exit(1)
-
-    if args.output:
-        Path(args.output).write_text(json.dumps(all_results, indent=2))
-        print(f"Results written to {args.output}\n")
 
 
 if __name__ == "__main__":
