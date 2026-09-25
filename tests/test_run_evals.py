@@ -131,5 +131,42 @@ _threshold_at = _exit_block.index("if args.fail_below is not None:")
 ok(_errored_at < _threshold_at, "the error exit comes before the threshold check")
 ok("sys.exit(1)" in _exit_block[_errored_at:_threshold_at], "and it exits non-zero")
 
+# ── one slip by the agent is outvoted; a steady failure is not ───────────────
+def _trial_case(answers, trials):
+    """Run one case whose agent gives `answers` in turn; the grader passes a
+    response iff it is "right"."""
+    queue = list(answers)
+    saved = run_evals.run_agent, run_evals.grade_assertion
+    run_evals.run_agent = lambda *a, **k: (queue.pop(0), {})
+    run_evals.grade_assertion = lambda client, model, assertion, output, prompt: {
+        "assertion": assertion, "passed": output == "right",
+        "verdict": ("PASS: ok" if output == "right" else "FAIL: DVOL read as falling")}
+    try:
+        return run_evals._run_one_case(
+            _Block(parallel=False), "m", "m", "", {"id": 5, "prompt": "p",
+                                                   "assertions": ["DVOL rises"]},
+            True, trials=trials)
+    finally:
+        run_evals.run_agent, run_evals.grade_assertion = saved
+
+
+slip = _trial_case(["wrong", "right", "right"], 3)
+ok(slip["assertions"][0]["passed"] is True, "one wrong answer in three is outvoted")
+ok(slip["assertions"][0]["votes"] == "2/3", "and the vote is kept for the report")
+ok(len(slip["trials"]) == 3 and slip["trials"][0]["output"] == "wrong",
+   "every trial's response is kept")
+steady = _trial_case(["wrong", "wrong", "right"], 3)
+ok(steady["assertions"][0]["passed"] is False, "two wrong answers in three still fail")
+ok(steady["assertions"][0]["verdict"] == "FAIL: DVOL read as falling",
+   "a failed vote reports a failing trial's reason")
+single = _trial_case(["wrong"], 1)
+ok(single["assertions"][0]["passed"] is False, "one trial is one vote")
+even = False
+try:
+    run_evals.parse_trials("2")
+except Exception:
+    even = True
+ok(even, "an even trial count is refused: a tie has no majority")
+
 print(f"\n{_p} passed, {_f} failed")
 sys.exit(1 if _f else 0)
