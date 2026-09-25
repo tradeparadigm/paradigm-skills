@@ -1,0 +1,75 @@
+{
+  "skill_name": "paradigm-ohlcv",
+  "requires_auth": false,
+  "evals": [
+    {
+      "id": 1,
+      "requires_live": true,
+      "prompt": "/ohlcv btc 1h 24h",
+      "expected_output": "A BTC candle table at 1h bars over the last 24 hours, built from bounded raw exchange partitions for one named venue. The interval, window and venue queried are stated. Periods that could not be read are named as gaps rather than rendered as zero-volume bars.",
+      "assertions": [
+        "Response opens with a header line naming the symbol, the interval, the venue and the UTC window",
+        "Response renders a Time/Open/High/Low/Close/Volume table with one row per bar",
+        "Response includes a summary line with the bar count and the change across the rendered bars",
+        "Any missing period appears as a coverage line stating a reason, never as a bar with zero volume",
+        "Response does not recommend or read any hot__ object"
+      ]
+    },
+    {
+      "id": 2,
+      "requires_live": true,
+      "prompt": "show me ETH 15m candles for the last 4 hours",
+      "expected_output": "An ETH candle table at 15m bars over 4 hours, reached without the user typing the slash command. Scoped to ETH and to one named venue.",
+      "assertions": [
+        "Response is a candle table for ETH, not for BTC or another asset",
+        "The interval rendered is 15m and the window is 4 hours",
+        "The venue the bars came from is named",
+        "Response does not estimate or simulate any bar"
+      ]
+    },
+    {
+      "id": 3,
+      "requires_live": false,
+      "simulate": false,
+      "prompt": "Render the /ohlcv output for BTC-PERP on deribit, 1h bars, window 2026-09-16 10:00–16:00 UTC, from exactly this evidence and nothing else. Bars (open time UTC, O/H/L/C/volume): 10:00 63120.5/63400.0/63050.0/63380.5/142.7; 11:00 63380.5/63512.0/63201.4/63244.9/98.3; 12:00 63244.9/63300.1/62980.0/63010.2/201.5; 15:00 62990.0/63180.4/62905.7/63150.8/77.4. The partitions for 13:00 and 14:00 were absent from S3. Do not invent the missing bars.",
+      "expected_output": "The fixed rendering of exactly four bars, with the two absent periods reported as a coverage line rather than filled in. No values beyond the supplied evidence.",
+      "assertions": [
+        "Response renders exactly four bars — 10:00, 11:00, 12:00 and 15:00 — and no others",
+        "The 13:00 and 14:00 periods do NOT appear as table rows",
+        "The absence of 13:00 and 14:00 is stated as a coverage line that gives a reason, marked with a warning",
+        "The table has the columns Time, Open, High, Low, Close and Volume in that order",
+        "A header line names BTC-PERP, the 1h interval, the deribit venue and the UTC window",
+        "The summary line reports 4 bars",
+        "The summary line's change is computed from the first rendered bar's open (63120.5) to the last rendered bar's close (63150.8)",
+        "The reported high across the window is 63512.0 and the low is 62905.7",
+        "Every open, high, low, close and volume in the table matches the supplied evidence exactly, with no substituted or rounded-away values",
+        "No bar is rendered with zero volume to stand in for a missing period",
+        "The response is the rendering itself, without narration about how it was produced"
+      ]
+    },
+    {
+      "id": 4,
+      "requires_live": true,
+      "prompt": "/ohlcv btc 1m 90d",
+      "expected_output": "The requested window exceeds what the skill will serve at that interval. The response says so and states the limit; it does not quietly return a shorter window's data as though it were the one requested.",
+      "assertions": [
+        "Response states that the requested window exceeds a limit, and names the limit",
+        "Response does NOT present data for a different window or interval as if it were the requested one",
+        "If any narrower window is rendered at all, the response says plainly that it is not what was asked for"
+      ]
+    },
+    {
+      "id": 5,
+      "requires_live": false,
+      "prompt": "what does the vol surface look like for BTC options right now",
+      "expected_output": "This skill does not answer the question. It covers perpetual and spot candles; options implied-volatility work is out of scope, and the response should decline rather than improvise a chart.",
+      "assertions": [
+        "Response does not render an OHLCV candle table",
+        "Response does not report ATM implied volatility, skew, risk reversals or term structure figures",
+        "Response declines the request rather than fabricating a vol surface",
+        "Response indicates the question belongs to options or volatility tooling rather than to candles",
+        "Response does not claim that candle data can substitute for an implied-volatility surface"
+      ]
+    }
+  ]
+}

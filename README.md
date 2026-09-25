@@ -12,6 +12,7 @@ Built on top of the [Paradigm MCP server](https://github.com/tradeparadigm/mcp-p
 | [block-analyst](./skills/block-analyst/) | Cross-venue analysis of Paradigm RFQ block trades using live market data from Deribit, OKX, and Bybit |
 | [data-discovery](./skills/data-discovery/) | Catalog and query-launcher for historical market data in S3 — returns an S3 path plus a ready-to-run DuckDB query |
 | [options-recap](./skills/options-recap/) | Fixed-format cross-venue options market recap for a window (`/recap`) — DVOL/spot, volume by venue, block structure mix, flow themes, vol surface |
+| [ohlcv](./skills/ohlcv/) | Open/high/low/close/volume candles for one perp or spot market over a window (`/ohlcv`) — venue-local bars from bounded raw partitions, with gaps reported rather than filled |
 
 ## Quick start
 
