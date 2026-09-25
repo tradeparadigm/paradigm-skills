@@ -820,6 +820,9 @@ def test_different_legs_stay_separate_structures():
             + _diag("d", "r4", prod="BTC OPTION - PRDX"))
     res = build_tape_blocks(rows)
     check("ratio, side and venue each split a structure", res["n_structures"] == 4, res["rows"])
+    uneven = build_tape_blocks(_diag("a", "r1", front=200, back=300)
+                               + _diag("b", "r2", front=200, back=400))
+    check("a 2:3 and a 1:2 are different structures", uneven["n_structures"] == 2, uneven["rows"])
     shared = build_tape_blocks(_diag("a", "r1") + _diag("b", "r1", back=500))
     check("different legs in one RFQ are two structures", shared["n_structures"] == 2, shared["rows"])
     sizeless = [_tape_leg("Call 25 Sep 26 80000", "", 0, 5_000_000, "a", rfq="r9"),
@@ -837,6 +840,15 @@ def test_missing_side_is_not_read_as_a_sell():
     row = build_tape_blocks(rows)["rows"][0]
     check("undisclosed legs still name a diagonal", row["structure"].endswith("Call Diagonal"), row)
     check("undisclosed legs render unsigned", row["detail"] == "500 25SEP26 80KC / 500 30OCT26 90KC", row)
+
+
+def test_a_leg_that_nets_to_zero_is_not_shown():
+    rows = [_tape_leg("Call 25 Sep 26 80000", "BUY", 100, 8_400_000, "x"),
+            _tape_leg("Call 25 Sep 26 80000", "SELL", 100, 8_400_000, "x"),
+            _tape_leg("Call 25 Sep 26 84000", "SELL", 60, 5_000_000, "x")]
+    row = build_tape_blocks(rows)["rows"][0]
+    check("only the leg left after netting is listed", row["detail"] == "-60 84KC", row)
+    check("the block is named from what was traded", row["structure"] == "25SEP26 Call", row)
 
 
 def test_ratio_labels_for_two_leg_shapes():
