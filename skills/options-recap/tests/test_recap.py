@@ -1067,6 +1067,26 @@ def test_block_flow_column_stretches_for_long_labels():
           (header, row))
 
 
+def test_biggest_print_shows_legs_as_traded():
+    # A 1x2 call diagonal: the line used to read "Call Diagonal   500x", hiding
+    # both the ratio and which leg was bought.
+    rows = [
+        _blk("Call 25 Sep 26 80000", "SELL", 42_100_000, bid="D1", rfq="RD", tid="t1", qty=500),
+        _blk("Call 30 Oct 26 90000", "BUY", 84_200_000, bid="D1", rfq="RD", tid="t2", qty=1000),
+    ]
+    bf, bp = _block_flow(rows)
+    md = render_md({"header": {"asset": "BTC", "window": "24h", "start_utc": "05:55",
+                               "end_utc": "05:55"},
+                    "snapshot": {}, "biggest_print": bp,
+                    "block_flow": bf, "vol_surface": None, "hot_horizon": None,
+                    "warnings": []})
+    line = next(l for l in md.splitlines() if "via Paradigm/" in l)
+    check("biggest print names the ratio", "Call Ratio Diagonal" in line, line)
+    check("biggest print lists signed legs",
+          line.endswith("-500 25SEP26 80KC / +1000 30OCT26 90KC"), line)
+    check("no unit-size column", "500x" not in line, line)
+
+
 # ── Snapshot helper labels ──────────────────────────────────────────────────
 
 def test_helpers():

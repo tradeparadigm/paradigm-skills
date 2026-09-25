@@ -256,7 +256,9 @@ def classify_structure(legs: list[dict]) -> str:
         sell) — an all-same-direction time strip → Custom.
       • 2 legs, diff strikes → Call/Put Diagonal (same long/short requirement;
         one call + one put is not a diagonal → Custom).
-      • anything else → Custom."""
+      • anything else → Custom.
+    Two-instrument spreads, calendars and diagonals whose sizes differ are
+    named as ratios ("Call Ratio Diagonal")."""
     if len(legs) == 1:
         return "Call" if legs[0]["instrument_name"].endswith("-C") else "Put"
     expiries, strikes, types = set(), set(), set()
@@ -278,6 +280,19 @@ def classify_structure(legs: list[dict]) -> str:
     disclosed = all(d in ("buy", "sell") for d in dirs)
     has_buy = any(d == "buy" for d in dirs)
     has_sell = any(d == "sell" for d in dirs)
+    per_inst: dict[str, float] = defaultdict(float)
+    for leg in legs:
+        per_inst[leg["instrument_name"]] += leg.get("amount") or 0
+    sizes = list(per_inst.values())
+    # A 1x2 is a different trade from a 1x1; naming it as the 1x1 hides the ratio.
+    ratio = (len(sizes) == 2 and all(sizes)
+             and not math.isclose(sizes[0], sizes[1], rel_tol=_FLY_RTOL))
+
+    def named(label: str) -> str:
+        if not ratio:
+            return label
+        base, _, kind = label.rpartition(" ")
+        return f"{base} Ratio {kind}".strip()
 
     # Multi-expiry. Calendars/diagonals are a long-one-tenor / short-the-other
     # trade: when every direction is disclosed, require both a buy and a sell;
@@ -288,7 +303,7 @@ def classify_structure(legs: list[dict]) -> str:
                      else "Put Calendar" if types == {"P"} else "Calendar")
             if disclosed and not (has_buy and has_sell):
                 return "Custom"
-            return label
+            return named(label)
         if len(legs) == 2:
             if types == {"C"}:
                 label = "Call Diagonal"
@@ -298,7 +313,7 @@ def classify_structure(legs: list[dict]) -> str:
                 return "Custom"   # one call + one put across expiries isn't a diagonal
             if disclosed and not (has_buy and has_sell):
                 return "Custom"
-            return label
+            return named(label)
         return "Custom"
 
     # Same expiry.
@@ -354,7 +369,7 @@ def classify_structure(legs: list[dict]) -> str:
             return "Strangle" if len(set(dirs)) == 1 else "Risk Reversal"
         return "Strangle/RR"
     if len(types) == 1 and len(strikes) > 1:
-        return "Call Spread" if types == {"C"} else "Put Spread"
+        return named("Call Spread" if types == {"C"} else "Put Spread")
     return "Custom"
 
 
@@ -745,17 +760,10 @@ def _block_from_rows(bid: str, rows: list[dict], iv_lookup=None) -> dict:
         unit = min(qtys) if qtys else 0
     else:
         # Per-leg rows: one option leg each; classify by the collected geometry.
-        legs = []
-        by_inst = defaultdict(float)
-        for r in rows:
-            p = parse_tape_description(r.get("DESCRIPTION"))
-            q = _fnum(r.get("QTY")) or 0
-            for lg in p["legs"]:
-                legs.append(lg)
-                by_inst[(lg["cp"], lg["strike"], lg["expiry_c"])] += q
+        legs = _traded_legs(rows)
         expiry = _join_exp([lg["expiry_c"] for lg in legs])
-        label = _classify_tape_legs(asset, rows) if legs else "Custom"
-        unit = min(by_inst.values()) if by_inst else (
+        label = _classify_tape_legs(asset, legs)
+        unit = min((lg["qty"] for lg in legs), default=0) or (
             min((_fnum(r.get("QTY")) or 0) for r in rows) or 0)
 
     # Detail + IV from the parsed legs (IV looked up per Deribit leg).
@@ -771,26 +779,53 @@ def _block_from_rows(bid: str, rows: list[dict], iv_lookup=None) -> dict:
     }
 
 
-def _classify_tape_legs(asset: str, rows: list[dict]) -> str:
-    """Reuse the Deribit-path classifier on synthesized instrument legs (one per
-    per-leg row), with each leg's direction taken straight from its SIDE."""
-    legs = []
+def _traded_legs(rows: list[dict]) -> list[dict]:
+    """One leg per instrument with its size and the taker's net side: sign +1
+    bought, -1 sold, None when a row carries no SIDE (the size is then shown
+    unsigned rather than guessed)."""
+    by_inst: dict[tuple, dict] = {}
     for r in rows:
-        p = parse_tape_description(r.get("DESCRIPTION"))
-        d = "buy" if (r.get("SIDE") or "").upper() == "BUY" else "sell"
-        for lg in p["legs"]:
-            legs.append({"instrument_name": f"{asset}-{lg['expiry_c']}-{int(lg['strike'])}-{lg['cp']}",
-                         "amount": _fnum(r.get("QTY")) or 0, "direction": d})
-    return classify_structure(legs) if legs else "Custom"
+        q = _fnum(r.get("QTY")) or 0
+        side = (r.get("SIDE") or "").upper()
+        sign = 1 if side == "BUY" else -1 if side == "SELL" else None
+        for lg in parse_tape_description(r.get("DESCRIPTION"))["legs"]:
+            key = (lg["cp"], lg["strike"], lg["expiry_c"])
+            leg = by_inst.setdefault(key, dict(lg, net=0.0, qty=0.0, signed=True))
+            leg["qty"] += q
+            if sign is None:
+                leg["signed"] = False
+            else:
+                leg["net"] += sign * q
+    legs = []
+    for leg in by_inst.values():
+        # Opposite prints on one instrument net down; the net is what was traded.
+        if leg["signed"]:
+            if not leg["net"]:
+                continue
+            leg["qty"] = abs(leg["net"])
+            leg["sign"] = 1 if leg["net"] > 0 else -1
+        else:
+            leg["sign"] = None
+        legs.append(leg)
+    legs.sort(key=lambda lg: (expiry_ms_from_instrument(f"X-{lg['expiry_c']}-0-C") or 0,
+                              lg["strike"], lg["cp"]))
+    return legs
+
+
+def _classify_tape_legs(asset: str, legs: list[dict]) -> str:
+    """Reuse the Deribit-path classifier on the block's net traded legs; an
+    unsigned leg stays undisclosed rather than being read as a sell."""
+    named = [{"instrument_name": f"{asset}-{lg['expiry_c']}-{int(lg['strike'])}-{lg['cp']}",
+              "amount": lg["qty"],
+              "direction": {1: "buy", -1: "sell"}.get(lg["sign"])} for lg in legs]
+    return classify_structure(named) if named else "Custom"
 
 
 def _tape_detail_iv(asset, venue, legs, unit, side, raw_desc, iv_lookup):
-    """One-line leg detail + average IV for a tape block. IV is looked up per
-    Deribit leg (the tape carries none); non-Deribit venues get IV n/a. Detail is
-    'strike+type / … x<size> <iv>v (<Side>)', built from the parsed legs and
-    falling back to the DESCRIPTION strike tail when the geometry isn't mapped.
-    The directional tag is added only for a one-sided block (Buy/Sell) — a Mixed
-    structure's legs point both ways, which the structure name already conveys."""
+    """One-line leg detail + average IV for a tape block. Per-leg tape rows give
+    '±size strike+type / …', each leg signed by the taker's side. A named
+    DESCRIPTION without per-leg sizes keeps 'strike+type / … x<unit> (<Side>)'.
+    IV is looked up per Deribit leg; other venues get none."""
     ivs = []
     if iv_lookup and venue == "Deribit":
         for lg in legs:
@@ -800,15 +835,26 @@ def _tape_detail_iv(asset, venue, legs, unit, side, raw_desc, iv_lookup):
     avg_iv = round(sum(ivs) / len(ivs), 1) if ivs else None
 
     multi_exp = len({lg["expiry_c"] for lg in legs}) > 1
+    traded = bool(legs) and all("qty" in lg for lg in legs)
     parts = []
     for lg in legs[:4]:
         sk = _tape_strike_label(lg["strike"])
-        parts.append(f"{lg['expiry_c']} {sk}{lg['cp']}" if multi_exp else f"{sk}{lg['cp']}")
+        name = f"{lg['expiry_c']} {sk}{lg['cp']}" if multi_exp else f"{sk}{lg['cp']}"
+        if traded:
+            sign = {1: "+", -1: "-"}.get(lg["sign"], "")
+            name = f"{sign}{lg['qty']:.10g} {name}"
+        parts.append(name)
+    if len(legs) > 4:
+        parts.append(f"({len(legs) - 4} more)")
     body = " / ".join(parts) or _tape_strike_tail(raw_desc)
-    detail = f"{body} x{unit:g}".strip() if body else f"x{unit:g}"
+    if traded:
+        # Each leg carries its own size and side, so no unit or side tag.
+        detail = body
+    else:
+        detail = f"{body} x{unit:g}".strip() if body else f"x{unit:g}"
     if avg_iv is not None:
         detail += f" {avg_iv}v"
-    if side in ("Buy", "Sell"):
+    if side in ("Buy", "Sell") and not traded:
         detail += f" ({side})"
     return detail, avg_iv
 
@@ -874,7 +920,7 @@ def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
         biggest = {"expiry": b0["expiry"], "structure": b0["structure"],
                    "size": b0["unit_size"], "notional_m": round(b0["notional_usd"] / 1e6, 1),
                    "time_utc": b0["time_utc"], "side": b0["side"],
-                   "avg_iv": b0["avg_iv"], "venue": b0["venue"],
+                   "avg_iv": b0["avg_iv"], "venue": b0["venue"], "detail": b0["detail"],
                    "source": b0.get("source") or "paradigm"}
 
     # Worked-order rollup: group blocks by RFQ_ID (blocks arrive notional-desc, so

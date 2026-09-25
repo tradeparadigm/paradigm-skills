@@ -158,7 +158,7 @@ Render exactly four sections in this order:
 1. **Snapshot** — spot range/change, DVOL/RV/VRP when available, comparable
    cross-venue volume/activity, and put/call balance.
 2. **Biggest Print** — the largest resolved option print/block in the window,
-   with venue, structure/instrument, size, premium, side, and IV when present.
+   with venue, structure, notional, and each leg's size and taker side.
 3. **Block Flow** — real block clusters by venue plus any source limitation or
    unresolved Paradigm linkage.
 4. **Vol Surface** — current ATM/skew/term and window change from raw summary

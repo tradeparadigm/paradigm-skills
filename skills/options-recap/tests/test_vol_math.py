@@ -545,7 +545,7 @@ def test_aggregate_clips_merges_worked_order():
     ranked = summarize_blocks(clusters, top_n=10**9, min_btc=5.0)
     grouped = aggregate_clips(ranked, clusters)
     check("4 blocks → 2 grouped rows", len(grouped) == 2, grouped)
-    spread = next(g for g in grouped if g["structure"] == "Put Spread")
+    spread = next(g for g in grouped if g["structure"] == "Put Ratio Spread")
     check("clip_count 3", spread["clip_count"] == 3, spread)
     check("sizes summed (150+30+30)", spread["size_btc"] == 210.0, spread)
     check("unit sizes summed (50+10+10)", spread["unit_size"] == 70.0, spread)
@@ -715,6 +715,45 @@ def test_build_tape_blocks_iv_lookup_deribit_only():
     check("Deribit block gets IV", by_venue["Deribit"]["avg_iv"] == 42.5, by_venue["Deribit"])
     check("Paradex block IV n/a (surface is Deribit-only)", by_venue["Paradex"]["avg_iv"] is None,
           by_venue["Paradex"])
+
+
+def _tape_leg(desc, side, qty, notl, bid, rfq="r1", t="15:45:10"):
+    return {"DATE": "2026-09-24", "TIME": t, "PRODUCT": "BTC OPTION - DBT",
+            "DESCRIPTION": desc, "QTY": qty, "SIDE": side,
+            "NOTIONAL_VOLUME_USD": notl, "RFQ_ID": rfq,
+            "TRADE_ID": f"{bid}-{desc}", "BLOCK_TRADE_ID": bid}
+
+
+def test_ratio_diagonal_shows_legs_as_traded():
+    """A 1x2 diagonal: 500 sold at the front, 1000 bought at the back. It used to
+    render as "Call Diagonal x500" with the ratio and the sides nowhere."""
+    rows = [_tape_leg("Call 25 Sep 26 80000", "SELL", 500, 42_100_000, "b1"),
+            _tape_leg("Call 30 Oct 26 90000", "BUY", 1000, 84_200_000, "b1")]
+    res = build_tape_blocks(rows)
+    row, bp = res["rows"][0], res["biggest_print"]
+    check("1x2 diagonal is named a ratio", row["structure"] == "25SEP26/30OCT26 Call Ratio Diagonal", row)
+    check("detail lists each leg with its signed size",
+          row["detail"] == "-500 25SEP26 80KC / +1000 30OCT26 90KC", row["detail"])
+    check("biggest print carries the same legs", bp.get("detail") == row["detail"], bp)
+
+
+def test_missing_side_is_not_read_as_a_sell():
+    rows = [_tape_leg("Call 25 Sep 26 80000", "", 500, 42_100_000, "b1"),
+            _tape_leg("Call 30 Oct 26 90000", "", 500, 42_100_000, "b1")]
+    row = build_tape_blocks(rows)["rows"][0]
+    check("undisclosed legs still name a diagonal", row["structure"].endswith("Call Diagonal"), row)
+    check("undisclosed legs render unsigned", row["detail"] == "500 25SEP26 80KC / 500 30OCT26 90KC", row)
+
+
+def test_ratio_labels_for_two_leg_shapes():
+    def legs(*spec):
+        return [{"instrument_name": n, "amount": a, "direction": d} for n, a, d in spec]
+    check("1x2 call spread", classify_structure(legs(
+        ("BTC-25SEP26-84000-C", 100, "buy"), ("BTC-25SEP26-86000-C", 200, "sell"))) == "Call Ratio Spread")
+    check("1x2 put calendar", classify_structure(legs(
+        ("BTC-25SEP26-80000-P", 100, "sell"), ("BTC-30OCT26-80000-P", 200, "buy"))) == "Put Ratio Calendar")
+    check("equal-size diagonal stays a diagonal", classify_structure(legs(
+        ("BTC-25SEP26-80000-C", 100, "sell"), ("BTC-30OCT26-90000-C", 100, "buy"))) == "Call Diagonal")
 
 
 def test_build_tape_blocks_empty():

@@ -99,25 +99,29 @@ never combine `amount_native` across venues.
 **Biggest Print**
 
 ```yaml
-[DDMMMYY] [structure]   [Nx]   $[X]M   [HH:MM] UTC   via Paradigm/[Venue] ([Buy/Sell, ][IV]v avg)
+[DDMMMYY] [structure]   $[X]M   [HH:MM] UTC   via Paradigm/[Venue]   [legs]
 ```
 
 The single largest **proven block** in the window, ranked by underlying USD
 notional, as in Block Flow. Snapshot Volume is USD premium turnover: never
 substitute one measure for the other. Group legs only on a real venue block/OTC id. The
-`via …` tag names the source and venue. A raw venue block without provable leg
+`via …` tag names the source and venue. `[legs]` is the same leg list the
+Block Flow Detail column shows. A raw venue block without provable leg
 geometry renders as
-`[Venue] Block   [Nx]   $[X]M   ~[HH:MM] UTC   via venue tape`
-(`~` = 5-min bucket resolution; `[Nx]` is its total coin size). The side word appears only when
-the whole block is one-directional (Buy/Sell); mixed-direction structures (any
-spread) carry no side tag — never write "two-way" here. The `[IV]v avg` appears
-only when the direct venue rows publish or support the IV calculation.
+`[Venue] Block   $[X]M   ~[HH:MM] UTC   via venue tape   x[coin] [IV]v — [n] legs`
+(`~` = 5-min bucket resolution; `x[coin]` is its total coin size).
 
-`[Nx]` is the structure UNIT size — the base (ratio-1) leg count of the
-package, e.g. a 4×63-lot iron fly is `63x`, a 600-per-leg calendar is `600x`.
-Never the leg-sum, which overstates a 4-leg package 4×. The same convention
-applies to the `x[size]` in Block Flow details (there it is the unit size
-summed across the row's clips).
+Legs are listed as traded, one per instrument: `[±size] [expiry] [K][C/P]`,
+e.g. `-500 25SEP26 80KC / +1000 30OCT26 90KC`. The sign is the taker's side
+(`+` bought, `-` sold) and the size is that instrument's net quantity in the
+block, so a ratio is visible in the sizes. A leg whose side the tape does not
+carry prints its size unsigned. The expiry prefix appears only on multi-expiry
+structures. Never write "two-way": the side is disclosed per leg. A block the
+tape describes only as a named package, without per-leg sizes, keeps the older
+`[K1][C/P] / [K2][C/P] x[unit] ([Buy/Sell])` form.
+
+Two-leg spreads, calendars and diagonals with unequal leg sizes are ratios and
+are named so: `Call Ratio Spread`, `Put Ratio Diagonal`, `Call Ratio Calendar`.
 
 Strike labels abbreviate at 10K and above (`68K`, `62.5K`); below 10K they
 stay raw (`1875`, `2000` — never `2K`), so one table never mixes conventions.
@@ -129,9 +133,9 @@ the Detail column.
 **Block Flow — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)]**
 
 ```yaml
-#  Structure                  Notl     Blocks  Detail
+#  Structure                  Notl     Blocks  Detail (+ taker bought, - taker sold)
 -  -------------------------  -------  ------  -----------------------------------
-1  [structure]                $[X]M    [n]     [K1][C/P] / [K2][C/P] x[size] [IV]v ([Side])
+1  [structure]                $[X]M    [n]     [±size] [K1][C/P] / [±size] [K2][C/P] [IV]v
 2  OKX Block                  $[X]M    1       x[size] [IV]v — [n] legs (venue tape)
 …
 ```
@@ -154,10 +158,9 @@ structures and `#` numbers them; the Blocks column carries each row's block
 count, so it sums to the header `[N]` and the row count equals `[M]`. When more
 than 8 structures qualify, the header gains the `(top 8 by notional)` suffix.
 
-Detail: strike+type legs (`[K1]C / [K2]P`), the structure unit `x[size]`, the
-average `[IV]v` (Deribit blocks only), and a `([Side])` tag when the block is
-one-directional (Buy/Sell) — omitted for mixed-direction structures. Multi-expiry
-structures prefix each leg with its own expiry.
+Detail: the legs as traded (see Biggest Print), then the average `[IV]v`
+(Deribit blocks only). The column header reads
+`Detail (+ taker bought, - taker sold)`.
 
 **Vol Surface**
 Skew: front 25Δ RR [±X]v → [puts bid / calls bid / flat] · Term: [front]v → [back]v → [contango / flat / backwardation / humped — peak at [DDMMMYY] / dished — trough at [DDMMMYY] / mixed]

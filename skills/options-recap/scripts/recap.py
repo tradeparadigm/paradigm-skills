@@ -1386,22 +1386,14 @@ def render_md(r: dict) -> str:
     L += ["```", "", "**Biggest Print**", "", "```yaml"]
 
     if bp:
-        # "Mixed" is a structure fact (legs point both ways), not an aggressor
-        # read — don't put it in the side slot. Venue names the executing venue.
-        # Source-aware routing tag: a Paradigm-brokered block reads
-        # "via Paradigm/<venue>"; a venue-tape block reads "via venue tape" —
-        # its venue is already the structure label ("OKX Block"), and the tag
-        # explains the unclassified structure + the ~approximate time.
-        tags = [bp["side"]] if bp.get("side") in ("Buy", "Sell") else []
-        if bp.get("avg_iv") is not None:
-            tags.append(f"{bp['avg_iv']}v avg")
-        tag_txt = f" ({', '.join(tags)})" if tags else ""
+        # The detail is the same leg list Block Flow shows: each leg's size and
+        # taker side, so the line never needs a separate size or side slot.
         via = ("via venue tape" if bp.get("source") == "venue"
                else f"via Paradigm/{bp.get('venue') or '?'}")
         label = f"{bp['expiry']} {bp['structure']}".strip()  # venue blocks have no expiry
-        L.append(f"{label}   {bp['size']:g}x   "
-                 f"${bp['notional_m']}M   {bp['time_utc']} UTC   "
-                 f"{via}{tag_txt}")
+        detail = (bp.get("detail") or "").replace(" (venue tape)", "")
+        L.append(f"{label}   ${bp['notional_m']}M   {bp['time_utc']} UTC   "
+                 f"{via}   {detail}".rstrip())
     else:
         # output-format.md: name the source and reason rather than going blank.
         # True whichever way the pool emptied — no blocks at all, all excluded by
@@ -1420,7 +1412,7 @@ def render_md(r: dict) -> str:
     L += ["```", "", f"**Block Flow — ${bf['total_m']}M / {bf['n_blocks']} {block_word} / "
           f"{n_struct} {struct_word}{trunc}**",
           "", "```yaml",
-          f"{'#':<3}{'Structure':<{sw}}{'Notl':<9}{'Blocks':<8}Detail",
+          f"{'#':<3}{'Structure':<{sw}}{'Notl':<9}{'Blocks':<8}Detail (+ taker bought, - taker sold)",
           f"{'-':<3}{'-' * (sw - 2):<{sw}}{'-' * 7:<9}{'-' * 6:<8}{'-' * 44}"]
     for row in bf["rows"]:
         notl = f"${row['notl_m']}M"
