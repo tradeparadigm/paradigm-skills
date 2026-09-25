@@ -483,6 +483,41 @@ def _atm_only_tickers(exp_atms):
             for exp, iv in exp_atms}
 
 
+AS_OF_SEP25 = 1790315700000   # 2026-09-25 05:55Z, two hours before 25SEP26 settles
+
+
+def test_an_expiry_settling_today_does_not_read_as_the_front():
+    s = compute_vol_surface(_atm_only_tickers([
+        ("25SEP26", 32.4), ("26SEP26", 32.9), ("2OCT26", 32.5)]), spot=84000,
+        as_of_ms=AS_OF_SEP25)
+    check("0DTE expiry left out", [e["expiry"] for e in s["expiries"]] == ["26SEP26", "2OCT26"],
+          s["expiries"])
+    check("front ATM is the next expiry", s["front_atm"] == 32.9, s["front_atm"])
+    after = compute_vol_surface(_atm_only_tickers([("26SEP26", 32.9)]), spot=84000,
+                                as_of_ms=AS_OF_SEP25 + 3 * 3600_000)   # 08:55, 23h to go
+    check("tomorrow's daily stays after today's settlement",
+          [e["expiry"] for e in after["expiries"]] == ["26SEP26"], after["expiries"])
+
+
+def test_surface_rows_are_chosen_by_tenor():
+    chain = [("26SEP26", 32.9), ("27SEP26", 26.8), ("28SEP26", 26.2), ("2OCT26", 32.5),
+             ("9OCT26", 33.0), ("16OCT26", 33.4), ("30OCT26", 34.0), ("27NOV26", 35.0),
+             ("25DEC26", 36.0), ("26MAR27", 38.0)]
+    s = compute_vol_surface(_atm_only_tickers(chain), spot=84000, max_expiries=5,
+                            as_of_ms=AS_OF_SEP25)
+    check("front, next weekly, then monthlies",
+          [e["expiry"] for e in s["expiries"]] == ["26SEP26", "2OCT26", "30OCT26", "27NOV26", "25DEC26"],
+          [e["expiry"] for e in s["expiries"]])
+
+
+def test_a_deeper_trough_outranks_a_shallow_peak():
+    s = compute_vol_surface(_atm_only_tickers([
+        ("15JUL26", 32.4), ("16JUL26", 32.9), ("17JUL26", 26.8), ("18JUL26", 26.2),
+        ("24JUL26", 32.5)]), spot=60000)
+    check("the 6-vol trough names the shape", s["term_structure"] == "dished — trough at 18JUL26",
+          s["term_structure"])
+
+
 def test_surface_term_structure_reads_whole_curve():
     # The reported bug: 33.3 → 35.6 → 35.1 → 35.2 → 33.7 rises then falls.
     # A front-vs-next comparison called this "contango"; it is humped.
@@ -545,7 +580,7 @@ def test_aggregate_clips_merges_worked_order():
     ranked = summarize_blocks(clusters, top_n=10**9, min_btc=5.0)
     grouped = aggregate_clips(ranked, clusters)
     check("4 blocks → 2 grouped rows", len(grouped) == 2, grouped)
-    spread = next(g for g in grouped if g["structure"] == "Put Spread")
+    spread = next(g for g in grouped if g["structure"] == "Put Ratio Spread")
     check("clip_count 3", spread["clip_count"] == 3, spread)
     check("sizes summed (150+30+30)", spread["size_btc"] == 210.0, spread)
     check("unit sizes summed (50+10+10)", spread["unit_size"] == 70.0, spread)
@@ -704,17 +739,127 @@ def test_build_tape_blocks_biggest_vs_rfq_rollup():
     check("Call row notional Σ clips $1.9M", call_row["notl_m"] == 1.9, call_row)
 
 
-def test_build_tape_blocks_iv_lookup_deribit_only():
-    rows = [
-        _trow("Call 26 Dec 25 104000", "BUY", 1_000_000, "bD", "rD"),          # Deribit
-        _trow("Call 26 Dec 25 104000", "BUY", 1_000_000, "bP", "rP", prod="BTC OPTION - PRDX"),
-    ]
-    iv = lambda cp, k, e: 42.5 if (cp == "C" and k == 104000 and e == "26DEC25") else None
-    res = build_tape_blocks(rows, iv_lookup=iv, min_notional_usd=100_000)
-    by_venue = {r["venue"]: r for r in res["rows"]}
-    check("Deribit block gets IV", by_venue["Deribit"]["avg_iv"] == 42.5, by_venue["Deribit"])
-    check("Paradex block IV n/a (surface is Deribit-only)", by_venue["Paradex"]["avg_iv"] is None,
-          by_venue["Paradex"])
+def test_leg_ivs_are_read_at_each_blocks_print_time():
+    """Each leg shows its own mark IV at the print, not an average of the legs at
+    the window's end."""
+    rows = (_diag("a", "r1") + _diag("b", "r2")
+            + [_tape_leg("Call 25 Sep 26 84000", "BUY", 100, 8_000_000, "p", rfq="r3")])
+    rows[2]["TIME"] = rows[3]["TIME"] = "16:00:00"
+    rows[-1]["PRODUCT"] = "BTC OPTION - PRDX"
+    at_a = 1790264710000   # 2026-09-24 15:45:10Z
+    at_b = 1790265600000   # 2026-09-24 16:00:00Z
+    calls = []
+
+    def leg_ivs(requests):
+        calls.append(requests)
+        return {("BTC-25SEP26-80000-C", at_a): 60.0, ("BTC-30OCT26-90000-C", at_a): 40.0,
+                ("BTC-25SEP26-80000-C", at_b): 70.0, ("BTC-30OCT26-90000-C", at_b): 42.0}
+
+    res = build_tape_blocks(rows, leg_ivs=leg_ivs)
+    check("one batched lookup", len(calls) == 1, calls)
+    check("only Deribit legs are requested, at their own print times",
+          calls and set(calls[0]) == {("BTC-25SEP26-80000-C", at_a), ("BTC-30OCT26-90000-C", at_a),
+                                      ("BTC-25SEP26-80000-C", at_b), ("BTC-30OCT26-90000-C", at_b)},
+          calls)
+    diag = next(r for r in res["rows"] if "Diagonal" in r["structure"])
+    check("each leg carries its own IV, weighted across the row's blocks",
+          diag["detail"] == "-1000 25SEP26 80KC 65.0v / +2000 30OCT26 90KC 41.0v", diag["detail"])
+    other = next(r for r in res["rows"] if r["venue"] == "Paradex")
+    check("a non-Deribit leg carries no IV", other["detail"] == "+100 84KC", other["detail"])
+    check("no averaged IV field", "avg_iv" not in diag and "avg_iv" not in res["biggest_print"], diag)
+
+
+def _tape_leg(desc, side, qty, notl, bid, rfq="r1", t="15:45:10"):
+    return {"DATE": "2026-09-24", "TIME": t, "PRODUCT": "BTC OPTION - DBT",
+            "DESCRIPTION": desc, "QTY": qty, "SIDE": side,
+            "NOTIONAL_VOLUME_USD": notl, "RFQ_ID": rfq,
+            "TRADE_ID": f"{bid}-{desc}", "BLOCK_TRADE_ID": bid}
+
+
+def test_ratio_diagonal_shows_legs_as_traded():
+    """A 1x2 diagonal: 500 sold at the front, 1000 bought at the back. It used to
+    render as "Call Diagonal x500" with the ratio and the sides nowhere."""
+    rows = [_tape_leg("Call 25 Sep 26 80000", "SELL", 500, 42_100_000, "b1"),
+            _tape_leg("Call 30 Oct 26 90000", "BUY", 1000, 84_200_000, "b1")]
+    res = build_tape_blocks(rows)
+    row, bp = res["rows"][0], res["biggest_print"]
+    check("1x2 diagonal is named a ratio", row["structure"] == "25SEP26/30OCT26 Call Ratio Diagonal", row)
+    check("detail lists each leg with its signed size",
+          row["detail"] == "-500 25SEP26 80KC / +1000 30OCT26 90KC", row["detail"])
+    check("biggest print carries the same legs", bp.get("detail") == row["detail"], bp)
+
+
+def _diag(bid, rfq, front=500, back=1000, sides=("SELL", "BUY"), prod="BTC OPTION - DBT"):
+    rows = [_tape_leg("Call 25 Sep 26 80000", sides[0], front, front * 84_200, bid, rfq=rfq),
+            _tape_leg("Call 30 Oct 26 90000", sides[1], back, back * 84_200, bid, rfq=rfq)]
+    for r in rows:
+        r["PRODUCT"] = prod
+    return rows
+
+
+def test_same_legs_across_rfqs_are_one_structure():
+    """Four RFQs of one 1x2 diagonal rendered as four "1 block" rows."""
+    rows = [r for i in range(4) for r in _diag(f"b{i}", f"rfq{i}")]
+    res = build_tape_blocks(rows)
+    check("four blocks", res["n_blocks"] == 4, res["n_blocks"])
+    check("one structure", res["n_structures"] == 1, res["n_structures"])
+    row = res["rows"][0]
+    check("row counts four blocks", row["blocks"] == 4, row)
+    check("row notional is the sum", row["notl_m"] == round(4 * 1500 * 84_200 / 1e6, 1), row)
+    check("row legs are summed", row["detail"] == "-2000 25SEP26 80KC / +4000 30OCT26 90KC", row)
+    check("biggest print stays one block", bp_size(res) == 1500 * 84_200, res["biggest_print"])
+
+
+def bp_size(res):
+    return round(res["biggest_print"]["notional_m"] * 1e6, -5)
+
+
+def test_different_legs_stay_separate_structures():
+    rows = (_diag("a", "r1") + _diag("b", "r2", back=500)
+            + _diag("c", "r3", sides=("BUY", "SELL"))
+            + _diag("d", "r4", prod="BTC OPTION - PRDX"))
+    res = build_tape_blocks(rows)
+    check("ratio, side and venue each split a structure", res["n_structures"] == 4, res["rows"])
+    uneven = build_tape_blocks(_diag("a", "r1", front=200, back=300)
+                               + _diag("b", "r2", front=200, back=400))
+    check("a 2:3 and a 1:2 are different structures", uneven["n_structures"] == 2, uneven["rows"])
+    shared = build_tape_blocks(_diag("a", "r1") + _diag("b", "r1", back=500))
+    check("different legs in one RFQ are two structures", shared["n_structures"] == 2, shared["rows"])
+    sizeless = [_tape_leg("Call 25 Sep 26 80000", "", 0, 5_000_000, "a", rfq="r9"),
+                _tape_leg("Call 25 Sep 26 84000", "", 50, 5_000_000, "a", rfq="r9"),
+                _tape_leg("Call 25 Sep 26 86000", "", 70, 4_000_000, "b", rfq="r9"),
+                _tape_leg("Call 25 Sep 26 88000", "", 0, 4_000_000, "b", rfq="r9")]
+    row = build_tape_blocks(sizeless)["rows"][0]
+    check("an RFQ-grouped row keeps its largest block's legs",
+          row["detail"] == "0 80KC / 50 84KC", row)
+
+
+def test_missing_side_is_not_read_as_a_sell():
+    rows = [_tape_leg("Call 25 Sep 26 80000", "", 500, 42_100_000, "b1"),
+            _tape_leg("Call 30 Oct 26 90000", "", 500, 42_100_000, "b1")]
+    row = build_tape_blocks(rows)["rows"][0]
+    check("undisclosed legs still name a diagonal", row["structure"].endswith("Call Diagonal"), row)
+    check("undisclosed legs render unsigned", row["detail"] == "500 25SEP26 80KC / 500 30OCT26 90KC", row)
+
+
+def test_a_leg_that_nets_to_zero_is_not_shown():
+    rows = [_tape_leg("Call 25 Sep 26 80000", "BUY", 100, 8_400_000, "x"),
+            _tape_leg("Call 25 Sep 26 80000", "SELL", 100, 8_400_000, "x"),
+            _tape_leg("Call 25 Sep 26 84000", "SELL", 60, 5_000_000, "x")]
+    row = build_tape_blocks(rows)["rows"][0]
+    check("only the leg left after netting is listed", row["detail"] == "-60 84KC", row)
+    check("the block is named from what was traded", row["structure"] == "25SEP26 Call", row)
+
+
+def test_ratio_labels_for_two_leg_shapes():
+    def legs(*spec):
+        return [{"instrument_name": n, "amount": a, "direction": d} for n, a, d in spec]
+    check("1x2 call spread", classify_structure(legs(
+        ("BTC-25SEP26-84000-C", 100, "buy"), ("BTC-25SEP26-86000-C", 200, "sell"))) == "Call Ratio Spread")
+    check("1x2 put calendar", classify_structure(legs(
+        ("BTC-25SEP26-80000-P", 100, "sell"), ("BTC-30OCT26-80000-P", 200, "buy"))) == "Put Ratio Calendar")
+    check("equal-size diagonal stays a diagonal", classify_structure(legs(
+        ("BTC-25SEP26-80000-C", 100, "sell"), ("BTC-30OCT26-90000-C", 100, "buy"))) == "Call Diagonal")
 
 
 def test_build_tape_blocks_empty():

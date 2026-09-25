@@ -24,7 +24,7 @@ would read as a zero-length window. Intraday windows stay HH:MM-only.
 Coverage  [N]/[M] venues  [per-venue state, or "all venue feeds complete"]
 Spot      $[X]        [up/down X%, or flat] (from $[Y], low $[Z])
 DVOL      [X]v        [flat/rising/falling] ([open] -> [close])
-RV 7d     [X]v        implied [CHEAP/RICH/IN LINE] vs realized
+RV 30d    [X]v        implied [CHEAP/RICH/IN LINE] vs realized
 VRP       [±X]v       vol [underpriced/overpriced/roughly fair] vs delivered
 Activity  [Nk]        trades — [Venue X% · Venue Y% · ...] (by trade count)
 Volume    $[X]M       observed valued trades · USD premium
@@ -33,7 +33,7 @@ P/C       [X.Xx]      [descriptor] (observed trades · see ⚠ lines)
 
 The `⚠` lines are the FIRST lines inside the fence, not above it: on
 2026-09-08 a relaying model kept every figure in the fence and deleted all
-three warning lines that sat outside it. `RV 7d` and `VRP` print
+three warning lines that sat outside it. `RV 30d` and `VRP` print
 `unavailable` when the Deribit close history cannot be fetched, rather than
 being dropped.
 
@@ -99,25 +99,34 @@ never combine `amount_native` across venues.
 **Biggest Print**
 
 ```yaml
-[DDMMMYY] [structure]   [Nx]   $[X]M   [HH:MM] UTC   via Paradigm/[Venue] ([Buy/Sell, ][IV]v avg)
+[DDMMMYY] [structure]   $[X]M   [HH:MM] UTC   via Paradigm/[Venue]   [legs]
 ```
 
 The single largest **proven block** in the window, ranked by underlying USD
 notional, as in Block Flow. Snapshot Volume is USD premium turnover: never
 substitute one measure for the other. Group legs only on a real venue block/OTC id. The
-`via …` tag names the source and venue. A raw venue block without provable leg
+`via …` tag names the source and venue. `[legs]` is the same leg list the
+Block Flow Detail column shows. A raw venue block without provable leg
 geometry renders as
-`[Venue] Block   [Nx]   $[X]M   ~[HH:MM] UTC   via venue tape`
-(`~` = 5-min bucket resolution; `[Nx]` is its total coin size). The side word appears only when
-the whole block is one-directional (Buy/Sell); mixed-direction structures (any
-spread) carry no side tag — never write "two-way" here. The `[IV]v avg` appears
-only when the direct venue rows publish or support the IV calculation.
+`[Venue] Block   $[X]M   ~[HH:MM] UTC   via venue tape   x[coin] — [n] legs`
+(`~` = 5-min bucket resolution; `x[coin]` is its total coin size).
 
-`[Nx]` is the structure UNIT size — the base (ratio-1) leg count of the
-package, e.g. a 4×63-lot iron fly is `63x`, a 600-per-leg calendar is `600x`.
-Never the leg-sum, which overstates a 4-leg package 4×. The same convention
-applies to the `x[size]` in Block Flow details (there it is the unit size
-summed across the row's clips).
+Legs are listed as traded, one per instrument: `[±size] [expiry] [K][C/P] [IV]v`,
+e.g. `-500 25SEP26 80KC 61.0v / +1000 30OCT26 90KC 44.0v`. The IV is Deribit's
+mark IV for that leg in the 5-minute snapshot holding the print, weighted by
+size across a row's blocks; non-Deribit legs, and legs with no snapshot at the
+print (a `⚠` line counts them), carry none. There is no averaged IV.
+
+The sign is the taker's side
+(`+` bought, `-` sold) and the size is that instrument's net quantity in the
+block, so a ratio is visible in the sizes. A leg whose side the tape does not
+carry prints its size unsigned. The expiry prefix appears only on multi-expiry
+structures. Never write "two-way": the side is disclosed per leg. A block the
+tape describes only as a named package, without per-leg sizes, keeps the older
+`[K1][C/P] / [K2][C/P] x[unit] ([Buy/Sell])` form.
+
+Two-leg spreads, calendars and diagonals with unequal leg sizes are ratios and
+are named so: `Call Ratio Spread`, `Put Ratio Diagonal`, `Call Ratio Calendar`.
 
 Strike labels abbreviate at 10K and above (`68K`, `62.5K`); below 10K they
 stay raw (`1875`, `2000` — never `2K`), so one table never mixes conventions.
@@ -126,13 +135,13 @@ ARE the complete expiry set (calendar, diagonal), `near→far` when interior
 tenors are elided (3+ expiries) — each leg's own expiry always appears in
 the Detail column.
 
-**Block Flow — $[X]M / [N] blocks / [M] structures[ (top 8 by notional)]**
+**Block Flow — $[X]M notional / [N] blocks / [M] structures[ (top 8 by notional)]**
 
 ```yaml
-#  Structure                  Notl     Blocks  Detail
+#  Structure                  Notl     Blocks  Detail (+ taker bought, - taker sold)
 -  -------------------------  -------  ------  -----------------------------------
-1  [structure]                $[X]M    [n]     [K1][C/P] / [K2][C/P] x[size] [IV]v ([Side])
-2  OKX Block                  $[X]M    1       x[size] [IV]v — [n] legs (venue tape)
+1  [structure]                $[X]M    [n]     [±size] [K1][C/P] [IV]v / [±size] [K2][C/P] [IV]v
+2  OKX Block                  $[X]M    1       x[size] — [n] legs (venue tape)
 …
 ```
 
@@ -148,24 +157,32 @@ structure needs. There is no per-row venue column — the Biggest Print line's
 carries its venue in the structure label (`OKX Block`).
 
 Two granularities, both always stated: tape **blocks** (`BLOCK_TRADE_ID`s, the
-industry term for the individual prints) and **structures** (clips of one worked
-order — the blocks sharing an `RFQ_ID` — grouped into one row). Rows are
+industry term for the individual prints) and **structures** (blocks with the
+same instruments, taker sides and leg ratio on one venue, whatever RFQ or hour
+they printed in, grouped into one row with their notional and leg sizes
+summed). A block the tape gives no size for on some leg groups on its RFQ id, keeping its largest block's detail. Rows are
 structures and `#` numbers them; the Blocks column carries each row's block
 count, so it sums to the header `[N]` and the row count equals `[M]`. When more
 than 8 structures qualify, the header gains the `(top 8 by notional)` suffix.
 
-Detail: strike+type legs (`[K1]C / [K2]P`), the structure unit `x[size]`, the
-average `[IV]v` (Deribit blocks only), and a `([Side])` tag when the block is
-one-directional (Buy/Sell) — omitted for mixed-direction structures. Multi-expiry
-structures prefix each leg with its own expiry.
+Detail: the legs as traded (see Biggest Print). The column header reads
+`Detail (+ taker bought, - taker sold)`.
 
 **Vol Surface**
 Skew: front 25Δ RR [±X]v → [puts bid / calls bid / flat] · Term: [front]v → [back]v → [contango / flat / backwardation / humped — peak at [DDMMMYY] / dished — trough at [DDMMMYY] / mixed]
 
-Term reads the whole listed curve, front to last expiry — monotonic (±0.2v
-tolerance) with >1v span is contango/backwardation; non-monotonic curves are
-humped/dished and name the interior peak/trough, or `mixed` when the shape is
-neither cleanly humped nor dished. `[back]` is the LAST listed
+Rows are chosen by tenor, up to five: the front expiry, the next Friday
+after it, then month-end Fridays (the monthlies and quarterlies), so weekend
+dailies never crowd out the months. Other dailies and weeklies are not shown,
+so fewer than five rows can appear. With a single row the Term slot reads
+`n/a`. An expiry settling on the window's end
+date is left out entirely — hours from settlement its IV is pin noise — so the
+front row, the skew line and the term label start at the next expiry.
+
+Term reads those rows, front to last — monotonic (±0.2v tolerance) with >1v
+span is contango/backwardation; non-monotonic curves are humped/dished, named
+by whichever interior extreme strays further from the two ends, or `mixed`
+when neither does. `[back]` is the LAST listed
 expiry's ATM, not the second. The skew side word is the RR's sign (negative →
 puts bid, positive → calls bid, zero → flat); extrapolated wings put a `*` on
 the RR figure (`+1.3v*`), never prose. These slots take exactly these tokens —

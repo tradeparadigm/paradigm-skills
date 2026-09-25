@@ -38,6 +38,7 @@ from vol_math import (  # noqa: E402
     dominant_side,
     summarize_blocks,
     RV_LOOKBACK_DAYS,
+    MAX_SURFACE_ROWS,
 )
 
 DERIBIT = "https://www.deribit.com/api/v2/public"
@@ -134,7 +135,7 @@ def compute_ground_truth(snapshot: dict) -> dict:
         if ticker and "mark_iv" in ticker:
             surface[inst_name] = round(ticker["mark_iv"], 1)
 
-    # Realized vol (#1) — from the trailing 7d spot history, vs DVOL (implied)
+    # Realized vol (#1) — from the trailing 30d spot history, vs DVOL (implied)
     rv = snapshot.get("realized_vol") or {}
     rv_value = rv.get("annualized_vol")
     vrp = None          # vol risk premium: implied − realized
@@ -153,7 +154,8 @@ def compute_ground_truth(snapshot: dict) -> dict:
 
     # Vol surface metrics (#3) — ATM / 25Δ RR / fly / term structure
     vol_surface_metrics = compute_vol_surface(
-        snapshot.get("tickers", {}), snapshot.get("spot_price_at_fetch"))
+        snapshot.get("tickers", {}), snapshot.get("spot_price_at_fetch"),
+        max_expiries=MAX_SURFACE_ROWS, as_of_ms=snapshot.get("end_ms"))
 
     # Derive spot-vol relationship label
     spot_vol_label = None
@@ -204,12 +206,13 @@ def compute_ground_truth(snapshot: dict) -> dict:
 
 
 def fetch_vol_surface(asset: str, spot_price: float) -> dict[str, dict]:
-    """Fetch tickers for key strikes around spot for front two expiries."""
+    """Fetch tickers for key strikes around spot for every listed expiry, so the
+    ground truth picks its rows by tenor exactly as the recap does."""
     currency = asset.upper()
     instruments = fetch("get_instruments", {"currency": currency, "kind": "option", "expired": "false"})
 
     expiries = sorted(set(i["expiration_timestamp"] for i in instruments))
-    front_expiries = expiries[:2]
+    front_expiries = expiries
 
     # Find strikes near spot (ATM ±4 strikes) for each front expiry. ±4 (not
     # ±2) so the 25-delta wings are bracketed and the surface skew/fly metrics
@@ -295,7 +298,7 @@ def main() -> None:
     })
     spot_price = spot_ohlcv["close"][-1] if spot_ohlcv.get("close") else None
 
-    # Fetch trailing 7d spot for realized vol (#1) — a longer, fixed lookback
+    # Fetch trailing 30d spot for realized vol (#1) — a longer, fixed lookback
     # than the recap window: RV-vs-implied is a slow statistic and needs a
     # stable sample, not the 8h window (which would annualize one trending
     # afternoon into noise).

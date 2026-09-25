@@ -10,14 +10,14 @@ for offline fixtures.
 
 recap.py — single-call orchestrator for the prior options recap implementation.
 
-ONE invocation does the entire recap: it fetches the Deribit 7d closes (the
+ONE invocation does the entire recap: it fetches the Deribit 30d closes (the
 realized-vol input), ingests the DuckDB-written CSVs (hot surface + the
 multi-venue block tape), runs the vol math (realized-vs-implied, block
 ranking/rollup, vol-surface skew/term), and prints ONE JSON object whose fields
 map 1:1 to the four output sections.
 
 Pipeline (concurrent where independent):
-  • Deribit 7d hourly closes        → realized vol (no non-Deribit source)
+  • Deribit 30d hourly closes       → realized vol (no non-Deribit source)
   • blocks.csv (DuckDB, tape)       → Biggest Print + Block Flow, across ALL
                                       venues Paradigm brokers (Deribit/Paradex/
                                       Bullish/…), notional already in USD per leg
@@ -28,7 +28,7 @@ Hot CSVs are authoritative for DVOL/spot/$Volume/activity/P-C/surface. Biggest
 Print + Block Flow come from the Paradigm block tape (paradigm_trade_tape_slim)
 — multi-venue, S3-sourced, no live exchange API. The tape carries no IV, so the
 top blocks' IV is looked up from the vol surface (Deribit legs only). Deribit
-still supplies the 7d realized-vol closes; nothing else hits an exchange API.
+still supplies the 30d realized-vol closes; nothing else hits an exchange API.
 
 Usage:
     uv run scripts/recap.py --asset btc --window 8h --csv-dir /tmp/recap
@@ -61,14 +61,12 @@ from vol_math import (  # noqa: E402
     tape_block_key,
     _TAPE_VENUE as _VOL_MATH_VENUE_CODES,
     RV_LOOKBACK_DAYS,
+    MAX_SURFACE_ROWS,
 )
 
 DERIBIT = "https://www.deribit.com/api/v2/public"
 WARNINGS: list[str] = []
 
-# Vol-surface table caps to the front N expiries (chronological). The v_vol_surface
-# store carries the full curve (~12 expiries); the recap only shows the near tenors.
-MAX_SURFACE_ROWS = 5
 
 # ── Freshness gate ──────────────────────────────────────────────────────────
 # How far behind the clock each HEARTBEAT source may fall before the recap stops
@@ -118,7 +116,7 @@ def _get(path: str, params: dict, timeout: int = 15) -> dict:
     return data["result"]
 
 
-def fetch_7d_closes(asset: str, end_ms: int) -> list[float]:
+def fetch_rv_closes(asset: str, end_ms: int) -> list[float]:
     start_ms = end_ms - RV_LOOKBACK_DAYS * 86400_000
     res = _get("get_tradingview_chart_data", {
         "instrument_name": f"{asset}-PERPETUAL", "resolution": "60",
@@ -128,15 +126,15 @@ def fetch_7d_closes(asset: str, end_ms: int) -> list[float]:
 
 
 def fetch_deribit(asset: str, start_ms: int, end_ms: int, want_market: bool) -> dict:
-    """Always: 7d closes (the realized-vol input; no non-Deribit source). If
+    """Always: RV closes (the realized-vol input; no non-Deribit source). If
     want_market (no S3), also DVOL, spot OHLC and a vol-surface ticker set so the
     pipeline runs end-to-end. Block flow no longer comes from here — it's the
     multi-venue Paradigm tape (blocks.csv), so no window-trade fetch."""
-    res: dict = {"closes_7d": [], "market": None}
+    res: dict = {"closes": [], "market": None}
     try:
-        res["closes_7d"] = fetch_7d_closes(asset, end_ms)
+        res["closes"] = fetch_rv_closes(asset, end_ms)
     except Exception as e:
-        warn(f"deribit 7d closes failed: {e}")
+        warn(f"deribit RV closes failed: {e}")
     if want_market:
         try:
             res["market"] = _fetch_market_fallback(asset, start_ms, end_ms)
@@ -839,28 +837,23 @@ def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
         vol = _num(r, "volume_coin")
         if not vol or not r.get("block_id"):
             continue
-        iv_sum, iv_count = _num(r, "iv_sum"), _num(r, "iv_count")
-        avg_iv = round(iv_sum / iv_count, 1) if iv_sum is not None and iv_count else None
         legs = int(_num(r, "leg_count") or 0)
         bucket_ms = _num(r, "bucket_at")
         venue = _venue_label(r.get("exchange"))
-        detail = f"x{vol:g}"
-        if avg_iv is not None:
-            detail += f" {avg_iv}v"
-        detail += f" — {legs or '?'} legs (venue tape)"
+        detail = f"x{vol:g} — {legs or '?'} legs (venue tape)"
         out.append({
             "block_trade_id": r.get("block_id"),
-            "rfq_id": r.get("block_id"),  # its own worked order
+            "rfq_id": r.get("block_id"),  # its own structure
             "structure": f"{venue} Block", "expiry": "",
             "venue": venue,
             "notional_usd": round(vol * (_price_at(r) or spot)),
             "unit_size": round(vol, 1),  # total coin size — legs unknown
-            "side": "", "avg_iv": avg_iv,
+            "side": "",
             # bucket_at is the block's first 5m bucket — ~5-min resolution,
             # hence the "~" prefix (the Paradigm tape has exact times).
             "time_utc": f"~{fmt_hhmm(int(bucket_ms))}" if bucket_ms else "",
             "detail": detail, "leg_count": legs,
-            "source": "venue",
+            "source": "venue", "close_priced": not _price_at(r),
         })
     return out
 
@@ -923,7 +916,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
           deri: dict, hot: dict, block_rows: list[dict] | None = None,
           venue_block_rows: list[dict] | None = None,
           stale: list[dict] | None = None,
-          tape_available: bool | None = None) -> dict:
+          tape_available: bool | None = None, leg_ivs=None) -> dict:
     asset = asset.upper()
     # Defaulting to True silently kept the pre-PR deletion on whichever caller
     # forgot to pass it. Unset now means "read it off the rows you handed me",
@@ -974,7 +967,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         # this recap travels as a gap line.
         spot_from_venue_tape = True
 
-    rv = realized_vs_implied(deri.get("closes_7d") or [], dvol_close)
+    rv = realized_vs_implied(deri.get("closes") or [], dvol_close)
 
     # Volume ($): the upstream turnover_usd sum is a true cross-venue USD total
     # (per-trade, priced at trade time). On a recap file that predates the column
@@ -1043,19 +1036,14 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     tickers = vs_now or hot.get("tickers") or (mkt or {}).get("tickers") or {}
     # Cap the "now" surface at the display limit so the term-structure label
     # describes exactly the tenors the table shows (not invisible back months).
-    surf = (compute_vol_surface(tickers, surf_spot, max_expiries=MAX_SURFACE_ROWS)
-            if tickers else None)
+    surf = (compute_vol_surface(tickers, surf_spot, max_expiries=MAX_SURFACE_ROWS,
+                                as_of_ms=end_ms) if tickers else None)
     surf_open = compute_vol_surface(vs_open, surf_spot) if vs_open else None
 
     # Biggest Print + Block Flow: the multi-venue Paradigm block tape (blocks.csv),
     # ranked/rolled-up in vol_math. Notional is USD per leg on the tape, so this path
-    # does no cross-venue normalization. IV isn't on the tape, so annotate the top
-    # blocks from the vol surface — Deribit legs only (the surface is Deribit-scoped);
-    # non-Deribit venues show IV n/a.
-    def iv_lookup(cp: str, strike: int, expiry_c: str):
-        t = (vs_now or {}).get(f"{asset}-{expiry_c}-{int(strike)}-{cp}")
-        return t.get("mark_iv") if t else None
-
+    # does no cross-venue normalization. Leg IVs come from `leg_ivs`, the surface
+    # at each block's print time; without it the legs carry none.
     # Defense in depth: the DuckDB query already scopes blocks.csv to this asset,
     # but drop any stray other-asset row (PRODUCT '<ASSET> OPTION - …') before
     # ranking — a leaked ETH row must never win a BTC recap's Biggest Print.
@@ -1084,7 +1072,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
     _in_window = [r for r in _deduped
                   if (_num(r, "bucket_at") or 0) >= start_ms]
     venue_blocks = _venue_tape_blocks(_in_window, spot)
-    block = build_tape_blocks(own_blocks, iv_lookup=iv_lookup,
+    block = build_tape_blocks(own_blocks, leg_ivs=leg_ivs,
                               extra_blocks=venue_blocks)
 
     # >24h flag: Volume/Activity/P-C/DVOL/spot come from the ~24h hot rollup, so a
@@ -1110,7 +1098,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "dvol_low": round(dvol_low, 1) if dvol_low is not None else None,
         "dvol_high": round(dvol_high, 1) if dvol_high is not None else None,
         "dvol_label": dvol_label(dvol_open, dvol_close),
-        "rv_7d": rv.get("value"), "vrp": rv.get("vrp"), "vrp_label": rv.get("vrp_label"),
+        "rv": rv.get("value"), "vrp": rv.get("vrp"), "vrp_label": rv.get("vrp_label"),
         "volume_usd_m": round(vol_usd / 1e6) if vol_usd else None,
         "volume_scope": volume_scope,
         "activity_trades": tt,
@@ -1129,7 +1117,7 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
             return round(curr - prev, 1) if (curr is not None and prev is not None) else None
 
         rows = []
-        for e in surf.get("expiries", [])[:MAX_SURFACE_ROWS]:
+        for e in surf.get("expiries", []):
             o = open_by_exp.get(e["expiry"])
             rows.append({
                 "expiry": e["expiry"], "atm": e["atm_iv"],
@@ -1166,6 +1154,10 @@ def build(asset: str, window: str, start_ms: int, end_ms: int,
         "block_exclusions": _lost_blocks(_excluded, start_ms, spot),
         "blocks_below_floor": block.get("trimmed", {}),
         "spot_from_venue_tape": spot_from_venue_tape,
+        # Only blocks ranked at the closing spot: a venue whose blocks were all
+        # excluded, unpriced or under the floor never was.
+        "close_priced_venues": sorted({b["venue"] for b in venue_blocks if b["close_priced"]
+                                       and b["notional_usd"] >= MIN_BLOCK_NOTIONAL_USD}),
     }
 
 
@@ -1344,8 +1336,8 @@ def render_md(r: dict) -> str:
     vrp = s.get("vrp")
     rich = ("unavailable" if vrp is None else "CHEAP" if vrp is not None and vrp < -1 else
             "RICH" if vrp is not None and vrp > 1 else "IN LINE")
-    rv = f"{s['rv_7d']}v" if s.get("rv_7d") is not None else "n/a"
-    L.append(f"{'RV 7d':<9} {rv:<11} implied {rich} vs realized")
+    rv = f"{s['rv']}v" if s.get("rv") is not None else "n/a"
+    L.append(f"{f'RV {RV_LOOKBACK_DAYS}d':<9} {rv:<11} implied {rich} vs realized")
 
     vrp_txt = f"{vrp:+}v" if vrp is not None else "n/a"
     # Same ±1v dead-band as the RV line above — otherwise a VRP in (0,1] prints
@@ -1386,22 +1378,14 @@ def render_md(r: dict) -> str:
     L += ["```", "", "**Biggest Print**", "", "```yaml"]
 
     if bp:
-        # "Mixed" is a structure fact (legs point both ways), not an aggressor
-        # read — don't put it in the side slot. Venue names the executing venue.
-        # Source-aware routing tag: a Paradigm-brokered block reads
-        # "via Paradigm/<venue>"; a venue-tape block reads "via venue tape" —
-        # its venue is already the structure label ("OKX Block"), and the tag
-        # explains the unclassified structure + the ~approximate time.
-        tags = [bp["side"]] if bp.get("side") in ("Buy", "Sell") else []
-        if bp.get("avg_iv") is not None:
-            tags.append(f"{bp['avg_iv']}v avg")
-        tag_txt = f" ({', '.join(tags)})" if tags else ""
+        # The detail is the same leg list Block Flow shows: each leg's size and
+        # taker side, so the line never needs a separate size or side slot.
         via = ("via venue tape" if bp.get("source") == "venue"
                else f"via Paradigm/{bp.get('venue') or '?'}")
         label = f"{bp['expiry']} {bp['structure']}".strip()  # venue blocks have no expiry
-        L.append(f"{label}   {bp['size']:g}x   "
-                 f"${bp['notional_m']}M   {bp['time_utc']} UTC   "
-                 f"{via}{tag_txt}")
+        detail = (bp.get("detail") or "").replace(" (venue tape)", "")
+        L.append(f"{label}   ${bp['notional_m']}M   {bp['time_utc']} UTC   "
+                 f"{via}   {detail}".rstrip())
     else:
         # output-format.md: name the source and reason rather than going blank.
         # True whichever way the pool emptied — no blocks at all, all excluded by
@@ -1417,10 +1401,10 @@ def render_md(r: dict) -> str:
     # venue isn't a column — the Biggest Print line's via Paradigm/<venue> tag
     # is where the venue shows.
     sw = max([27] + [len(row["structure"]) + 2 for row in bf["rows"]])
-    L += ["```", "", f"**Block Flow — ${bf['total_m']}M / {bf['n_blocks']} {block_word} / "
+    L += ["```", "", f"**Block Flow — ${bf['total_m']}M notional / {bf['n_blocks']} {block_word} / "
           f"{n_struct} {struct_word}{trunc}**",
           "", "```yaml",
-          f"{'#':<3}{'Structure':<{sw}}{'Notl':<9}{'Blocks':<8}Detail",
+          f"{'#':<3}{'Structure':<{sw}}{'Notl':<9}{'Blocks':<8}Detail (+ taker bought, - taker sold)",
           f"{'-':<3}{'-' * (sw - 2):<{sw}}{'-' * 7:<9}{'-' * 6:<8}{'-' * 44}"]
     for row in bf["rows"]:
         notl = f"${row['notl_m']}M"
@@ -1496,7 +1480,7 @@ def main() -> None:
         hot = {"tickers": {}}
         deri = fetch_deribit(ASSET, start_ms, now_ms, want_market=True)
     else:
-        # Parallelize the DuckDB read (hot CSVs + block tape) with the Deribit 7d
+        # Parallelize the DuckDB read (hot CSVs + block tape) with the Deribit 30d
         # closes fetch (the realized-vol input) — both are network-bound.
         with ThreadPoolExecutor(max_workers=2) as ex:
             duck_fut = ex.submit(run_duckdb, args.duckdb_sql) if args.duckdb_sql else None

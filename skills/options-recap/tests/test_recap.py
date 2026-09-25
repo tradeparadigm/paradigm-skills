@@ -16,6 +16,7 @@ exact rows seen in production.
 """
 
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -145,7 +146,7 @@ TRADES = [
     {"instrument_name": "BTC-26JUN26-65000-C", "index_price": 60000, "iv": 60.0,
      "timestamp": 1780000000000, "direction": "sell", "amount": 100, "block_trade_id": "B1"},
 ]
-CLOSES_7D = [60000 + (i % 5) * 50 for i in range(60)]  # gentle, non-flat
+CLOSES = [60000 + (i % 5) * 50 for i in range(60)]  # gentle, non-flat
 
 # Block tape (paradigm_trade_tape_slim) rows — the source for Biggest Print +
 # Block Flow now. A Risk Reversal booked as two per-leg rows (put buy + call
@@ -259,7 +260,7 @@ def test_volume_hot_only_deribit_scoped():
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot(d)
         res = build("btc", "8h", 0, 8 * 3600_000,
-                    {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+                    {"closes": CLOSES, "market": None}, hot, BLOCKS_RR)
     s = res["snapshot"]
     # Deribit-scoped: 7422.5 BTC × $60,468 ≈ $448.9M — NOT the old $9.8T, and NOT
     # the $12M block-tape figure (blocks are a different, multi-venue universe).
@@ -284,7 +285,7 @@ def test_volume_na_without_hot():
     with tempfile.TemporaryDirectory() as d:
         hot = load_hot(d, "BTC")  # empty dir → no hot volume_btc
     res = build("btc", "8h", 0, 8 * 3600_000,
-                {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+                {"closes": CLOSES, "market": None}, hot, BLOCKS_RR)
     check("volume_usd_m None without hot", res["snapshot"]["volume_usd_m"] is None,
           res["snapshot"]["volume_usd_m"])
     md = render_md(res)
@@ -402,7 +403,7 @@ def test_venue_tape_blocks_priced_by_coin_volume_not_premium():
     check("notional = volume_coin × spot", big["notional_usd"] == 300 * 60468,
           big["notional_usd"])
     check("premium never the notional", big["notional_usd"] != 90000, big["notional_usd"])
-    check("avg_iv from components (62.5)", big["avg_iv"] == 62.5, big["avg_iv"])
+    check("no leg-averaged IV in the detail", "62.5v" not in big["detail"], big["detail"])
     check("source tagged venue", big["source"] == "venue", big)
     check("time approximate (~HH:MM)", big["time_utc"].startswith("~"), big["time_utc"])
     # Venue lives in the structure label — there is no per-row venue column.
@@ -421,7 +422,7 @@ def test_venue_blocks_merge_into_block_flow():
         _write(d, "venue_blocks.csv", VENUE_BLOCKS_CSV)
         venue_rows = load_venue_blocks(d, "BTC")
         res = build("btc", "8h", 0, 8 * 3600_000,
-                    {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR, venue_rows)
+                    {"closes": CLOSES, "market": None}, hot, BLOCKS_RR, venue_rows)
     bf, bp = res["block_flow"], res["biggest_print"]
     # Pool after structural dedupe + $250k floor: Paradigm RR $12M + OKX
     # $18.14M. Deribit/Bullish venue-tape blocks are excluded (brokered venues,
@@ -433,6 +434,8 @@ def test_venue_blocks_merge_into_block_flow():
     venues = [r.get("venue") for r in bf["rows"]]
     check("OKX venue row present", "OKX" in venues, venues)
     check("no brokered-venue tape rows leaked", "Bullish" not in venues, venues)
+    check("only venues that reached the pool are named as close-priced",
+          res.get("close_priced_venues") == ["OKX"], res.get("close_priced_venues"))
     check("OKX outranks the RR", bf["rows"][0]["venue"] == "OKX", bf["rows"][0])
     # Biggest Print is the OKX venue-tape block, source-tagged.
     check("biggest is the OKX block", bp["notional_m"] == 18.1, bp)
@@ -441,6 +444,7 @@ def test_venue_blocks_merge_into_block_flow():
     check("biggest line names venue in label", "OKX Block" in md, "render")
     check("biggest line says via venue tape", "via venue tape" in md, "render")
     check("title stays plain (no source scope tag)", "**Block Flow — $" in md, "render")
+    check("the total says it is notional", re.search(r"\*\*Block Flow — \$[\d.]+M notional / ", md), md)
     check("~time rendered (5m resolution)", "~" in md, "render")
 
 
@@ -448,7 +452,7 @@ def test_block_flow_unchanged_without_venue_blocks():
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot(d)
         res = build("btc", "8h", 0, 8 * 3600_000,
-                    {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+                    {"closes": CLOSES, "market": None}, hot, BLOCKS_RR)
     md = render_md(res)
     check("plain title", "**Block Flow — $" in md, "render")
     check("no venue-tape traces", "venue tape" not in md, "render")
@@ -481,7 +485,7 @@ def test_turnover_drives_volume_line_and_label():
         _write(d, "dvol_spot.csv", DVOL_SPOT_CSV)
         hot = load_hot(d, "BTC")
         res = build("btc", "8h", 0, 8 * 3600_000,
-                    {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+                    {"closes": CLOSES, "market": None}, hot, BLOCKS_RR)
     s = res["snapshot"]
     check("volume_usd_m from turnover (280)",
           s["volume_usd_m"] == round(UPGRADED_TURNOVER_TOTAL / 1e6), s["volume_usd_m"])
@@ -500,7 +504,7 @@ def test_missing_turnover_falls_back_to_deribit_scope():
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot(d)  # CORRUPT_VOLUME_CSV carries no turnover_usd
         res = build("btc", "8h", 0, 8 * 3600_000,
-                    {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+                    {"closes": CLOSES, "market": None}, hot, BLOCKS_RR)
     s = res["snapshot"]
     check("no turnover parsed", hot["turnover_usd"] is None, hot["turnover_usd"])
     check("fallback scope deribit", s["volume_scope"] == "deribit", s["volume_scope"])
@@ -522,7 +526,7 @@ def test_all_null_turnover_column_falls_back():
         _write(d, "dvol_spot.csv", DVOL_SPOT_CSV)
         hot = load_hot(d, "BTC")
         res = build("btc", "8h", 0, 8 * 3600_000,
-                    {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+                    {"closes": CLOSES, "market": None}, hot, BLOCKS_RR)
     check("all-null → no turnover", hot["turnover_usd"] is None, hot["turnover_usd"])
     check("all-null → fallback scope", res["snapshot"]["volume_scope"] == "deribit",
           res["snapshot"]["volume_scope"])
@@ -544,7 +548,7 @@ def test_partial_turnover_does_not_claim_all_venues():
         _write(d, "dvol_spot.csv", DVOL_SPOT_CSV)
         hot = load_hot(d, "BTC")
         res = build("btc", "8h", 0, 8 * 3600_000,
-                    {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+                    {"closes": CLOSES, "market": None}, hot, BLOCKS_RR)
     s = res["snapshot"]
     check("partial turnover detected", hot["turnover_complete"] is False,
           hot["turnover_complete"])
@@ -569,13 +573,13 @@ def test_a_dead_price_feed_does_not_zero_block_flow():
     venue_rows = [{"exchange": "deribit", "block_id": "V-1", "bucket_at": 1_500_000,
                    "volume_coin": 10.0, "leg_count": 1}]
     # No spot anywhere: no Deribit market, no hot surface, no spot_close.
-    res = build("btc", "8h", 0, 8 * 3600_000, {"closes_7d": [], "market": None},
+    res = build("btc", "8h", 0, 8 * 3600_000, {"closes": [], "market": None},
                 {"trades_total": 10, "trades_by_venue": {"deribit": 10}},
                 venue_block_rows=venue_rows, tape_available=False)
     check("with no price at all Block Flow is empty",
           res["block_flow"]["n_blocks"] == 0, res["block_flow"])
     # Same window, same rows, but the venue tape carried its own index.
-    res2 = build("btc", "8h", 0, 8 * 3600_000, {"closes_7d": [], "market": None},
+    res2 = build("btc", "8h", 0, 8 * 3600_000, {"closes": [], "market": None},
                  {"trades_total": 10, "trades_by_venue": {"deribit": 10},
                   "venue_index_close": 100_000.0},
                  venue_block_rows=venue_rows, tape_available=False)
@@ -587,7 +591,7 @@ def test_a_dead_price_feed_does_not_zero_block_flow():
     check("and the reader is told the price is approximate",
           res2.get("spot_from_venue_tape") is True, res2.get("spot_from_venue_tape"))
     check("while a normal run claims nothing",
-          build("btc", "8h", 0, 8 * 3600_000, {"closes_7d": [], "market": None},
+          build("btc", "8h", 0, 8 * 3600_000, {"closes": [], "market": None},
                 {"spot_close": 100000.0, "trades_total": 1},
                 tape_available=False).get("spot_from_venue_tape") is False)
 
@@ -595,7 +599,7 @@ def test_a_dead_price_feed_does_not_zero_block_flow():
 def test_an_extrapolated_surface_value_is_starred_where_it_renders():
     """Every star mutation survived the gate: nothing rendered a surface whose
     values were clamped to a thin chain's endpoint rather than interpolated."""
-    res = build("btc", "8h", 0, 8 * 3600_000, {"closes_7d": [], "market": None},
+    res = build("btc", "8h", 0, 8 * 3600_000, {"closes": [], "market": None},
                 {"spot_close": 100000.0, "trades_total": 1}, tape_available=False)
     res["vol_surface"] = {
         "skew_line": "front 25Δ RR +1.0v → calls bid", "term_line": "humped",
@@ -675,7 +679,7 @@ def test_activity_split_collapses_deribit_venues():
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot(d)
         res = build("btc", "8h", 0, 8 * 3600_000,
-                    {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
+                    {"closes": CLOSES, "trades": [], "market": None}, hot)
     s = res["snapshot"]
     split = s["activity_split"]
     deribit_entries = [v for v in split if v["venue"] == "Deribit"]
@@ -832,7 +836,7 @@ def test_surface_metrics_flow_through_build():
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot(d)
         res = build("btc", "8h", 0, 8 * 3600_000,
-                    {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
+                    {"closes": CLOSES, "trades": [], "market": None}, hot)
     vs = res["vol_surface"]
     check("surface present", vs is not None and len(vs["rows"]) == 1, vs)
     row = vs["rows"][0]
@@ -871,7 +875,7 @@ def test_surface_deltas_flow_through_build():
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot_deltas(d)
         res = build("btc", "8h", 0, 8 * 3600_000,
-                    {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
+                    {"closes": CLOSES, "trades": [], "market": None}, hot)
     row = res["vol_surface"]["rows"][0]
     # Displayed (now) values come from v_vol_surface.
     check("now ATM 45", row["atm"] == 45.0, row)
@@ -887,7 +891,7 @@ def test_render_delta_columns_present_and_formatted():
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot_deltas(d)
         res = build("btc", "8h", 0, 8 * 3600_000,
-                    {"closes_7d": CLOSES_7D, "trades": TRADES, "market": None}, hot)
+                    {"closes": CLOSES, "trades": TRADES, "market": None}, hot)
     md = render_md(res)
     check("header has ΔATM", "ΔATM" in md, md)
     check("header has ΔRR", "ΔRR" in md, md)
@@ -908,8 +912,9 @@ def test_delta_fmt():
 
 
 def test_surface_caps_to_max_rows():
-    # 6 expiries in the now snapshot → table caps to MAX_SURFACE_ROWS (front).
-    exps = ["3JUL26", "10JUL26", "17JUL26", "24JUL26", "31JUL26", "28AUG26"]
+    # 8 expiries in the now snapshot → MAX_SURFACE_ROWS of them, chosen by tenor.
+    exps = ["3JUL26", "10JUL26", "17JUL26", "24JUL26", "31JUL26", "28AUG26",
+            "25SEP26", "30OCT26"]
     lines = ["symbol,mark_iv,delta"]
     for e in exps:
         lines += [f"BTC-{e}-60000-C,45.0,0.50",
@@ -920,9 +925,12 @@ def test_surface_caps_to_max_rows():
         _write(d, "surface_now.csv", "\n".join(lines) + "\n")
         hot = load_hot(d, "BTC")
         res = build("btc", "8h", 0, 8 * 3600_000,
-                    {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
+                    {"closes": CLOSES, "trades": [], "market": None}, hot)
     n = len(res["vol_surface"]["rows"])
     check(f"rows capped to {MAX_SURFACE_ROWS}", n == MAX_SURFACE_ROWS, n)
+    shown = [r["expiry"] for r in res["vol_surface"]["rows"]]
+    check("front, next weekly, then monthlies",
+          shown == ["3JUL26", "10JUL26", "31JUL26", "28AUG26", "25SEP26"], shown)
 
 
 # ── load_hot: missing files degrade, don't crash ────────────────────────────
@@ -943,7 +951,7 @@ def _block_flow(block_rows):
     """Build via the live path (build → build_tape_blocks) with empty hot, so the
     block section is exercised end-to-end. Returns (block_flow, biggest_print)."""
     res = build("btc", "8h", 0, 8 * 3600_000,
-                {"closes_7d": CLOSES_7D, "market": None}, {}, block_rows)
+                {"closes": CLOSES, "market": None}, {}, block_rows)
     return res["block_flow"], res["biggest_print"]
 
 
@@ -1067,6 +1075,26 @@ def test_block_flow_column_stretches_for_long_labels():
           (header, row))
 
 
+def test_biggest_print_shows_legs_as_traded():
+    # A 1x2 call diagonal: the line used to read "Call Diagonal   500x", hiding
+    # both the ratio and which leg was bought.
+    rows = [
+        _blk("Call 25 Sep 26 80000", "SELL", 42_100_000, bid="D1", rfq="RD", tid="t1", qty=500),
+        _blk("Call 30 Oct 26 90000", "BUY", 84_200_000, bid="D1", rfq="RD", tid="t2", qty=1000),
+    ]
+    bf, bp = _block_flow(rows)
+    md = render_md({"header": {"asset": "BTC", "window": "24h", "start_utc": "05:55",
+                               "end_utc": "05:55"},
+                    "snapshot": {}, "biggest_print": bp,
+                    "block_flow": bf, "vol_surface": None, "hot_horizon": None,
+                    "warnings": []})
+    line = next(l for l in md.splitlines() if "via Paradigm/" in l)
+    check("biggest print names the ratio", "Call Ratio Diagonal" in line, line)
+    check("biggest print lists signed legs",
+          line.endswith("-500 25SEP26 80KC / +1000 30OCT26 90KC"), line)
+    check("no unit-size column", "500x" not in line, line)
+
+
 # ── Snapshot helper labels ──────────────────────────────────────────────────
 
 def test_helpers():
@@ -1093,7 +1121,7 @@ def _full_result():
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot(d)
     return build("btc", "8h", 0, 8 * 3600_000,
-                 {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+                 {"closes": CLOSES, "market": None}, hot, BLOCKS_RR)
 
 
 def test_render_four_sections():
@@ -1126,12 +1154,12 @@ def test_render_vrp_deadband_matches_rv_line():
     # "overpriced" on adjacent lines (the contradiction this fix removes).
     md = render_md({"header": {"asset": "BTC", "window": "1h", "start_utc": "01:00",
                                "end_utc": "02:00"},
-                    "snapshot": {"vrp": 0.5, "rv_7d": 45.0, "dvol": 45.5},
+                    "snapshot": {"vrp": 0.5, "rv": 45.0, "dvol": 45.5},
                     "biggest_print": None,
                     "block_flow": {"rows": [], "n_blocks": 0, "n_structures": 0,
                                    "total_m": 0, "truncated": False},
                     "vol_surface": None, "hot_horizon": None, "warnings": []})
-    rv_line = next(l for l in md.splitlines() if l.startswith("RV 7d"))
+    rv_line = next(l for l in md.splitlines() if l.startswith("RV 30d"))
     vrp_line = next(l for l in md.splitlines() if l.startswith("VRP"))
     check("small +VRP → RV line IN LINE", "IN LINE" in rv_line, rv_line)
     check("small +VRP → VRP line roughly fair", "roughly fair" in vrp_line, vrp_line)
@@ -1139,7 +1167,7 @@ def test_render_vrp_deadband_matches_rv_line():
     # Outside the band the words still flip.
     md2 = render_md({"header": {"asset": "BTC", "window": "1h", "start_utc": "01:00",
                                 "end_utc": "02:00"},
-                     "snapshot": {"vrp": 3.0, "rv_7d": 42.0, "dvol": 45.0},
+                     "snapshot": {"vrp": 3.0, "rv": 42.0, "dvol": 45.0},
                      "biggest_print": None,
                      "block_flow": {"rows": [], "n_blocks": 0, "n_structures": 0,
                                     "total_m": 0, "truncated": False},
@@ -1160,7 +1188,7 @@ def test_render_activity_na_when_missing():
     with tempfile.TemporaryDirectory() as d:
         hot = load_hot(d, "BTC")  # empty dir → no activity
     res = build("btc", "30m", 0, 1800_000,
-                {"closes_7d": [], "trades": [], "market": None}, hot)
+                {"closes": [], "trades": [], "market": None}, hot)
     md = render_md(res)
     activity_lines = [ln for ln in md.splitlines() if ln.strip().startswith("Activity")]
     check("Activity line present when empty", len(activity_lines) == 1, md[:400])
@@ -1193,7 +1221,7 @@ def test_beyond_24h_prefers_market_ohlc():
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot(d)  # hot says spot low 59000, dvol 43.34 — 24h-scoped
     res = build("btc", "48h", end - 48 * 3600_000, end,
-                {"closes_7d": CLOSES_7D, "trades": [], "market": mkt}, hot)
+                {"closes": CLOSES, "trades": [], "market": mkt}, hot)
     s = res["snapshot"]
     check("48h spot low from market, not hot", s["spot_low"] == 60500, s["spot_low"])
     check("48h spot from market", s["spot"] == 63000, s["spot"])
@@ -1206,13 +1234,13 @@ def test_beyond_24h_prefers_market_ohlc():
         scoped = _full_hot(d)
     scoped["dvol_window_scoped"] = True
     kept = build("btc", "48h", end - 48 * 3600_000, end,
-                 {"closes_7d": CLOSES_7D, "trades": [], "market": mkt}, scoped)["snapshot"]
+                 {"closes": CLOSES, "trades": [], "market": mkt}, scoped)["snapshot"]
     check("48h dvol keeps a window-scoped read", kept["dvol"] == 43.3, kept["dvol"])
     check("48h spot still comes from market", kept["spot"] == 63000, kept["spot"])
     check("48h dvol_open from market", round(s["dvol_open"], 1) == 40.0, s["dvol_open"])
     # Within 24h, hot stays authoritative even when a market series exists.
     res8 = build("btc", "8h", end - 8 * 3600_000, end,
-                 {"closes_7d": CLOSES_7D, "trades": [], "market": mkt}, hot)
+                 {"closes": CLOSES, "trades": [], "market": mkt}, hot)
     check("8h keeps hot spot", res8["snapshot"]["spot"] == 60468, res8["snapshot"]["spot"])
     check("8h keeps hot dvol", res8["snapshot"]["dvol"] == 43.3, res8["snapshot"]["dvol"])
 
@@ -1222,7 +1250,7 @@ def test_render_degraded_banner():
     with tempfile.TemporaryDirectory() as d:
         hot = load_hot(d, "BTC")  # empty → no volume, no surface, warnings
     res = build("btc", "8h", 0, 8 * 3600_000,
-                {"closes_7d": [], "trades": [], "market": None}, hot)
+                {"closes": [], "trades": [], "market": None}, hot)
     md = render_md(res)
     check("degraded banner leads the Snapshot fence",
           _first_fenced(md).startswith("⚠ hot surface unavailable"), md.splitlines()[:8])
@@ -1280,13 +1308,13 @@ def test_header_dates_on_multiday_windows():
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot(d)
     res = build("btc", "48h", end - 48 * 3600_000, end,
-                {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
+                {"closes": CLOSES, "trades": [], "market": None}, hot)
     h = res["header"]
     check("48h start != end in header", h["start_utc"] != h["end_utc"], h)
     check("48h header carries a date", " " in h["start_utc"], h["start_utc"])
     # Intraday window stays HH:MM only.
     res8 = build("btc", "8h", end - 8 * 3600_000, end,
-                 {"closes_7d": CLOSES_7D, "trades": [], "market": None}, hot)
+                 {"closes": CLOSES, "trades": [], "market": None}, hot)
     check("8h header HH:MM only", " " not in res8["header"]["start_utc"], res8["header"])
 
 
@@ -1300,7 +1328,7 @@ def test_hot_horizon_banner_beyond_24h():
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot(d)
     res = build("btc", "72h", start, end,
-                {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+                {"closes": CLOSES, "market": None}, hot, BLOCKS_RR)
     check("hot_horizon set to 72", res["hot_horizon"] == 72, res["hot_horizon"])
     md = render_md(res)
     check("banner rendered", "hot-rollup horizon" in md, md[:200])
@@ -1316,7 +1344,7 @@ def test_no_hot_horizon_banner_within_24h():
     with tempfile.TemporaryDirectory() as d:
         hot = _full_hot(d)
     res = build("btc", "8h", end - 8 * 3600_000, end,
-                {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+                {"closes": CLOSES, "market": None}, hot, BLOCKS_RR)
     check("no hot_horizon within 24h", res["hot_horizon"] is None, res["hot_horizon"])
     check("no banner in md", "hot-rollup horizon" not in render_md(res))
 
@@ -1486,7 +1514,7 @@ def test_stale_surface_spot_cannot_outrank_the_live_fallback():
               "spot_now": 121000.0, "tickers": {}}
     drop_stale_snapshot_fields(hot, market)
     r = build("BTC", "8h", NOW - 8 * 3600_000, NOW,
-              {"closes_7d": [], "market": market}, hot, [], [], stale=[])
+              {"closes": [], "market": market}, hot, [], [], stale=[])
     snap = r["snapshot"]
     check("snapshot exposes spot, not spot_close", "spot" in snap, sorted(snap))
     check("stale July price did not resurface", snap.get("spot") != 55000, snap.get("spot"))
@@ -1502,7 +1530,7 @@ def test_fmt_lag_is_human():
 
 def _minimal_result(stale):
     return build("BTC", "8h", NOW - 8 * 3600_000, NOW,
-                 {"closes_7d": [], "market": None}, {}, [], [], stale=stale)
+                 {"closes": [], "market": None}, {}, [], [], stale=stale)
 
 
 def test_stale_banner_leads_and_states_the_outcome():
@@ -1578,7 +1606,7 @@ def _run_main(csv_dir, market=None, now_ms=NOW, extra_argv=()):
     orig_fb, orig_deri = recap._fetch_market_fallback, recap.fetch_deribit
     recap._fetch_market_fallback = fake_fallback
     recap.fetch_deribit = (lambda a, s, e, want_market=False:
-                           {"closes_7d": [],
+                           {"closes": [],
                             "market": market if want_market else None})
     argv = ["recap.py", "--asset", "BTC", "--window", "8h",
             "--csv-dir", csv_dir, "--now-ms", str(now_ms), "--render", *extra_argv]
@@ -1784,7 +1812,7 @@ def test_build_passes_the_tape_to_the_dedupe():
 
     recap._dedupe_venue_blocks = spy
     try:
-        build("BTC", "8h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+        build("BTC", "8h", 1_000_000, 2_000_000, {"closes": [], "market": None},
               {"spot_close": 100000.0},
               [{"PRODUCT": "BTC OPTION - DBT", "DESCRIPTION": "C", "QTY": "1",
                 "NOTIONAL_VOLUME_USD": "1000", "SIDE": "BUY", "BLOCK_TRADE_ID": "D1",
@@ -1871,7 +1899,7 @@ def test_pre_window_venue_block_never_reaches_the_pool():
     start = 1_000_000_000_000
     bucket = start - 120_000            # inside the straddling bucket, BEFORE open
     r = build("BTC", "8h", start, start + 8 * 3600_000,
-              {"closes_7d": [], "market": None}, {"spot_close": 100_000.0}, [],
+              {"closes": [], "market": None}, {"spot_close": 100_000.0}, [],
               [{"exchange": "okex-options", "block_id": "STALE", "bucket_at": str(bucket),
                 "volume_coin": "500", "premium_usd": "50000000", "leg_count": "1"},
                {"exchange": "okex-options", "block_id": "FRESH",
@@ -1924,7 +1952,7 @@ def test_empty_block_tape_is_rendered_not_silently_quiet():
     # indistinguishable from a genuinely quiet window unless it is said out
     # loud. WARNINGS are discarded on --render, so this is rendered.
     r = build("BTC", "8h", NOW - 8 * 3600_000, NOW,
-              {"closes_7d": [], "market": None}, {}, [], [])
+              {"closes": [], "market": None}, {}, [], [])
     r["block_tape_empty"] = True
     md = render_md(r)
     check("empty feed is announced", "Block Flow unavailable" in md, md.splitlines()[:4])
@@ -1991,7 +2019,7 @@ def test_warning_banners_render_inside_snapshot_fence():
     with tempfile.TemporaryDirectory() as d:
         hot = load_hot(d, "BTC")
     res = build("btc", "8h", 0, 8 * 3600_000,
-                {"closes_7d": CLOSES_7D, "market": None}, hot, BLOCKS_RR)
+                {"closes": CLOSES, "market": None}, hot, BLOCKS_RR)
     res["source_gaps"] = [
         "Paradigm executions: coverage ends 66 min before the requested end",
         "option_trades_bullish: 4/9 hourly/bucket paths absent; partial coverage",
@@ -2049,7 +2077,7 @@ def test_coverage_leads_the_snapshot_and_names_unread_venues():
     The line sits INSIDE the Snapshot fence because on 2026-09-08 the relay kept
     every Snapshot figure and deleted all three unfenced warning lines."""
     out = render_md(build(
-        "BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+        "BTC", "24h", 1_000_000, 2_000_000, {"closes": [], "market": None},
         {"spot_close": 100000.0, "trades_total": 10,
          "trades_by_venue": {"deribit": 8, "bullish": 0, "bybit-options": 2},
          "venue_coverage": {"deribit": ("complete", {}), "bullish": ("quiet", {}),
@@ -2074,14 +2102,14 @@ def test_coverage_leads_the_snapshot_and_names_unread_venues():
              "unreadable": "READ FAILED", "unknown": "unverified"}
     for state, word in words.items():
         one = render_md(build(
-            "BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+            "BTC", "24h", 1_000_000, 2_000_000, {"closes": [], "market": None},
             {"spot_close": 100000.0, "trades_total": 10, "trades_by_venue": {"deribit": 10},
              "venue_coverage": {"deribit": (state, {})}}))
         line = next((l for l in one.splitlines() if l.startswith("Coverage")), "")
         check(f"{state} renders as '{word}'", word in line, line)
     # An unrecognised state must not take the render down with it.
     odd = render_md(build(
-        "BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+        "BTC", "24h", 1_000_000, 2_000_000, {"closes": [], "market": None},
         {"spot_close": 100000.0, "trades_total": 10,
          "trades_by_venue": {"deribit": 8, "deribit-usdc": 2},
          "venue_coverage": {"deribit": ("complete", {}), "deribit-usdc": ("stale_feed", {})}}))
@@ -2090,7 +2118,7 @@ def test_coverage_leads_the_snapshot_and_names_unread_venues():
           next((l for l in odd.splitlines() if l.startswith("Coverage")), ""))
     # Coverage and Activity must not contradict each other on adjacent lines.
     both = render_md(build(
-        "BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+        "BTC", "24h", 1_000_000, 2_000_000, {"closes": [], "market": None},
         {"spot_close": 100000.0, "trades_total": 1000,
          "trades_by_venue": {"deribit": 600, "okex-options": 400},
          "venue_coverage": {"deribit": ("feed_gap", {}), "okex-options": ("companion_gap", {})}}))
@@ -2100,7 +2128,7 @@ def test_coverage_leads_the_snapshot_and_names_unread_venues():
           "1/2 venues" in cline and "Deribit unread" in aline, (cline, aline))
     # An all-unread window must not render a dangling separator.
     none_read = render_md(build(
-        "BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+        "BTC", "24h", 1_000_000, 2_000_000, {"closes": [], "market": None},
         {"spot_close": 100000.0, "trades_total": 10, "trades_by_venue": {"deribit": 10},
          "venue_coverage": {"deribit": ("unreadable", {})}}))
     nline = next((l for l in none_read.splitlines() if l.startswith("Activity")), "")
@@ -2116,7 +2144,7 @@ def test_coverage_leads_the_snapshot_and_names_unread_venues():
     # The denominator drops with it. A feed_gap venue still contributes SOME
     # trades, so dividing by the full total left the shown shares summing to
     # less than 100% under a line promising they were shares of what was read.
-    partial = build("BTC", "24h", 1_000_000, 2_000_000, {"closes_7d": [], "market": None},
+    partial = build("BTC", "24h", 1_000_000, 2_000_000, {"closes": [], "market": None},
                     {"spot_close": 100000.0, "trades_total": 1000,
                      "trades_by_venue": {"deribit": 600, "okex-options": 200,
                                          "bybit-options": 200},

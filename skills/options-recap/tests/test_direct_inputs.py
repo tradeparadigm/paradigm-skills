@@ -57,7 +57,6 @@ def test_event_time_units_not_latest_metadata():
     snapshot, blocks, turnover = reduce(trades(trade()), spec(), gaps)
     assert turnover == 800.0  # 100 contracts * 0.01 BTC * 0.01 premium * 80k
     assert blocks[0]["volume_coin"] == 1.0
-    assert blocks[0]["iv_sum"] == 40.0
     assert snapshot["put_trades"] == 1
     assert not gaps
 
@@ -442,7 +441,7 @@ def _run_once(monkeypatch, *, coverage=("feed_gap", {"lost_hours": ["20260916T10
     monkeypatch.setattr(direct, "aggregate_trades", lambda *a, **k: dict(direct.EMPTY_TOTAL))
     monkeypatch.setattr(direct, "read_executions",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no partition")))
-    monkeypatch.setattr(recap, "fetch_7d_closes", lambda *a, **k: [])
+    monkeypatch.setattr(recap, "fetch_rv_closes", lambda *a, **k: [])
     monkeypatch.setattr(recap, "_fetch_market_fallback", lambda *a, **k: None)
     captured = {}
 
@@ -689,3 +688,65 @@ def test_the_scope_labels_match_the_documented_template():
     source = Path(direct.__file__).read_text(encoding="utf-8")
     for label in re.findall(r'\["(?:volume|activity)_scope"\] = "([^"]+)"', source):
         assert label in template, label
+
+
+def test_leg_iv_is_the_snapshot_nearest_the_print(tmp_path):
+    """The mark IV comes from the bucket holding the print, not the window's end."""
+    import duckdb
+    snaps = tmp_path / "summary.parquet"
+    at = datetime(2026, 9, 24, 15, 45, 10, tzinfo=UTC)
+    pl.DataFrame({
+        "symbol": ["BTC-30OCT26-90000-C"] * 3 + ["BTC-25SEP26-80000-C"],
+        "timestamp": ["2026-09-24T15:45:00Z", "2026-09-24T15:49:00Z",
+                      "2026-09-24T15:50:00Z", "2026-09-24T15:46:00Z"],
+        "markIV": [0.44, 0.45, 0.60, 0.61],
+    }).write_parquet(snaps)
+    ms = int(at.timestamp() * 1000)
+    query = collector.print_surface_query("BTC", [("BTC-30OCT26-90000-C", ms),
+                                                  ("BTC-25SEP26-80000-C", ms)])
+    assert query.paths == [collector.bucket_pattern("deribit", "btc", at.replace(second=0))]
+    got = duckdb.sql(query.sql.replace("__PATHS__", f"['{snaps}']")).pl()
+    marks = dict(zip(got["symbol"], got["markIV"]))
+    assert marks == {"BTC-30OCT26-90000-C": 0.44, "BTC-25SEP26-80000-C": 0.61}
+
+
+def test_leg_ivs_convert_units_and_report_a_failed_read(monkeypatch):
+    unit = pl.DataFrame({"symbol": ["BTC-30OCT26-90000-C"], "captured_at": [START],
+                         "iv_unit": ["decimal"], "oi_unit": ["coin"], "contract_size": [1.0],
+                         "price_unit": ["coin"]})
+    rows = pl.DataFrame({"symbol": ["BTC-30OCT26-90000-C"], "at_ms": [1],
+                         "markIV": [0.44], "timestamp": ["2026-09-08T08:30:00Z"]})
+    monkeypatch.setattr(direct, "run_query", lambda q: ({"status": "ok"}, rows))
+    gaps = []
+    found = direct.leg_ivs("BTC", [("BTC-30OCT26-90000-C", 1)], {"deribit": unit}, gaps)
+    assert found == {("BTC-30OCT26-90000-C", 1): pytest.approx(44.0)}
+    assert not gaps
+    direct.leg_ivs("BTC", [("BTC-30OCT26-90000-C", 1), ("BTC-25SEP26-80000-C", 1)],
+                   {"deribit": unit}, gaps)
+    assert gaps == ["Block Flow: 1 of 2 Deribit legs show no IV — no usable snapshot or IV unit at their print time"]
+    gaps.clear()
+    monkeypatch.setattr(direct, "run_query",
+                        lambda q: ({"status": "unavailable", "error": "403"}, pl.DataFrame()))
+    assert direct.leg_ivs("BTC", [("BTC-30OCT26-90000-C", 1)], {"deribit": unit}, gaps) == {}
+    assert gaps == ["Block Flow: leg IVs unavailable — 403"]
+
+
+def test_a_small_unvalued_share_is_not_printed_as_zero():
+    gaps = []
+    totals = {"bybit-options": dict(direct.EMPTY_TOTAL, count=46_597, missing=95, missing_symbols=8)}
+    direct.inputs(totals, {}, {}, gaps)
+    assert "Bybit 95 of 46,597 (0.2%) across 8 symbols" in gaps[0]
+
+
+def test_the_tape_tail_gap_states_a_fact_not_an_instruction():
+    line = direct.tape_coverage_gap({"coverage_complete": False,
+                                     "coverage_shortfall_seconds": 95 * 60})
+    assert line == ("Paradigm executions: the last 95 min of the window are not on the tape "
+                    "yet (hourly upstream sync) — blocks printed then are missing from "
+                    "Block Flow, not absent")
+    unknown = direct.tape_coverage_gap({"coverage_complete": False,
+                                        "coverage_shortfall_seconds": None})
+    assert "coverage unknown" in unknown
+    assert direct.tape_coverage_gap({"coverage_complete": True}) is None
+    assert "the last 1 min" in direct.tape_coverage_gap({"coverage_complete": False,
+                                                         "coverage_shortfall_seconds": 12})
