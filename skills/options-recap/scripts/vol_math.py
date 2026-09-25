@@ -750,6 +750,7 @@ def _block_from_rows(bid: str, rows: list[dict], iv_lookup=None) -> dict:
     named = next((parse_tape_description(d) for d in descs
                   if parse_tape_description(d)["label"] not in ("Call", "Put")
                   and parse_tape_description(d)["classified"]), None)
+    traded = []
     if named:
         label, expiry, legs = named["label"], named["expiry"], named["legs"]
         # Combined-DESCRIPTION block: each row is a leg (its SIDE/price picks which)
@@ -760,7 +761,7 @@ def _block_from_rows(bid: str, rows: list[dict], iv_lookup=None) -> dict:
         unit = min(qtys) if qtys else 0
     else:
         # Per-leg rows: one option leg each; classify by the collected geometry.
-        legs = _traded_legs(rows)
+        legs = traded = _traded_legs(rows)
         expiry = _join_exp([lg["expiry_c"] for lg in legs])
         label = _classify_tape_legs(asset, legs)
         unit = min((lg["qty"] for lg in legs), default=0) or (
@@ -770,7 +771,8 @@ def _block_from_rows(bid: str, rows: list[dict], iv_lookup=None) -> dict:
     detail, avg_iv = _tape_detail_iv(asset, venue, legs, unit, side,
                                      rows[0].get("DESCRIPTION"), iv_lookup)
     return {
-        "block_trade_id": bid, "rfq_id": rows[0].get("RFQ_ID") or bid,
+        "block_trade_id": bid, "rfq_id": rows[0].get("RFQ_ID") or bid, "legs": traded,
+        "asset": asset,
         "structure": label, "expiry": expiry, "venue": venue,
         "notional_usd": round(notional), "unit_size": round(unit, 1),
         "side": side, "avg_iv": avg_iv, "time_utc": time_utc, "detail": detail,
@@ -873,6 +875,19 @@ def tape_block_key(row: dict):
 MIN_BLOCK_NOTIONAL_USD = 250_000
 
 
+def leg_pattern(block: dict) -> tuple:
+    """Blocks with the same instruments, taker sides and leg ratio on one venue
+    are one structure, whatever RFQ or hour they printed in. A block without
+    per-leg sizes can only be matched on its RFQ id."""
+    legs = block.get("legs")
+    base = min((lg["qty"] for lg in legs), default=0) if legs else 0
+    if base <= 0:
+        return ("rfq", block["rfq_id"])
+    return (block["venue"],) + tuple(
+        (lg["expiry_c"], lg["strike"], lg["cp"], lg["sign"], round(lg["qty"] / base, 2))
+        for lg in legs)
+
+
 def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
                       min_notional_usd: float = MIN_BLOCK_NOTIONAL_USD,
                       extra_blocks: list[dict] | None = None) -> dict:
@@ -881,15 +896,15 @@ def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
     Two levels, matching the recap's block/structure model:
       • BLOCK_TRADE_ID → one executed block (Σ per-leg notional). The BIGGEST
         PRINT is the single largest such block.
-      • RFQ_ID         → one worked order; its clips share the id. Block Flow
-        rows are worked orders, `blocks` = distinct BLOCK_TRADE_IDs in the order,
-        notional = Σ across them.
+      • leg_pattern    → one structure: blocks with the same legs, sides and
+        ratio on one venue. Block Flow rows are structures, `blocks` = how many
+        blocks, notional and leg sizes = Σ across them.
 
     `extra_blocks` are PRE-SHAPED block dicts (same keys _block_from_rows emits,
     with source="venue") from exchange tapes the Paradigm tape doesn't cover —
     e.g. OKX blocks off the hot recap file. They enter the pool before the
     min-notional filter and compete for Biggest Print / top-N on equal terms;
-    each is its own worked order (rfq_id = its block id). Their notional_usd
+    each is its own structure (rfq_id = its block id). Their notional_usd
     MUST already be underlying-USD, the same basis as NOTIONAL_VOLUME_USD.
 
     `iv_lookup(cp, strike, expiry_c) -> mark_iv | None` annotates Deribit blocks.
@@ -923,16 +938,23 @@ def build_tape_blocks(rows: list[dict], iv_lookup=None, top_n: int = 8,
                    "avg_iv": b0["avg_iv"], "venue": b0["venue"], "detail": b0["detail"],
                    "source": b0.get("source") or "paradigm"}
 
-    # Worked-order rollup: group blocks by RFQ_ID (blocks arrive notional-desc, so
-    # the first seen in a group is its largest — it names the merged row).
-    groups: dict[str, dict] = {}
+    groups: dict[tuple, dict] = {}
     for b in blocks:
-        g = groups.get(b["rfq_id"])
+        key = leg_pattern(b)
+        g = groups.get(key)
         if g is None:
-            groups[b["rfq_id"]] = {**b, "blocks": 1}
-        else:
-            g["notional_usd"] += b["notional_usd"]
-            g["blocks"] += 1
+            groups[key] = {**b, "blocks": 1,
+                           "legs": [dict(lg) for lg in b.get("legs") or []]}
+            continue
+        g["notional_usd"] += b["notional_usd"]
+        g["blocks"] += 1
+        if key[0] != "rfq":
+            for gl, bl in zip(g["legs"], b["legs"]):
+                gl["qty"] += bl["qty"]
+    for key, g in groups.items():
+        if g["blocks"] > 1 and key[0] != "rfq":
+            g["detail"], g["avg_iv"] = _tape_detail_iv(
+                g["asset"], g["venue"], g["legs"], 0, g["side"], "", iv_lookup)
     structures = sorted(groups.values(), key=lambda g: g["notional_usd"], reverse=True)
 
     out_rows = []

@@ -152,8 +152,10 @@ structure needs. There is no per-row venue column — the Biggest Print line's
 carries its venue in the structure label (`OKX Block`).
 
 Two granularities, both always stated: tape **blocks** (`BLOCK_TRADE_ID`s, the
-industry term for the individual prints) and **structures** (clips of one worked
-order — the blocks sharing an `RFQ_ID` — grouped into one row). Rows are
+industry term for the individual prints) and **structures** (blocks with the
+same instruments, taker sides and leg ratio on one venue, whatever RFQ or hour
+they printed in, grouped into one row with their notional and leg sizes
+summed). A block the tape gives no size for on some leg groups on its RFQ id, keeping its largest block's detail. Rows are
 structures and `#` numbers them; the Blocks column carries each row's block
 count, so it sums to the header `[N]` and the row count equals `[M]`. When more
 than 8 structures qualify, the header gains the `(top 8 by notional)` suffix.

@@ -737,6 +737,48 @@ def test_ratio_diagonal_shows_legs_as_traded():
     check("biggest print carries the same legs", bp.get("detail") == row["detail"], bp)
 
 
+def _diag(bid, rfq, front=500, back=1000, sides=("SELL", "BUY"), prod="BTC OPTION - DBT"):
+    rows = [_tape_leg("Call 25 Sep 26 80000", sides[0], front, front * 84_200, bid, rfq=rfq),
+            _tape_leg("Call 30 Oct 26 90000", sides[1], back, back * 84_200, bid, rfq=rfq)]
+    for r in rows:
+        r["PRODUCT"] = prod
+    return rows
+
+
+def test_same_legs_across_rfqs_are_one_structure():
+    """Four RFQs of one 1x2 diagonal rendered as four "1 block" rows."""
+    rows = [r for i in range(4) for r in _diag(f"b{i}", f"rfq{i}")]
+    res = build_tape_blocks(rows)
+    check("four blocks", res["n_blocks"] == 4, res["n_blocks"])
+    check("one structure", res["n_structures"] == 1, res["n_structures"])
+    row = res["rows"][0]
+    check("row counts four blocks", row["blocks"] == 4, row)
+    check("row notional is the sum", row["notl_m"] == round(4 * 1500 * 84_200 / 1e6, 1), row)
+    check("row legs are summed", row["detail"] == "-2000 25SEP26 80KC / +4000 30OCT26 90KC", row)
+    check("biggest print stays one block", bp_size(res) == 1500 * 84_200, res["biggest_print"])
+
+
+def bp_size(res):
+    return round(res["biggest_print"]["notional_m"] * 1e6, -5)
+
+
+def test_different_legs_stay_separate_structures():
+    rows = (_diag("a", "r1") + _diag("b", "r2", back=500)
+            + _diag("c", "r3", sides=("BUY", "SELL"))
+            + _diag("d", "r4", prod="BTC OPTION - PRDX"))
+    res = build_tape_blocks(rows)
+    check("ratio, side and venue each split a structure", res["n_structures"] == 4, res["rows"])
+    shared = build_tape_blocks(_diag("a", "r1") + _diag("b", "r1", back=500))
+    check("different legs in one RFQ are two structures", shared["n_structures"] == 2, shared["rows"])
+    sizeless = [_tape_leg("Call 25 Sep 26 80000", "", 0, 5_000_000, "a", rfq="r9"),
+                _tape_leg("Call 25 Sep 26 84000", "", 50, 5_000_000, "a", rfq="r9"),
+                _tape_leg("Call 25 Sep 26 86000", "", 70, 4_000_000, "b", rfq="r9"),
+                _tape_leg("Call 25 Sep 26 88000", "", 0, 4_000_000, "b", rfq="r9")]
+    row = build_tape_blocks(sizeless)["rows"][0]
+    check("an RFQ-grouped row keeps its largest block's legs",
+          row["detail"] == "0 80KC / 50 84KC", row)
+
+
 def test_missing_side_is_not_read_as_a_sell():
     rows = [_tape_leg("Call 25 Sep 26 80000", "", 500, 42_100_000, "b1"),
             _tape_leg("Call 30 Oct 26 90000", "", 500, 42_100_000, "b1")]

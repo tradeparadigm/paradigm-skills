@@ -850,7 +850,7 @@ def _venue_tape_blocks(rows: list[dict], spot: float | None) -> list[dict]:
         detail += f" — {legs or '?'} legs (venue tape)"
         out.append({
             "block_trade_id": r.get("block_id"),
-            "rfq_id": r.get("block_id"),  # its own worked order
+            "rfq_id": r.get("block_id"),  # its own structure
             "structure": f"{venue} Block", "expiry": "",
             "venue": venue,
             "notional_usd": round(vol * (_price_at(r) or spot)),
